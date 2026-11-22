@@ -1,0 +1,64 @@
+import '@testing-library/jest-dom'
+
+import { fireEvent, render } from '@testing-library/react'
+
+import { DashboardPlacement, DashboardTile } from '~/types'
+
+import { TextCard } from './TextCard'
+import { TextContent } from './TextContent'
+
+const makeTextTile = (overrides: Partial<DashboardTile> = {}): DashboardTile =>
+    ({
+        id: 1,
+        text: {
+            body: 'text body',
+            last_modified_at: '2022-04-01T12:24:36',
+        },
+        layouts: {},
+        color: null,
+        ...overrides,
+    }) as DashboardTile
+
+describe('TextCard', () => {
+    it('shows the more button when placement is not Public', () => {
+        const { getByLabelText, getByText } = render(
+            <TextCard
+                textTile={makeTextTile()}
+                placement={DashboardPlacement.Dashboard}
+                moreButtonOverlay={<div>more overlay</div>}
+            />
+        )
+
+        // click the visible more button (aria-label="more") and ensure overlay content appears
+        fireEvent.click(getByLabelText('more'))
+        expect(getByText('more overlay')).toBeInTheDocument()
+    })
+
+    describe('TextContent', () => {
+        it('calls closeDetails when clicked', () => {
+            const closeDetails = jest.fn()
+
+            const { container } = render(
+                <TextContent text="some **markdown**" closeDetails={closeDetails} className="custom-class" />
+            )
+
+            const paragraph = container.querySelector('p')
+            expect(paragraph).not.toBeNull()
+            fireEvent.click(paragraph as HTMLElement)
+            expect(closeDetails).toHaveBeenCalledTimes(1)
+        })
+    })
+
+    describe('resize handles', () => {
+        it('shows only the bottom-right handle when showResizeHandles is true', () => {
+            const { container } = render(
+                <TextCard textTile={makeTextTile()} placement={DashboardPlacement.Dashboard} showResizeHandles={true} />
+            )
+
+            const handles = container.querySelectorAll('.handle')
+
+            expect(handles).toHaveLength(1)
+            expect(handles[0]).toHaveClass('corner', 'bottom-right')
+        })
+    })
+})

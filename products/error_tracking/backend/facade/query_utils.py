@@ -1,0 +1,748 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta
+from typing import cast
+from zoneinfo import ZoneInfo
+
+from posthog.hogql.escape_sql import escape_hogql_string
+
+from posthog.dataclasses import frozen
+from posthog.utils import relative_date_parse
+
+from products.error_tracking.backend.facade.contracts import IssueTrendDirection
+
+MAX_NORMALIZED_TEXT_CHARS = 1000
+MAX_STACK_FRAMES = 50
+# The issue detail tool returns the full description, so list rows keep only a preview.
+MAX_LIST_DESCRIPTION_CHARS = 300
+
+ISSUE_FIELDS = [
+    "id",
+    "name",
+    "description",
+    "status",
+    "severity",
+    "first_seen",
+    "last_seen",
+    "library",
+    "source",
+    "function",
+    "assignee",
+]
+
+LIST_ISSUE_FIELDS = [
+    "id",
+    "name",
+    "description",
+    "status",
+    "severity",
+    "first_seen",
+    "last_seen",
+    "library",
+    "source",
+    "assignee",
+    "aggregations",
+]
+
+# Keep in sync with ERROR_TRACKING_LISTING_RESOLUTION in products/error_tracking/frontend/utils.ts
+ERROR_TRACKING_LISTING_VOLUME_RESOLUTION = 20
+
+
+def normalize_volume_resolution(volume_resolution: int) -> int:
+    return max(volume_resolution, 1)
+
+
+CONTEXT_EVENT_SELECTS = ["properties.$exception_list", "properties.$exception_release"]
+RELEASE_EVENT_SELECTS = ["properties.$exception_release"]
+DEFAULT_EVENT_CONTEXT_INCLUDES = ["exception", "environment", "navigation", "correlation"]
+EVENT_CONTEXT_PROPERTY_SELECTS = {
+    "exception": [
+        "properties.$exception_types",
+        "properties.$exception_values",
+        "properties.$exception_list",
+        "properties.$exception_fingerprint",
+        "properties.$exception_level",
+        "properties.$exception_handled",
+    ],
+    "stacktrace": ["properties.$exception_list"],
+    "code_variables": ["properties.$exception_list"],
+    "environment": [
+        "properties.$lib",
+        "properties.$lib_version",
+        "properties.$browser",
+        "properties.$browser_version",
+        "properties.$os",
+        "properties.$os_version",
+        "properties.$app_namespace",
+        "properties.$app_version",
+        "properties.$device_type",
+    ],
+    "release": ["properties.$exception_release"],
+    "navigation": ["properties.$current_url", "properties.$screen_name", "properties.$referrer"],
+    "correlation": [
+        "properties.$session_id",
+        "properties.$trace_id",
+        "properties.$span_id",
+        "properties.$ai_trace_id",
+        "properties.$ai_span_id",
+    ],
+    "diagnostics": ["properties.$cymbal_errors"],
+}
+EVENT_PROPERTY_SELECTS = list(
+    dict.fromkeys(select for context_group in EVENT_CONTEXT_PROPERTY_SELECTS.values() for select in context_group)
+)
+EVENT_SELECTS = ["uuid", "timestamp", "distinct_id", *EVENT_PROPERTY_SELECTS]
+EVENT_SEARCH_PROPERTIES = ["properties.$exception_types", "properties.$exception_values", "properties.$current_url"]
+PROPERTY_COLUMN_NAMES = {
+    select.removeprefix("properties.") for select in [*CONTEXT_EVENT_SELECTS, *EVENT_PROPERTY_SELECTS]
+}
+
+ISSUE_BREAKDOWN_TOP_VALUES = 5
+ISSUE_BREAKDOWN_MAX_DAYS = 30
+MAX_BREAKDOWN_VALUE_CHARS = 200
+# Ask for more values than the response returns: NULL and empty values can take a slot, and they are dropped.
+ISSUE_BREAKDOWN_QUERY_VALUES = ISSUE_BREAKDOWN_TOP_VALUES + 2
+# Dimension name in the response -> event property. All of them have materialized columns. A property without one
+# makes the query read the whole properties blob, which holds the exception payload. On a high-volume issue that
+# multiplies the bytes read by about 40, for example with $trace_id or $exception_handled.
+ISSUE_BREAKDOWN_DIMENSIONS = {
+    "path": "$pathname",
+    "url": "$current_url",
+    "screen": "$screen_name",
+    "browser": "$browser",
+    "os": "$os",
+    "library": "$lib",
+    "library_version": "$lib_version",
+    "app_version": "$app_version",
+}
+ISSUE_BREAKDOWN_SESSION_PROPERTY = "$session_id"
+ISSUE_BREAKDOWN_PROPERTIES = [*ISSUE_BREAKDOWN_DIMENSIONS.values(), ISSUE_BREAKDOWN_SESSION_PROPERTY]
+# Labels the breakdowns query uses for a missing value.
+BREAKDOWN_EMPTY_VALUES = {"", "$$_posthog_breakdown_null_$$"}
+
+
+def build_event_selects(includes: list[str]) -> list[str]:
+    property_selects = list(
+        dict.fromkeys(select for include in includes for select in EVENT_CONTEXT_PROPERTY_SELECTS.get(include, []))
+    )
+    return ["uuid", "timestamp", "distinct_id", *property_selects]
+
+
+def compact_dict(record: dict[str, object]) -> dict[str, object]:
+    """Remove empty response fields while intentionally preserving 0 and false values."""
+    return {
+        key: value for key, value in record.items() if value is not None and value != [] and value != {} and value != ""
+    }
+
+
+def escape_hogql_like_pattern(value: str) -> str:
+    pattern = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escape_hogql_string(f"%{pattern}%")
+
+
+def as_list(value: str | list[str]) -> list[str]:
+    return value if isinstance(value, list) else [value]
+
+
+def build_date_range(raw_date_range: object) -> dict[str, object]:
+    date_range: dict[str, object] = {"date_from": "-7d"}
+    if isinstance(raw_date_range, dict):
+        date_range.update({str(key): value for key, value in raw_date_range.items()})
+    return date_range
+
+
+def add_event_filter(filters: list[dict[str, object]], key: str, operator: str, value: str | list[str]) -> None:
+    filters.append(
+        {"type": "event", "key": key, "operator": operator, "value": as_list(value) if operator == "exact" else value}
+    )
+
+
+def add_release_filter(filters: list[dict[str, object]], release: str) -> None:
+    escaped_release = escape_hogql_string(release)
+    filters.append(
+        {
+            "type": "hogql",
+            "key": f"position(toString(properties.$exception_release), {escaped_release}) > 0",
+        }
+    )
+    filters.append(
+        {
+            "type": "hogql",
+            "key": (
+                f"{escaped_release} IN (toString(properties.$exception_release.id), "
+                "toString(properties.$exception_release.version), "
+                "toString(properties.$exception_release.metadata.git.commit_id))"
+            ),
+        }
+    )
+
+
+def build_issue_filters(params: dict[str, object]) -> list[dict[str, object]]:
+    filters = [dict(item) for item in cast(list[dict[str, object]], params.get("filterGroup", []))]
+    first_seen_after = params.get("firstSeenAfter")
+    if isinstance(first_seen_after, str):
+        filters.append(
+            {
+                "type": "error_tracking_issue",
+                "key": "first_seen",
+                "operator": "is_date_after",
+                "value": first_seen_after,
+            }
+        )
+    library = params.get("library")
+    if isinstance(library, str | list):
+        add_event_filter(filters, "$lib", "exact", cast(str | list[str], library))
+    release = params.get("release")
+    if isinstance(release, str):
+        add_release_filter(filters, release)
+    fingerprint = params.get("fingerprint")
+    if isinstance(fingerprint, str | list):
+        add_event_filter(filters, "$exception_fingerprint", "exact", cast(str | list[str], fingerprint))
+    url = params.get("url")
+    if isinstance(url, str):
+        add_event_filter(filters, "$current_url", "icontains", url)
+    return filters
+
+
+def build_property_group(filters: list[dict[str, object]]) -> dict[str, object] | None:
+    if not filters:
+        return None
+    return {"type": "AND", "values": [{"type": "AND", "values": filters}]}
+
+
+def build_search_query(params: dict[str, object]) -> str | None:
+    terms = [
+        value.strip()
+        for value in [params.get("searchQuery"), params.get("user"), params.get("filePath")]
+        if isinstance(value, str) and value.strip()
+    ]
+    return " ".join(terms) if terms else None
+
+
+def get_page_info(data: dict[str, object], limit: int, offset: int) -> tuple[bool, int | None]:
+    results = data.get("results")
+    row_count = len(results) if isinstance(results, list) else 0
+    has_more = bool(data.get("hasMore")) or row_count > limit
+    return has_more, offset + limit if has_more else None
+
+
+def pick_fields(record: dict[str, object], fields: list[str]) -> dict[str, object]:
+    return {field: record[field] for field in fields if field in record}
+
+
+def build_list_issue(issue: dict[str, object], include_volume: bool) -> dict[str, object]:
+    row = pick_fields(issue, LIST_ISSUE_FIELDS)
+    if "description" in row:
+        row["description"] = truncate_text(row["description"], MAX_LIST_DESCRIPTION_CHARS)
+    aggregations = as_record(row.get("aggregations"))
+    if aggregations is not None and not include_volume:
+        # The query always computes one volume bucket, which only repeats the occurrence count.
+        row["aggregations"] = {
+            key: value for key, value in aggregations.items() if key not in {"volumeRange", "volume_buckets"}
+        }
+    return row
+
+
+def to_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+def parse_jsonish(value: object) -> object:
+    parsed = value
+    for _ in range(2):
+        if not isinstance(parsed, str):
+            return parsed
+        trimmed = parsed.strip()
+        if not trimmed or trimmed[0] not in {"[", "{", '"'}:
+            return parsed
+        try:
+            parsed = json.loads(trimmed)
+        except json.JSONDecodeError:
+            return parsed
+    return parsed
+
+
+def truncate_text(value: object, max_chars: int = MAX_NORMALIZED_TEXT_CHARS) -> object:
+    if not isinstance(value, str) or len(value) <= max_chars:
+        return value
+    suffix = f"… [truncated from {len(value)} chars]"
+    return f"{value[: max_chars - len(suffix)]}{suffix}"
+
+
+def as_record(value: object) -> dict[str, object] | None:
+    return cast(dict[str, object], value) if isinstance(value, dict) else None
+
+
+def strip_non_raw_fields(record: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in record.items() if key not in {"junk_drawer", "raw_id"}}
+
+
+def normalize_frame(
+    frame: object, only_app_frames: bool, include_code_variables: bool = True
+) -> dict[str, object] | None:
+    frame_record = as_record(parse_jsonish(frame))
+    if frame_record is None:
+        return None
+    if only_app_frames and frame_record.get("in_app") is not True:
+        return None
+    base_frame = strip_non_raw_fields(frame_record)
+    if not include_code_variables:
+        base_frame = {key: value for key, value in base_frame.items() if key != "code_variables"}
+    normalized = {
+        **base_frame,
+        "mangled_name": frame_record.get("mangled_name") or frame_record.get("function") or frame_record.get("name"),
+        "source": frame_record.get("source") or frame_record.get("filename") or frame_record.get("abs_path"),
+        "line": frame_record.get("line") or frame_record.get("lineno"),
+        "column": frame_record.get("column") or frame_record.get("colno"),
+    }
+    return compact_dict(normalized)
+
+
+def normalize_stacktrace(
+    stacktrace: object, only_app_frames: bool, include_code_variables: bool = True
+) -> dict[str, object] | None:
+    stacktrace_record = as_record(parse_jsonish(stacktrace))
+    if stacktrace_record is None:
+        return None
+    raw_frames = stacktrace_record.get("frames")
+    frames = (
+        [
+            normalized
+            for frame in cast(list[object], raw_frames)
+            if (normalized := normalize_frame(frame, only_app_frames, include_code_variables)) is not None
+        ]
+        if isinstance(raw_frames, list)
+        else None
+    )
+    frames_omitted = 0
+    if frames is not None and len(frames) > MAX_STACK_FRAMES:
+        # Frames run from the outermost call to the frame that raised, so keep the end of the list. A deep
+        # recursion can otherwise return thousands of frames that repeat the same few lines.
+        frames_omitted = len(frames) - MAX_STACK_FRAMES
+        frames = frames[-MAX_STACK_FRAMES:]
+    base_stacktrace = strip_non_raw_fields(stacktrace_record)
+    return compact_dict({**base_stacktrace, "frames": frames, "frames_omitted": frames_omitted or None})
+
+
+def normalize_exception(
+    exception: object, include_stacktrace: bool, only_app_frames: bool, include_code_variables: bool = True
+) -> dict[str, object] | None:
+    exception_record = as_record(parse_jsonish(exception))
+    if exception_record is None:
+        return None
+    summary = compact_dict(
+        {
+            "type": exception_record.get("type") or exception_record.get("exception_type"),
+            "value": truncate_text(
+                exception_record.get("value")
+                or exception_record.get("message")
+                or exception_record.get("exception_message")
+            ),
+            "module": exception_record.get("module"),
+            "mechanism": exception_record.get("mechanism"),
+        }
+    )
+    if not include_stacktrace:
+        return summary
+    stacktrace = normalize_stacktrace(exception_record.get("stacktrace"), only_app_frames, include_code_variables)
+    return compact_dict({**summary, "stacktrace": stacktrace})
+
+
+def normalize_exception_list(
+    value: object, include_stacktrace: bool, only_app_frames: bool, include_code_variables: bool = True
+) -> object:
+    parsed = parse_jsonish(value)
+    record = as_record(parsed)
+    exceptions = parsed if isinstance(parsed, list) else record.get("values") if record else None
+    if not isinstance(exceptions, list):
+        return parsed
+    return [
+        normalized
+        for exception in exceptions
+        if (normalized := normalize_exception(exception, include_stacktrace, only_app_frames, include_code_variables))
+        is not None
+    ]
+
+
+def normalize_string_array(value: object, truncate_items: bool = False) -> object:
+    parsed = parse_jsonish(value)
+    if not isinstance(parsed, list):
+        return parsed
+    return [truncate_text(item) for item in parsed] if truncate_items else parsed
+
+
+def normalize_error_property(
+    name: str, value: object, include_stacktrace: bool, only_app_frames: bool, include_code_variables: bool = True
+) -> object:
+    if name == "$exception_list":
+        return normalize_exception_list(value, include_stacktrace, only_app_frames, include_code_variables)
+    if name in {"$exception_release", "$cymbal_errors"}:
+        return parse_jsonish(value)
+    if name == "$exception_handled" and isinstance(value, str) and value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    if name == "$exception_types":
+        return normalize_string_array(value)
+    if name == "$exception_values":
+        return normalize_string_array(value, True)
+    return value
+
+
+def property_name(select: str) -> str | None:
+    if select.startswith("properties."):
+        return select.removeprefix("properties.")
+    return select if select in PROPERTY_COLUMN_NAMES else None
+
+
+def map_event_row(
+    row: object,
+    columns: list[str],
+    include_stacktrace: bool,
+    only_app_frames: bool,
+    include_code_variables: bool = True,
+) -> dict[str, object]:
+    if isinstance(row, list):
+        values = row
+    else:
+        record = as_record(row)
+        values = [record.get(column) if record else None for column in columns]
+    event: dict[str, object] = {"properties": {}}
+    properties = cast(dict[str, object], event["properties"])
+    for index, column in enumerate(columns):
+        value = values[index] if isinstance(values, list) and index < len(values) else None
+        if value is None:
+            continue
+        prop = property_name(column)
+        if prop:
+            properties[prop] = normalize_error_property(
+                prop, value, include_stacktrace, only_app_frames, include_code_variables
+            )
+        else:
+            event[column] = value
+    return event
+
+
+def dedupe_repeated_stacktraces(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Replace a stack trace that the page already returned with a reference to the first copy.
+
+    Events of one issue usually share one stack, so a page of sampled events otherwise repeats the same frames once
+    for each event. The reference names the event and the index of the exception in its `$exception_list`, because
+    one event can hold several exceptions with different stacks, and two of them can share a stack. Stacks that
+    differ in any frame, or in code variables, stay in full.
+    """
+    first_copy_by_stack: dict[str, dict[str, object]] = {}
+    for event in events:
+        event_uuid = event.get("uuid")
+        properties = as_record(event.get("properties"))
+        exceptions = properties.get("$exception_list") if properties else None
+        if not isinstance(exceptions, list):
+            continue
+        for index, exception in enumerate(exceptions):
+            exception_record = as_record(exception)
+            stacktrace = as_record(exception_record.get("stacktrace")) if exception_record else None
+            if exception_record is None or stacktrace is None or not stacktrace.get("frames"):
+                continue
+            key = json.dumps(stacktrace, sort_keys=True, default=str)
+            first_copy = first_copy_by_stack.get(key)
+            if first_copy is not None:
+                exception_record["stacktrace"] = dict(first_copy)
+            elif isinstance(event_uuid, str):
+                first_copy_by_stack[key] = {"same_as_event": event_uuid, "same_as_exception": index}
+    return events
+
+
+def map_context_event_properties(data: dict[str, object]) -> dict[str, object]:
+    rows = data.get("results")
+    row = rows[0] if isinstance(rows, list) and rows else None
+    if row is None:
+        return {}
+    raw_columns = data.get("columns")
+    columns = [str(column) for column in raw_columns] if isinstance(raw_columns, list) else CONTEXT_EVENT_SELECTS
+    return cast(dict[str, object], map_event_row(row, columns, True, True)["properties"])
+
+
+def get_frames(exception_list: object) -> list[dict[str, object]]:
+    if not isinstance(exception_list, list):
+        return []
+    frames: list[dict[str, object]] = []
+    for exception in exception_list:
+        exception_record = as_record(exception)
+        if exception_record is None:
+            continue
+        stacktrace = as_record(exception_record.get("stacktrace"))
+        exception_frames = stacktrace.get("frames") if stacktrace else None
+        if isinstance(exception_frames, list):
+            frames.extend(frame for frame in exception_frames if isinstance(frame, dict))
+    return frames
+
+
+def get_frame_value(frame: dict[str, object], keys: list[str]) -> object:
+    for key in keys:
+        value = frame.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def build_top_in_app_frame(issue: dict[str, object], event_properties: dict[str, object]) -> dict[str, object]:
+    top_frame = next(
+        (
+            frame
+            for frame in reversed(get_frames(event_properties.get("$exception_list")))
+            if frame.get("in_app") is True
+        ),
+        None,
+    )
+    if top_frame is None:
+        return {}
+    frame_function = get_frame_value(top_frame, ["function", "mangled_name", "name"])
+    fallback_function = issue.get("function") if isinstance(issue.get("function"), str) else None
+    function = frame_function if isinstance(frame_function, str) and frame_function != "?" else fallback_function
+    frame_source = get_frame_value(top_frame, ["source", "filename", "abs_path", "module"])
+    fallback_source = issue.get("source") if isinstance(issue.get("source"), str) else None
+    return compact_dict(
+        {
+            "function": function,
+            "source": frame_source or fallback_source,
+            "line": get_frame_value(top_frame, ["line", "lineno"]),
+            "column": get_frame_value(top_frame, ["column", "colno"]),
+            "in_app": True,
+        }
+    )
+
+
+def extract_release(event_properties: dict[str, object]) -> dict[str, object]:
+    release = as_record(event_properties.get("$exception_release"))
+    if release is None:
+        return {}
+    metadata = as_record(release.get("metadata"))
+    git = as_record(metadata.get("git") if metadata else None)
+    return compact_dict(
+        {
+            "version": release.get("version"),
+            "project": release.get("project"),
+            "timestamp": release.get("timestamp"),
+            "commit_id": git.get("commit_id") if git else None,
+            "branch": git.get("branch") if git else None,
+            "repo_name": git.get("repo_name") if git else None,
+        }
+    )
+
+
+# A late event can carry a timestamp before first_seen, but no first event is after it.
+FIRST_EVENT_LOOKBACK = timedelta(days=1)
+# EventsQuery bounds are exclusive, so the window ends just after first_seen.
+FIRST_EVENT_LOOKAHEAD = timedelta(seconds=1)
+
+
+def parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+@frozen
+class EventWindow:
+    after: str
+    before: str
+
+
+def first_event_window(first_seen: datetime | None) -> EventWindow | None:
+    if first_seen is None:
+        return None
+    return EventWindow(
+        after=(first_seen - FIRST_EVENT_LOOKBACK).isoformat(),
+        before=(first_seen + FIRST_EVENT_LOOKAHEAD).isoformat(),
+    )
+
+
+@frozen
+class BreakdownRange:
+    date_from: datetime
+    date_to: datetime
+    # True when the limit made the range shorter than the request.
+    range_limited: bool
+
+
+def resolve_breakdown_range(date_range: dict[str, object], timezone_info: ZoneInfo, now: datetime) -> BreakdownRange:
+    """Resolve the breakdown range and limit it to the last ISSUE_BREAKDOWN_MAX_DAYS days before its end.
+
+    The breakdown aggregates every matching event, so its cost grows with the range. The limit keeps the cost
+    bounded.
+    """
+    raw_date_to = date_range.get("date_to")
+    date_to = relative_date_parse(str(raw_date_to), timezone_info, now=now) if raw_date_to else now
+    raw_date_from = date_range.get("date_from")
+    date_from = (
+        relative_date_parse(str(raw_date_from), timezone_info, now=now)
+        if raw_date_from and raw_date_from != "all"
+        else None
+    )
+    earliest = date_to - timedelta(days=ISSUE_BREAKDOWN_MAX_DAYS)
+    if date_from is None or date_from < earliest:
+        return BreakdownRange(date_from=earliest, date_to=date_to, range_limited=True)
+    return BreakdownRange(date_from=date_from, date_to=date_to, range_limited=False)
+
+
+def breakdown_query_date_range(
+    date_range: dict[str, object], timezone_info: ZoneInfo, now: datetime
+) -> tuple[dict[str, str | None], bool]:
+    """Build the date range for the breakdowns query and say whether the 30-day limit made it shorter.
+
+    A range within the limit keeps the requested strings, so a relative range such as -7d gives the same query, and
+    the same cache key, on every call. A relative date_to is sent resolved: the breakdowns query reads it forward.
+    """
+    resolved = resolve_breakdown_range(date_range, timezone_info, now)
+    raw_date_from = date_range.get("date_from")
+    return {
+        "date_from": resolved.date_from.isoformat() if resolved.range_limited else str(raw_date_from),
+        "date_to": resolved.date_to.isoformat() if date_range.get("date_to") else None,
+    }, resolved.range_limited
+
+
+def as_count(value: object) -> int:
+    # The breakdowns query returns counts as floats.
+    return int(value) if isinstance(value, int | float) and not isinstance(value, bool) else 0
+
+
+def breakdown_values(results: dict[str, object], prop: str, limit: int) -> list[dict[str, object]]:
+    property_result = as_record(results.get(prop))
+    raw_values = property_result.get("values") if property_result else None
+    values: list[dict[str, object]] = []
+    for item in raw_values if isinstance(raw_values, list) else []:
+        record = as_record(item)
+        value = record.get("value") if record else None
+        count = record.get("count") if record else None
+        if not isinstance(value, str) or value in BREAKDOWN_EMPTY_VALUES:
+            continue
+        values.append({"value": truncate_text(value, MAX_BREAKDOWN_VALUE_CHARS), "count": as_count(count)})
+    return values[:limit]
+
+
+def map_issue_breakdown(results: dict[str, object]) -> dict[str, object]:
+    """Map ErrorTrackingBreakdownsQuery results to the compact breakdown of the issue tool."""
+    totals = [
+        as_count(record.get("total_count"))
+        for prop in ISSUE_BREAKDOWN_PROPERTIES
+        if (record := as_record(results.get(prop))) is not None
+    ]
+    top_values = {
+        name: breakdown_values(results, prop, ISSUE_BREAKDOWN_TOP_VALUES)
+        for name, prop in ISSUE_BREAKDOWN_DIMENSIONS.items()
+    }
+    # The URL only matters when there is no path: backend SDKs set $current_url but not $pathname.
+    if top_values["path"]:
+        top_values["url"] = []
+    sessions = breakdown_values(results, ISSUE_BREAKDOWN_SESSION_PROPERTY, ISSUE_BREAKDOWN_TOP_VALUES)
+    return {
+        # Each event adds one row for each property, so every property has the same total.
+        "occurrences": max(totals, default=0),
+        "sample_session_ids": [session["value"] for session in sessions],
+        # Leave out empty dimensions: backend SDKs send no browser or OS, and web SDKs send no screen name.
+        "top_values": {name: items for name, items in top_values.items() if items},
+    }
+
+
+def build_impact(issue: dict[str, object]) -> dict[str, object]:
+    aggregations = as_record(issue.get("aggregations")) or {}
+    return compact_dict(
+        {
+            "occurrences": to_number(aggregations.get("occurrences")),
+            "users": to_number(aggregations.get("users")),
+            "sessions": to_number(aggregations.get("sessions")),
+        }
+    )
+
+
+def volume_bucket_records(issue: dict[str, object]) -> list[dict[str, object]]:
+    aggregations = as_record(issue.get("aggregations")) or {}
+    volume_buckets = aggregations.get("volume_buckets")
+    if not isinstance(volume_buckets, list):
+        return []
+    return [record for bucket in volume_buckets if (record := as_record(bucket)) is not None]
+
+
+def build_sparkline(issue: dict[str, object], volume_resolution: int) -> list[float] | None:
+    aggregations = as_record(issue.get("aggregations")) or {}
+    volume_range = aggregations.get("volumeRange")
+    values: list[float] = []
+    if isinstance(volume_range, list):
+        for value in volume_range:
+            numeric_value = to_number(value)
+            if numeric_value is None:
+                return None
+            values.append(numeric_value)
+    else:
+        values = [
+            value for record in volume_bucket_records(issue) if (value := to_number(record.get("value"))) is not None
+        ]
+    if len(values) == volume_resolution * 2:
+        # trend_volume_resolution doubled the count, so add each pair of buckets back together.
+        values = [first + second for first, second in zip(values[::2], values[1::2])]
+    return values or None
+
+
+# The fewest volume buckets that split the date range into two halves.
+TREND_VOLUME_RESOLUTION = 2
+TREND_CHANGE_FRACTION = 0.25
+
+
+def trend_volume_resolution(volume_resolution: int) -> int:
+    # An odd count has no bucket edge at the midpoint of the date range.
+    return volume_resolution * 2 if volume_resolution % 2 else volume_resolution
+
+
+def trend_direction(
+    previous: int, current: int, first_seen: datetime | None, current_from: object
+) -> IssueTrendDirection:
+    current_from_at = parse_timestamp(current_from)
+    if previous == 0 and current > 0 and first_seen and current_from_at and first_seen >= current_from_at:
+        return IssueTrendDirection.NEW
+    change = current - previous
+    if change and abs(change) >= previous * TREND_CHANGE_FRACTION:
+        return IssueTrendDirection.INCREASING if change > 0 else IssueTrendDirection.DECREASING
+    return IssueTrendDirection.STABLE
+
+
+def build_trend(issue: dict[str, object], first_seen: datetime | None) -> dict[str, object] | None:
+    buckets = volume_bucket_records(issue)
+    half = len(buckets) // 2
+    if half == 0:
+        return None
+    # With an odd bucket count the middle bucket is left out, so both halves cover the same time.
+    previous_buckets, current_buckets = buckets[:half], buckets[-half:]
+    previous = int(sum(to_number(bucket.get("value")) or 0 for bucket in previous_buckets))
+    current = int(sum(to_number(bucket.get("value")) or 0 for bucket in current_buckets))
+    current_from = current_buckets[0].get("label")
+    return compact_dict(
+        {
+            "direction": trend_direction(previous, current, first_seen, current_from).value,
+            "current_occurrences": current,
+            "previous_occurrences": previous,
+            "change_percent": round((current - previous) / previous * 100) if previous else None,
+            "previous_from": previous_buckets[0].get("label"),
+            "previous_to": buckets[half].get("label"),
+            "current_from": current_from,
+        }
+    )
+
+
+def build_issue_where(issue_id: str) -> list[str]:
+    return [f"issue_id = toUUID({escape_hogql_string(issue_id)})"]
+
+
+def build_issue_event_where(issue_id: str, search_query: str | None) -> list[str]:
+    return add_event_search_where(build_issue_where(issue_id), search_query)
+
+
+def add_event_search_where(where: list[str], search_query: str | None) -> list[str]:
+    if search_query:
+        search = escape_hogql_like_pattern(search_query)
+        chunks = [f"ilike(toString({prop}), {search})" for prop in EVENT_SEARCH_PROPERTIES]
+        where.append(f"({' OR '.join(chunks)})")
+    return where

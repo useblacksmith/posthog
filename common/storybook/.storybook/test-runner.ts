@@ -1,0 +1,1058 @@
+import type { Locator, LocatorScreenshotOptions, Page } from '@playwright/test'
+import { TestContext, TestRunnerConfig, getStoryContext } from '@storybook/test-runner'
+import { toMatchImageSnapshot } from 'jest-image-snapshot'
+import { fileURLToPath } from 'node:url'
+import path from 'path'
+
+import type { SnapshotTheme, SupportedBrowserName, ViewportWidthName } from '~/@types/storybook-parameters'
+
+// Storybook 10 loads this config as a native ES module, where `__dirname` is
+// not defined — derive it from the module URL instead.
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+type StoryContext = Awaited<ReturnType<typeof getStoryContext>>
+
+const DEFAULT_VIEWPORT = { width: 1280, height: 720 }
+
+const VIEWPORT_WIDTHS = {
+    narrow: { width: 568, height: 720 },
+    medium: { width: 960, height: 720 },
+    wide: { width: 1300, height: 720 },
+    superwide: { width: 1920, height: 720 },
+} as const satisfies Record<ViewportWidthName, { width: number; height: number }>
+
+const RETRY_TIMES = 2
+// A snapshot is kept when two captures in a row match. The cap ends the loop on a page that never stops
+// changing; readiness stories fail instead of keeping an unstable capture.
+const MAX_SNAPSHOT_CAPTURES = 4
+const RECAPTURE_SETTLE_MS = 100
+const FRAME_SELECTOR_SEPARATOR = ' >>> '
+const LOADER_SELECTORS = [
+    '.Spinner',
+    '.quill-spinner', // Quill's <Spinner /> — rotates while present, so it must settle before we snapshot
+    '.LemonSkeleton',
+    '.LemonTableLoader',
+    '.Toastify__toast',
+    '[aria-busy="true"]',
+    '.SessionRecordingPlayer--buffering',
+    '.Lettermark--unknown',
+    '[data-attr="loading-bar"]',
+]
+
+const customSnapshotsDir = path.resolve(__dirname, '../../../frontend/__snapshots__')
+// eslint-disable-next-line no-console
+console.log('[test-runner] Storybook snapshots will be saved to', customSnapshotsDir)
+
+const JEST_TIMEOUT_MS = 60000 // Multi-viewport snapshots can take substantially longer in CI
+const PLAYWRIGHT_TIMEOUT_MS = 10000 // Must be shorter than JEST_TIMEOUT_MS
+const VIEWPORT_SETTLE_TIMEOUT_MS = 5000
+
+// Each story file gets a fresh browser context, so `prepare` reloads the whole preview bundle with a
+// cold HTTP cache. Under CI contention that tail overruns Playwright's 30s default. RETRY_TIMES can't
+// save it: `jest.retryTimes` is registered from setupFilesAfterEnv, which runs *after* the environment
+// setup this navigation happens in, so the throw kills the suite file outright. Hence retrying here.
+const NAVIGATION_TIMEOUT_MS = 45000
+const NAVIGATION_ATTEMPTS = 3
+const NAVIGATION_LIVENESS_TIMEOUT_MS = 10000
+
+const ATTEMPT_COUNT_PER_ID: Record<string, number> = {}
+// The jest environment replaces a page that stops responding. A retry on the new page must not ask the
+// preview to remount the story, because that preview has not rendered it and does not answer the request.
+const STORY_VISITED_BY_PAGE = new WeakMap<Page, string>()
+
+// Storybook channel events that mean a forced remount's play function failed. Shared between the
+// in-page listener (which also waits for the success event, `storyRendered`) and the outer check
+// that decides whether to fail the retry, so the two can't drift apart.
+const REMOUNT_FAILURE_EVENTS = [
+    'storyErrored',
+    'storyThrewException',
+    'playFunctionThrewException',
+    // Storybook can still emit `storyRendered` after this one (an unhandled error doesn't stop the
+    // story from finishing), so it must be listened for directly instead of relying on the later
+    // `storyRendered` to end the wait.
+    'unhandledErrorsWhilePlaying',
+]
+
+// Sharing/embed stories render a preview iframe pointing at the shared/embedded URL, which Storybook
+// can't serve, so it 404s to a browser error page whose rendering is browser-version-dependent (and so
+// produces noisy, non-deterministic snapshots). Stub those navigations with a fixed page.
+// Yellow background with default black text keeps the stub legible and obviously intentional in both
+// light and dark snapshot themes; color-scheme:light stops the browser dark-inverting the page.
+const EMBED_STUB_HTML =
+    '<!doctype html><meta charset="utf-8"><title>mock iframe</title><body style="color-scheme:light;background:#ffeb3b;margin:0">mock iframe</body>'
+
+export default {
+    // Overrides the runner's default prepare: identical navigation, plus a UA patch that must
+    // run BEFORE any page script. The runner itself only appends "StorybookTestRunner" to the
+    // user agent via addScriptTag AFTER the iframe's load event — app modules that evaluate
+    // during preview boot (chunk-graph dependent) read the unpatched UA, so a module-scope
+    // `inStorybookTestRunner()` caches `false` for the whole session. That intermittently
+    // disabled storybook-only rendering paths (e.g. InsightCard viz below the fold) and flipped
+    // visual regression snapshots. An init script re-runs before every document's first script,
+    // making the marker visible from the very first module evaluation.
+    async prepare({ page, browserContext, testRunnerConfig }) {
+        await page.addInitScript(() => {
+            // Seeded (mulberry32) and restarted per story in preVisit, so random placeholders render the same every run.
+            const RANDOM_SEED = 1
+            let randomState = RANDOM_SEED
+            Math.random = (): number => {
+                randomState = (randomState + 0x6d2b79f5) | 0
+                let value = Math.imul(randomState ^ (randomState >>> 15), 1 | randomState)
+                value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value
+                return ((value ^ (value >>> 14)) >>> 0) / 4294967296
+            }
+            ;(window as unknown as { __testRunnerRestartRandom: () => void }).__testRunnerRestartRandom = (): void => {
+                randomState = RANDOM_SEED
+            }
+
+            const patchedUserAgent = `${navigator.userAgent} StorybookTestRunner`
+            Object.defineProperty(navigator, 'userAgent', {
+                get: () => patchedUserAgent,
+                configurable: true,
+            })
+
+            // Monaco cancels its own in-flight work with a rejection named "Canceled" and treats
+            // it as expected (VS Code's unexpected-error handler ignores cancellation errors).
+            // One such rejection escapes as unhandled here: under Playwright WebKit, Monaco's
+            // clipboard workaround hands a DeferredPromise to `navigator.clipboard.write`, which
+            // the sandbox denies without ever consuming the promise, so the next click's
+            // `cancel()` has no consumer and Storybook fails the story via
+            // `unhandledErrorsWhilePlaying`. This listener registers before any page script, so
+            // it sees the event first and can stop Storybook's listener from recording it.
+            window.addEventListener('unhandledrejection', (event) => {
+                const reason = event.reason as { name?: string; message?: string } | undefined
+                if (reason?.name === 'Canceled' && reason?.message === 'Canceled') {
+                    event.stopImmediatePropagation()
+                    event.preventDefault()
+                }
+            })
+        })
+
+        // The rest replicates @storybook/test-runner's defaultPrepare (not exported).
+        const targetURL = process.env.TARGET_URL
+        const iframeURL = new URL('iframe.html', targetURL).toString()
+        if (testRunnerConfig?.getHttpHeaders) {
+            const headers = await testRunnerConfig.getHttpHeaders(iframeURL)
+            await browserContext.setExtraHTTPHeaders(headers)
+        }
+        await gotoStorybookIframe(page, iframeURL, targetURL)
+    },
+
+    setup() {
+        expect.extend({ toMatchImageSnapshot })
+        jest.retryTimes(RETRY_TIMES, { logErrorsBeforeRetry: true })
+        jest.setTimeout(JEST_TIMEOUT_MS)
+    },
+
+    async preVisit(page, context) {
+        // Resets the scheme `takeSnapshotWithTheme` emulates, which is page-level and outlasts the story.
+        // Not `null`: that stops emulation, so WebKit follows a dark host.
+        // Reduced motion also stops requestAnimationFrame motion (React Flow, d3) that the CSS override cannot reach.
+        await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'reduce' })
+        await page.evaluate(() =>
+            (window as unknown as { __testRunnerRestartRandom?: () => void }).__testRunnerRestartRandom?.()
+        )
+        await page.route(/\/(embedded|shared)\//, (route) =>
+            route.fulfill({ status: 200, contentType: 'text/html', body: EMBED_STUB_HTML })
+        )
+        // On jest retries the preview answers setCurrentStory with `storyUnchanged`, which
+        // does NOT re-run loaders or the play function — the retry would just re-snapshot the
+        // page the failed attempt left behind. Force a full remount so retries start fresh,
+        // and surface the replayed play function's error if it throws again.
+        if (STORY_VISITED_BY_PAGE.get(page) === context.id) {
+            const remountResult = await page
+                .evaluate(
+                    ({ storyId, failureEvents }) => {
+                        return new Promise<{ event: string; message?: string }>((resolve) => {
+                            const channel = (
+                                window as unknown as {
+                                    __STORYBOOK_ADDONS_CHANNEL__: {
+                                        on: (event: string, listener: (data?: unknown) => void) => void
+                                        off: (event: string, listener: (data?: unknown) => void) => void
+                                        emit: (event: string, data?: unknown) => void
+                                    }
+                                }
+                            ).__STORYBOOK_ADDONS_CHANNEL__
+                            const doneEvents = [...failureEvents, 'storyRendered']
+                            const listeners: Record<string, (data?: unknown) => void> = {}
+                            // Purely diagnostic: when the remount wait times out, the phase it was stuck
+                            // in ("loading" vs "playing") points at the story rather than the machinery.
+                            let lastPhase: string | undefined
+                            const phaseListener = (data?: unknown): void => {
+                                lastPhase = (data as { newPhase?: string } | undefined)?.newPhase
+                            }
+                            const finish = (event: string, data?: unknown): void => {
+                                clearTimeout(timeoutId)
+                                channel.off('storyRenderPhaseChanged', phaseListener)
+                                doneEvents.forEach((e) => channel.off(e, listeners[e]))
+                                // unhandledErrorsWhilePlaying's payload is an array of serialized errors;
+                                // every other done event passes the error object directly.
+                                const error = (Array.isArray(data) ? data[0] : data) as
+                                    | { message?: string; description?: string }
+                                    | undefined
+                                resolve({ event, message: error?.message ?? error?.description })
+                            }
+                            doneEvents.forEach((e) => {
+                                listeners[e] = (data?: unknown) => finish(e, data)
+                                channel.on(e, listeners[e])
+                            })
+                            channel.on('storyRenderPhaseChanged', phaseListener)
+                            // If the remount never settles, stop waiting so postVisit can proceed — but
+                            // treat it as a failed retry below rather than silently falling through as if
+                            // the remount had finished cleanly.
+                            const timeoutId = setTimeout(
+                                () =>
+                                    finish('timeout', {
+                                        message: `remount did not settle within 30s (last render phase: ${
+                                            lastPhase ?? 'unknown'
+                                        })`,
+                                    }),
+                                30000
+                            )
+                            channel.emit('forceRemount', { storyId })
+                        })
+                    },
+                    { storyId: context.id, failureEvents: REMOUNT_FAILURE_EVENTS }
+                )
+                // page.evaluate() itself can reject (e.g. the page navigated or its execution context
+                // was destroyed mid-remount) — treat that as a failure too instead of letting `undefined`
+                // pass the check below as if the remount had finished cleanly.
+                .catch((error) => ({ event: 'evaluationFailed', message: (error as Error).message }))
+            if (
+                [
+                    ...REMOUNT_FAILURE_EVENTS,
+                    'evaluationFailed',
+                    // A remount that's still running when the wait times out must not be treated as
+                    // a clean success — the snapshot flow below would then race unfinished play logic.
+                    'timeout',
+                ].includes(remountResult.event)
+            ) {
+                throw new Error(
+                    `Story remount on retry failed (${remountResult.event}): ${remountResult.message ?? 'unknown error'}`
+                )
+            }
+        }
+        const storyContext = await getStoryContext(page, context)
+        const { viewport, viewportWidths, jestTimeout } = storyContext.parameters?.testOptions ?? {}
+        applyStoryTimeouts(page, viewportWidths, jestTimeout)
+        const effectiveViewport = viewportWidths?.length
+            ? VIEWPORT_WIDTHS[viewportWidths[0]]
+            : viewport || DEFAULT_VIEWPORT
+        await resizeViewportAndWait(page, effectiveViewport)
+        await applyTestRunnerBodyClasses(page, storyContext.parameters?.layout || 'padded')
+    },
+
+    async postVisit(page, context) {
+        ATTEMPT_COUNT_PER_ID[context.id] = (ATTEMPT_COUNT_PER_ID[context.id] || 0) + 1
+        STORY_VISITED_BY_PAGE.set(page, context.id)
+        // The generated test also calls postVisit when the story or its play function already
+        // failed (so configs can do failure handling — our jest environment takes the failure
+        // screenshot). Don't run the snapshot flow then: its selector waits can outlast the jest
+        // timeout, which would bury the real error under an opaque "Exceeded timeout of 60000 ms".
+        if (context.hasFailure) {
+            return
+        }
+        const storyContext = await getStoryContext(page, context)
+        if (storyContext.parameters?.testOptions?.waitForSceneReady !== false) {
+            sceneReadyStories.set(page, storyContext.id)
+        } else {
+            sceneReadyStories.delete(page)
+        }
+        const { viewport, viewportWidths, jestTimeout } = storyContext.parameters?.testOptions ?? {}
+        const effectiveViewport = viewportWidths?.length
+            ? VIEWPORT_WIDTHS[viewportWidths[0]]
+            : viewport || DEFAULT_VIEWPORT
+
+        await page.evaluate(
+            // eslint-disable-next-line no-console
+            ([retry, id]) => console.log(`[${id}] Attempt ${retry}`),
+            [ATTEMPT_COUNT_PER_ID[context.id], context.id]
+        )
+
+        if (ATTEMPT_COUNT_PER_ID[context.id] > 1) {
+            // When retrying, resize the viewport and then resize again to default,
+            // just in case the retry is due to a useResizeObserver fail
+            await resizeViewportAndWait(page, { width: 1920, height: 1080 })
+            await resizeViewportAndWait(page, effectiveViewport)
+        }
+
+        const browserContext = page.context()
+        const { snapshotBrowsers = ['chromium'] } = storyContext.parameters?.testOptions ?? {}
+
+        // Keep timeouts scaled in postVisit too, as retries can run through this path multiple times.
+        applyStoryTimeouts(page, viewportWidths, jestTimeout)
+        const currentBrowser = browserContext.browser()!.browserType().name() as SupportedBrowserName
+        if (snapshotBrowsers.includes(currentBrowser)) {
+            if (viewportWidths?.length) {
+                for (const widthName of viewportWidths) {
+                    await resizeViewportAndWait(page, VIEWPORT_WIDTHS[widthName])
+
+                    const contextForWidth = { ...context, id: `${context.id}--${widthName}` }
+                    await expectStoryToMatchSnapshot(page, contextForWidth, storyContext, currentBrowser)
+                }
+            } else {
+                await expectStoryToMatchSnapshot(page, context, storyContext, currentBrowser)
+            }
+        }
+    },
+    tags: {
+        skip: ['test-skip'], // NOTE: This is overridden by the CI action ci-storybook.yml to include browser specific skipping
+    },
+} as TestRunnerConfig
+
+/**
+ * Runs before the story renders, because the classes hide scrollbars. Chromium keeps a scroll container's
+ * height from a layout with scrollbars after they are hidden, so a story laid out first can carry
+ * stale extra height into the first snapshot.
+ */
+async function applyTestRunnerBodyClasses(page: Page, layout: string): Promise<void> {
+    await page.evaluate((layout: string) => {
+        // Stop all animations for consistent snapshots, and adjust other styles
+        document.body.classList.add('storybook-test-runner')
+        document.body.classList.remove(
+            'storybook-test-runner--fullscreen',
+            'storybook-test-runner--padded',
+            'storybook-test-runner--centered'
+        )
+        document.body.classList.add(`storybook-test-runner--${layout}`)
+    }, layout)
+}
+
+async function gotoStorybookIframe(page: Page, iframeURL: string, targetURL: string | undefined): Promise<void> {
+    const unreachable = (detail: string): Error =>
+        new Error(`Could not access the Storybook instance at ${targetURL}. Are you sure it's running?\n\n${detail}`)
+
+    for (let attempt = 1; attempt <= NAVIGATION_ATTEMPTS; attempt++) {
+        try {
+            await page.goto(iframeURL, { waitUntil: 'load', timeout: NAVIGATION_TIMEOUT_MS })
+            return
+        } catch (error) {
+            const detail = (error as Error).message ?? String(error)
+            if (detail.includes('ERR_CONNECTION_REFUSED')) {
+                throw unreachable(detail)
+            }
+            if (attempt === NAVIGATION_ATTEMPTS) {
+                throw new Error(
+                    `Loading ${iframeURL} timed out on all ${NAVIGATION_ATTEMPTS} attempts of ${NAVIGATION_TIMEOUT_MS}ms.\n\n${detail}`
+                )
+            }
+            // Only a slow bundle load earns another attempt. A server that can't serve its index within
+            // seconds has wedged, and retrying every story file would burn the shard's whole timeout
+            // budget before reporting anything useful.
+            const serverResponds = await page.request
+                .get(targetURL ?? iframeURL, { timeout: NAVIGATION_LIVENESS_TIMEOUT_MS })
+                .then((response) => response.ok())
+                .catch(() => false)
+            if (!serverResponds) {
+                throw unreachable(detail)
+            }
+            // eslint-disable-next-line no-console
+            console.warn(
+                `[test-runner] Navigating to ${iframeURL} timed out after ${NAVIGATION_TIMEOUT_MS}ms, retrying (${
+                    attempt + 1
+                }/${NAVIGATION_ATTEMPTS})`
+            )
+        }
+    }
+}
+
+async function expectStoryToMatchSnapshot(
+    page: Page,
+    context: TestContext,
+    storyContext: StoryContext,
+    browser: SupportedBrowserName
+): Promise<void> {
+    const {
+        skipIframeWait = false,
+        skipDarkMode = false,
+        skipLightMode = false,
+    } = storyContext.parameters?.testOptions ?? {}
+    await waitForPageReady(page, skipIframeWait)
+
+    // set up iframe load tracking early, before they start loading
+    await page.evaluate(() => {
+        // use MutationObserver to catch iframes as they're added to the DOM
+        const trackIframeLoad = (iframe: HTMLIFrameElement): void => {
+            if (!iframe.hasAttribute('data-load-tracked')) {
+                iframe.setAttribute('data-load-tracked', 'loading')
+                iframe.addEventListener(
+                    'load',
+                    () => {
+                        iframe.setAttribute('data-load-tracked', 'loaded')
+                    },
+                    { once: true }
+                )
+            }
+        }
+
+        // track existing iframes
+        document.querySelectorAll('iframe').forEach(trackIframeLoad)
+
+        // track future iframes
+        const observer = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+                mutation.addedNodes.forEach((node) => {
+                    if (node instanceof HTMLIFrameElement) {
+                        trackIframeLoad(node)
+                    }
+                    if (node instanceof Element) {
+                        node.querySelectorAll('iframe').forEach(trackIframeLoad)
+                    }
+                })
+            })
+        })
+        observer.observe(document.body, { childList: true, subtree: true })
+        ;(window as Window & { __iframeObserver?: MutationObserver }).__iframeObserver = observer
+    })
+
+    // Trigger ResizeObserver callbacks to ensure layout-dependent state (e.g. CardMeta's
+    // showControlsLabels) has settled before taking snapshots. ResizeObserver fires
+    // asynchronously after render, so without this nudge the observer may not have reported
+    // dimensions yet, causing non-deterministic button labels in dashboard stories.
+    await page.evaluate(() => {
+        // Force a reflow so ResizeObserver has up-to-date geometry to report
+        void document.body.offsetHeight
+        // Dispatch a resize event to trigger any observers that key off window size
+        window.dispatchEvent(new Event('resize'))
+    })
+    // Allow ResizeObserver callbacks to fire and React to re-render with updated dimensions
+    await page.waitForTimeout(300)
+
+    const { waitForSelector, waitForSelectorTimeout } = storyContext.parameters?.testOptions ?? {}
+
+    const loaderWaitTimeout = getLoaderWaitTimeout(context, storyContext)
+    if (loaderWaitTimeout !== null) {
+        await waitForEveryLoaderHidden(page, loaderWaitTimeout)
+    }
+
+    if (typeof waitForSelector === 'string') {
+        await waitForPossiblyFramedSelector(page, waitForSelector, waitForSelectorTimeout)
+    } else if (Array.isArray(waitForSelector)) {
+        await Promise.all(
+            waitForSelector.map((selector) => waitForPossiblyFramedSelector(page, selector, waitForSelectorTimeout))
+        )
+    }
+
+    // Snapshot both light and dark themes
+    if (!skipLightMode) {
+        await takeSnapshotWithTheme(page, context, browser, 'light', storyContext)
+    }
+    if (!skipDarkMode) {
+        await takeSnapshotWithTheme(page, context, browser, 'dark', storyContext)
+    }
+}
+
+/** The loader wait timeout for the story, or null when the story shows a loader on purpose. */
+function getLoaderWaitTimeout(context: TestContext, storyContext: StoryContext): number | null {
+    const { waitForLoadersToDisappear = true } = storyContext.parameters?.testOptions ?? {}
+    if (!waitForLoadersToDisappear) {
+        return null
+    }
+    // The timeout allows loaders and toasts to disappear - toasts usually signify something wrong
+    // Timeout is 5000ms by default, but increased to 10000ms for stories with async data loading (Dashboards, Max)
+    // to account for slower CI environments while still catching stuck elements
+    return context.id.includes('dashboards') || context.id.includes('max') ? 10000 : 5000
+}
+
+function locateVisibleLoaders(page: Page): Locator {
+    return page.locator(LOADER_SELECTORS.join(',')).filter({ visible: true })
+}
+
+/**
+ * Wait until no loader on the page is visible.
+ *
+ * `page.waitForSelector(..., { state: 'hidden' })` checks only the first element that matches, so a
+ * page with two loaders was captured while the second one still showed. Here the locator keeps only
+ * visible matches, so its first match is hidden only when no loader is visible. "Visible" follows
+ * Playwright's definition: a non-empty box and no `visibility: hidden`, because some loaders (like
+ * toasts) stay in the DOM after they hide. A locator also reaches into open shadow roots, where the
+ * toolbar stories render their loaders.
+ */
+async function waitForEveryLoaderHidden(page: Page, timeout: number): Promise<void> {
+    const visibleLoaders = locateVisibleLoaders(page)
+    try {
+        await visibleLoaders.first().waitFor({ state: 'hidden', timeout })
+    } catch (error) {
+        const stillVisible = await visibleLoaders
+            .evaluateAll((elements) => elements.map((element) => element.outerHTML.slice(0, 120)))
+            .catch(() => [])
+        if (stillVisible.length === 0) {
+            throw error
+        }
+        throw new Error(
+            `A loader was still visible after ${timeout}ms. Mock the request it waits for, or set ` +
+                `testOptions.waitForLoadersToDisappear: false if the story shows it on purpose:\n` +
+                stillVisible.join('\n')
+        )
+    }
+}
+
+/**
+ * Wait for a selector that may live inside a same-origin iframe.
+ *
+ * `page.waitForSelector` does not cross a frame boundary, so a story whose content renders in one
+ * (the session replay player, which mounts rrweb into its own document) writes
+ * `'iframe.Outer >>> .inner'` and gets the frame's own wait instead.
+ */
+async function waitForPossiblyFramedSelector(page: Page, selector: string, timeout: number | undefined): Promise<void> {
+    const [frameSelector, innerSelector] = selector.split(FRAME_SELECTOR_SEPARATOR)
+    if (innerSelector === undefined) {
+        await page.waitForSelector(selector, { timeout })
+        return
+    }
+    await page.frameLocator(frameSelector.trim()).locator(innerSelector.trim()).first().waitFor({ timeout })
+}
+
+/** A resize wipes a quill chart canvas before its repaint, and the body-size check cannot see a chart resizing inside a fixed-height card. */
+async function waitForChartCanvasesPainted(page: Page): Promise<void> {
+    await page
+        .waitForFunction(
+            () =>
+                new Promise<boolean>((resolve) => {
+                    let settledFrames = 0
+                    const check = (): void => {
+                        const pending = document.querySelector('canvas[data-hog-charts-paint="pending"]')
+                        settledFrames = pending ? 0 : settledFrames + 1
+                        if (settledFrames >= 5) {
+                            resolve(true)
+                            return
+                        }
+                        requestAnimationFrame(check)
+                    }
+                    requestAnimationFrame(check)
+                }),
+            undefined,
+            { timeout: 3000 }
+        )
+        .catch(() => {})
+}
+
+const sceneReadyStories = new WeakMap<Page, string>()
+
+async function waitForSceneReady(page: Page): Promise<string | null> {
+    const storyId = sceneReadyStories.get(page)
+    if (!storyId) {
+        return null
+    }
+    try {
+        const handle = await page.waitForFunction((id) => {
+            const readiness = window.__STORYBOOK_SCENE_READINESS__
+            if (readiness?.storyId !== id) {
+                return false
+            }
+            const version = readiness.getReadyVersion()
+            return version === null ? false : { version: `${readiness.instanceId}:${version}` }
+        }, storyId)
+        const readiness = await handle.jsonValue()
+        await handle.dispose()
+        if (!readiness) {
+            throw new Error('Scene readiness resolved without a ready version')
+        }
+        return readiness.version
+    } catch (error) {
+        throw new Error(`Story "${storyId}" did not signal scene readiness. Check its pending content holds.`, {
+            cause: error,
+        })
+    }
+}
+
+async function takeSnapshotWithTheme(
+    page: Page,
+    context: TestContext,
+    browser: SupportedBrowserName,
+    theme: SnapshotTheme,
+    storyContext: StoryContext
+): Promise<void> {
+    const { allowImagesWithoutWidth = false } = storyContext.parameters?.testOptions ?? {}
+
+    // Set the right theme
+    await page.evaluate((theme: SnapshotTheme) => document.body.setAttribute('theme', theme), theme)
+    // `isDarkModeOn` does not list that attribute as a selector input, so only a scheme change recomputes it.
+    await page.emulateMedia({ colorScheme: theme, reducedMotion: 'reduce' })
+
+    await waitForSceneReady(page)
+
+    // Wait until we're sure we've finished loading everything
+    const { skipIframeWait = false } = storyContext.parameters?.testOptions ?? {}
+    await waitForPageReady(page, skipIframeWait)
+    // A request can start after the wait in expectStoryToMatchSnapshot, for example one that waits for
+    // earlier mocked calls and a debounce, so its loader can show up between the two themes.
+    const loaderWaitTimeout = getLoaderWaitTimeout(context, storyContext)
+    if (loaderWaitTimeout !== null) {
+        await waitForEveryLoaderHidden(page, loaderWaitTimeout)
+    }
+    // check if all images have width, unless purposefully skipped
+    if (!allowImagesWithoutWidth) {
+        // A lazy image far below the fold stays unfetched until it nears the viewport, and the
+        // element screenshot can bring it into range mid-capture. Switching to eager starts the
+        // fetch now, so the wait below covers it.
+        await page.evaluate(() => {
+            document.querySelectorAll<HTMLImageElement>('img[loading="lazy"]').forEach((img) => {
+                img.loading = 'eager'
+            })
+        })
+        await page.waitForFunction(() => {
+            // Declared inside the callback because this whole body is serialized into the browser.
+            function isImageAccountedFor(i: HTMLImageElement): boolean {
+                // naturalWidth is set once the header is parsed, before the download completes.
+                if (i.complete && i.naturalWidth) {
+                    return true
+                }
+                // ProseMirror-separator isn't an actual image of any sort, so we ignore those
+                if (i.classList.contains('ProseMirror-separator')) {
+                    return true
+                }
+                // A `loading="lazy"` image with no layout box has nothing to intersect, so the
+                // browser can leave it unfetched and this wait can only time out. It is safe to
+                // skip because such an image cannot appear in the screenshot either.
+                // getClientRects() is empty only for display:none, so this still waits for a
+                // visible image that is downloading.
+                return i.getClientRects().length === 0
+            }
+
+            const allImages = Array.from(document.images)
+            const areAllImagesLoaded = allImages.every(isImageAccountedFor)
+            if (areAllImagesLoaded) {
+                // Hide gifs to prevent their animations causing flakiness
+                for (const image of allImages) {
+                    if (image.src.endsWith('.gif')) {
+                        image.style.visibility = 'hidden'
+                        image.style.background = 'red'
+                    }
+                }
+            }
+            return areAllImagesLoaded
+        })
+        // `decoding="async"` lets a loaded image paint a frame later, so wait for its pixels.
+        await page.evaluate(() =>
+            Promise.all(Array.from(document.images).map((img) => img.decode().catch(() => undefined)))
+        )
+    }
+
+    // wait for iframes to load their content
+    if (!skipIframeWait) {
+        const iframeCount = await page.locator('iframe').count()
+        if (iframeCount > 0) {
+            await page
+                .waitForFunction(
+                    () => {
+                        const iframes = Array.from(document.querySelectorAll('iframe'))
+                        return iframes.every((iframe) => iframe.getAttribute('data-load-tracked') === 'loaded')
+                    },
+                    undefined,
+                    { timeout: 8000 }
+                )
+                .catch(() => {
+                    // if timeout, that's okay - some iframes might not fire load events
+                })
+            // give iframe content a moment to render after load event
+            await page.waitForTimeout(1000)
+        }
+    }
+
+    // Inner containers keep their scroll position. Components scroll them on a timer (the settings
+    // nav scrolls to the selected item), so resetting them races that timer and flips the snapshot.
+    await page.evaluate(() => {
+        window.scrollTo(0, 0)
+        // Navigation.tsx uses <main id="main-content"> as the scroll container
+        const mainContent = document.querySelector('#main-content')
+        if (mainContent instanceof HTMLElement) {
+            mainContent.scrollTop = 0
+        }
+    })
+
+    // wait for content to stabilize - detects when DOM stops changing
+    await page
+        .waitForFunction(
+            () => {
+                return new Promise<boolean>((resolve) => {
+                    let lastHeight = document.body.scrollHeight
+                    let lastWidth = document.body.scrollWidth
+                    let stableCount = 0
+
+                    const checkStability = (): void => {
+                        const currentHeight = document.body.scrollHeight
+                        const currentWidth = document.body.scrollWidth
+
+                        if (currentHeight === lastHeight && currentWidth === lastWidth) {
+                            stableCount++
+                            if (stableCount >= 3) {
+                                resolve(true)
+                                return
+                            }
+                        } else {
+                            stableCount = 0
+                            lastHeight = currentHeight
+                            lastWidth = currentWidth
+                        }
+
+                        setTimeout(checkStability, 100)
+                    }
+
+                    checkStability()
+                })
+            },
+            undefined,
+            { timeout: 3000 }
+        )
+        .catch(() => {
+            // if content keeps changing, that's okay - we'll proceed anyway
+        })
+
+    if (sceneReadyStories.has(page)) {
+        await waitForSceneReady(page)
+    } else {
+        await page.waitForTimeout(1000)
+    }
+
+    await waitForChartCanvasesPainted(page)
+
+    await finishAnimations(page)
+
+    // Do take the snapshot
+    await doTakeSnapshotWithTheme(page, context, browser, theme, storyContext)
+}
+
+/** Headless Chromium sometimes paints the first keyframe of the 0 ms animations base.scss forces; this commits the last. */
+async function finishAnimations(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        // document.getAnimations() leaves out shadow trees, and the toolbar renders in one.
+        const roots: (Document | ShadowRoot)[] = [document]
+        document.querySelectorAll('*').forEach((element) => {
+            if (element.shadowRoot) {
+                roots.push(element.shadowRoot)
+            }
+        })
+        for (const animation of roots.flatMap((root) => root.getAnimations())) {
+            try {
+                animation.finish()
+            } catch {
+                continue
+            }
+        }
+    })
+}
+
+async function doTakeSnapshotWithTheme(
+    page: Page,
+    context: TestContext,
+    browser: SupportedBrowserName,
+    theme: SnapshotTheme,
+    storyContext: StoryContext
+): Promise<void> {
+    const { includeNavigationInSnapshot = false, snapshotTargetSelector } = storyContext.parameters?.testOptions ?? {}
+
+    // Figure out what's the right check function depending on the parameters
+    let check: (
+        page: Page,
+        context: TestContext,
+        browser: SupportedBrowserName,
+        theme: SnapshotTheme,
+        loaderWaitTimeout: number | null,
+        targetSelector?: string
+    ) => Promise<void>
+    if (storyContext.parameters?.layout === 'fullscreen') {
+        if (snapshotTargetSelector) {
+            throw new Error(
+                `snapshotTargetSelector is not supported with layout: 'fullscreen'. ` +
+                    `Fullscreen stories always snapshot body/main. ` +
+                    `Remove snapshotTargetSelector from testOptions or change the layout.`
+            )
+        }
+        if (includeNavigationInSnapshot) {
+            check = expectStoryToMatchViewportSnapshot
+        } else {
+            check = expectStoryToMatchSceneSnapshot
+        }
+    } else {
+        check = expectStoryToMatchComponentSnapshot
+    }
+
+    await check(page, context, browser, theme, getLoaderWaitTimeout(context, storyContext), snapshotTargetSelector)
+}
+
+async function expectStoryToMatchViewportSnapshot(
+    page: Page,
+    context: TestContext,
+    browser: SupportedBrowserName,
+    theme: SnapshotTheme,
+    loaderWaitTimeout: number | null
+): Promise<void> {
+    await expectLocatorToMatchStorySnapshot(page, context, browser, theme, loaderWaitTimeout)
+}
+
+async function expectStoryToMatchSceneSnapshot(
+    page: Page,
+    context: TestContext,
+    browser: SupportedBrowserName,
+    theme: SnapshotTheme,
+    loaderWaitTimeout: number | null
+): Promise<void> {
+    // If the `main` element isn't present, let's use `body` - this is needed in logged-out screens.
+    // We use .last(), because the order of selector matches is based on the order of elements in the DOM,
+    // and not the order of the selectors in the query.
+    await expectLocatorToMatchStorySnapshot(
+        page.locator('body, main').last(),
+        context,
+        browser,
+        theme,
+        loaderWaitTimeout
+    )
+}
+
+async function expectStoryToMatchComponentSnapshot(
+    page: Page,
+    context: TestContext,
+    browser: SupportedBrowserName,
+    theme: SnapshotTheme,
+    loaderWaitTimeout: number | null,
+    targetSelector: string = '#storybook-root'
+): Promise<void> {
+    await page.evaluate(() => {
+        const rootEl = document.getElementById('storybook-root')
+        if (!rootEl) {
+            throw new Error('Could not find root element')
+        }
+
+        // If needed, expand the root element so that all popovers are visible in the screenshot
+        document.querySelectorAll('.Popover, .Tooltip').forEach((popover) => {
+            const currentRootBoundingClientRect = rootEl.getBoundingClientRect()
+            const popoverBoundingClientRect = popover.getBoundingClientRect()
+            if (popoverBoundingClientRect.right > currentRootBoundingClientRect.right) {
+                rootEl.style.width = `${popoverBoundingClientRect.right}px`
+            }
+            if (popoverBoundingClientRect.bottom > currentRootBoundingClientRect.bottom) {
+                rootEl.style.height = `${popoverBoundingClientRect.bottom}px`
+            }
+            if (popoverBoundingClientRect.top < currentRootBoundingClientRect.top) {
+                rootEl.style.height = `${-popoverBoundingClientRect.top + currentRootBoundingClientRect.bottom}px`
+            }
+            if (popoverBoundingClientRect.left < currentRootBoundingClientRect.left) {
+                rootEl.style.width = `${-popoverBoundingClientRect.left + currentRootBoundingClientRect.right}px`
+            }
+        })
+    })
+    // Widening the root for a popover can resize a chart again.
+    await waitForChartCanvasesPainted(page)
+
+    await expectLocatorToMatchStorySnapshot(page.locator(targetSelector), context, browser, theme, loaderWaitTimeout, {
+        omitBackground: true,
+    })
+}
+
+async function expectLocatorToMatchStorySnapshot(
+    locator: Locator | Page,
+    context: TestContext,
+    browser: SupportedBrowserName,
+    theme: SnapshotTheme,
+    loaderWaitTimeout: number | null,
+    options?: LocatorScreenshotOptions
+): Promise<void> {
+    const image = await takeSettledSnapshotImage(locator, context, theme, loaderWaitTimeout, options)
+    let customSnapshotIdentifier = `${context.id}--${theme}`
+    if (browser !== 'chromium') {
+        customSnapshotIdentifier += `--${browser}`
+    }
+
+    expect(image).toMatchImageSnapshot({
+        customSnapshotsDir,
+        runInProcess: true,
+        customSnapshotIdentifier,
+        // Compare structural similarity instead of raw pixels - reducing false positives
+        // See https://github.com/americanexpress/jest-image-snapshot#recommendations-when-using-ssim-comparison
+        comparisonMethod: 'ssim',
+        // 0.01 is a 1% difference
+        failureThreshold: 0.01,
+        failureThresholdType: 'percent',
+    })
+}
+
+/**
+ * Captures until two screenshots in a row match, the way Playwright's `toHaveScreenshot` does.
+ * Between captures the chart paint and animation finish run again, so a page that changed after the
+ * waits is captured again once it settles.
+ *
+ * A match alone does not prove the page is done: the 0 ms animations freeze a spinner, so two captures
+ * of a loading state match too. So unless the story opts out of the loader wait, each capture waits
+ * for loaders first, and a capture is kept only when no loader shows after it.
+ */
+async function takeSettledSnapshotImage(
+    locator: Locator | Page,
+    context: TestContext,
+    theme: SnapshotTheme,
+    loaderWaitTimeout: number | null,
+    options?: LocatorScreenshotOptions
+): Promise<Buffer> {
+    const page = 'page' in locator ? locator.page() : locator
+    if (loaderWaitTimeout !== null) {
+        await waitForEveryLoaderHidden(page, loaderWaitTimeout)
+    }
+    let previousVersion = await waitForSceneReady(page)
+    let previous = await takeSnapshotImage(locator, context, options)
+    for (let capture = 2; capture <= MAX_SNAPSHOT_CAPTURES; capture++) {
+        await page.waitForTimeout(RECAPTURE_SETTLE_MS)
+        await waitForChartCanvasesPainted(page)
+        await finishAnimations(page)
+        if (loaderWaitTimeout !== null) {
+            await waitForEveryLoaderHidden(page, loaderWaitTimeout)
+        }
+        const version = await waitForSceneReady(page)
+        const image = await takeSnapshotImage(locator, context, options)
+        const versionAfterCapture = await waitForSceneReady(page)
+        const loaderShowed = loaderWaitTimeout !== null && (await locateVisibleLoaders(page).count()) > 0
+        if (image.equals(previous) && !loaderShowed && previousVersion === version && version === versionAfterCapture) {
+            return image
+        }
+        previous = image
+        previousVersion = version
+    }
+    if (sceneReadyStories.has(page)) {
+        throw new Error(`Story "${context.id}" (${theme}) did not settle after ${MAX_SNAPSHOT_CAPTURES} captures.`)
+    }
+    // eslint-disable-next-line no-console
+    console.warn(
+        `[test-runner] ${context.id} (${theme}): still changed after ${MAX_SNAPSHOT_CAPTURES} captures. Look for an animation, a timer or late content.`
+    )
+    return previous
+}
+
+/**
+ * Screenshot the snapshot target, naming the one cause Playwright reports opaquely: a story that
+ * renders nothing. `#storybook-root` is `display: inline-block` here, so an empty render collapses it
+ * to zero size, and all Playwright says - after a full 10s wait, three times over - is "element is not
+ * visible".
+ */
+async function takeSnapshotImage(
+    locator: Locator | Page,
+    context: TestContext,
+    options?: LocatorScreenshotOptions
+): Promise<Buffer> {
+    try {
+        return await locator.screenshot({ ...options })
+    } catch (error) {
+        const box = 'boundingBox' in locator ? await locator.boundingBox().catch(() => null) : null
+        if (box && !box.width && !box.height) {
+            throw new Error(
+                `Story "${context.id}" rendered nothing, so there is no screenshot to take. ` +
+                    `Wrap it in a decorator that gives the snapshot a sized box, or tag it 'test-skip'.`
+            )
+        }
+        throw error
+    }
+}
+
+/**
+ * Just like the `waitForPageReady` helper offered by Playwright - except we only wait for `networkidle` in CI,
+ * as it doesn't work with local Storybook (the live reload feature keeps up a long-running request, so we aren't idle).
+ *
+ * @param skipNetworkIdle - Skip waiting for network idle. Useful for stories with iframes that cause ongoing network activity.
+ */
+async function waitForPageReady(page: Page, skipNetworkIdle = false): Promise<void> {
+    await page.waitForLoadState('domcontentloaded')
+    await page.waitForLoadState('load')
+
+    if (process.env.CI && !skipNetworkIdle) {
+        // networkidle can be flaky in CI due to background requests - don't fail on timeout
+        await page.waitForLoadState('networkidle').catch(() => undefined)
+    }
+
+    // `document.fonts.ready` only covers fonts that have already been *requested* — a story that
+    // renders no text until async data arrives (loaders, mocked API calls) requests RoundHog/Inter
+    // only close to capture time, and the screenshot races the font-display:swap repaint. Kicking
+    // the loads off explicitly here means late-mounted text renders in the real fonts directly, so
+    // there is no swap left to race. No-op once the fonts are cached.
+    await page
+        .evaluate(() =>
+            Promise.all(
+                ['400', '500', '700', '800'].flatMap((weight) => [
+                    document.fonts.load(`${weight} 16px RoundHog`),
+                    document.fonts.load(`italic ${weight} 16px RoundHog`),
+                    document.fonts.load(`${weight} 16px Inter`),
+                ])
+            ).then(() => document.fonts.ready)
+        )
+        .catch(() => undefined)
+}
+
+function applyStoryTimeouts(page: Page, viewportWidths?: ViewportWidthName[], jestTimeout?: number): void {
+    // Multi-width stories effectively run several snapshots inside one smoke test.
+    const timeoutMultiplier = viewportWidths?.length || 1
+    jest.setTimeout((jestTimeout ?? JEST_TIMEOUT_MS) * timeoutMultiplier)
+    page.context().setDefaultTimeout(PLAYWRIGHT_TIMEOUT_MS * timeoutMultiplier)
+}
+
+async function waitForInnerViewport(
+    page: Page,
+    viewport: { width: number; height: number },
+    timeout: number = VIEWPORT_SETTLE_TIMEOUT_MS
+): Promise<void> {
+    await page.waitForFunction(
+        ([expectedWidth, expectedHeight]) => {
+            return window.innerWidth === expectedWidth && window.innerHeight === expectedHeight
+        },
+        [viewport.width, viewport.height],
+        { timeout }
+    )
+}
+
+async function resizeViewportAndWait(page: Page, viewport: { width: number; height: number }): Promise<void> {
+    const currentViewport = page.viewportSize()
+    if (currentViewport?.width === viewport.width && currentViewport.height === viewport.height) {
+        // Force an actual geometry change so ResizeObserver subscribers always re-run.
+        const nudgedWidth = viewport.width > 320 ? viewport.width - 1 : viewport.width + 1
+        await page.setViewportSize({ width: nudgedWidth, height: viewport.height })
+    }
+
+    await page.setViewportSize(viewport)
+    await waitForInnerViewport(page, viewport).catch(async () => {
+        // Under heavy CI load, the first viewport resize can occasionally lag. Retry once.
+        const nudgedWidth = viewport.width > 320 ? viewport.width - 1 : viewport.width + 1
+        await page.setViewportSize({ width: nudgedWidth, height: viewport.height })
+        await page.setViewportSize(viewport)
+        await waitForInnerViewport(page, viewport, VIEWPORT_SETTLE_TIMEOUT_MS * 2).catch(() => undefined)
+    })
+
+    await page.evaluate(async () => {
+        void document.body.offsetHeight
+        window.dispatchEvent(new Event('resize'))
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+    })
+
+    await page
+        .waitForFunction(
+            () => {
+                return new Promise<boolean>((resolve) => {
+                    let lastSignature = ''
+                    let stableCount = 0
+                    const checkStability = (): void => {
+                        const signature = [
+                            document.documentElement.clientWidth,
+                            document.documentElement.clientHeight,
+                            document.body.scrollWidth,
+                            document.body.scrollHeight,
+                        ].join(':')
+
+                        if (signature === lastSignature) {
+                            stableCount++
+                            if (stableCount >= 3) {
+                                resolve(true)
+                                return
+                            }
+                        } else {
+                            stableCount = 0
+                            lastSignature = signature
+                        }
+
+                        setTimeout(checkStability, 50)
+                    }
+
+                    checkStability()
+                })
+            },
+            undefined,
+            { timeout: VIEWPORT_SETTLE_TIMEOUT_MS }
+        )
+        .catch(() => {
+            // Some stories keep changing dimensions forever (charts/animations). Keep going.
+        })
+}

@@ -1,0 +1,927 @@
+import datetime
+
+from posthog.test.base import (
+    BaseTest,
+    ClickhouseTestMixin,
+    _create_event,
+    flush_persons_and_events,
+    snapshot_clickhouse_queries,
+)
+
+from parameterized import parameterized
+
+from posthog.clickhouse.client import query_with_columns, sync_execute
+from posthog.models.raw_sessions.sessions_v3 import (
+    DISTRIBUTED_RAW_SESSIONS_TABLE_V3,
+    GET_NUM_RAW_SESSIONS_ACTIVE_PARTS,
+    RAW_SESSION_TABLE_BACKFILL_RECORDINGS_SQL_V3,
+    RAW_SESSION_TABLE_BACKFILL_SQL_V3,
+)
+from posthog.models.utils import uuid7
+from posthog.session_recordings.queries.test.session_replay_sql import produce_replay_summary
+
+distinct_id_counter = 0
+session_id_counter = 0
+
+
+def create_distinct_id():
+    global distinct_id_counter
+    distinct_id_counter += 1
+    return f"d{distinct_id_counter}"
+
+
+def create_session_id(start: str = "2024-03-08T00:00:00+00:00") -> str:
+    # The sessions MV drops events that are far from the session id's own timestamp, so the id has to
+    # start at the same time as the events these tests write.
+    global session_id_counter
+    session_id_counter += 1
+    return str(uuid7(start, random=session_id_counter))
+
+
+@snapshot_clickhouse_queries
+class TestRawSessionsModel(ClickhouseTestMixin, BaseTest):
+    snapshot_replace_all_numbers = True
+
+    def select_by_session_id(self, session_id):
+        flush_persons_and_events()
+        return query_with_columns(
+            """
+            select
+                *
+            from raw_sessions_v3_v
+            where
+                session_id_v7 = toUInt128(toUUID(%(session_id)s)) AND
+                team_id = %(team_id)s
+                """,
+            {
+                "session_id": session_id,
+                "team_id": self.team.id,
+            },
+        )
+
+    def test_it_creates_session_when_creating_event(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$current_url": "/", "$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        response = sync_execute(
+            """
+            select
+                session_id_v7,
+                team_id
+            from raw_sessions_v3_v
+            where
+                session_id_v7 = toUInt128(toUUID(%(session_id)s))  AND
+                team_id = %(team_id)s
+                """,
+            {
+                "session_id": session_id,
+                "team_id": self.team.id,
+            },
+        )
+
+        assert len(response) == 1
+
+    def test_handles_different_distinct_id_across_same_session(self):
+        distinct_id1 = create_distinct_id()
+        distinct_id2 = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id1,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id2,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        responses = self.select_by_session_id(session_id)
+        assert len(responses) == 1
+        assert responses[0]["distinct_id"] in {distinct_id1, distinct_id2}
+        assert responses[0]["pageview_uniq"] == 2
+
+    def test_handles_entry_and_exit_urls(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$current_url": "/entry", "$session_id": session_id},
+            timestamp="2024-03-08:01",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$current_url": "/middle", "$session_id": session_id},
+            timestamp="2024-03-08:02",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$current_url": "/middle", "$session_id": session_id},
+            timestamp="2024-03-08:03",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$current_url": "/exit", "$session_id": session_id},
+            timestamp="2024-03-08:04",
+        )
+
+        responses = self.select_by_session_id(session_id)
+        assert len(responses) == 1
+        assert responses[0]["entry_url"] == "/entry"
+        assert responses[0]["end_url"] == "/exit"
+        assert len(responses[0]["urls"]) == 3
+        assert set(responses[0]["urls"]) == {"/entry", "/middle", "/exit"}  # order is not guaranteed
+
+    def test_handles_initial_utm_properties(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id, "utm_source": "source"},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id, "utm_source": "other_source"},
+            timestamp="2024-03-08",
+        )
+
+        responses = self.select_by_session_id(session_id)
+        assert len(responses) == 1
+        assert responses[0]["entry_utm_source"] == "source"
+
+    def test_counts_pageviews_autocaptures_and_events(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$autocapture",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$autocapture",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="other event",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageleave",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        responses = self.select_by_session_id(session_id)
+        assert len(responses) == 1
+        assert responses[0]["pageview_uniq"] == 1
+        assert responses[0]["autocapture_uniq"] == 2
+
+    def test_separates_sessions_across_same_user(self):
+        distinct_id = create_distinct_id()
+        session_id1 = create_session_id()
+        session_id2 = create_session_id()
+        session_id3 = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id1},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id2},
+            timestamp="2024-03-08",
+        )
+
+        responses = self.select_by_session_id(session_id1)
+        assert len(responses) == 1
+        responses = self.select_by_session_id(session_id2)
+        assert len(responses) == 1
+        responses = self.select_by_session_id(session_id3)
+        assert len(responses) == 0
+
+    def test_select_from_sessions(self):
+        # just make sure that we can select from the sessions table without error
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        # we can't include all the columns as this clickhouse driver doesn't support selecting states
+        responses = sync_execute(
+            """
+        SELECT
+            session_id_v7,
+            team_id,
+            min_timestamp,
+            max_timestamp,
+            urls
+        FROM raw_sessions_v3
+        WHERE session_id_v7 = toUInt128(toUUID(%(session_id)s)) AND team_id = %(team_id)s
+        """,
+            {
+                "session_id": session_id,
+                "team_id": self.team.id,
+            },
+        )
+        assert len(responses) == 1
+
+    def test_select_from_sessions_mv(self):
+        # just make sure that we can select from the sessions mv without error
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        # we can't include all the columns as this clickhouse driver doesn't support selecting states
+        responses = sync_execute(
+            """
+        SELECT
+            session_id_v7,
+            team_id,
+            min_timestamp,
+            max_timestamp,
+            urls
+        FROM raw_sessions_v3_mv
+        WHERE session_id_v7 = toUInt128(toUUID(%(session_id)s)) AND team_id = %(team_id)s
+        """,
+            {
+                "session_id": session_id,
+                "team_id": self.team.id,
+            },
+        )
+        assert len(responses) == 1
+
+    def test_backfill_sql(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$current_url": "/", "$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        produce_replay_summary(
+            team_id=self.team.pk,
+            distinct_id=distinct_id,
+            session_id=session_id,
+            first_timestamp="2024-03-08",
+            last_timestamp="2024-03-08",
+        )
+
+        # just test that the backfill SQL can be run without error
+        sync_execute(
+            RAW_SESSION_TABLE_BACKFILL_SQL_V3(
+                where="team_id = %(team_id)s AND timestamp >= '2024-03-01'",
+                shard_index=1,
+                num_shards=2,
+                include_session_timestamp=True,
+            ),
+            {"team_id": self.team.id},
+        )
+        sync_execute(
+            RAW_SESSION_TABLE_BACKFILL_RECORDINGS_SQL_V3(
+                where="team_id = %(team_id)s AND min_first_timestamp >= '2024-03-01'",
+                shard_index=1,
+                num_shards=2,
+            ),
+            {"team_id": self.team.id},
+        )
+        # also test backfill into the distributed table (which forwards to sharded);
+        # session_timestamp must be included because the underlying sharded table
+        # has it as DEFAULT, not MATERIALIZED
+        sync_execute(
+            RAW_SESSION_TABLE_BACKFILL_SQL_V3(
+                where="team_id = %(team_id)s AND timestamp >= '2024-03-01'",
+                target_table=DISTRIBUTED_RAW_SESSIONS_TABLE_V3(),
+                include_session_timestamp=True,
+            ),
+            {"team_id": self.team.id},
+        )
+
+    def test_max_inserted_at(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        now = datetime.datetime.now(datetime.UTC)
+
+        result = self.select_by_session_id(session_id)
+        max_inserted_at = result[0]["max_inserted_at"]
+        # assert that it's close to now, allowing for a small margin of error because we're running this on CI in the cloud somewhere with preempting
+        assert abs((max_inserted_at - now).total_seconds()) < 10
+
+    def test_ad_ids_set_collects_kv_pairs(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        present_ad_id = "irclid"
+        missing_ad_id = "wbraid"
+        value = "test_irclid"
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id, present_ad_id: value},
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        ad_ids_set = result[0]["entry_ad_ids_set"]
+        assert f"{present_ad_id}={value}" in ad_ids_set
+        assert not any(entry.startswith(f"{missing_ad_id}=") for entry in ad_ids_set)
+
+    @parameterized.expand(
+        [
+            ("gad_campaignid", "gad_campaignid", "123456789"),
+            ("utm_id", "utm_id", "spring_sale"),
+            ("irclickid", "irclickid", "imp_abc"),
+            ("snapchat_canonical", "sccid", "sc-lower"),
+            ("snapchat_sccid_cased", "ScCid", "sc-cased"),
+            ("snapchat_sscid_cased", "SsCid", "sc-alt"),
+        ]
+    )
+    def test_ad_ids_fall_back_to_url_params(self, _name, url_param, value):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id, "$current_url": f"https://example.com/?{url_param}={value}"},
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        canonical_key = "sccid" if url_param in ("ScCid", "SsCid") else url_param
+        assert f"{canonical_key}={value}" in result[0]["entry_ad_ids_set"]
+
+    @parameterized.expand(
+        [
+            ("property_wins", "from_property", "from_property"),
+            ("empty_property_falls_back", "", "from_url"),
+        ]
+    )
+    def test_ad_id_property_vs_url_param_precedence(self, _name, property_value, expected):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={
+                "$session_id": session_id,
+                "ttclid": property_value,
+                "$current_url": "https://example.com/?ttclid=from_url",
+            },
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        assert f"ttclid={expected}" in result[0]["entry_ad_ids_set"]
+
+    def test_ad_id_url_param_decodes_plus_as_space(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={
+                "$session_id": session_id,
+                "$current_url": "https://example.com/?utm_id=spring+sale",
+            },
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        # The SDK promotes this property as 'spring sale', so a fallback that kept the plus
+        # would split one campaign across two values.
+        assert "utm_id=spring sale" in result[0]["entry_ad_ids_set"]
+
+    def test_ad_id_url_param_with_undecodable_bytes_is_normalized(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={
+                "$session_id": session_id,
+                "$current_url": "https://example.com/?ttclid=%FF",
+            },
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        # Without toValidUTF8 this value comes back as bytes, which breaks text readers.
+        assert "ttclid=\ufffd" in result[0]["entry_ad_ids_set"]
+
+    @parameterized.expand(
+        [
+            ("click_ids_present", "some_gclid", "some_fbclid", True, True),
+            ("empty_click_ids_are_not_present", "", "", False, False),
+        ]
+    )
+    def test_channel_type_properties(self, _name, gclid, fbclid, expected_has_gclid, expected_has_fbclid):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={
+                "$session_id": session_id,
+                "gad_source": "1",
+                "gclid": gclid,
+                "fbclid": fbclid,
+                "$referring_domain": "google.com",
+                "utm_campaign": "some_campaign",
+                "utm_medium": "some_medium",
+                "utm_source": "some_source",
+            },
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        assert result[0]["entry_channel_type_properties"] == (
+            "some_source",
+            "some_medium",
+            "some_campaign",
+            "google.com",
+            expected_has_gclid,
+            expected_has_fbclid,
+            "1",
+        )
+        assert result[0]["entry_has_gclid"] is expected_has_gclid
+        assert result[0]["entry_has_fbclid"] is expected_has_fbclid
+
+    @parameterized.expand(
+        [
+            ("autocapture_first", "$autocapture", False),
+            ("pageleave_first", "$pageleave", False),
+            ("custom_event_first", "$feature_flag_called", False),
+            ("pageview_inserted_before_earlier_event", "$autocapture", True),
+        ]
+    )
+    def test_non_pageview_event_does_not_set_attribution_when_pageview_present(
+        self, _name, first_event, insert_pageview_first
+    ):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        def create_first_event() -> None:
+            _create_event(
+                team=self.team,
+                event=first_event,
+                distinct_id=distinct_id,
+                properties={
+                    "$session_id": session_id,
+                    "$current_url": "/1",
+                    "utm_source": "source1",
+                },
+                timestamp="2024-03-08",
+            )
+
+        def create_pageview() -> None:
+            _create_event(
+                team=self.team,
+                event="$pageview",
+                distinct_id=distinct_id,
+                properties={
+                    "$session_id": session_id,
+                    "$current_url": "/2",
+                    "utm_source": "source2",
+                },
+                timestamp="2024-03-09",
+            )
+
+        if insert_pageview_first:
+            create_pageview()
+            create_first_event()
+        else:
+            create_first_event()
+            create_pageview()
+
+        result = self.select_by_session_id(session_id)
+
+        assert result[0]["entry_url"] == "/2"
+        assert result[0]["end_url"] == "/2"
+        assert result[0]["urls"] == ["/2"]
+        assert result[0]["entry_utm_source"] == "source2"
+
+    def test_autocapture_does_set_attribution_when_only_event(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$autocapture",
+            distinct_id=distinct_id,
+            properties={
+                "$session_id": session_id,
+                "$current_url": "/1",
+                "utm_source": "source1",
+            },
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        assert result[0]["entry_url"] == "/1"
+        assert result[0]["end_url"] == "/1"
+        assert result[0]["urls"] == []
+        assert result[0]["entry_utm_source"] == "source1"
+
+    def test_store_all_feature_flag_values(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={
+                "$session_id": session_id,
+                "$feature/flag_string": "f1_a",
+                "$feature/flag_int": 1,
+                "$feature/flag_complex": ["hello", 123],
+                "$feature/flag_duplicates": "a",
+            },
+            timestamp="2024-03-08",
+        )
+
+        _create_event(
+            team=self.team,
+            event="$autocapture",
+            distinct_id=distinct_id,
+            properties={
+                "$session_id": session_id,
+                "$feature/flag_string": "f1_b",
+                "$feature/flag_int": 2,
+                "$feature/flag_complex": {"key": "value"},
+                "$feature/flag_duplicates": "a",
+            },
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        flag_key_values = result[0]["flag_key_values"]
+        # contains all values
+        assert {"$feature/flag_string=f1_a", "$feature/flag_string=f1_b"} <= set(flag_key_values)
+        # converts to string
+        assert {"$feature/flag_int=1", "$feature/flag_int=2"} <= set(flag_key_values)
+        # converts to json string
+        assert {'$feature/flag_complex=["hello",123]', '$feature/flag_complex={"key":"value"}'} <= set(flag_key_values)
+        # deduplicates
+        assert flag_key_values.count("$feature/flag_duplicates=a") == 1
+
+    def test_lookup_feature_flag(self):
+        distinct_id_1 = create_distinct_id()
+        session_id_1 = create_session_id()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id_1,
+            properties={
+                "$session_id": session_id_1,
+                "$feature/flag_string": "f1_a",
+            },
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="custom event",
+            distinct_id=distinct_id_1,
+            properties={
+                "$session_id": session_id_1,
+                "$feature/flag_string": "f1_b",
+            },
+            timestamp="2024-03-08",
+        )
+
+        distinct_id_2 = create_distinct_id()
+        session_id_2 = create_session_id()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id_2,
+            properties={
+                "$session_id": session_id_2,
+                "$feature/flag_string": "f1_c",
+            },
+            timestamp="2024-03-08",
+        )
+
+        result = query_with_columns(
+            """
+            select
+                session_id_v7,
+                has(flag_key_values, '$feature/flag_string=f1_a') as has_f1_a,
+                has(flag_key_values, '$feature/flag_string=f1_b') as has_f1_b,
+                has(flag_key_values, '$feature/flag_string=f1_c') as has_f1_c
+            from raw_sessions_v3_v
+            where
+                team_id = %(team_id)s
+            ORDER BY session_id_v7
+                """,
+            {
+                "team_id": self.team.id,
+            },
+        )
+        assert result[0]["has_f1_a"]
+        assert result[0]["has_f1_b"]
+        assert not result[0]["has_f1_c"]
+
+        assert not result[1]["has_f1_a"]
+        assert not result[1]["has_f1_b"]
+        assert result[1]["has_f1_c"]
+
+    def test_tracks_all_distinct_ids(self):
+        distinct_id_1 = create_distinct_id()
+        distinct_id_2 = create_distinct_id()
+        session_id = create_session_id()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id_1,
+            properties={"$current_url": "/", "$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id_2,
+            properties={"$current_url": "/", "$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        assert set(result[0]["distinct_ids"]) == {distinct_id_1, distinct_id_2}
+
+    def test_has_replay_events(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$current_url": "/", "$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        result_1 = self.select_by_session_id(session_id)
+        assert result_1[0]["has_replay_events"] is False
+
+        produce_replay_summary(
+            team_id=self.team.pk,
+            distinct_id=distinct_id,
+            session_id=session_id,
+            first_timestamp="2024-03-08",
+            last_timestamp="2024-03-08",
+            ensure_analytics_event_in_session=False,
+        )
+
+        result_2 = self.select_by_session_id(session_id)
+        assert result_2[0]["has_replay_events"] is True
+
+        # everything else except for inserted_at should be the same
+        assert {k: v for k, v in result_1[0].items() if k not in {"has_replay_events", "max_inserted_at"}} == {
+            k: v for k, v in result_2[0].items() if k not in {"has_replay_events", "max_inserted_at"}
+        }
+
+    @parameterized.expand(
+        [
+            ("garbage_session_timestamp", "1970-01-02T00:00:00+00:00", "2024-03-08", False),
+            ("session_id_over_31_days_after_event", "2024-04-10T00:00:00+00:00", "2024-03-08", False),
+            ("client_clock_days_ahead", "2024-03-11T00:00:00+00:00", "2024-03-08", True),
+            ("late_event_within_31_days", "2024-03-08T00:00:00+00:00", "2024-04-07", True),
+        ]
+    )
+    def test_drops_events_far_from_the_session_id_timestamp(self, _name, session_start, event_timestamp, kept):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id(session_start)
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$current_url": "/", "$session_id": session_id},
+            timestamp=event_timestamp,
+        )
+        produce_replay_summary(
+            team_id=self.team.pk,
+            distinct_id=distinct_id,
+            session_id=session_id,
+            first_timestamp=event_timestamp,
+            last_timestamp=event_timestamp,
+            ensure_analytics_event_in_session=False,
+        )
+
+        assert len(self.select_by_session_id(session_id)) == (1 if kept else 0)
+
+    def test_event_names_are_collected(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$autocapture",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="custom_event",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        assert set(result[0]["event_names"]) == {"$pageview", "$autocapture", "custom_event"}
+
+    def test_hosts_are_collected(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id, "$host": "app.example.com"},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id, "$host": "api.example.com"},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id, "$host": "app.example.com"},
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        assert set(result[0]["hosts"]) == {"app.example.com", "api.example.com"}
+
+    def test_emails_are_collected(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            person_properties={"email": "alice@example.com"},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            person_properties={"email": "bob@example.com"},
+            timestamp="2024-03-08",
+        )
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            person_properties={"email": "alice@example.com"},
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        assert set(result[0]["emails"]) == {"alice@example.com", "bob@example.com"}
+
+    def test_empty_hosts_and_emails(self):
+        distinct_id = create_distinct_id()
+        session_id = create_session_id()
+
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id=distinct_id,
+            properties={"$session_id": session_id},
+            timestamp="2024-03-08",
+        )
+
+        result = self.select_by_session_id(session_id)
+
+        assert result[0]["hosts"] == []
+        assert result[0]["emails"] == []
+
+    def test_get_number_of_umerged_parts(self):
+        # Just test that the query succeeds without errors and returns an int.
+        # We can't really guarantee anything about the number of parts on the test DB.
+        query = GET_NUM_RAW_SESSIONS_ACTIVE_PARTS(["202511"])
+        result = sync_execute(query)
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0][0], int)
+        self.assertIsInstance(result[0][1], str)
+        self.assertIsInstance(result[0][2], str)

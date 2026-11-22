@@ -1,0 +1,921 @@
+---
+title: Using sandboxed agents
+sidebar: Docs
+showTitle: true
+---
+
+Sandboxed agents are background AI agents that run in isolated cloud containers with access to PostHog data,
+GitHub repositories, and code execution.
+Use them when your feature needs an autonomous agent that reads PostHog data, writes code, and produces artifacts like PRs or reports.
+
+For simpler LLM calls (summarization, translation, classification),
+skip this page and use the LLM gateway (`get_llm_client(product=..., team_id=...)`) directly —
+it's simpler and doesn't need a sandbox.
+
+## When to use what
+
+| Example                                                                                         | Solution                                                   |
+| ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| Signals team building an enrichment pipeline that generates reports from PostHog analytics data | Sandboxed agent (this page)                                |
+| Conversations team building a support agent that queries PostHog and customer documentation     | Sandboxed agent (this page)                                |
+| AI observability summarizing a funnel, generating a natural-language insight title              | LLM gateway via `get_llm_client(product=..., team_id=...)` |
+| Not sure                                                                                        | Ask in `#team-posthog-ai`                                  |
+
+**Rule of thumb**: if the LLM needs to _do things_ (query data, read files, create branches, open PRs), use a sandboxed agent.
+If it just needs to _answer a question_ given some context you already have, use the LLM gateway.
+
+## How it works
+
+A sandboxed agent runs inside an isolated cloud container (Modal in production, Docker locally).
+The system provisions the sandbox, clones a GitHub repo, starts an agent server, and waits for the agent to finish.
+
+The run thread shows startup state in a progress accordion, with completed steps available in its history.
+Before progress arrives, it shows "Setting up sandbox", including when resuming a finished run.
+The full task composer remains available during startup.
+Follow-up messages collect in "Up next" and send after the first response finishes.
+Once the agent starts, Steer can send them before the current turn ends.
+The thread hides empty and whitespace-only assistant messages during streaming and history replay.
+The PostHog AI thread and embedded run views render Pi session logs independently of the `pi-acp` rollout flag.
+
+An idle sandbox resume does not run an agent turn, so it does not send a finished notification or mark the run's activity completed.
+
+The chat history filters for PostHog AI, Slack, and Desktop show tasks created by the current user.
+These requests wait until the current user's ID is available, including filter changes, searches, and refreshes.
+When the user loads, the pending request uses the active filter and search term.
+
+### Provider rate limits
+
+Initial and resumed agent turns retry provider rate limits and capacity refusals up to four times.
+Without a provider hint, each retry uses a random delay between zero and an exponential ceiling of 15, 30, 60, then 120 seconds.
+A provider's `try again in` hint adds a minimum delay, capped at 60 seconds to leave room for jitter.
+The total delay stays below 120 seconds, including the hint.
+Canceling the turn interrupts the retry wait immediately.
+Other transient provider failures allow two retries with a five-second delay.
+Task spend limits and subscription usage limits do not trigger these retries.
+
+The turn retry log records the classification, attempt, and delay.
+The run's `state.upstream_turn_retry` stores the latest retry's `classification`, `attempt`, and `delay_ms`.
+This state remains available when a later retry succeeds.
+An exhausted rate-limit retry reports `upstream_rate_limited` as the error category.
+
+### Stream recovery
+
+The shared agent thread reconnects automatically after temporary network failures.
+It keeps displayed output while it restores saved history, including output saved during the interruption.
+A connection failure does not mark the run as failed: only the run's authoritative status can do that.
+
+Recovery opens the stream before reading history and buffers incoming frames until reconciliation finishes.
+Shared `event_id` and `first_event_id` values reconcile live events with saved, coalesced messages.
+Coalesced text replaces only text events in its range, preserving interleaved task notifications.
+Saved user messages replace their optimistic copies, and a retained follow-up keeps its turn active when saved history lags.
+Older logs without these IDs use the existing content multiset comparison, which cannot identify every overlap.
+Late Django backlog frames also match their saved log position and payload, without suppressing repeated live output.
+Output that was never persisted or mirrored cannot be reconstructed.
+The resume cursor advances only with retained output; a cursor in session storage does not prove that history is complete.
+Django backlog cursors retain their source run ID so reconnecting after a run marker does not duplicate output.
+
+Stream recovery allows 10 attempts with a 2-second exponential backoff capped at 30 seconds, plus a cumulative cap of 30 reconnects per recovery session.
+Status probes after a drop participate in that budget, including failed probes.
+Bootstrap status, final status, and history reads each allow three attempts.
+Proxy authentication permits five token remints before requiring manual recovery.
+Metadata, token, and handshake requests time out after 30 seconds; history reads and streams without data or keepalives time out after 60 seconds.
+Network failures, timeouts, HTTP 408, 429, 5xx, and retryable stream error frames retry automatically.
+After token refresh handling, HTTP 401, 403, and 406 require Retry; HTTP 404 and other permanent errors stop automatic recovery.
+
+When attempts run out, the thread shows Retry beside the connection error.
+Recovery stays paused until Retry, including when the browser comes online or the tab becomes visible.
+Retry resets the budgets and reads the same run's status and history without submitting messages, commands, or another run.
+Read-only viewers refresh run metadata and saved history without opening a live stream.
+Once a stream ends, Retry can refresh status and history but cannot reopen the stream.
+The thinking indicator stops at stream end, and a history error stays visible even if the final run status is known.
+
+`sandbox_stream_disconnected` records final recovery failures, with `recovery_phase`, `run_status`, `http_status`, and attempt counts.
+`sandbox_stream_recovered` records successful recovery after history reconciliation, with the phase, run status, attempt counts, and elapsed time.
+Neither event includes transcript contents or proxy tokens.
+
+After deployment, verify recovery on both stream legs (agent proxy and Django): interrupt a live stream, let the agent persist output, and confirm the restored transcript contains it once.
+Also exhaust retries and verify that Retry works for both an active run and an ended run with an unreadable history snapshot.
+
+```text
+Your product code
+    │
+    │  Task.create_and_run(...)
+    ▼
+Temporal workflow (process-task)
+    │
+    ├── 1. Create scoped OAuth token
+    ├── 2. Provision sandbox (Modal / Docker)
+    ├── 3. Clone repository
+    ├── 4. Start agent server
+    ├── 5. Wait for completion (heartbeat-extended timeout)
+    └── 6. Cleanup sandbox
+```
+
+The agent inside the sandbox gets:
+
+- A **scoped OAuth access token** for the PostHog API (6-hour TTL)
+- A **GitHub installation token** for repo operations
+- Access to the **PostHog MCP server** for querying data
+- **Code execution** capabilities within the sandbox
+
+### Run system prompts
+
+Pull request footers link to an inbox report when the task has a report.
+Desktop attribution requires recorded `posthog_desktop` client provenance.
+Tasks with missing or unknown client provenance use generic PostHog branding without a Desktop source link.
+
+The run's `state.systemPrompt` is server-owned. Set it through trusted server-side run creation
+or state updates. The run PATCH endpoint silently ignores attempts to replace, remove, or append
+to this key, including requests from the sandbox itself. The run detail endpoint serves the prompt
+only to the task-bound sandbox, so it can initialize the agent session.
+
+### Pi project resources
+
+Cloud Pi sessions treat checked-out projects as untrusted, including when resuming a session.
+Project extensions, settings, prompt templates, system prompt overrides, and `.pi/mcp.json` are not loaded.
+Project skills in `.pi/skills` and `.agents/skills` are not automatically discovered.
+Repository `AGENTS.md` instructions continue to load.
+Bundled extensions and MCP servers supplied by the task runtime remain available.
+Local Desktop Pi sessions retain their existing project-resource behavior.
+
+## Creating a sandboxed agent
+
+Use `Task.create_and_run()` to launch a sandboxed agent from your product code:
+
+```python
+from products.tasks.backend.facade.profiles import get_task_profile
+from products.tasks.backend.models import Task
+
+task = Task.create_and_run(
+    team=team,
+    title="Generate weekly signal report",
+    description="Analyze error trends and generate a summary report with recommendations.",
+    profile=get_task_profile("error_tracking"),  # or your product's profile
+    user_id=user.id,
+    posthog_mcp_scopes="read_only",  # or "full" if the agent needs write access
+)
+```
+
+### Parameters
+
+| Parameter                | Required | Description                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `team`                   | Yes      | The team this task belongs to                                                                                                                                                                                                                                                                                                                                              |
+| `title`                  | Yes      | Human-readable task title                                                                                                                                                                                                                                                                                                                                                  |
+| `description`            | Yes      | Detailed description of what the agent should do                                                                                                                                                                                                                                                                                                                           |
+| `profile`                | Yes      | The task profile for this kind of task, registered by your product in `task_profiles.py`. It sets the origin, limits and defaults                                                                                                                                                                                                                                          |
+| `user_id`                | Yes      | User ID — used for feature flag validation and creating the scoped API key                                                                                                                                                                                                                                                                                                 |
+| `repository`             | Yes      | GitHub repo in `org/repo` format (e.g., `posthog/posthog-js`)                                                                                                                                                                                                                                                                                                              |
+| `posthog_mcp_scopes`     | No       | Scope preset or explicit scope list (default: `"full"`)                                                                                                                                                                                                                                                                                                                    |
+| `create_pr`              | No       | Whether the agent should create a PR (default: `True`)                                                                                                                                                                                                                                                                                                                     |
+| `mode`                   | No       | Execution mode (default: `"background"`)                                                                                                                                                                                                                                                                                                                                   |
+| `slack_thread_context`   | No       | Slack thread context for agents triggered from Slack                                                                                                                                                                                                                                                                                                                       |
+| `start_workflow`         | No       | Whether to start the Temporal workflow immediately (default: `True`)                                                                                                                                                                                                                                                                                                       |
+| `sandbox_environment_id` | No       | ID of a `SandboxEnvironment` to apply network restrictions (see below)                                                                                                                                                                                                                                                                                                     |
+| `sandbox_template`       | No       | Image the sandbox boots from, as a `SandboxTemplate` value (default: `"default_base"`). `"autoresearch_base"` adds pandas, numpy, scikit-learn and pyarrow, and runs on Modal and Docker only (a non-default template keeps the run off hogland). `"vm_base"` cannot be requested; VM routing selects it server-side. Later runs of the task keep the first run's template |
+
+### Adding a new origin product
+
+Task creation needs a registered profile.
+A profile names the origin product and sets who can see the task, the sandbox limits and the defaults.
+
+If your product doesn't have an `OriginProduct` entry yet,
+add one to `Task.OriginProduct` in `products/tasks/backend/models.py`:
+
+```python
+class OriginProduct(models.TextChoices):
+    ERROR_TRACKING = "error_tracking", "Error Tracking"
+    # ...
+    YOUR_PRODUCT = "your_product", "Your Product"
+```
+
+Then create and run a Django migration.
+
+Define a `TaskProfile` for your product in `products/your_product/backend/task_profiles.py`,
+with `origin_product="your_product"`.
+`products/autoresearch/backend/task_profiles.py` is a complete example.
+Give each kind of task its own profile key, such as `your_product.report`.
+
+A profile with `billing_product="background_agents"` runs on PostHog-funded inference.
+Its origin must be in `BACKGROUND_AGENTS_ORIGINS` in `products/tasks/backend/temporal/process_task/ai_gateway_token.py`
+and in `Task.SERVER_ONLY_ORIGIN_PRODUCTS`, so API callers cannot set it.
+Without the first entry the tasks worker refuses the run an AI gateway token, with the reason `no_background_agents_provenance`.
+`test_background_agents_profile_can_mint_a_gateway_token` in `products/tasks/backend/tests/test_profile_parity.py` fails until both entries exist.
+
+Register the profiles from your product's `AppConfig.ready()`:
+
+```python
+def ready(self) -> None:
+    from products.your_product.backend import task_profiles
+
+    task_profiles.register()
+```
+
+`products/autoresearch/backend/apps.py` shows the same call.
+
+Pass the profile as `profile=` when you create the task.
+Import it from your module, or look it up by key with `get_task_profile("your_product.report")`.
+
+### Starting a task from a deep link
+
+In the new PostHog AI view, `/ai?ask=...` hands the prompt to the task composer once.
+The handoff removes `ask` from the current browser history entry while preserving other query parameters and the hash.
+Changing the panel state or remounting the view therefore does not submit the prompt again.
+Without organization-level AI data-processing consent, the prompt only prefills the composer.
+
+## Task navigation
+
+Task links in shared AI history open `/ai?task=<task-id>` and render the task runner, regardless of the saved chat view preference.
+The task stays selected on reload and when navigating back or forward.
+Existing `/tasks/<task-id>` links still open the standalone runner.
+Task headers keep horizontal padding around the title and run metadata.
+With `today-rail-nav` enabled, task loading placeholders preserve the header height, conversation column, and composer area while task metadata and run history load.
+In the AI chat view, the staff options menu sits beside the task actions, including **Open in PostHog Desktop**.
+
+## Fine-grained access tokens
+
+Every sandboxed agent gets a scoped OAuth access token that controls what PostHog resources it can access.
+Tokens expire after 6 hours and are scoped to a single team.
+Task-bound tokens enforce organization IP restrictions. When a signed MCP client IP is present, restrictions apply to that verified address; direct requests are checked using their trusted client IP.
+
+### Scope presets
+
+Use the `posthog_mcp_scopes` parameter to control access:
+
+| Preset             | What it grants                                                                                            | When to use                                                                                        |
+| ------------------ | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `"read_only"`      | Read access to actions, cohorts, dashboards, experiments, feature flags, insights, queries, surveys, etc. | Agent only needs to read data for analysis or reporting                                            |
+| `"full"` (default) | Read + write access to all MCP-exposed resources                                                          | Agent needs to create or modify PostHog resources (e.g., create feature flags, update experiments) |
+
+The internal `signals_research` preset also reads the project-member roster through `scout-members-list`.
+It can write to the scratchpad, but it cannot emit signals, edit reports, or start tasks.
+Report research returns reviewer decisions as structured output; the pipeline validates project access before it stores them.
+The `signals-research-reviewer-selection` flag controls this selection path.
+Research picks route the report. Autostart permits a research-selected task user only when the ownership or commit resolver independently confirms the same member.
+The check uses current project access and the member’s linked GitHub account. Personal priority settings and skill-owner exclusions still apply.
+This requires additional GitHub lookups. Failed or unmatched lookups retain the existing team fallback and no-runner behavior.
+Non-owner scout picks keep their existing task-user rules; they do not use this additional confirmation.
+A missing decision or a decision with no valid members uses the ownership and commit resolver.
+An explicit empty decision clears automatic suggestions and records its reason in the report log. Human reviewer edits take precedence.
+
+### Custom scopes
+
+For more granular control, pass an explicit list of scopes instead of a preset:
+
+```python
+Task.create_and_run(
+    # ...
+    posthog_mcp_scopes=["query:read", "feature_flag:read", "experiment:read"],
+)
+```
+
+Available read scopes: `action:read`, `cohort:read`, `dashboard:read`, `error_tracking:read`,
+`event_definition:read`, `experiment:read`, `feature_flag:read`, `insight:read`,
+`project:read`, `query:read`, `survey:read`, and others.
+
+Available write scopes: `action:write`, `cohort:write`, `dashboard:write`,
+`experiment:write`, `feature_flag:write`, `insight:write`, `survey:write`, and others.
+
+Internal scopes (`task:write`, `inbox:write`, `llm_gateway:read`) are always added automatically.
+
+Pre-warming through `warm_task_run` uses the task profile's MCP scopes. Pass `posthog_mcp_scopes` to narrow them for a run; warming refuses scopes beyond the profile. Tasks without a profile retain the `full` default. The selected scopes are saved before dispatch so the sandbox environment and MCP session receive the same permissions. Rewarming a completed run preserves its scopes, and a warm session cannot be reused for a different scope selection.
+
+Direct starts also use the task profile's MCP scopes, subject to the read-only limit for agent-started runs. Resumes keep their saved scopes and are rejected if those exceed the current profile or run-source limit.
+
+An empty list (`posthog_mcp_scopes=[]`) omits the built-in PostHog MCP connection.
+Internal credentials for task lifecycle and model calls remain available, including the local `task_summary_update` tool.
+
+See `posthog/temporal/oauth.py` for the full list.
+
+> **Principle of least privilege**: default to `"read_only"` unless your agent genuinely needs to create or modify resources.
+> This limits blast radius if the agent misbehaves.
+
+### Scout tool selections
+
+Scout configs can store an exact `allowed_mcp_tools` list beside their scope grants.
+`null` preserves unrestricted tool selection within the scout's scopes; `[]` selects no additional tools.
+The `read_only` and `support_notes` tool presets expand into a snapshot when saved, so later preset changes do not change existing grants.
+A preset containing a non-holdable tool is rejected, as is an explicit selection containing unknown, superseded, non-holdable, or built-in run-context tools.
+
+For an explicit list, the API derives `write_scopes` from selected write tools and refuses direct scope edits.
+Adding a write tool requires the scout's acting user or a project admin, and a credential carrying its required scopes, even if the scout already holds those scopes.
+Removing tools or narrowing an unrestricted selection without adding scopes needs ordinary scout configuration access.
+Clearing the list restores unrestricted tool selection and requires grant authorization; it preserves the last derived scopes, which can then be edited separately.
+Sandbox-bound tokens cannot change either tool-selection field.
+Both fields and their initial values are activity-logged.
+
+The write path is gated by `scouts-tool-access` and fails closed when the flag is absent or unavailable.
+
+While the flag is on, a run stamps the list on its task at dispatch, and a config edit applies from the next run.
+The run holds the listed tools, the built-in run-context tools, and the tools the MCP server offers every client.
+The run-context tools include `skill-get` and `skill-file-get`, so even an empty selection can load its skill and reference files without granting skill writes.
+The tool catalogue returns `run_context_tools` for the picker’s always-available group. The picker excludes these from choices and removes redundant entries from saved lists when editing them.
+The API refuses a request that uses a method other than GET, HEAD, or OPTIONS, or that needs a write scope, unless a tool the run holds calls that endpoint or the endpoint belongs to the sandbox harness.
+The method counts because some actions change state behind a read scope.
+Harness run writes and run-context writes are restricted to the token-bound task’s current run.
+Report artefacts require a held tool; they are not a harness exception.
+For soft-delete endpoints, updating an object does not grant deletion, and a delete-only grant cannot change other fields.
+A narrowed run cannot call external MCP server tools or change tool approvals through the MCP Store endpoints.
+The refusal is a 403 with the code `scout_tool_not_granted`.
+The check reads the run from the token's task binding, never from a request header.
+GET reads stay governed by the token scopes.
+Token introspection supplies the dispatch snapshot to the MCP server, which hides unpicked tools and refuses direct and exec calls with `tool_not_granted`.
+Refused exec calls retain the catalogued target tool name in analytics; unknown names are recorded as `unrecognized`.
+Keep the flag disabled for customers until the settings picker ships.
+
+### Activity attribution
+
+A sandboxed agent authenticates as a person, so the activity log names that person as the actor.
+The client tag on the row is what says an agent made the change.
+
+A Signals scout run writes the tag `scout:<skill_name>`, which the activity log and the audit log render as `via scout <skill_name>`.
+The tag is derived from the task binding on the run's own token, not from the `x-posthog-client` request header.
+The `scout:` prefix is reserved for that path, and a header value claiming it is dropped, so an agent cannot claim to be a scout it is not.
+Every other client keeps the self-reported header value.
+
+A row written with a token bound to a sandbox task still records the request IP address.
+The token can leave the sandbox, so the address is what tells a sandbox write apart from a write made elsewhere with the same token.
+The audit log tags these rows "via scout <skill_name>" or "via sandbox", and shows the IP in a tooltip on the IP address column.
+
+## PostHog MCP server
+
+The sandbox comes with access to the PostHog MCP server,
+which exposes PostHog resources as tools the agent can call —
+listing feature flags, running HogQL queries, searching session recordings, etc.
+
+The MCP server is ready to use today.
+For details on available tools, see [Implementing MCP tools](/handbook/engineering/ai/implementing-mcp-tools).
+
+### Skills
+
+Skills are job-to-be-done templates that teach agents _how_ to compose MCP tools into workflows.
+They provide domain knowledge, query patterns, and step-by-step guidance.
+
+Skills are pre-installed in the sandbox base image and available to all sandboxed agents.
+They're copied to three discovery locations during image build:
+
+- `/scripts/plugins/posthog/skills/` – plugin discovery
+- `~/.agents/skills/` – Codex agent discovery
+- `~/.claude/skills/` – Claude Code CLI discovery
+
+Evals build skills from the local checkout into a new output directory, then capture a snapshot. Model comparisons share one saved snapshot across their model runs, so rendered examples cannot change between models. `--skill-snapshot-report <results.json>` reuses a previous run's archived snapshot only if its source fingerprint and commit match the checkout. The fingerprint includes staged and unstaged changes plus untracked source files, so schema edits outside the skill folders also invalidate reuse. It excludes configured result files and comparison output directories, including outputs inside the checkout. Docker mounts the snapshot at all three discovery paths, replacing image-only skills as well. Modal builds use the same snapshot. Before the agent starts, the harness checks every skill file against a SHA-256 manifest in the agent's task filesystem and stops on missing, changed, or extra files. MCP delivery pins the archive hash and clears native bundled skills. Verification reads the delivery mode inside the running sandbox, including when a worker retrieves it by ID. Desktop skill-source preferences and shell-level MCP archive URLs cannot replace the eval snapshot.
+
+Run reports and PostHog eval metadata record the skill snapshot hash alongside the commit and dirty-worktree flag. The local run report includes the full file manifest's path. Model comparisons reject missing or different snapshot hashes. These checks confirm which files the agent can read; separate tool-call checks confirm whether it reads a skill.
+
+For details on writing skills, see [Writing skills](/handbook/engineering/ai/writing-skills).
+
+## Multi-turn sessions
+
+`MultiTurnSession` provides a structured API for building custom multi-turn research agents.
+Use it when your agent needs multiple conversation turns with schema-validated responses –
+for example, a discovery pass followed by per-item research, then assessment and summarization.
+
+### Mental model
+
+1. **Start** – `MultiTurnSession.start(prompt, context, model=Shape)` launches a sandbox, sends the first prompt, and returns a validated Pydantic model.
+2. **Follow up** – `session.send_followup(prompt, Shape)` sends additional prompts within the same sandbox session. Each response is validated against the provided schema. The session retries once on empty responses.
+3. **End** – `session.end()` signals the sandbox workflow to shut down.
+
+### Example
+
+```python
+from products.tasks.backend.logic.services.custom_prompt_multi_turn_runner import MultiTurnSession
+from products.tasks.backend.logic.services.custom_prompt_internals import CustomPromptSandboxContext
+
+# 1. Start: discovery turn
+session, candidates = await MultiTurnSession.start(
+    prompt="Find up to 10 items to investigate.",
+    context=context,  # CustomPromptSandboxContext
+    model=DiscoveryResult,
+    branch="master",
+    step_name="my_discovery",
+)
+
+# 2. Follow up: research each item
+for item in candidates.items:
+    finding = await session.send_followup(
+        f"Research {item.name} in detail.",
+        FindingResult,
+        label=f"research_{item.name}",
+    )
+
+# 3. Follow up: summarize
+summary = await session.send_followup(
+    "Summarize all findings.",
+    SummaryResult,
+    label="summary",
+)
+
+# 4. End the session
+await session.end()
+```
+
+Sessions with the `scout_suggestions` origin hide the agent's `finish` tool so the caller can validate and save the result before closing the sandbox.
+
+### Reference implementation
+
+The scout rubric generator in `products/signals/backend/scout_harness/rubrics_runner.py` proposes editable criteria in a background session.
+It defaults to GPT-6 Sol at high effort through the Codex runtime.
+The `signals-pipeline-models` payload can select its adapter, model and effort through the `scout_rubrics` step without changing regular scout runs.
+The backend supplies the description, current instructions, reference text and up to five recent run summaries in the first request.
+Owners can add an optional paragraph of priorities for one generation. It is saved with that request, and the next generation starts without it.
+The generator treats these priorities as extra context, not evidence or a replacement for the scout's responsibilities, shared checks or saved choices.
+Rubric generation requests no project-read MCP scopes because its source context is supplied up front.
+The existing sandbox still has internal credentials and tool access; this remains an accepted limitation of the staff-only v0.
+That request includes effective defaults and disabled criteria, including edits, but withholds enabled custom criteria until a second comparison step.
+Reference text comes from the exact skill version in the same project, ordered by path and limited to four files and 60,000 characters combined.
+The context marks clipped instructions, references, summaries and report identifier lists explicitly.
+It includes the scout's report capabilities and matching disposition rules from the normal scout prompt; scouts without report tools receive no report-disposition instructions.
+Historical transcripts and full report contents are not supplied or inspected.
+When no runs exist, the generator uses the description and available instructions without inventing history.
+The prompt asks for a few distinct judgments about required outcomes and decisions, preserving saved coverage, edits and disabled choices.
+Each passing condition explains the required result in plain language. For complex policies, a short description of the governing source rules follows that explanation to preserve conditions and exceptions.
+Writing instructions and a short example follow the source and schema. They ask for readable titles, descriptions, passing conditions, applicability and summaries without narrowing the source rules or losing permitted outcomes.
+Later evaluation must receive those reference instructions alongside the rubric; a tested variant's changed instructions must not silently replace them.
+The generator saves its exact governing source before starting the session, including the skill version, description, instructions, report-disposition rules, reference texts and completeness markers. A resumed attempt reuses this immutable context. Historical examples remain separate.
+Each suggestion must work independently with the saved criteria and source, and missing evaluation evidence must remain distinct from a known unmet requirement.
+Its API records a generation request before dispatching a Temporal workflow, then links the task before the agent starts.
+The agent first drafts a complete set of source-specific criteria, then receives the full saved rubric and selects which draft items add useful judgments.
+Selection returns indices rather than rewritten criteria; the backend preserves each selected item exactly and keeps draft order.
+Its summary explains the suggested checks and important evidence limits in plain language.
+An empty selection is valid when the saved rubric already supplies the draft's judgments.
+The agent can update its own task's progress before the final result.
+The summary describes supplied evidence and material limitations without grading historical runs.
+The two steps share one conditional JSON or schema correction in the same session and the original runtime limit.
+A second invalid reply fails the generation. Duplicate or out-of-range selection indices are invalid.
+The follow-up is bounded to 240,000 serialized bytes; an oversized request fails generation without truncating criteria.
+Only the validated final suggestions are stored on the scout config; a failed generation preserves the saved rubric.
+Late failure callbacks preserve results from generations that already completed or failed.
+The worker ends the session after success or failure.
+The generation panel explains that suggestions take a few minutes and shows elapsed time while the agent works.
+The browser can close during generation and retrieve the result later without restoring a sandbox.
+Suggestions remain separate from the saved rubric until a person selects and saves them.
+Saving with `adopt_generation_id` explicitly binds the whole rubric to that completed generation's captured source. Both the rubric revision and generation identifier must match. Ordinary criterion edits retain the saved source; skill edits and later generations do not replace it.
+Older rubrics without captured source context remain readable, but their reference context is not reconstructed from current instructions or task logs.
+Save includes checked suggestions and shows the number of new criteria it will add.
+Suggestions appear above the criteria and start unselected. Owners can select them individually or select all.
+Suggested and saved criteria show their title and description first. Expanding a row reveals the passing rules and when they apply.
+Editing a suggestion selects it and keeps its edits in the suggestions list until Save rubrics.
+Editing a criterion shows all its fields. Done editing closes the form without saving; Save rubrics saves the full draft.
+Save rubric edits before generating suggestions; generation uses the saved criteria.
+Every save must retain the shared default criteria, which owners can edit or disable.
+Edits to shared defaults apply only to that scout. Custom criteria appear above the shared defaults in the editor.
+Revision checks protect concurrent saves, and each completion checks its generation identifier before updating the config.
+
+See `products/tasks/backend/logic/services/mts_example/` for a complete working example.
+It runs a multi-turn agent that discovers "cursed" identifiers in a repo,
+researches each one, and produces output in the shape Signals consumes:
+
+```text
+discovery → research ×N → actionability → priority? → presentation
+```
+
+Run it locally (DEBUG only):
+
+```bash
+DEBUG=1 python manage.py demo_mts_example --team-id <id> --user-id <id>
+```
+
+See the [example README](https://github.com/PostHog/posthog/blob/master/products/tasks/backend/logic/services/mts_example/README.md) for details on adapting it to your own use case.
+
+Signals report research stops retrying when GitHub still rejects repository credentials after the clone activity exhausts its retries.
+Transient clone failures remain retryable.
+When GitHub access is optional, research falls back to project data without code access.
+
+## Code execution
+
+Agents run inside an isolated sandbox with full code execution capabilities.
+They can:
+
+- Read, write, and execute files in the cloned repository
+- Install dependencies (npm, pip, etc.)
+- Run tests, linters, and build tools
+- Create git branches and pull requests (commits must be signed — see below)
+- Execute arbitrary shell commands within the container
+
+Claude sessions use `applyFlagSettings()` at startup to set `attribution.pr` to an empty string and disable Claude Code's default footer in pull request descriptions.
+The agent keeps the PostHog attribution footer from its task instructions.
+The same call sets `attribution.commit` to an empty string, consistent with the task instructions that prohibit Claude's default commit trailer.
+
+### Git commit signing
+
+Direct `git commit` and `git push` commands are blocked in the sandbox to ensure all commits are properly signed by GitHub. A PATH shim (`git-guard.sh` at `/opt/posthog/bin/git`) intercepts these subcommands while passing all other git operations through to the real binary.
+
+If an agent attempts to run `git commit` or `git push`, it will see:
+
+```text
+git commit is disabled in PostHog Desktop: commits must be signed.
+To commit: stage changes with 'git add', then call the git_signed_commit tool.
+To force-push after a rebase/conflict fix: call the git_signed_rewrite tool.
+```
+
+Agents should stage changes with `git add`, then use the `git_signed_commit` tool to create signed commits. For force-pushing after a rebase or conflict resolution, use the `git_signed_rewrite` tool instead.
+
+**Debugging escape hatch**: Set `POSTHOG_ALLOW_UNSIGNED_GIT=1` in the sandbox environment to bypass this restriction. This is intended for debugging only and should not be used in production.
+
+### Sandbox isolation
+
+|           | Production (Modal)                     | Local dev (Docker)                      |
+| --------- | -------------------------------------- | --------------------------------------- |
+| Isolation | gVisor container or VM microVM         | Standard Docker container               |
+| Network   | Configurable via `SandboxEnvironment`  | Host network via `host.docker.internal` |
+| Image     | `ghcr.io/posthog/posthog-sandbox-base` | Local Dockerfile build                  |
+| Auth      | Modal connect token                    | No token needed                         |
+
+### Runtime selection (gVisor vs Modal VM)
+
+Production sandboxes run on one of two Modal runtimes,
+chosen per run in `get_task_processing_context` (`_resolve_modal_vm_sandbox`)
+and forked in `provision_sandbox`:
+
+- **gVisor** (`SandboxTemplate.DEFAULT_BASE`) — the historical default: a gVisor kernel-sandboxed container.
+- **Modal VM** (`SandboxTemplate.VM_BASE`) — a kernel microVM that also bakes in Docker-in-Docker,
+  so the agent can run nested containers.
+  Custom base images layer on this base, and it is what image-builder runs execute on.
+
+Selection is driven by the `tasks-modal-vm-sandbox` flag's JSON payload,
+which carries two origin allowlists and an optional default image:
+
+- `origin_products` — origins allowed on the VM runtime when a custom image is resolved for the run
+  (custom images cannot run under gVisor).
+- `default_base_origin_products` — origins that default to the bare VM base image **even without a custom image**.
+  This is the knob for making the VM runtime the default for standard cloud runs;
+  we widen it origin-by-origin (and, later, the flag's release condition) as the rollout expands.
+- `default_custom_image` — a Modal image name that VM runs fall back to when no custom image was picked.
+  Because the flag's payload variants are org-targeted, this routes _which default VM image an org gets_:
+  PostHog's own org points at the prebaked dev-stack image (below), everyone else keeps the plain VM base.
+  A user- or environment-selected custom image always wins over this default,
+  and provisioning falls back to the plain VM base if the named image is missing.
+
+#### The prebaked dev-stack image
+
+`hogli start` on a fresh VM pays for multi-gigabyte docker pulls and the full Django + persons +
+ClickHouse migration history — and dead-ends anyway, because the lean VM base lacks the dev
+toolchain flox provides on dev machines (brotli, phrocs, Go, Rust). For runs on the PostHog
+monorepo we bake all of that ahead of time:
+the `bake-dev-stack-image` Temporal workflow boots a plain VM-base sandbox,
+runs `bake-posthog-dev-stack.sh` inside it (install the dev toolchain, pre-pull the dev compose
+images, bring the stack up, run the Django and Rust-driven migrations, shut down cleanly),
+snapshots the filesystem, and publishes it under the fixed
+Modal image name `posthog-dev-stack` (see `products/tasks/backend/logic/services/dev_stack_image.py`).
+It is dispatched on two cadences, both gated per region on the `tasks-dev-stack-image-bake` flag
+via a `region` person property: a nightly full rebake that keeps the heavy state (migrations,
+docker pulls) close to master, and a two-minute sweep that rebakes as soon as the VM base image
+digest moves (e.g. an agent-server release), at most once per new digest. User-authored custom
+images retain their separate ten-minute, batched refresh fanout.
+`python manage.py bake_dev_stack_image` triggers a bake manually and bypasses the flag.
+Pointing an org's `default_custom_image` payload key at that name gives its VM runs warm docker
+state and already-migrated databases, so a task-time `hogli start` only applies the migrations
+that landed since the last bake. The snapshot clones the migrated Postgres database into
+`test_posthog`, so pytest's default `--reuse-db` path also applies only newer migrations.
+The pnpm store and Playwright's Chromium are prewarmed too:
+`pnpm install --frozen-lockfile --prefer-offline` is a fast linking pass and browser installs
+are no-ops. The image also has `ffmpeg`, because the lean VM base ships no codec tooling,
+and the CI-pinned `semgrep`, `actionlint` and `shellcheck`, so agents can run the repo's lint gates before they push.
+Build outputs (node_modules, Storybook dist, Vite/Turbo caches) are deliberately
+not baked — the bake's checkout is deleted before the snapshot — so frontend builds always run
+from the task's own source. The bake must run on the real VM runtime —
+dockerd cannot run inside Modal's gVisor image builder — which is why it is a sandbox filesystem
+snapshot rather than a spec-built image.
+
+At task time the restored image is not self-starting: the sandbox runtime rewrites `/etc/hosts`
+at boot and dockerd does not autostart. Run the baked `bootstrap-dev-stack` helper first
+(restores the compose host aliases and starts dockerd — the bake manifest at
+`/opt/posthog/dev-stack-bake.json` names it under `bootstrap`), then from the checkout run
+`uv sync`, `source .venv/bin/activate`, `hogli start -y -d`, and `hogli wait`. Detached mode is
+required — the sandbox has no TTY, and running phrocs under a pseudo-TTY makes it balloon in
+memory until it is OOM-killed — and the detached start returns while the stack is still booting,
+so `hogli wait` is what blocks until every process reports ready.
+On a 16 GiB self-driving run the full stack takes about 12 GiB and leaves no room for tests,
+so the agent should start only the datastores unless the task needs the running app
+(see `docs/internal/cloud-task-sandbox.md`).
+
+Provisioning also fires that helper detached as soon as the sandbox is up (best-effort, only on
+runs that booted the PostHog-published `posthog-dev-stack` image itself — never a user-authored
+custom image, and never a filesystem-snapshot restore, whose filesystem a prior run could have
+altered; directory-snapshot resumes only mount the workspace, so they keep the warmup), so
+the dockerd warmup overlaps the repo clone and the environment is usually
+ready by the agent's first command. Running `bootstrap-dev-stack` again is still the right first
+step — it is the synchronization point, blocking until the warmup completes.
+
+##### Preview URL
+
+A user-created cloud run on `PostHog/PostHog` that booted the dev-stack image can also serve
+that stack back to the person who started it, so they can click through a change instead of
+reading the diff. Gated on the `tasks-dev-stack-preview` flag, per organization.
+
+Once the branch is checked out, the workflow starts the stack in the background
+(`start_dev_stack_preview`) and then waits for it (`wait_dev_stack_preview`) without holding
+the agent up. The in-sandbox script (`start-dev-stack-preview.sh`) runs `pnpm install`, `uv sync`,
+`hogli start -y -d`, `hogli wait`, and `setup_dev --no-data`, then reports `starting`, `ready`, or
+`failed` in `/tmp/posthog-preview/status.json`, which the wait activity polls. A crashed or unready
+dev-stack process fails the preview instead of publishing a half-working one, and each click on the
+link re-probes Django and Vite inside the sandbox before redirecting. Startup peaks around 19 GB, so
+these runs default to 32 GB rather than the standard VM memory size; the core limit stays at the
+VM default, but a box that actually boots the dev-stack image reserves 2 cores instead of the
+burstable 0.5 floor (a fallback to the plain base image keeps the plain floor), and a per-task
+`sandbox_resources` override still wins. The launcher starts with a scrubbed
+environment (`env -i`, fixed PATH), so the stack and its containers never inherit the run's
+GitHub token or personal API key. Relaunching is safe: the script takes an `flock` and reports
+`ready` straight away when the stack is already serving. While that lock is held, or once the
+stack it started answers `/_health`, `bin/start` (so `hogli start`) exits 0 without starting a
+second stack and tells the agent to poll `status.json` for `ready` or `failed`; `hogli wait`
+returns `not reachable` (exit 3) until the launcher reaches the phrocs step, so the agent retries
+it rather than forcing a start. The backend does not retry a `failed` preview; the agent then
+starts the stack itself. `HOGLI_SKIP_PREVIEW_CHECK=1` bypasses the guard, and the launcher sets it
+for its own `hogli start`.
+
+A Modal tunnel cannot reach the 127.0.0.1 listeners the dev compose stack publishes, and a
+two-origin setup breaks ES module loading, so the script puts one host-network Caddy container on
+port 8020 in front of both Django (8010) and Vite (8234). It serves `/_metrics` a 404, because
+that endpoint is unauthenticated under `DEBUG`.
+
+When the stack answers, the run's state gets a `dev_stack_preview` entry and the link is emitted
+as a progress step. The link always points at PostHog:
+`GET /api/projects/{team}/tasks/{task}/runs/{run}/preview/` requires control of the task (a
+`task:write` scope, not only visibility of a shared run) because the dev stack behind it is
+writable, mints a fresh Modal connect token per click, and redirects. Read-only impersonation sessions
+get a 403 for the same reason. No sandbox host or token is ever stored on the run. A preview that fails
+to launch, fails to boot, or takes too long is reported as a failed `preview` step and the run carries on
+without it. The launcher only writes `ready` after it logs in through the proxy and loads
+`/api/projects/@current/`, so a stack that answers `/_health` but errors after login is reported as failed.
+When a sandbox was sized by a worker that does not know the preview flag, the preview is skipped for that run.
+
+Known limit for v1: the dev stack runs with `DEBUG=1`, so a server error renders Django's debug
+page inside the preview.
+
+Modal is the authoritative network enforcement layer on every restricted Modal run, including on VMs.
+AgentSH also applies the compiled policy to the agent-server process tree as defense in depth. The
+provider policy applies outside the sandbox, so it covers traffic from the VM and its Docker containers
+without relying on AgentSH process tracing.
+Modal applies domain restrictions using the requested hostname or TLS SNI. Raw IP connections without
+an allowed SNI fail, while a connection to an IP with an allowed SNI can pass the boundary. This is an
+SNI allowlist, not DNS-to-destination-IP binding. AgentSH repeats the domain policy for the processes it
+traces as a second layer. It is not authoritative for VM egress: traffic that bypasses its proxy or process
+tree is outside that layer, and AgentSH does not add strict hostname-to-destination binding. Use an externally
+enforced egress proxy with a provider CIDR allowlist if a workload needs that binding. Test both host and
+container traffic because their network paths differ.
+The `use_modal_vm_sandbox` run-state key force-selects the VM runtime for trusted server-created runs
+(image builders) and is never accepted from client input.
+
+### Sandbox readiness
+
+Every Modal sandbox is created with a [readiness probe](https://modal.com/docs/guide/sandboxes#readiness-probes) that runs `true` inside the sandbox until it exits 0.
+Provisioning waits on that probe before it runs anything else in the sandbox, because a sandbox can come up dead with every RPC succeeding.
+That happens most often after a filesystem snapshot restore: a repository snapshot, a Streamlit app image, or the prebaked dev-stack image, which is itself a snapshot.
+A sandbox whose probe has not passed within `READINESS_PROBE_TIMEOUT_SECONDS` (`products/tasks/backend/logic/services/modal_sandbox.py`) is terminated and recreated from the next image candidate in the downgrade chain: custom or dev-stack image, then the plain base.
+Termination is retried, and provisioning fails when it still does not complete: the run stores only the id of the sandbox that `create()` returned, so a sandbox left running here is invisible to every later cleanup path.
+A directory resume snapshot is mounted into the sandbox after the probe has passed, and Modal stops the probe at its first success.
+Provisioning therefore runs one more `true` after that mount, and recreates the sandbox without the mount when it fails.
+The run log records the full downgrade chain as "Sandbox image downgraded: ...", one entry per recreation.
+The application log keeps a warning for every recreation.
+When no candidate remains, provisioning fails with a transient error and Temporal retries the activity.
+
+### Network access
+
+Network access is configured per-team via `SandboxEnvironment`:
+
+- **Trusted** — only allows access to a default set of trusted domains (GitHub, npm, PyPI, etc.)
+- **Full** — unrestricted network access
+- **Custom** — explicit allowlist of domains, optionally including the trusted defaults
+
+Allowed-domain values contain a domain name only, such as `example.com` or `*.example.com`.
+Schemes, paths, ports, IP addresses, rooted names, local host aliases, and wildcards in other positions
+are rejected when an environment is created or updated. Values are normalized to lowercase IDNA names,
+duplicates are removed, and each environment can contain up to 100 allowed domains.
+
+`None` is the internal representation for unrestricted access. A restricted empty list still includes
+the infrastructure domains required to run the sandbox. Modal and agentsh consume provider-specific
+forms of one compiled effective policy, including the same infrastructure domain coverage.
+
+To apply network restrictions from your product code,
+create a `SandboxEnvironment` and pass its ID to `Task.create_and_run`:
+
+```python
+from products.tasks.backend.models import SandboxEnvironment, Task
+
+# 1. Create an environment (once, or look up an existing one)
+env = SandboxEnvironment.objects.create(
+    team=team,
+    created_by=user,
+    name="Restricted agent env",
+    network_access_level="custom",  # "full" | "trusted" | "custom"
+    allowed_domains=["github.com", "api.example.com"],
+    include_default_domains=True,  # merge GitHub, npm, PyPI defaults
+)
+
+# 2. Pass its ID when creating the task
+task = Task.create_and_run(
+    team=team,
+    title="My restricted task",
+    description="...",
+    profile=get_task_profile("your_product"),
+    user_id=user.id,
+    repository="org/repo",
+    sandbox_environment_id=str(env.id),
+)
+```
+
+The temporal workflow resolves and compiles allowed domains at execution time, so environment updates
+take effect on the next run. The compiled policy and its fingerprint stay fixed across activity retries.
+Modal enforces the network boundary on every restricted run that provisions on Modal.
+Hogland runs rely on agentsh inside the sandbox.
+
+Environments can also be managed via the REST API (`SandboxEnvironmentViewSet`)
+or the PostHog Desktop settings UI.
+
+### Custom base images
+
+Teams can bake their own tools and dependencies into a custom base image (`SandboxCustomImage`)
+and select it as a cloud environment's base via `SandboxEnvironment.custom_image`.
+Custom images always layer on top of the published VM sandbox base —
+agent tooling, git guard, and the VM runtime are always present —
+and the whole mechanism is gated on the Modal VM runtime being available:
+the `sandbox_custom_images` API returns 403 (and the PostHog Desktop UI hides the feature)
+unless the `tasks-modal-vm-sandbox` flag is enabled for the org
+with `user_created` in its `origin_products` payload allowlist,
+since custom-image sandboxes cannot run under gVisor.
+
+The flow, driven from the PostHog Desktop Environments → Cloud tab:
+
+1. Creating an image spawns an interactive **image-builder agent task**
+   (`custom_image_builder_id` in the run state, VM runtime forced)
+   that iterates inside the real VM base and maintains a declarative spec
+   (`SandboxImageSpec`: `apt_packages`, `run_commands`, `env`) at `/tmp/workspace/image-spec.yaml`.
+2. "Save & build" reads the spec from the builder sandbox (or accepts it inline via
+   `POST /api/projects/:id/sandbox_custom_images/:id/build/`), then the
+   `build-sandbox-image` Temporal workflow runs an LLM security scan of the spec,
+   builds it layered on the VM base, and publishes it as a Modal named image
+   (`Image.publish()` / `Image.from_name()`).
+3. Runs using an environment with a ready custom image provision their sandbox
+   from the published image (`SandboxConfig.custom_image_name`),
+   falling back to the standard base if the image can't be loaded.
+   Repo-setup snapshots are skipped for custom-image runs; resume snapshots still apply.
+
+## Composer prewarming
+
+The task composer can warm a sandbox while the user types.
+Submission stops pending warm-up timers before creating a task or resuming a run, so a delayed warm-up cannot create an extra task after the backend has checked the warm pool.
+The submission takes ownership of held and pending warm-ups before sending, so closing the composer cannot cancel a run while its first message is being delivered.
+Each response reconciles only its own submission's warm-up, including one whose response arrives later.
+Once submission returns, the composer keeps the activated run and releases an unused warm-up if no later submission could have activated it.
+Overlapping submissions leave earlier warm-ups to the server reaper because either request might deliver to the same run.
+If the response is lost, the server reaper handles unused warm-ups because the composer cannot tell whether the message reached the run.
+Releases use `only_if_awaiting_first_message` and claim the run under the same row lock as activation.
+Activation claims the run before delivering its first message, so another composer or browser tab cannot cancel delivery in progress.
+A release that claims the run first prevents subsequent activation.
+
+## Continuing after sandbox inactivity
+
+When a sandbox expires, a new user message starts the next turn with the preserved
+conversation and workspace. A prewarmed successor waits for the queued message even
+after activation clears `await_user_message`. The agent restores context and decides
+whether to wait before accepting commands. Message IDs deduplicate retried deliveries.
+
+Explicit recovery of an interrupted run can still continue automatically. Idle
+same-run restores stay idle until a message arrives. Internal recovery instructions
+use hidden content blocks; adapters and transcript rendering omit those blocks from
+user message echoes. Existing unmarked transcript entries are unchanged.
+
+Repository snapshots contain an agent binary. Prewarmed resumes require its
+`prewarmedResumeMessageDriven` capability; the older `prewarmedResumeIdle` capability
+alone is insufficient. An incompatible snapshot uses the existing fresh-agent fallback.
+The check applies to ACP runs, because the capability belongs to the ACP agent server.
+Pi runs keep their snapshot, because the Pi server starts no turn of its own and loads
+its session history from the API.
+Publish the updated agent and rebuild sandbox images before deploying the stricter
+backend capability gate, so the fallback supplies a compatible agent.
+
+## Recovering task messages after a refresh
+
+The task page and side panel save unsent queue text and composer drafts in browser
+local storage once a task has an ID. The cache is scoped to the signed-in user,
+project, and task, expires after seven days, and does not sync between browsers.
+The latest edit wins across tabs; another tab's edits do not replace an open composer.
+
+Opening the task again restores queued messages followed by the unfinished draft
+into one editable draft, separated by blank lines. The queue starts empty. The
+user must review and submit the restored draft; sandbox readiness, turn completion,
+and permission responses cannot send it or start a run. An active optimistic
+handoff keeps its live queue and does not perform draft recovery.
+
+Messages awaiting a send acknowledgement remain cached. If a page closes before
+confirmation, recovery asks the user to check the conversation before sending again.
+Successful sends clear the submitted text while preserving newer edits. Storage
+failures do not block composing or sending; those drafts cannot survive a refresh.
+
+While a sandbox starts, the conversation displays its first submitted message from
+the run's saved `pending_user_message` when logs do not yet contain it. This is a
+display fallback: it strips context wrappers, gives way to the selected run's log
+or stream echo, and never submits the message again.
+
+## Context selection experiment
+
+The `phai-context-selection` feature flag enables hidden organizational context on human prompts in web and Slack cloud runs using Claude or Codex.
+The `phai-context-selection` flag selects `control`, `shadow`, or `treatment` using the task ID.
+Person-property conditions use the current actor's email and staff status, so an email-targeted rollout applies to that actor's eligible tasks while percentage and variant bucketing remain task-based.
+Other flag values disable selection. Local runs, Pi, and other runtime adapters skip it.
+An explicit disabled response stops further preparation requests for that sandbox session, including after conversation history is cleared.
+Flag changes can enable selection in a new session. Preparation errors do not disable later attempts.
+
+Before a human prompt reaches Claude or Codex, the sandbox calls the task-bound selection endpoint.
+Follow-ups delivered through the user-message command, including automated CI and peer messages, can trigger selection.
+Internal retry continuations, steering, and slash commands do not trigger selection.
+Shadow and treatment require the organization's existing AI data processing consent before retrieval or model calls.
+Shadow and treatment selections share project rate limits of 30 preparations per minute and 300 per hour.
+The limits apply after the eligibility, variant, and consent checks, so ineligible runs, such as scouts, never consume them.
+A selection over the limit returns `rate_limited` and skips retrieval and model calls.
+Each sandbox task can also call the selection endpoint at most 30 times per minute, whatever its eligibility.
+
+System One first checks whether organizational context could help, using the request and bounded conversation history.
+When the gate passes, the selector calls the existing skill search, catalog list/search, and Business Knowledge search APIs with the sandbox bearer credential.
+There is no separate projection or refresh job. Candidate counts are bounded per source.
+Each source endpoint enforces its existing OAuth scopes, project restrictions, and actor permissions.
+The selector does not maintain a separate source or conversation-audience permission policy.
+System One reranks up to 32 returned candidates in one request. Candidate content, the user request, and history stay in model state; questions refer to candidate keys.
+Source APIs receive bounded natural-language query text and apply their existing query handling. The selector does not maintain a stop-word list.
+Search queries retain the end of the current request and reserve space for recent history within the source APIs' 200-character limit.
+References link to the retrieved sources; skill references fetch the latest published version by name.
+Each reference also carries a `url` the user can open: the fetched page for a URL-backed Business Knowledge document, or the in-app page for a skill or metric. Text and file documents, certifications, and relationships have none.
+At most five references and 8,000 characters survive into a hidden context block, identified by `selection_id`.
+The agent server sends the keys of references already injected in the conversation as `exclude`, and selection skips them, so a follow-up never repeats a reference the agent still holds.
+Compaction and a cleared conversation reset that list, and a resumed run rebuilds it from the logged prompt requests.
+Retrieved content is data to verify through existing tools, rather than instructions or approval.
+Skill references contain descriptions and bounded search excerpts, so the prompt requires `skill-get` with the referenced name before the agent relies on or follows a skill.
+Long catalog records retain their status, proposed status, and drift metadata while verbose content becomes a bounded excerpt.
+A general knowledge search does not replace that fetch. If the fetch fails or access is denied, the agent must not treat the description as a verified definition or instruction.
+This is a prompt requirement, rather than a runtime guarantee that the fetch occurs.
+When a reference informs the answer, the agent is instructed to cite it by title and link its `url` when one exists, as it would any document it read.
+It ignores references that do not apply without commenting on them, and must not mention selection, suggestions, injection, or the hidden block's metadata, including in progress updates, tool-call explanations, and task summaries.
+
+Control skips retrieval. Shadow computes the selected bundle without injecting it. Treatment injects the bundle.
+Selection has an eight-second budget by default, starting before worker submission and run/actor lookups. Expired lookups do not start source or model requests.
+Saturation, timeout, and selection failures leave the ordinary prompt flow available.
+Source requests run concurrently and use at most half the remaining budget, leaving time to score ready results.
+A denied, failed, or slow source does not suppress results from other sources.
+A failed or incomplete reranking response skips enrichment for the turn; individual scores are not recovered from a failed batch.
+Source lookup uses the current project endpoint; the selector does not expand the credential to a parent project.
+The agent truncates requests and history and validates the context budget in Unicode code points, matching the backend renderer.
+Each active session owns its bounded selection history. Session creation and restoration seed that history explicitly from the prior conversation.
+The shared prompt dispatch path prepares human requests, checks cancellation, and records completed turns. Human request text stays separate from resume wrappers and retry continuations.
+Native and summary resumes preserve bounded prior conversation history for later turns; a successful `/clear` resets selection history.
+Actor refreshes update the selection credential. Flag eligibility is checked on each human turn.
+Preparation failure reports distinguish HTTP status, timeouts, response validation, and transport failures without recording exception messages or source content.
+Startup preparation shares the message-delivery queue with follow-ups, preserving prompt order.
+Cancellation during preparation prevents the prepared prompt from reaching the model.
+The selector uses one implementation for source retrieval, scoring, and bounded rendering. Only source retrieval uses the bounded worker pool.
+
+The existing System One call telemetry receives the selection ID, task/run/message IDs, flag mode, configuration version, and runtime version.
+The selector does not emit an additional `$ai_span` or separately persist the final shadow bundle. Source and selection failures use ordinary logs.
+The selection ID in a treatment's hidden marker correlates preparation with downstream model input.
+Offline evals can check downstream inputs, outputs, and tool calls where the existing LLM traces retain them.
+Existing trace retention and truncation apply, so absent output or context does not prove the agent ignored it.
+No dedicated evidence tables, prompt archive, or dispatch receipts are required.
+
+## Local development
+
+To set up sandboxed agents for local development:
+
+1. Create a personal dev GitHub App (see the [Cloud runs setup guide](https://github.com/PostHog/posthog/blob/master/docs/internal/sandboxes-setup-guide.md#github-app) for details)
+2. Run `python manage.py setup_background_agents`
+3. Run `hogli start`
+
+The setup command is idempotent and handles:
+
+- Writing required env vars (`OIDC_RSA_PRIVATE_KEY`, `SANDBOX_JWT_PRIVATE_KEY`, `DEBUG`, `SANDBOX_PROVIDER`, `SANDBOX_MCP_URL`) to your `.env`
+- Creating the Array OAuth application
+- Enabling the `tasks` feature flag for all teams
+- Building the agent skills bundle
+
+For advanced setup options (Modal sandboxes, local agent packages, MCP), see the [Cloud runs setup guide](https://github.com/PostHog/posthog/blob/master/docs/internal/sandboxes-setup-guide.md).
+
+**Tip:** Set `SANDBOX_REPO_MOUNT_MAP` to bind-mount local repositories into the Docker container and skip cloning from GitHub. Format: `SANDBOX_REPO_MOUNT_MAP=org/repo:/local/path` (e.g., `SANDBOX_REPO_MOUNT_MAP=PostHog/posthog:~/Developer/posthog`). This can significantly reduce sandbox startup time for large repos.
+
+### Workflow integration tests
+
+`TestProcessTaskWorkflow` in `products/tasks/backend/temporal/process_task/tests/test_workflow.py`
+boots real Modal sandboxes. Set `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, then run:
+
+```sh
+hogli test products/tasks/backend/temporal/process_task/tests/test_workflow.py::TestProcessTaskWorkflow
+```
+
+The completion and failure cases use a fixture HTTP API inside the sandbox. It serves
+the test task and a prewarmed run waiting for a message, so the real agent can become
+ready without calling a live PostHog API or submitting an LLM prompt. The test waits
+for readiness before signaling completion, then checks persisted status, error, and
+sandbox shutdown. It does not test Django API authentication or LLM task execution.
+
+These tests consume the published sandbox image, not the agent source in the checkout.
+The image pins the agent version in `Dockerfile.sandbox-base`.
+An agent release opens a pull request that bumps that pin.
+Every master push, a half-hourly schedule, and a manual dispatch compare the pin and the image inputs on master with the labels on the published images, and rebuild when they differ.
+That build checks the installed agent against the pin and starts the `agent-server` entrypoint on both architectures before the image is promoted.
+Before the pull request is approved, the bump workflow runs one Claude turn and one Codex turn from that image through the production Go ai-gateway, on the agent's default models and efforts.
+After the pull request merges, the bump workflow waits until `posthog-sandbox-base:master` reports the new version, dispatches a rebuild when it does not, and posts the outcome in the release thread.
+Running backend tests against that image alone does not validate an unpublished agent change.
+
+## Questions?
+
+If you're unsure whether a sandboxed agent is the right fit for your use case,
+ask in **#team-posthog-ai** on Slack.

@@ -1,0 +1,91 @@
+import { urls } from 'scenes/urls'
+
+import { ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
+
+import { ActivityScope, FileSystemIconColor, ProductManifest } from '../../frontend/src/types'
+
+export const manifest: ProductManifest = {
+    name: 'Support',
+    globalModals: {
+        ComposeTicketModal: () =>
+            import('./frontend/components/ComposeTicket/ComposeTicketModalHost').then(
+                (module) => module.ComposeTicketModalHost
+            ),
+    },
+    activityDescribers: {
+        [ActivityScope.TICKET]: () =>
+            import('./frontend/activityDescriber').then((module) => module.ticketActivityDescriber),
+    },
+    scenes: {
+        SupportOverview: {
+            name: 'Support overview',
+            import: () => import('./frontend/scenes/overview/SupportOverviewScene'),
+            projectBased: true,
+            layout: 'app-container',
+        },
+        SupportTickets: {
+            name: 'Ticket list',
+            description:
+                'Collect support tickets from an in-app widget, email, or Slack into one inbox, with the product context behind every ticket',
+            iconType: 'conversations',
+            import: () => import('./frontend/scenes/tickets/SupportTicketsScene'),
+            projectBased: true,
+            layout: 'app-container',
+            docsHref: 'https://posthog.com/docs/support',
+        },
+        SupportTicketDetail: {
+            name: 'Ticket detail',
+            import: () => import('./frontend/scenes/ticket/SupportTicketScene'),
+            projectBased: true,
+            layout: 'app-container',
+        },
+        SupportSettings: {
+            name: 'Support settings',
+            import: () => import('./frontend/scenes/settings/SupportSettingsScene'),
+            projectBased: true,
+            layout: 'app-container',
+        },
+        // The user's own tickets with PostHog support — unrelated to the Support product's
+        // agent inbox above, which shows tickets from *their* customers
+        MyTickets: {
+            name: 'Your tickets',
+            import: () => import('./frontend/scenes/myTickets/MyTicketsScene'),
+            projectBased: true,
+            layout: 'app-container',
+        },
+    },
+    routes: {
+        '/support': ['SupportOverview', 'supportOverview'],
+        '/support/tickets': ['SupportTickets', 'supportTickets'],
+        '/support/tickets/:ticketId': ['SupportTicketDetail', 'supportTicketDetail'],
+        '/support/settings': ['SupportSettings', 'supportSettings'],
+        '/my-tickets': ['MyTickets', 'myTickets'],
+    },
+    urls: {
+        supportDashboard: (): string => '/support',
+        supportTickets: (): string => '/support/tickets',
+        supportTicketDetail: (ticketId: string | number): string => `/support/tickets/${ticketId}`,
+        supportSettings: (): string => '/support/settings',
+        myTickets: (ticketId?: string): string =>
+            ticketId ? `/my-tickets?ticket=${encodeURIComponent(ticketId)}` : '/my-tickets',
+    },
+    fileSystemTypes: {},
+    treeItemsNew: [],
+    treeItemsProducts: [
+        {
+            path: 'Support',
+            intents: [ProductKey.CONVERSATIONS],
+            category: ProductItemCategory.MONITORING,
+            href: urls.supportTickets(),
+            searchKeywords: ['tickets', 'conversations', 'helpdesk', 'chat widget'],
+            type: 'conversations',
+            iconType: 'conversations',
+            iconColor: [
+                'var(--color-product-support-light)',
+                'var(--color-product-support-dark)',
+            ] as FileSystemIconColor,
+            sceneKey: 'SupportTickets',
+        },
+    ],
+    treeItemsMetadata: [],
+}

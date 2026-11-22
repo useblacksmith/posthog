@@ -1,0 +1,3371 @@
+use std::sync::Arc;
+use std::time::Instant;
+
+use chrono::{TimeZone, Utc};
+use dashmap::DashMap;
+use metrics::{counter, histogram};
+use personhog_proto::personhog::leader::v1::person_hog_leader_server::PersonHogLeader;
+use personhog_proto::personhog::types::v1::{
+    FencePersonRequest, FencePersonResponse, FencePersonsRequest, FencePersonsResponse,
+    FoldPersonDocumentRequest, FoldPersonDocumentResponse, GetPersonRequest, GetPersonResponse,
+    Person, RaisePersonVersionRequest, RaisePersonVersionResponse, ReleaseFenceRequest,
+    ReleaseFenceResponse, ReleaseFencesRequest, ReleaseFencesResponse, SealedSourceSnapshot,
+    UpdatePersonPropertiesRequest, UpdatePersonPropertiesResponse,
+};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use tonic::{Request, Response, Status};
+use uuid::Uuid;
+
+use personhog_common::partitioning::partition_for_person;
+
+use personhog_coordination::authority::AuthorityClock;
+
+use crate::cache::{
+    CacheLookup, CachedPerson, DirtyIndex, DirtyMark, PartitionedCache, PersonCacheKey, Stream,
+};
+use crate::coordination::ChangelogCaptures;
+use crate::emitted::{EmittedVersionGuard, EmittedVersions};
+use crate::fence::{
+    fenced_status, semantic_refusal, target_mark_status, FenceHealer, FenceMap, FenceState,
+    MarkVerifier,
+};
+#[cfg(test)]
+use crate::fencing::FencedProducerConfig;
+use crate::fencing::{FencedChangelogProducers, FencedProduceError};
+use crate::inflight::{InflightGuard, InflightTracker};
+use crate::person_update::{apply_property_updates, compute_event_property_updates};
+use crate::pg::{load_person_from_pg, LoadError, PgFallback};
+use crate::recovery::ChangelogRecovery;
+use crate::warnings::{DepthViolationWarning, SizeViolationWarning, WarningsProducer};
+use personhog_common::properties::{
+    can_trim_property, jsonb_column_size, sanitize_for_jsonb, trim_properties_to_fit_size,
+    trim_properties_with_candidates, SanitizeStats, TrimResult,
+};
+
+mod lifecycle;
+
+/// Mirrors the config's `fence_map_max_entries` default; production
+/// overrides via [`PersonHogLeaderService::with_fence_capacity`].
+const DEFAULT_FENCE_MAP_MAX_ENTRIES: usize = 250_000;
+
+/// Admission-time property size limits, in `pg_column_size` (JSONB
+/// binary) terms — the same units as the `check_properties_size`
+/// constraint they exist to enforce.
+#[derive(Clone, Copy)]
+pub struct PropertySizeLimits {
+    /// Reject or trim above this (the constraint's ceiling).
+    pub threshold: usize,
+    /// Trim down to this, leaving headroom under the threshold.
+    pub trim_target: usize,
+}
+
+impl PropertySizeLimits {
+    /// Panics if `trim_target > threshold`: an inverted configuration would
+    /// let admission pass documents above the threshold untrimmed, silently
+    /// weakening the applyability guarantee. Refusing to construct makes the
+    /// admission path's `TrimResult::Fits` arm unreachable.
+    pub fn new(threshold: usize, trim_target: usize) -> Self {
+        assert!(
+            trim_target <= threshold,
+            "properties_trim_target ({trim_target}) must not exceed \
+             properties_size_threshold ({threshold})"
+        );
+        Self {
+            threshold,
+            trim_target,
+        }
+    }
+}
+
+/// Lands a document in the changelog and then the cache, as its own task,
+/// so a handler dropped by its client cannot leave a record in flight
+/// without the person lock or committed without the cache update.
+struct Committer {
+    cache: Arc<PartitionedCache>,
+    dirty_index: Arc<DirtyIndex>,
+    emitted_versions: Arc<EmittedVersions>,
+    fenced: Arc<FencedChangelogProducers>,
+    /// Shared with the service; a mark names the partition's captured topic.
+    captures: ChangelogCaptures,
+}
+
+const NESTING_LIMIT_REFUSAL: &str = "exceeds the nesting limit";
+
+const STORED_TOO_DEEP_MESSAGE: &str = "This person's stored properties are nested more than 128 \
+     levels deep, so events for this person are not processed. This usually means an object such \
+     as a DOM element or an SDK instance was set as a person property. Delete this person to \
+     resume processing their events, and pass a plain value where the property is set.";
+
+const UPDATE_TOO_DEEP_MESSAGE: &str = "A person property update was rejected because a value is \
+     nested more than 128 levels deep. This usually means an object such as a DOM element or an \
+     SDK instance was passed as a property value. Pass a plain value instead.";
+
+/// DATA_LOSS is outside every client retry set.
+fn unprocessable_person_status() -> Status {
+    Status::data_loss("stored person properties cannot be parsed")
+}
+
+fn not_served(partition: u32) -> Status {
+    Status::failed_precondition(format!("partition {partition} is not served by this pod"))
+}
+
+fn record_pg_load_ages(person: &CachedPerson, now_ms: i64) {
+    let seconds_since = |ms: i64| (now_ms - ms).max(0) as f64 / 1000.0;
+    histogram!("personhog_leader_pg_load_person_age_seconds")
+        .record(seconds_since(person.created_at));
+    if let Some(last_seen_at) = person.last_seen_at {
+        histogram!("personhog_leader_pg_load_last_seen_age_seconds")
+            .record(seconds_since(last_seen_at));
+    }
+}
+
+/// A committed document, with the locks the handler took for it, so the
+/// handler keeps them until it is done with the document.
+struct Committed {
+    proto: Person,
+    _lock: OwnedMutexGuard<()>,
+    _inflight: InflightGuard,
+}
+
+/// Registers the revival outcomes at zero. A revival under a standing
+/// death document is rare, so a series born at its first one would hide
+/// that one from `increase()`.
+fn register_revival_metrics() {
+    for outcome in [
+        "served",
+        "row_below_death",
+        "tombstoned",
+        "no_fallback",
+        "load_error",
+    ] {
+        counter!("personhog_leader_revivals_total", "outcome" => outcome).increment(0);
+    }
+    drop(histogram!("personhog_leader_person_load_duration_ms", "source" => "revival"));
+}
+
+pub struct PersonHogLeaderService {
+    committer: Arc<Committer>,
+    cache: Arc<PartitionedCache>,
+    /// Per-key locks to serialize concurrent updates for the same person.
+    /// Prevents lost updates from concurrent get -> compute -> produce -> put
+    /// sequences, and thundering herd on PG fallback.
+    locks: Arc<DashMap<PersonCacheKey, Arc<Mutex<()>>>>,
+    /// Read-only PG fallback (pool + the table it reads) for cache miss.
+    fallback: Option<PgFallback>,
+    /// Per-partition inflight counter used to drive the handoff drain phase.
+    inflight: Arc<InflightTracker>,
+    /// What each served partition was acquired under; shared with the handler.
+    captures: ChangelogCaptures,
+    /// Persons whose latest acked state the writer may not have applied to
+    /// PG yet. Consulted on every cache miss: marked persons recover from
+    /// the changelog, unmarked persons' PG rows are known current.
+    dirty_index: Arc<DirtyIndex>,
+    recovery: Arc<ChangelogRecovery>,
+    size_limits: PropertySizeLimits,
+    warnings: WarningsProducer,
+    /// The in-process copy of the fence state (see the fence module for the
+    /// durability model: the marks in Postgres are the source of truth,
+    /// this map exists so the write path rejects without a database read).
+    /// Mutated only under the per-key lock.
+    fences: FenceMap,
+    /// Ghost-fence recovery, derived from the fallback pool at
+    /// construction. Absent without one (dev fixtures) — ghost fences
+    /// then last until the partition changes hands, as before.
+    fence_healer: Option<Arc<FenceHealer>>,
+    /// The committed-release mark check, one query per op per pod. Absent
+    /// without a fallback pool, in which case a release is refused.
+    mark_verifier: Option<MarkVerifier>,
+    /// Memory fuse for the fence map (see `fence_map_max_entries` in the
+    /// config for the full policy): at this many live fences, FencePerson
+    /// sheds new fences with RESOURCE_EXHAUSTED.
+    fence_map_max_entries: usize,
+    /// This pod's claim to serve, consulted before answering a strong read.
+    authority: Arc<AuthorityClock>,
+    /// Versions emitted without a confirmed outcome, so a later write for
+    /// the same person cannot reuse one.
+    emitted_versions: Arc<EmittedVersions>,
+}
+
+impl PersonHogLeaderService {
+    /// Refuse to answer as the partition's owner once this pod's lease
+    /// may have expired.
+    ///
+    /// The cache is only authoritative while the lease behind it is, and
+    /// the keepalive's own detection cannot be relied on to notice: a
+    /// process that is stopped, starved, or wedged stops renewing and
+    /// stops noticing together, then keeps serving state the new owner
+    /// is already changing. Reading the published stamp here makes the
+    /// lapse self-enforcing — nothing has to be alive to apply it.
+    ///
+    /// Refusal starts at the keepalive's renewal margin, strictly before
+    /// the coordinator could treat the lease as expired, so requests are
+    /// turned away while ownership is merely doubtful rather than after
+    /// it is wrong. `FailedPrecondition` is the admission fence's own
+    /// vocabulary: the router bounces and re-resolves toward whoever
+    /// actually owns the partition.
+    #[allow(clippy::result_large_err)]
+    fn check_authority(&self, partition: u32) -> Result<(), Status> {
+        let authority = &self.authority;
+        if authority.is_valid() {
+            return Ok(());
+        }
+        let reason = if authority.is_surrendered() {
+            "surrendered"
+        } else {
+            "stale"
+        };
+        counter!(
+            "personhog_leader_authority_lapsed_rejections_total",
+            "reason" => reason
+        )
+        .increment(1);
+        let since = authority.since_confirmed();
+        // Debug, not warn: the gate refuses *every* request for the whole
+        // duration of a lapse, so this fires at the pod's full read rate
+        // during exactly the incident someone would be reading logs for.
+        // The labelled counter above carries the rate and the cause.
+        tracing::debug!(
+            partition,
+            ?since,
+            margin = ?authority.margin(),
+            "refusing to serve: no confirmed lease renewal within the margin"
+        );
+        Err(Status::failed_precondition(format!(
+            "serving authority lapsed: no confirmed lease renewal in {since:?}"
+        )))
+    }
+
+    /// The gate every ack passes: a valid lease and in-process ownership.
+    #[allow(clippy::result_large_err)]
+    fn assert_authoritative(&self, partition: u32) -> Result<(), Status> {
+        self.check_authority(partition)?;
+        self.validate_ownership(partition)
+    }
+
+    /// The fence RPCs' exit gate: a success answer re-proves authority at
+    /// the moment it is given. Only a stale Ok can wrongly settle a saga;
+    /// errors bounce and retry.
+    #[allow(clippy::result_large_err)]
+    fn authoritative_ok<T>(&self, partition: u32, resp: T) -> Result<Response<T>, Status> {
+        self.assert_authoritative(partition)?;
+        Ok(Response::new(resp))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cache: Arc<PartitionedCache>,
+        fallback: Option<PgFallback>,
+        locks: Arc<DashMap<PersonCacheKey, Arc<Mutex<()>>>>,
+        inflight: Arc<InflightTracker>,
+        captures: ChangelogCaptures,
+        dirty_index: Arc<DirtyIndex>,
+        recovery: Arc<ChangelogRecovery>,
+        size_limits: PropertySizeLimits,
+        warnings: WarningsProducer,
+        fences: FenceMap,
+        fenced: Arc<FencedChangelogProducers>,
+        authority: Arc<AuthorityClock>,
+        emitted_versions: Arc<EmittedVersions>,
+    ) -> Self {
+        register_revival_metrics();
+        let committer = Arc::new(Committer {
+            cache: Arc::clone(&cache),
+            dirty_index: Arc::clone(&dirty_index),
+            emitted_versions: Arc::clone(&emitted_versions),
+            fenced,
+            captures: Arc::clone(&captures),
+        });
+        Self {
+            committer,
+            cache,
+            locks,
+            fence_healer: fallback
+                .as_ref()
+                .map(|f| Arc::new(FenceHealer::new(f.clone(), Arc::clone(&fences)))),
+            mark_verifier: fallback.as_ref().map(MarkVerifier::new),
+            fallback,
+            inflight,
+            captures,
+            dirty_index,
+            recovery,
+            size_limits,
+            warnings,
+            fences,
+            authority,
+            emitted_versions,
+            fence_map_max_entries: DEFAULT_FENCE_MAP_MAX_ENTRIES,
+        }
+    }
+
+    /// Override the fence-map capacity (`fence_map_max_entries` in the
+    /// config). Separate from `new` so the many test fixtures keep the
+    /// default without threading one more argument through.
+    pub fn with_fence_capacity(mut self, max_entries: usize) -> Self {
+        self.fence_map_max_entries = max_entries;
+        self
+    }
+
+    /// Verify the router's routing decision against the request body: the
+    /// partition a request arrived on must equal the partition derived from
+    /// the key it carries. A mismatch means a client stamped wrong
+    /// routing-key headers or the hash implementations diverged; serving it
+    /// would read or write through the wrong partition's cache, so fail
+    /// closed.
+    #[allow(clippy::result_large_err)]
+    fn validate_partition(
+        &self,
+        partition: u32,
+        team_id: i64,
+        person_id: i64,
+    ) -> Result<(), Status> {
+        let modulus = self
+            .captures
+            .get(&partition)
+            .map(|c| c.config.partitions)
+            .ok_or_else(|| not_served(partition))?;
+        let expected = partition_for_person(team_id, person_id, modulus);
+        if partition != expected {
+            counter!("personhog_leader_partition_mismatch_total").increment(1);
+            // A precondition, so the router bounces and retries, landing once it adopts the new count.
+            return Err(Status::failed_precondition(format!(
+                "x-partition {partition} does not match partition {expected} \
+                 derived from team_id={team_id} person_id={person_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The fence RPCs must never succeed on a pod that does not serve the
+    /// partition. A misrouted release that removed nothing and returned
+    /// OK would leave the real owner's fence in place while the saga
+    /// believes it released — a person frozen with no retry coming. The
+    /// handoff guard is not enough on its own: `release_partition`
+    /// unfences, so a pod that has already handed the partition off looks
+    /// unfenced. Rejecting sends the saga's retry to the current owner.
+    #[allow(clippy::result_large_err)]
+    fn validate_ownership(&self, partition: u32) -> Result<(), Status> {
+        if !self.cache.has_partition(partition) {
+            return Err(not_served(partition));
+        }
+        Ok(())
+    }
+
+    fn record_cache_hit() {
+        counter!(
+            "personhog_leader_person_loads_total",
+            "source" => "cache", "outcome" => "ok"
+        )
+        .increment(1);
+    }
+
+    /// A delete needs the row's version and creation time, never its properties.
+    pub(crate) async fn load_unreadable_row(
+        &self,
+        key: &PersonCacheKey,
+    ) -> Result<CachedPerson, Status> {
+        let Some(fallback) = &self.fallback else {
+            return Err(unprocessable_person_status());
+        };
+        match load_person_from_pg(&fallback.pool, &fallback.table, key).await {
+            Ok(Some(person)) => Ok(person),
+            Ok(None) => Err(Status::not_found("person is destroyed")),
+            Err(LoadError::UnprocessableProperties { row, .. }) => Ok(*row),
+            Err(LoadError::Query(e)) => {
+                tracing::error!(
+                    team_id = key.team_id,
+                    person_id = key.person_id,
+                    error = %e,
+                    "PG fallback query failed"
+                );
+                Err(Status::internal("failed to load person from database"))
+            }
+        }
+    }
+
+    fn warn_stored_too_deep(&self, team_id: i64, person_uuid: String, reason: &str) {
+        if reason.contains("recursion limit") {
+            self.warnings.emit_depth(&DepthViolationWarning {
+                team_id,
+                person_uuid: Some(person_uuid),
+                message: STORED_TOO_DEEP_MESSAGE,
+            });
+        }
+    }
+
+    fn warn_update_too_deep(&self, partition: u32, key: &PersonCacheKey, refusal: &Status) {
+        if !refusal.message().ends_with(NESTING_LIMIT_REFUSAL) {
+            return;
+        }
+        let person_uuid = match self.cache.get(partition, key) {
+            CacheLookup::Found(person) => Some(person.uuid),
+            _ => None,
+        };
+        self.warnings.emit_depth(&DepthViolationWarning {
+            team_id: key.team_id,
+            person_uuid,
+            message: UPDATE_TOO_DEEP_MESSAGE,
+        });
+    }
+
+    /// Recover a cache miss from the right source. A person in the dirty
+    /// index has acked state the writer may not have applied to PG yet, so
+    /// the PG row cannot be trusted — recover the full latest state from
+    /// the changelog record at the marked offset instead. If that fetch
+    /// fails, the only honest answer is a retryable error: falling back to
+    /// PG would serve exactly the staleness this index exists to prevent.
+    /// Unmarked persons' PG rows are known current — but only while this
+    /// pod owns the partition, so the no-mark path re-checks ownership
+    /// before trusting PG. Assumes the caller holds the per-key lock.
+    async fn recover_or_load(
+        &self,
+        partition: u32,
+        key: &PersonCacheKey,
+    ) -> Result<CachedPerson, Status> {
+        let Some(mark) = self.dirty_index.get(key) else {
+            // "No mark" means PG is current — but only while this pod owns
+            // the partition. Handoffs drain writes, not reads, so a read
+            // admitted before the freeze can still be executing here when
+            // `release_partition` clears the partition's marks (the new
+            // owner rebuilds its own), and to that reader a still-dirty
+            // person now looks safe to load from PG. Re-checking the cache
+            // AFTER the index read settles which world we're in: release
+            // drops the cache partition first and clears marks second, so
+            // if this miss was caused by release, the partition is already
+            // gone from the cache and we fail closed; if the partition is
+            // still present, the marks were intact when we read them and
+            // the absence is genuine. There is no interleaving that gets
+            // past both checks into a stale PG read.
+            return match self.cache.get(partition, key) {
+                CacheLookup::Found(person) => {
+                    Self::record_cache_hit();
+                    Ok(person)
+                }
+                CacheLookup::PersonNotFound => self.load_from_pg(partition, key).await,
+                CacheLookup::PartitionNotOwned => Err(Status::failed_precondition(format!(
+                    "partition {partition} not owned by this leader"
+                ))),
+            };
+        };
+
+        let started = Instant::now();
+        let result = self.recovery.fetch_person_at(&mark, key).await;
+        histogram!("personhog_leader_person_load_duration_ms", "source" => "changelog")
+            .record(started.elapsed().as_secs_f64() * 1000.0);
+        match result {
+            Ok(person) => {
+                counter!(
+                    "personhog_leader_person_loads_total",
+                    "source" => "changelog", "outcome" => "ok"
+                )
+                .increment(1);
+                self.cache.put(partition, key.clone(), person.clone());
+                Ok(person)
+            }
+            Err(e) => {
+                counter!(
+                    "personhog_leader_person_loads_total",
+                    "source" => "changelog", "outcome" => "error"
+                )
+                .increment(1);
+                tracing::error!(
+                    team_id = key.team_id,
+                    person_id = key.person_id,
+                    offset = mark.offset,
+                    error = %e,
+                    "changelog recovery failed for dirty person"
+                );
+                Err(Status::unavailable(
+                    "person state is pending durable write and changelog recovery failed; retry",
+                ))
+            }
+        }
+    }
+
+    /// Load a person from PG and populate the cache. Assumes the caller
+    /// holds the per-key lock.
+    async fn load_from_pg(
+        &self,
+        partition: u32,
+        key: &PersonCacheKey,
+    ) -> Result<CachedPerson, Status> {
+        let Some(fallback) = &self.fallback else {
+            // Without the pool a cache miss answers NotFound, which callers
+            // read as authoritative death; production always sets it.
+            return Err(Status::not_found(format!(
+                "person not found: team_id={}, person_id={}",
+                key.team_id, key.person_id
+            )));
+        };
+
+        let started = Instant::now();
+        let result = load_person_from_pg(&fallback.pool, &fallback.table, key).await;
+        // A stub is a row the writer has not written yet, so no cache size could have held it.
+        let loaded = match &result {
+            Ok(Some(person)) if person.has_no_properties() => "stub",
+            Ok(Some(_)) => "existing",
+            Ok(None) | Err(_) => "none",
+        };
+        histogram!(
+            "personhog_leader_person_load_duration_ms",
+            "source" => "pg", "person" => loaded
+        )
+        .record(started.elapsed().as_secs_f64() * 1000.0);
+        match result {
+            Ok(Some(person)) => {
+                counter!(
+                    "personhog_leader_person_loads_total",
+                    "source" => "pg", "outcome" => "ok", "person" => loaded
+                )
+                .increment(1);
+                record_pg_load_ages(&person, Utc::now().timestamp_millis());
+                self.cache.put(partition, key.clone(), person.clone());
+                Ok(person)
+            }
+            Ok(None) => {
+                counter!(
+                    "personhog_leader_person_loads_total",
+                    "source" => "pg", "outcome" => "not_found"
+                )
+                .increment(1);
+                Err(Status::not_found(format!(
+                    "person not found: team_id={}, person_id={}",
+                    key.team_id, key.person_id
+                )))
+            }
+            Err(LoadError::UnprocessableProperties { reason, row }) => {
+                counter!(
+                    "personhog_leader_person_loads_total",
+                    "source" => "pg", "outcome" => "unprocessable"
+                )
+                .increment(1);
+                tracing::error!(
+                    team_id = key.team_id,
+                    person_id = key.person_id,
+                    reason,
+                    "stored person properties cannot be parsed"
+                );
+                self.warn_stored_too_deep(key.team_id, row.uuid, &reason);
+                Err(unprocessable_person_status())
+            }
+            Err(LoadError::Query(e)) => {
+                counter!(
+                    "personhog_leader_person_loads_total",
+                    "source" => "pg", "outcome" => "error"
+                )
+                .increment(1);
+                counter!("personhog_leader_pg_fallback_errors_total").increment(1);
+                tracing::error!(
+                    team_id = key.team_id,
+                    person_id = key.person_id,
+                    error = %e,
+                    "PG fallback query failed"
+                );
+                Err(Status::internal("failed to load person from database"))
+            }
+        }
+    }
+
+    /// A live PG row above the death version can only be a stub-create
+    /// revival under the same id. Caller holds the per-key lock.
+    async fn serve_revival(
+        &self,
+        partition: u32,
+        key: &PersonCacheKey,
+        person: CachedPerson,
+    ) -> Result<CachedPerson, Status> {
+        if !person.is_deleted {
+            return Ok(person);
+        }
+        let Some(fallback) = &self.fallback else {
+            counter!("personhog_leader_revivals_total", "outcome" => "no_fallback").increment(1);
+            return Ok(person);
+        };
+        let started = Instant::now();
+        let result = load_person_from_pg(&fallback.pool, &fallback.table, key).await;
+        histogram!("personhog_leader_person_load_duration_ms", "source" => "revival")
+            .record(started.elapsed().as_secs_f64() * 1000.0);
+        match result {
+            Ok(Some(row)) if row.version > person.version => {
+                counter!("personhog_leader_revivals_total", "outcome" => "served").increment(1);
+                tracing::info!(
+                    team_id = key.team_id,
+                    person_id = key.person_id,
+                    death_version = person.version,
+                    version = row.version,
+                    "serving a person revived in Postgres over its death document"
+                );
+                self.cache.put(partition, key.clone(), row.clone());
+                Ok(row)
+            }
+            Ok(Some(row)) => {
+                // The tombstone precedes the release, so a live row this
+                // low is a pre-death read; it must not revive the person.
+                counter!("personhog_leader_revivals_total", "outcome" => "row_below_death")
+                    .increment(1);
+                tracing::warn!(
+                    team_id = key.team_id,
+                    person_id = key.person_id,
+                    death_version = person.version,
+                    version = row.version,
+                    "a live Postgres row sits at or below the death document"
+                );
+                Ok(person)
+            }
+            Ok(None) => {
+                counter!("personhog_leader_revivals_total", "outcome" => "tombstoned").increment(1);
+                Ok(person)
+            }
+            // As for a readable row this low: pre-death state, not a revival.
+            Err(LoadError::UnprocessableProperties { row, .. })
+                if row.version <= person.version =>
+            {
+                counter!("personhog_leader_revivals_total", "outcome" => "row_below_death")
+                    .increment(1);
+                Ok(person)
+            }
+            Err(LoadError::UnprocessableProperties { reason, row }) => {
+                counter!("personhog_leader_revivals_total", "outcome" => "unprocessable")
+                    .increment(1);
+                tracing::error!(
+                    team_id = key.team_id,
+                    person_id = key.person_id,
+                    reason,
+                    "stored person properties cannot be parsed"
+                );
+                self.warn_stored_too_deep(key.team_id, row.uuid, &reason);
+                Err(unprocessable_person_status())
+            }
+            Err(LoadError::Query(e)) => {
+                counter!("personhog_leader_revivals_total", "outcome" => "load_error").increment(1);
+                counter!("personhog_leader_pg_fallback_errors_total").increment(1);
+                tracing::error!(
+                    team_id = key.team_id,
+                    person_id = key.person_id,
+                    error = %e,
+                    "PG revival check failed"
+                );
+                // Callers read not-found as gone, which this could not establish.
+                Err(Status::unavailable(
+                    "could not check whether a destroyed person was revived; retry",
+                ))
+            }
+        }
+    }
+
+    /// Look up a person from cache, falling back to PG on miss.
+    /// Acquires a per-key lock.
+    async fn lookup_or_load(
+        &self,
+        partition: u32,
+        key: &PersonCacheKey,
+    ) -> Result<CachedPerson, Status> {
+        // Fast path: cache hit (no lock needed); a death document takes the locked path.
+        match self.cache.get(partition, key) {
+            CacheLookup::Found(person) if !person.is_deleted => {
+                Self::record_cache_hit();
+                return Ok(person);
+            }
+            CacheLookup::Found(_) => {}
+            CacheLookup::PartitionNotOwned => {
+                return Err(Status::failed_precondition(format!(
+                    "partition {} not owned by this leader",
+                    partition
+                )));
+            }
+            CacheLookup::PersonNotFound => {}
+        }
+
+        // Cache miss -- acquire per-key lock to prevent thundering herd
+        let mutex = self.locks.entry(key.clone()).or_default().value().clone();
+        let _guard = mutex.lock().await;
+
+        // Double-check cache -- another request may have loaded it
+        let person = if let CacheLookup::Found(person) = self.cache.get(partition, key) {
+            Self::record_cache_hit();
+            person
+        } else {
+            self.recover_or_load(partition, key).await?
+        };
+        self.serve_revival(partition, key, person).await
+    }
+
+    /// Look up a person from cache, falling back to PG on miss.
+    /// The caller must already hold the per-key lock.
+    async fn lookup_or_load_locked(
+        &self,
+        partition: u32,
+        key: &PersonCacheKey,
+    ) -> Result<CachedPerson, Status> {
+        let person = match self.cache.get(partition, key) {
+            CacheLookup::Found(person) => {
+                Self::record_cache_hit();
+                person
+            }
+            CacheLookup::PartitionNotOwned => {
+                return Err(Status::failed_precondition(format!(
+                    "partition {} not owned by this leader",
+                    partition
+                )))
+            }
+            CacheLookup::PersonNotFound => self.recover_or_load(partition, key).await?,
+        };
+        self.serve_revival(partition, key, person).await
+    }
+
+    /// The shared tail of every document write: refuse unapplyable records,
+    /// produce to Kafka first, then dirty-mark and update the cache, so
+    /// readers only ever see durably committed state. The person lock and
+    /// the in-flight slot travel with the commit and come back with the
+    /// document.
+    async fn commit_document(
+        &self,
+        partition: u32,
+        cache_key: &PersonCacheKey,
+        person: CachedPerson,
+        lock: OwnedMutexGuard<()>,
+        inflight: InflightGuard,
+    ) -> Result<Committed, Status> {
+        // A record the writer cannot bind must never reach the changelog —
+        // no consumer downstream can apply or repair it.
+        if let Err(reason) = assert_writeable(&person) {
+            counter!("personhog_leader_unwriteable_state_total").increment(1);
+            tracing::error!(
+                team_id = cache_key.team_id,
+                person_id = cache_key.person_id,
+                reason,
+                "refusing to produce an unapplyable changelog record"
+            );
+            return Err(Status::internal(format!(
+                "person state is not writeable: {reason}"
+            )));
+        }
+
+        let proto = cached_person_into_proto(person.clone());
+
+        // Re-check before producing, for the same reason the read path
+        // re-checks before answering: admission proves nothing about the
+        // moment the record lands. Between the check at entry and here a
+        // write can wait on the per-key lock behind another produce, and
+        // on a changelog recovery — long enough for a starved keepalive's
+        // stamp to age out, for the lease to expire at etcd, and for the
+        // coordinator to warm a successor past the point this record
+        // would land.
+        self.check_authority(partition)?;
+
+        // From here the record may reach the changelog whatever happens
+        // to this request, including the request ceasing to exist when
+        // the client's deadline expires, so the rest runs as its own
+        // task: it finishes under the person lock, lands the record in
+        // the cache, and only then lets the lock go.
+        let committer = Arc::clone(&self.committer);
+        let (team_id, person_id) = (cache_key.team_id, cache_key.person_id);
+        let cache_key = cache_key.clone();
+        tokio::spawn(async move {
+            committer
+                .commit(partition, cache_key, person, proto, lock, inflight)
+                .await
+        })
+        .await
+        .unwrap_or_else(|e| {
+            // The floor stays raised through the unwind, so the version
+            // is spent; what is lost is only the outcome.
+            tracing::error!(
+                team_id,
+                person_id,
+                partition,
+                error = %e,
+                "commit task ended without reporting an outcome"
+            );
+            Err(Status::internal(format!("commit task: {e}")))
+        })
+    }
+}
+
+impl Committer {
+    /// The producer was acquired on the capture's topic, so its records land there.
+    #[allow(clippy::result_large_err)]
+    fn stream_of(&self, partition: u32) -> Result<Stream, Status> {
+        let (topic, cluster) = self
+            .captures
+            .get(&partition)
+            .map(|c| (Arc::clone(&c.topic), c.cluster.clone()))
+            .ok_or_else(|| not_served(partition))?;
+        Ok(Stream {
+            topic,
+            cluster,
+            partition,
+        })
+    }
+
+    async fn commit(
+        &self,
+        partition: u32,
+        cache_key: PersonCacheKey,
+        person: CachedPerson,
+        proto: Person,
+        lock: OwnedMutexGuard<()>,
+        inflight: InflightGuard,
+    ) -> Result<Committed, Status> {
+        let stream = self.stream_of(partition)?;
+        // The guard is what makes the version un-reusable if this task
+        // never reports.
+        let mut emitted = EmittedVersionGuard::new(
+            Arc::clone(&self.emitted_versions),
+            partition,
+            cache_key.clone(),
+            person.version,
+        );
+        emitted.emitting();
+
+        // Produce to Kafka first, then update the cache on success.
+        // Readers only ever see durably committed state.
+        let offset = match self.fenced.produce(partition, &proto).await {
+            Ok(offset) => offset,
+            // The broker fenced this pod: a newer owner holds the
+            // partition, so this claim is stale. FailedPrecondition
+            // is the admission fence's own vocabulary — the router
+            // classifies it as a bounce and re-resolves toward the
+            // real owner.
+            Err(e @ FencedProduceError::Fenced) => {
+                // Rejected at the broker, so the record does not
+                // exist and its version is free.
+                emitted.discarded();
+                tracing::error!(
+                    team_id = cache_key.team_id,
+                    person_id = cache_key.person_id,
+                    partition,
+                    "changelog producer fenced; rejecting write as stale owner"
+                );
+                // No local reaction beyond failing the write: a fence
+                // proves someone newer took the id, not that this pod
+                // lost the partition. `heal_fence` re-takes the epoch
+                // on the next convergence, once the stamp allows it.
+                return Err(Status::failed_precondition(format!(
+                    "partition ownership fenced: {e}"
+                )));
+            }
+            // The partition moved and this window's outcome never
+            // came back, so the router gets its ownership answer but
+            // the version cannot be handed back.
+            Err(e @ FencedProduceError::FencedUncertain(_)) => {
+                // The record may or may not be in the log, so the
+                // version stays spent.
+                counter!(
+                    "personhog_leader_indeterminate_outcomes_total",
+                    "fenced" => "true"
+                )
+                .increment(1);
+                tracing::error!(
+                    team_id = cache_key.team_id,
+                    person_id = cache_key.person_id,
+                    partition,
+                    error = %e,
+                    "changelog producer fenced with an unknown outcome; version kept spent"
+                );
+                return Err(Status::failed_precondition(format!(
+                    "partition ownership fenced: {e}"
+                )));
+            }
+            Err(e @ FencedProduceError::NotAcquired) => {
+                emitted.discarded();
+                tracing::warn!(
+                    team_id = cache_key.team_id,
+                    person_id = cache_key.person_id,
+                    partition,
+                    "no changelog fence held for partition; rejecting write"
+                );
+                return Err(Status::failed_precondition(format!(
+                    "partition fence not held: {e}"
+                )));
+            }
+            // Whether the record became visible is unknown, so the
+            // version stays spent: a retry reusing it would race a
+            // record that may already have committed.
+            Err(e @ FencedProduceError::Indeterminate(_)) => {
+                // The retry derives past the spent version.
+                counter!(
+                    "personhog_leader_indeterminate_outcomes_total",
+                    "fenced" => "false"
+                )
+                .increment(1);
+                tracing::error!(
+                    team_id = cache_key.team_id,
+                    person_id = cache_key.person_id,
+                    partition,
+                    error = %e,
+                    "changelog commit outcome unknown; version kept spent"
+                );
+                return Err(Status::unknown(format!(
+                    "person state may or may not have been stored: {e}"
+                )));
+            }
+            // The window aborted, so nothing became visible and
+            // ABORTED is the code clients retry on.
+            Err(e) => {
+                // Nothing became visible, so the version is free.
+                emitted.discarded();
+                tracing::error!(
+                    team_id = cache_key.team_id,
+                    person_id = cache_key.person_id,
+                    error = %e,
+                    "failed to produce person state changelog"
+                );
+                return Err(Status::aborted(format!(
+                    "failed to durably store person state: {e}"
+                )));
+            }
+        };
+
+        // Mark before the cache insert: a reader that misses the cache in
+        // the gap sees the mark and recovers this exact record from the
+        // changelog. The mark outlives eviction and is pruned once the
+        // writer's committed offset passes it.
+        self.dirty_index.mark(
+            cache_key.clone(),
+            DirtyMark {
+                version: person.version,
+                offset,
+                partition,
+                stream,
+                is_deleted: person.is_deleted,
+            },
+        );
+        self.cache.put(partition, cache_key, person);
+        // The cache carries the version now, so the floor has nothing
+        // left to say.
+        emitted.resolved();
+        Ok(Committed {
+            proto,
+            _lock: lock,
+            _inflight: inflight,
+        })
+    }
+}
+
+impl PersonHogLeaderService {
+    /// The write path's fence conditional: an in-memory lookup and nothing
+    /// else. The map is authoritative here — a fence that outlives its op
+    /// is not the leader's to detect, because the op being unfinished is
+    /// exactly what a live mark means (see the fence module's ownership
+    /// model). Returns the fence to reject with, or None when the person
+    /// is writable. Assumes the caller holds the per-key lock.
+    fn check_fence(&self, cache_key: &PersonCacheKey) -> Option<FenceState> {
+        self.fences.get(cache_key).map(|entry| *entry.value())
+    }
+}
+
+/// The first instant Postgres accepts in a `timestamptz`: Julian day 0,
+/// which Postgres documents as 4713 BC (Julian calendar) and chrono
+/// renders as -4713-11-24 (proleptic Gregorian). chrono reaches much
+/// further back, so this is the binding bound.
+const PG_TIMESTAMPTZ_MIN_MS: i64 = -210_866_803_200_000;
+
+/// Upper bound on the epoch-millisecond timestamps the leader will put in
+/// a changelog record: the last instant of year 9999. Inside both chrono's
+/// and Postgres's ranges; nothing legitimate sits above it.
+const MAX_EPOCH_MS_YEAR_9999: i64 = 253_402_300_799_999;
+
+/// Whether the writer can bind this epoch-millisecond value as a
+/// `timestamptz`: chrono must represent it and Postgres must accept it.
+/// Rows written before personhog carry a client's zero `DateTime` (year 1)
+/// as `created_at`, and those must keep writing.
+fn writeable_epoch_ms(ms: i64) -> bool {
+    (PG_TIMESTAMPTZ_MIN_MS..=MAX_EPOCH_MS_YEAR_9999).contains(&ms)
+        && Utc.timestamp_millis_opt(ms).single().is_some()
+}
+
+/// The granularity `last_seen_at` is stored at. Matches ingestion's own
+/// hourly truncation so both write paths produce identical stored values.
+const MS_PER_HOUR: i64 = 3_600_000;
+
+/// Floors to the hour on either side of the epoch; `%` would round a
+/// negative value up to the next hour instead.
+fn floor_to_hour(ms: i64) -> i64 {
+    ms.div_euclid(MS_PER_HOUR) * MS_PER_HOUR
+}
+
+/// The changelog contract: every produced record must be applyable by the
+/// writer's upsert verbatim. Properties are guaranteed by admission
+/// (NUL sanitization plus the exact size measure); this checks the
+/// remaining writer-bound fields against the writer's bind conversions —
+/// uuid must parse, team_id must fit the column's `integer`, and the
+/// timestamps must convert to a `timestamptz`. The legacy jsonb columns
+/// have no cache field and are unconditionally empty in
+/// `cached_person_into_proto`, so a record structurally cannot carry
+/// values the writer would refuse there.
+fn assert_writeable(p: &CachedPerson) -> Result<(), String> {
+    if Uuid::parse_str(&p.uuid).is_err() {
+        return Err("uuid does not parse as a UUID".to_string());
+    }
+    if p.team_id <= 0 || p.team_id > i32::MAX as i64 {
+        return Err(format!(
+            "team_id {} is outside the column's integer range",
+            p.team_id
+        ));
+    }
+    if !writeable_epoch_ms(p.created_at) {
+        return Err(format!(
+            "created_at epoch {} is not representable as a timestamp",
+            p.created_at
+        ));
+    }
+    if let Some(t) = p.last_seen_at {
+        if !writeable_epoch_ms(t) {
+            return Err(format!(
+                "last_seen_at epoch {t} is not representable as a timestamp"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn cached_person_into_proto(p: CachedPerson) -> Person {
+    Person {
+        id: p.id,
+        uuid: p.uuid,
+        team_id: p.team_id,
+        properties: p.properties,
+        created_at: p.created_at,
+        version: p.version,
+        is_identified: p.is_identified,
+        is_user_id: None,
+        last_seen_at: p.last_seen_at,
+        is_deleted: p.is_deleted,
+    }
+}
+
+/// The ingestion client drops an update refused for its nesting, keyed on
+/// this message, so a wording change here must change there too.
+// See `partition_from_metadata` for why `result_large_err` is allowed.
+#[allow(clippy::result_large_err)]
+fn parse_update_properties(bytes: &[u8], field: &str) -> Result<serde_json::Value, Status> {
+    if bytes.is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_slice(bytes).map_err(|e| {
+        if e.to_string().contains("recursion limit") {
+            counter!("personhog_leader_updates_total", "outcome" => "rejected_too_deep")
+                .increment(1);
+            Status::invalid_argument(format!("{field} {NESTING_LIMIT_REFUSAL}"))
+        } else {
+            Status::invalid_argument(format!("invalid {field} JSON: {e}"))
+        }
+    })
+}
+
+/// Parse a JSON-map wire field (empty bytes mean an empty map), refusing
+/// anything that is not a JSON object.
+// See `partition_from_metadata` for why `result_large_err` is allowed.
+#[allow(clippy::result_large_err)]
+fn parse_json_object_field(bytes: &[u8], field: &str) -> Result<serde_json::Value, Status> {
+    if bytes.is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| Status::invalid_argument(format!("invalid {field} JSON: {e}")))?;
+    if !value.is_object() {
+        return Err(Status::invalid_argument(format!(
+            "{field} must be a JSON object"
+        )));
+    }
+    Ok(value)
+}
+
+/// A sealed source snapshot after admission: identity-checked against the
+/// fold's target, JSON-parsed, and sanitized.
+#[derive(Debug)]
+struct SealedSnapshot {
+    ordinal: i32,
+    properties: serde_json::Value,
+    version: i64,
+    created_at: i64,
+    last_seen_at: Option<i64>,
+}
+
+/// Admit the fold request's sealed snapshots: validate, parse, and
+/// sanitize each, returning them in ordinal order plus what sanitization
+/// rewrote. Every refusal is a deterministic `InvalidArgument`: each
+/// snapshot must be a plausible living source of the target — same team,
+/// a different person, not a death document — and ordinals must be
+/// unique, or precedence would be ambiguous. A mismatch can only be a
+/// saga bug, and folding it silently would launder it into the target.
+// See `partition_from_metadata` for why `result_large_err` is allowed.
+#[allow(clippy::result_large_err)]
+fn parse_sealed_snapshots(
+    sealed_snapshots: &[SealedSourceSnapshot],
+    team_id: i64,
+    person_id: i64,
+) -> Result<(Vec<SealedSnapshot>, SanitizeStats), Status> {
+    let mut stats = SanitizeStats::default();
+    let mut seen_ordinals = std::collections::HashSet::with_capacity(sealed_snapshots.len());
+    let mut snapshots: Vec<SealedSnapshot> = Vec::with_capacity(sealed_snapshots.len());
+    for snapshot in sealed_snapshots {
+        let Some(person) = &snapshot.person else {
+            return Err(Status::invalid_argument(
+                "sealed snapshot is missing its person",
+            ));
+        };
+        if person.team_id != team_id {
+            return Err(Status::invalid_argument(
+                "sealed snapshot belongs to a different team than the target",
+            ));
+        }
+        if person.id == person_id {
+            return Err(Status::invalid_argument(
+                "sealed snapshot is the merge target itself",
+            ));
+        }
+        if person.is_deleted {
+            return Err(Status::invalid_argument(
+                "sealed snapshot is a death document; only living sealed state folds",
+            ));
+        }
+        if !seen_ordinals.insert(snapshot.ordinal) {
+            return Err(Status::invalid_argument(
+                "sealed snapshots carry a duplicate ordinal; precedence would be ambiguous",
+            ));
+        }
+        let mut properties =
+            parse_json_object_field(&person.properties, "sealed snapshot properties")?;
+        let snapshot_stats = sanitize_for_jsonb(&mut properties);
+        stats.nul_strings += snapshot_stats.nul_strings;
+        stats.clamped_numbers += snapshot_stats.clamped_numbers;
+        snapshots.push(SealedSnapshot {
+            ordinal: snapshot.ordinal,
+            properties,
+            version: person.version,
+            created_at: person.created_at,
+            last_seen_at: person.last_seen_at,
+        });
+    }
+    // Precedence comes from the recorded pair order, not from the
+    // request: a re-drive that lists sources differently must fold the
+    // same document.
+    snapshots.sort_by_key(|snapshot| snapshot.ordinal);
+    Ok((snapshots, stats))
+}
+
+/// Extract the routing partition from the `x-partition` request-metadata
+/// header. The router stamps this on every leader call after hashing
+/// `(team_id, person_id)`; its absence means a misrouted or malformed
+/// request, so we fail closed with `InvalidArgument` rather than guessing.
+// `Status` is the idiomatic tonic error throughout this service; the small
+// `Ok(u32)` against a large `Status` trips `result_large_err`, but boxing
+// here would diverge from every other handler's signature.
+#[allow(clippy::result_large_err)]
+fn partition_from_metadata<T>(request: &Request<T>) -> Result<u32, Status> {
+    request
+        .metadata()
+        .get("x-partition")
+        .ok_or_else(|| Status::invalid_argument("missing x-partition metadata"))?
+        .to_str()
+        .map_err(|_| Status::invalid_argument("x-partition metadata is not valid ASCII"))?
+        .parse::<u32>()
+        .map_err(|_| Status::invalid_argument("x-partition metadata is not a valid u32"))
+}
+
+#[tonic::async_trait]
+impl PersonHogLeader for PersonHogLeaderService {
+    async fn get_person(
+        &self,
+        request: Request<GetPersonRequest>,
+    ) -> Result<Response<GetPersonResponse>, Status> {
+        let partition = partition_from_metadata(&request)?;
+        let req = request.into_inner();
+        self.validate_partition(partition, req.team_id, req.person_id)?;
+        self.check_authority(partition)?;
+        let cache_key = PersonCacheKey {
+            team_id: req.team_id,
+            person_id: req.person_id,
+        };
+
+        let person = self.lookup_or_load(partition, &cache_key).await?;
+        // Re-check before answering. The load can wait — on the per-key
+        // lock behind another request's produce, or on a changelog
+        // recovery — for long enough that a claim valid at admission has
+        // lapsed by the time there is something to return, and it is the
+        // answer, not the arrival, that has to be backed by ownership.
+        self.check_authority(partition)?;
+
+        // A recovered death document is an authoritative not-found: the
+        // person was destroyed and this entry closes its stream.
+        if person.is_deleted {
+            return Err(Status::not_found("person is destroyed"));
+        }
+
+        Ok(Response::new(GetPersonResponse {
+            person: Some(cached_person_into_proto(person)),
+        }))
+    }
+
+    async fn update_person_properties(
+        &self,
+        request: Request<UpdatePersonPropertiesRequest>,
+    ) -> Result<Response<UpdatePersonPropertiesResponse>, Status> {
+        let partition = partition_from_metadata(&request)?;
+        let req = request.into_inner();
+        self.validate_partition(partition, req.team_id, req.person_id)?;
+        // A write is serving too. Broker-enforced fencing covers this
+        // path when it is on, but it cannot be turned on first — startup
+        // refuses fencing without the gate — so every fleet passes
+        // through a window where the gate is the only thing standing
+        // between a pod that stopped renewing and a write the successor
+        // will never see. The lease-loss path surrenders before it
+        // drains, deliberately, and until this check existed only reads
+        // honoured that: writes stayed admitted until the local fence
+        // landed, behind a watch teardown and a task join.
+        self.check_authority(partition)?;
+
+        // Admit the write as inflight, unless the partition is fenced. A
+        // fenced partition has drained for handoff: every router acked the
+        // freeze, so this write can only come from a router with a stale
+        // view — accepting it would produce past the Kafka HWM that the new
+        // owner's warming snapshots, silently losing the write. Admission
+        // and the fence check are one atomic operation (`try_begin`): the
+        // inflight increment precedes the check, so the drain either waits
+        // for this write or this write sees the fence. Reads are unaffected
+        // — the frozen state stays the latest until cutover. The handoff
+        // protocol waits for the per-partition inflight count to drop to
+        // zero before advancing; combined with sync-acked produces, a zero
+        // count implies every acked write is durable in Kafka. The guard
+        // moves into the commit, which holds it through the outcome.
+        let Some(inflight_guard) = self.inflight.try_begin(partition) else {
+            return Err(Status::failed_precondition(format!(
+                "partition {partition} is fenced for handoff; writes are rejected"
+            )));
+        };
+
+        let cache_key = PersonCacheKey {
+            team_id: req.team_id,
+            person_id: req.person_id,
+        };
+
+        // Parse JSON before acquiring the per-key lock to minimize lock hold time
+        let set_properties = parse_update_properties(&req.set_properties, "set_properties")
+            .inspect_err(|refusal| self.warn_update_too_deep(partition, &cache_key, refusal))?;
+        let set_once_properties =
+            parse_update_properties(&req.set_once_properties, "set_once_properties")
+                .inspect_err(|refusal| self.warn_update_too_deep(partition, &cache_key, refusal))?;
+
+        // Sanitize the request values before diffing so no-op detection
+        // compares in sanitized space: cached state holds the sanitized
+        // form, and an unsanitized repeat of the same value must hit the
+        // no-change fast path instead of producing a fresh record every
+        // time. The post-merge sanitize below stays as the admission
+        // guarantee (it also covers legacy dirt already in the cache).
+        let mut set_properties = set_properties;
+        let mut set_once_properties = set_once_properties;
+        let input_stats = {
+            let mut stats = sanitize_for_jsonb(&mut set_properties);
+            let once = sanitize_for_jsonb(&mut set_once_properties);
+            stats.nul_strings += once.nul_strings;
+            stats.clamped_numbers += once.clamped_numbers;
+            stats
+        };
+        if input_stats.nul_strings > 0 {
+            counter!("personhog_leader_properties_nul_sanitized_total")
+                .increment(input_stats.nul_strings);
+        }
+        if input_stats.clamped_numbers > 0 {
+            counter!("personhog_leader_properties_numbers_clamped_total")
+                .increment(input_stats.clamped_numbers);
+        }
+        // Unset targets must match keys as stored, i.e. sanitized.
+        let unset_properties: Vec<String> = req
+            .unset_properties
+            .iter()
+            .map(|k| k.replace('\u{0000}', "\u{FFFD}"))
+            .collect();
+
+        // Per-key lock serializes concurrent updates for the same person.
+        // The wait is measured because it is the queueing component of
+        // handler latency: with every acked write holding the lock
+        // through its acks=all produce, per-person throughput is capped
+        // near 1/produce-latency, and contending updates spend their
+        // time here — invisible in the produce histogram.
+        let mutex = self
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let lock_wait = std::time::Instant::now();
+        let guard = mutex.lock_owned().await;
+        histogram!("personhog_leader_person_lock_wait_ms")
+            .record(lock_wait.elapsed().as_secs_f64() * 1000.0);
+
+        // Admission check before any work: if the dirty index is at
+        // capacity and this person is not already marked, acking the write
+        // would leave it durable but unmarked — reopening the
+        // stale-fallback hole on eviction. Shed instead; the index drains
+        // (and admission resumes) as the writer catches up.
+        if !self.dirty_index.can_admit(&cache_key) {
+            counter!("personhog_leader_writes_shed_total", "reason" => "dirty_index_full")
+                .increment(1);
+            return Err(Status::resource_exhausted(
+                "dirty index at capacity: the writer is behind and this person's write cannot \
+                 be tracked; retry later",
+            ));
+        }
+
+        // A person fenced by a live lifecycle op rejects writes until the
+        // fence is released; reads are unaffected. Checked under the
+        // per-key lock so a concurrent FencePerson cannot be missed.
+        if let Some(fence) = self.check_fence(&cache_key) {
+            counter!("personhog_leader_writes_fenced_total").increment(1);
+            // Off the request path: if this fence is a ghost (its op
+            // already settled), the healer drops it and a retry goes
+            // through.
+            if let Some(healer) = &self.fence_healer {
+                healer.maybe_heal(cache_key.clone(), fence);
+            }
+            return Err(fenced_status(&fence));
+        }
+
+        let person = self.lookup_or_load_locked(partition, &cache_key).await?;
+        // The load can park past the claim; the no-change answers below
+        // carry cached state, so they need ownership like any read.
+        self.check_authority(partition)?;
+
+        // A destroyed person answers not-found — the caller re-resolves;
+        // post-death the distinct id may have been reborn as a new person.
+        if person.is_deleted {
+            return Err(Status::not_found("person is destroyed"));
+        }
+
+        // One parse per update: the cache stores properties serialized,
+        // and this handler reads them as a map throughout.
+        let person_properties = person
+            .parse_properties()
+            .map_err(|e| Status::internal(format!("cached properties unparseable: {e}")))?;
+
+        // Compute property updates
+        let updates = compute_event_property_updates(
+            &req.event_name,
+            &set_properties,
+            &set_once_properties,
+            &unset_properties,
+            &person_properties,
+            req.force_update,
+        );
+
+        // OR-merge: identification never reverts through this RPC, so
+        // only a true that finds false is a change. It counts as one on
+        // its own — an $identify with no property diffs must still
+        // produce a record.
+        let identified_now = person.is_identified || req.is_identified == Some(true);
+        let identity_changed = identified_now != person.is_identified;
+
+        // last_seen_at is request-borne and best-effort: an out-of-range
+        // value is discarded rather than failing the update, so the
+        // acked ⇒ writeable invariant never hinges on it. In-range values
+        // are floored to the hour — Node's startOf('hour') on its
+        // UTC-normalized timestamps, expressed in epoch terms — so record
+        // volume is bounded at one per person-hour by construction, not
+        // by trusting callers to coarsen.
+        let requested_last_seen = req.last_seen_at.filter(|t| writeable_epoch_ms(*t));
+        if requested_last_seen != req.last_seen_at {
+            counter!("personhog_leader_last_seen_discarded_total").increment(1);
+        }
+        let requested_last_seen = requested_last_seen.map(floor_to_hour);
+        // Max-merge: the stored value only ever advances, and an advance
+        // is a change in its own right — ingestion's direct write path
+        // persists a last-seen-only advance, so this path must too.
+        let merged_last_seen = person.last_seen_at.max(requested_last_seen);
+        let last_seen_changed = merged_last_seen != person.last_seen_at;
+
+        // Fast path: no diffs detected, skip the clone in apply_property_updates
+        if !updates.has_changes && !identity_changed && !last_seen_changed {
+            counter!("personhog_leader_updates_total", "outcome" => "no_change").increment(1);
+            return Ok(Response::new(UpdatePersonPropertiesResponse {
+                person: Some(cached_person_into_proto(person)),
+                updated: false,
+            }));
+        }
+
+        // Filtered-only changes are answered without writing, matching the
+        // Postgres suppression; a scalar move or force promotes everything.
+        if !updates.has_non_filtered_changes && !identity_changed && !last_seen_changed {
+            counter!("personhog_leader_updates_total", "outcome" => "filtered_only").increment(1);
+            return Ok(Response::new(UpdatePersonPropertiesResponse {
+                person: Some(cached_person_into_proto(person)),
+                updated: false,
+            }));
+        }
+
+        // Slow path: apply diffs and check if the values actually changed
+        // (has_changes can be true when $set sends the same value that already exists)
+        let (new_properties, actually_updated) =
+            apply_property_updates(&updates, &person_properties);
+
+        if !actually_updated && !identity_changed && !last_seen_changed {
+            counter!("personhog_leader_updates_total", "outcome" => "no_change").increment(1);
+            return Ok(Response::new(UpdatePersonPropertiesResponse {
+                person: Some(cached_person_into_proto(person)),
+                updated: false,
+            }));
+        }
+
+        // Admission-time size enforcement, hoisted from the writer: every
+        // acked record must be applyable by the writer verbatim, or the
+        // cache and changelog would carry state Postgres never gets (the
+        // stale-serve hole the dirty index exists to close). The measure
+        // is the constraint's own — pg_column_size of the JSONB encoding
+        // — so admitted rows cannot violate it at apply time.
+        let mut new_properties = new_properties;
+
+        // Rewrite the merged state into jsonb-safe form before measuring:
+        // NUL sanitization (Node-pipeline parity — Postgres refuses it)
+        // and extreme-float clamping (Postgres's expanded numeric
+        // rendering would otherwise be unparseable on the way back). The
+        // measured size is then the stored size.
+        let sanitize_stats = sanitize_for_jsonb(&mut new_properties);
+        let mut properties_changed = actually_updated
+            || sanitize_stats.nul_strings > 0
+            || sanitize_stats.clamped_numbers > 0;
+        if sanitize_stats.nul_strings > 0 {
+            counter!("personhog_leader_properties_nul_sanitized_total")
+                .increment(sanitize_stats.nul_strings);
+        }
+        if sanitize_stats.clamped_numbers > 0 {
+            counter!("personhog_leader_properties_numbers_clamped_total")
+                .increment(sanitize_stats.clamped_numbers);
+        }
+
+        let jsonb_size = jsonb_column_size(&new_properties);
+        if jsonb_size > self.size_limits.threshold {
+            // Policy mirror of the Node pipeline's
+            // `handleOversizedPersonProperties`: trimming is remediation
+            // for rows already oversized in storage (they predate the
+            // constraint, or another writer produced them) — the stored
+            // properties are trimmed to the target and the triggering
+            // update's property changes are discarded, exactly as Node
+            // retries with trimmed existing state. An update that would
+            // newly push a within-limit row over the ceiling is rejected
+            // outright: a rejection with a warning is a deliberate,
+            // visible outcome where a silent trim would be arbitrary
+            // deferred data loss. Warnings and errors carry sizes, never
+            // property values.
+            let existing_size = jsonb_column_size(&person_properties);
+            if existing_size >= self.size_limits.threshold {
+                match trim_properties_to_fit_size(&person_properties, self.size_limits.trim_target)
+                {
+                    TrimResult::Trimmed(trimmed) => {
+                        counter!("personhog_leader_properties_trimmed_total").increment(1);
+                        self.warnings.emit(&SizeViolationWarning {
+                            team_id: cache_key.team_id,
+                            person_uuid: person.uuid.clone(),
+                            message: "Oversized person properties were trimmed to fit the size \
+                                      limit; the update that surfaced them was discarded"
+                                .to_string(),
+                        });
+                        new_properties = trimmed;
+                        properties_changed = true;
+                    }
+                    // Reachable only when trim_target == threshold and the
+                    // stored size sits exactly on it: nothing to trim, but
+                    // the update still cannot apply — keep the stored
+                    // state, discarding the update like the arm above.
+                    TrimResult::Fits => {
+                        new_properties = person_properties.clone();
+                        properties_changed = false;
+                    }
+                    TrimResult::CannotFit => {
+                        counter!(
+                            "personhog_leader_updates_total",
+                            "outcome" => "rejected_unremediable"
+                        )
+                        .increment(1);
+                        self.warnings.emit(&SizeViolationWarning {
+                            team_id: cache_key.team_id,
+                            person_uuid: person.uuid.clone(),
+                            message: "Person properties exceed the size limit and could not be \
+                                      trimmed; the update was rejected"
+                                .to_string(),
+                        });
+                        return Err(Status::invalid_argument(format!(
+                            "person properties exceed the size limit: stored state is \
+                             {existing_size} bytes (jsonb) and protected properties alone exceed \
+                             the {} trim target",
+                            self.size_limits.trim_target,
+                        )));
+                    }
+                }
+            } else {
+                counter!("personhog_leader_updates_total", "outcome" => "rejected_oversized")
+                    .increment(1);
+                self.warnings.emit(&SizeViolationWarning {
+                    team_id: cache_key.team_id,
+                    person_uuid: person.uuid.clone(),
+                    message: "Person properties update would exceed the size limit and was \
+                              rejected"
+                        .to_string(),
+                });
+                return Err(Status::invalid_argument(format!(
+                    "person properties update would exceed the size limit: {jsonb_size} bytes \
+                     (jsonb) over the {} ceiling",
+                    self.size_limits.threshold,
+                )));
+            }
+        }
+
+        let properties_outcome = if properties_changed {
+            "changed"
+        } else {
+            "unchanged"
+        };
+        let properties_bytes = serde_json::to_vec(&new_properties)
+            .map_err(|e| Status::internal(format!("serialize updated properties: {e}")))?;
+        // A version this pod already put on the wire is spent even when
+        // it never learned the outcome, so the next one has to clear that
+        // floor as well as the state it derived from. Reusing it produces
+        // a second record at the same version, and the writer's strict
+        // guard keeps only whichever arrived first.
+        let base_version = self
+            .emitted_versions
+            .floor_for(partition, &cache_key, person.version);
+        let updated_person = CachedPerson {
+            id: person.id,
+            uuid: person.uuid.clone(),
+            team_id: person.team_id,
+            properties: properties_bytes,
+            created_at: person.created_at,
+            version: base_version + 1,
+            is_identified: identified_now,
+            is_deleted: false,
+            last_seen_at: merged_last_seen,
+        };
+
+        let committed = self
+            .commit_document(partition, &cache_key, updated_person, guard, inflight_guard)
+            .await?;
+        counter!(
+            "personhog_leader_updates_total",
+            "outcome" => "updated",
+            "properties" => properties_outcome
+        )
+        .increment(1);
+        counter!(
+            "personhog_leader_updated_properties_bytes_total",
+            "properties" => properties_outcome
+        )
+        .increment(jsonb_size as u64);
+
+        Ok(Response::new(UpdatePersonPropertiesResponse {
+            person: Some(committed.proto),
+            updated: true,
+        }))
+    }
+
+    async fn raise_person_version(
+        &self,
+        request: Request<RaisePersonVersionRequest>,
+    ) -> Result<Response<RaisePersonVersionResponse>, Status> {
+        let partition = partition_from_metadata(&request)?;
+        let req = request.into_inner();
+        self.validate_partition(partition, req.team_id, req.person_id)?;
+        if req.min_version <= 0 {
+            return Err(Status::invalid_argument("min_version must be positive"));
+        }
+        self.check_authority(partition)?;
+
+        let Some(inflight_guard) = self.inflight.try_begin(partition) else {
+            return Err(Status::failed_precondition(format!(
+                "partition {partition} is fenced for handoff; writes are rejected"
+            )));
+        };
+
+        let cache_key = PersonCacheKey {
+            team_id: req.team_id,
+            person_id: req.person_id,
+        };
+        let mutex = self
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let lock_wait = std::time::Instant::now();
+        let guard = mutex.lock_owned().await;
+        histogram!("personhog_leader_person_lock_wait_ms")
+            .record(lock_wait.elapsed().as_secs_f64() * 1000.0);
+
+        if !self.dirty_index.can_admit(&cache_key) {
+            counter!("personhog_leader_writes_shed_total", "reason" => "dirty_index_full")
+                .increment(1);
+            return Err(Status::resource_exhausted(
+                "dirty index at capacity: the writer is behind and this raise cannot be \
+                 tracked; retry later",
+            ));
+        }
+
+        if let Some(fence) = self.check_fence(&cache_key) {
+            counter!("personhog_leader_writes_fenced_total").increment(1);
+            if let Some(healer) = &self.fence_healer {
+                healer.maybe_heal(cache_key.clone(), fence);
+            }
+            return Err(fenced_status(&fence));
+        }
+
+        let person = self.lookup_or_load_locked(partition, &cache_key).await?;
+        self.check_authority(partition)?;
+        if person.is_deleted {
+            return Err(Status::not_found("person is destroyed"));
+        }
+
+        if person.version >= req.min_version {
+            counter!("personhog_leader_version_raises_total", "outcome" => "at_or_above")
+                .increment(1);
+            return self.authoritative_ok(
+                partition,
+                RaisePersonVersionResponse {
+                    person: Some(cached_person_into_proto(person)),
+                    raised: false,
+                },
+            );
+        }
+
+        // A spent version may already be in the changelog, so the raise must clear it.
+        let floor = self
+            .emitted_versions
+            .floor_for(partition, &cache_key, person.version);
+        let version = floor
+            .checked_add(1)
+            .ok_or_else(|| Status::invalid_argument("no version left above the emitted floor"))?
+            .max(req.min_version);
+        let mut raised = CachedPerson { version, ..person };
+
+        // A stored row over the size limit would stop the writer's partition, so trim it as an update does.
+        let stored = raised
+            .parse_properties()
+            .map_err(|e| Status::internal(format!("cached properties unparseable: {e}")))?;
+        let stored_size = jsonb_column_size(&stored);
+        if stored_size >= self.size_limits.threshold {
+            match trim_properties_to_fit_size(&stored, self.size_limits.trim_target) {
+                TrimResult::Trimmed(trimmed) => {
+                    counter!("personhog_leader_properties_trimmed_total").increment(1);
+                    self.warnings.emit(&SizeViolationWarning {
+                        team_id: cache_key.team_id,
+                        person_uuid: raised.uuid.clone(),
+                        message: "Oversized person properties were trimmed to fit the size limit"
+                            .to_string(),
+                    });
+                    raised.properties = serde_json::to_vec(&trimmed).map_err(|e| {
+                        Status::internal(format!("serialize trimmed properties: {e}"))
+                    })?;
+                }
+                TrimResult::Fits => {}
+                TrimResult::CannotFit => {
+                    counter!(
+                        "personhog_leader_version_raises_total",
+                        "outcome" => "rejected_unremediable"
+                    )
+                    .increment(1);
+                    return Err(semantic_refusal(
+                        format!(
+                            "person properties exceed the size limit: stored state is \
+                             {stored_size} bytes (jsonb) and protected properties alone exceed \
+                             the {} trim target",
+                            self.size_limits.trim_target,
+                        ),
+                        "person-too-large",
+                    ));
+                }
+            }
+        }
+
+        let committed = self
+            .commit_document(partition, &cache_key, raised, guard, inflight_guard)
+            .await?;
+        counter!("personhog_leader_version_raises_total", "outcome" => "raised").increment(1);
+
+        self.authoritative_ok(
+            partition,
+            RaisePersonVersionResponse {
+                person: Some(committed.proto),
+                raised: true,
+            },
+        )
+    }
+
+    async fn fold_person_document(
+        &self,
+        request: Request<FoldPersonDocumentRequest>,
+    ) -> Result<Response<FoldPersonDocumentResponse>, Status> {
+        let partition = partition_from_metadata(&request)?;
+        let req = request.into_inner();
+        self.validate_partition(partition, req.team_id, req.person_id)?;
+        self.check_authority(partition)?;
+        let op_id = Uuid::parse_str(&req.op_id)
+            .map_err(|_| Status::invalid_argument("op_id must be a valid UUID"))?;
+        if req.sealed_snapshots.is_empty() {
+            return Err(Status::invalid_argument(
+                "sealed_snapshots must be non-empty: a merge with no sealed sources has nothing \
+                 to fold",
+            ));
+        }
+
+        let Some(inflight_guard) = self.inflight.try_begin(partition) else {
+            return Err(Status::failed_precondition(format!(
+                "partition {partition} is fenced for handoff; writes are rejected"
+            )));
+        };
+
+        // Parse and sanitize every JSON input before taking the per-key
+        // lock. Snapshot properties were sanitized when the source's
+        // leader cached them, but they crossed the wire since; sanitizing
+        // again keeps the fold's admission guarantee self-contained.
+        let mut sanitize_totals = SanitizeStats::default();
+        let mut track = |stats: SanitizeStats| {
+            sanitize_totals.nul_strings += stats.nul_strings;
+            sanitize_totals.clamped_numbers += stats.clamped_numbers;
+        };
+        let mut event_set = parse_json_object_field(&req.event_set, "event_set")?;
+        let mut event_set_once = parse_json_object_field(&req.event_set_once, "event_set_once")?;
+        track(sanitize_for_jsonb(&mut event_set));
+        track(sanitize_for_jsonb(&mut event_set_once));
+        let (snapshots, snapshot_stats) =
+            parse_sealed_snapshots(&req.sealed_snapshots, req.team_id, req.person_id)?;
+        track(snapshot_stats);
+
+        let cache_key = PersonCacheKey {
+            team_id: req.team_id,
+            person_id: req.person_id,
+        };
+        let mutex = self
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let lock_wait = std::time::Instant::now();
+        let guard = mutex.lock_owned().await;
+        histogram!("personhog_leader_person_lock_wait_ms")
+            .record(lock_wait.elapsed().as_secs_f64() * 1000.0);
+
+        if !self.dirty_index.can_admit(&cache_key) {
+            counter!("personhog_leader_writes_shed_total", "reason" => "dirty_index_full")
+                .increment(1);
+            return Err(Status::resource_exhausted(
+                "dirty index at capacity: the writer is behind and this fold cannot be tracked; \
+                 retry later",
+            ));
+        }
+
+        // The merge target is marked, never fenced, so a fence here is
+        // either a ghost from a settled op (the healer clears it and the
+        // saga's retry goes through) or a bug. Same-op tolerance mirrors
+        // FencePerson's re-seal semantics.
+        if let Some(fence) = self.check_fence(&cache_key) {
+            if fence.op_id != op_id {
+                counter!("personhog_leader_writes_fenced_total").increment(1);
+                if let Some(healer) = &self.fence_healer {
+                    healer.maybe_heal(cache_key.clone(), fence);
+                }
+                return Err(fenced_status(&fence));
+            }
+        }
+
+        let person = self.lookup_or_load_locked(partition, &cache_key).await?;
+        // The load can park past the claim, and a not-found here is a
+        // verdict the router delivers, so it needs ownership like any
+        // answer.
+        self.check_authority(partition)?;
+        if person.is_deleted {
+            return Err(Status::not_found("person is destroyed"));
+        }
+
+        // The mark row — the fence's source of truth — must vouch for the
+        // op holding this person as its live merge target before the fold
+        // may write. The fence check above proves nothing here (the target
+        // is marked, never fenced), and without this a superseded or
+        // settled saga runner's late fold would still land. Mirrors
+        // ReleaseFence: unverifiable requests are refused — fail closed.
+        let Some(fallback) = &self.fallback else {
+            return Err(semantic_refusal(
+                "no lifecycle database configured; refusing to fold",
+                "no-lifecycle-db",
+            ));
+        };
+        match target_mark_status(fallback, op_id, req.team_id, req.person_id).await {
+            Ok(Some(status)) if status == "marked" => {}
+            Ok(_) => {
+                counter!("personhog_leader_fences_total", "action" => "fold_unverified")
+                    .increment(1);
+                return Err(semantic_refusal(
+                    "op holds no live target mark for this person; refusing to fold",
+                    "fold-unverified",
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "target mark verification failed; rejecting (fail closed)");
+                return Err(Status::unavailable(
+                    "could not verify the lifecycle op against its target mark; retry",
+                ));
+            }
+        }
+
+        // The fold: the target wins every key it has; snapshots fill
+        // still-absent keys in request order; then the merge event's $set
+        // overrides and $set_once fills. All inputs are sanitized, so the
+        // merged document is measured in stored form.
+        let mut target_properties = match person.parse_properties() {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => serde_json::Value::Object(serde_json::Map::new()),
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "cached properties unparseable: {e}"
+                )))
+            }
+        };
+        // The cached state is an input like any other: rows loaded from
+        // Postgres or warmed from records that predate sanitization can
+        // carry dirt the wire inputs cannot.
+        track(sanitize_for_jsonb(&mut target_properties));
+        if sanitize_totals.nul_strings > 0 {
+            counter!("personhog_leader_properties_nul_sanitized_total")
+                .increment(sanitize_totals.nul_strings);
+        }
+        if sanitize_totals.clamped_numbers > 0 {
+            counter!("personhog_leader_properties_numbers_clamped_total")
+                .increment(sanitize_totals.clamped_numbers);
+        }
+        let target_map = target_properties
+            .as_object()
+            .expect("target_properties was just normalized to an object");
+        let mut folded = target_properties.clone();
+        let folded_map = folded
+            .as_object_mut()
+            .expect("folded clones the normalized target");
+        for snapshot in &snapshots {
+            if let Some(map) = snapshot.properties.as_object() {
+                for (key, value) in map {
+                    if !folded_map.contains_key(key) {
+                        folded_map.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        if let Some(map) = event_set.as_object() {
+            for (key, value) in map {
+                folded_map.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(map) = event_set_once.as_object() {
+            for (key, value) in map {
+                if !folded_map.contains_key(key) {
+                    folded_map.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        // Unlike a property update, a fold cannot be rejected for size:
+        // the saga would re-drive it forever, so trimming is the only
+        // completing behavior. Trim candidates are the fold's own
+        // contribution — keys the target did not already hold — so a
+        // within-limit target never loses a key it had to a fold. The
+        // target's own keys join the candidates only when its stored
+        // document already exceeded the limit (the remediation the update
+        // path applies to already-oversized rows). The trim aims for the
+        // hysteresis target first and, when that is unreachable, retries
+        // against the hard ceiling: any document at or under the
+        // threshold is still applyable by the writer. When neither bound
+        // is reachable, the fold keeps the target's properties,
+        // discarding its contribution.
+        let jsonb_size = jsonb_column_size(&folded);
+        let mut fold_outcome = "folded";
+        if jsonb_size > self.size_limits.threshold {
+            let target_size = jsonb_column_size(&target_properties);
+            let target_oversized = target_size >= self.size_limits.threshold;
+            let mut candidates: Vec<String> = folded
+                .as_object()
+                .expect("folded is an object")
+                .keys()
+                .filter(|k| !target_map.contains_key(*k) && can_trim_property(k))
+                .cloned()
+                .collect();
+            candidates.sort();
+            if target_oversized {
+                let mut own: Vec<String> = target_map
+                    .keys()
+                    .filter(|k| can_trim_property(k))
+                    .cloned()
+                    .collect();
+                own.sort();
+                candidates.extend(own);
+            }
+            let trim_result = match trim_properties_with_candidates(
+                &folded,
+                self.size_limits.trim_target,
+                candidates.clone(),
+            ) {
+                TrimResult::CannotFit => {
+                    trim_properties_with_candidates(&folded, self.size_limits.threshold, candidates)
+                }
+                result => result,
+            };
+            match trim_result {
+                TrimResult::Trimmed(trimmed) => {
+                    counter!("personhog_leader_properties_trimmed_total").increment(1);
+                    self.warnings.emit(&SizeViolationWarning {
+                        team_id: cache_key.team_id,
+                        person_uuid: person.uuid.clone(),
+                        message: "Merged person properties exceeded the size limit and were \
+                                  trimmed to fit"
+                            .to_string(),
+                    });
+                    folded = trimmed;
+                }
+                TrimResult::Fits => {}
+                TrimResult::CannotFit => {
+                    self.warnings.emit(&SizeViolationWarning {
+                        team_id: cache_key.team_id,
+                        person_uuid: person.uuid.clone(),
+                        message: "Merged person properties exceed the size limit and could not \
+                                  be trimmed; the merged-in properties were discarded"
+                            .to_string(),
+                    });
+                    if target_oversized {
+                        // No applyable document exists: the stored one
+                        // itself violates the size constraint (protected
+                        // keys alone exceed the ceiling). Producing it
+                        // anyway would halt the writer — admission
+                        // promises every acked record applies verbatim,
+                        // and the writer fail-stops on a violation rather
+                        // than skip — and rejecting would wedge the
+                        // saga's re-drive loop. The fold completes
+                        // without producing: this person's fold effects
+                        // (properties and scalars) are skipped. Accepted
+                        // residual — README, "Admission".
+                        counter!("personhog_leader_folds_total", "outcome" => "unapplyable")
+                            .increment(1);
+                        tracing::error!(
+                            team_id = cache_key.team_id,
+                            person_uuid = %person.uuid,
+                            stored_size = target_size,
+                            threshold = self.size_limits.threshold,
+                            "fold target's stored properties exceed the size constraint; \
+                             skipping the fold's document write"
+                        );
+                        return self.authoritative_ok(
+                            partition,
+                            FoldPersonDocumentResponse {
+                                person: Some(cached_person_into_proto(person)),
+                            },
+                        );
+                    }
+                    fold_outcome = "unremediable";
+                    folded = target_properties.clone();
+                }
+            }
+        }
+
+        // Scalars: created_at is the min over the target and every
+        // snapshot (ignoring non-positive values a malformed snapshot
+        // could carry); is_identified is unconditionally true — a merge
+        // is an identify; last_seen_at max-merges like the update path —
+        // the merged person was last seen whenever any constituent was
+        // (snapshot values were already hour-floored when stored).
+        //
+        // The Postgres backend never passes last_seen_at to its merge
+        // update; the caller's follow-up update advances it.
+        let created_at = snapshots
+            .iter()
+            .map(|snapshot| snapshot.created_at)
+            .filter(|ts| *ts > 0)
+            .chain(std::iter::once(person.created_at))
+            .min()
+            .unwrap_or(person.created_at);
+        let last_seen_at = snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.last_seen_at)
+            .chain(person.last_seen_at)
+            .max();
+
+        // The version is a max-merge over the target's floor and every
+        // sealed version, plus one. A source's death document starts
+        // from the same sealed + 1, so the fold sits at or above it and
+        // equals it when the highest sealed version dominates. A source
+        // row that moved after its seal raises its death document above
+        // the fold. The streams are per-person, so the relation is a
+        // convention, not a collision guard. Re-applying the fold only
+        // bumps the version again, so it converges under at-least-once
+        // delivery.
+        let base_version = self
+            .emitted_versions
+            .floor_for(partition, &cache_key, person.version);
+        let max_sealed = snapshots
+            .iter()
+            .map(|snapshot| snapshot.version)
+            .max()
+            .unwrap_or(0);
+        let version = base_version.max(max_sealed).checked_add(1).ok_or_else(|| {
+            Status::invalid_argument("sealed versions leave no room for the folded version")
+        })?;
+
+        let folded_bytes = serde_json::to_vec(&folded)
+            .map_err(|e| Status::internal(format!("serialize folded properties: {e}")))?;
+        let folded_person = CachedPerson {
+            id: person.id,
+            uuid: person.uuid.clone(),
+            team_id: person.team_id,
+            properties: folded_bytes,
+            created_at,
+            version,
+            is_identified: true,
+            is_deleted: false,
+            last_seen_at,
+        };
+
+        let committed = self
+            .commit_document(partition, &cache_key, folded_person, guard, inflight_guard)
+            .await?;
+        counter!("personhog_leader_folds_total", "outcome" => fold_outcome).increment(1);
+
+        self.authoritative_ok(
+            partition,
+            FoldPersonDocumentResponse {
+                person: Some(committed.proto),
+            },
+        )
+    }
+
+    async fn fence_person(
+        &self,
+        request: Request<FencePersonRequest>,
+    ) -> Result<Response<FencePersonResponse>, Status> {
+        self.fence_person_rpc(request).await
+    }
+
+    async fn fence_persons(
+        &self,
+        request: Request<FencePersonsRequest>,
+    ) -> Result<Response<FencePersonsResponse>, Status> {
+        self.fence_persons_rpc(request).await
+    }
+
+    async fn release_fence(
+        &self,
+        request: Request<ReleaseFenceRequest>,
+    ) -> Result<Response<ReleaseFenceResponse>, Status> {
+        self.release_fence_rpc(request).await
+    }
+
+    async fn release_fences(
+        &self,
+        request: Request<ReleaseFencesRequest>,
+    ) -> Result<Response<ReleaseFencesResponse>, Status> {
+        self.release_fences_rpc(request).await
+    }
+}
+
+/// Remove lock entries that no one is currently waiting on. Entries
+/// with `Arc::strong_count == 1` are only held by the map itself, so
+/// no request is actively using them. Returns the number removed.
+pub fn sweep_idle_locks(locks: &DashMap<PersonCacheKey, Arc<Mutex<()>>>) -> usize {
+    let before = locks.len();
+    locks.retain(|_, v| Arc::strong_count(v) > 1);
+    let removed = before - locks.len();
+    if removed > 0 {
+        tracing::debug!(removed, remaining = locks.len(), "swept idle locks");
+    }
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use chrono::Datelike;
+    use common_kafka::config::KafkaConfig;
+    use envconfig::Envconfig;
+    use personhog_proto::personhog::types::v1::{LifecycleOpType, ReleaseOutcome};
+    use tonic::Code;
+
+    use super::*;
+    use crate::recovery::RecoveryConfig;
+
+    /// A client's zero `DateTime` serialises as year 1, and persons created
+    /// from such events before personhog carry it as `created_at`.
+    const YEAR_ONE_MS: i64 = -62_135_596_800_000;
+
+    #[test]
+    fn an_update_nested_past_the_parser_limit_is_refused_as_too_deep() {
+        let nested = format!("{{\"a\":{}1{}}}", "[".repeat(200), "]".repeat(200));
+        let refused = parse_update_properties(nested.as_bytes(), "set_properties").unwrap_err();
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        assert_eq!(
+            refused.message(),
+            "set_properties exceeds the nesting limit"
+        );
+    }
+
+    #[test]
+    fn writeable_accepts_what_the_writer_binds_and_refuses_the_rest() {
+        let person = CachedPerson {
+            id: 1,
+            uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+            team_id: 7,
+            properties: b"{}".to_vec(),
+            created_at: YEAR_ONE_MS,
+            version: 1,
+            is_identified: false,
+            is_deleted: false,
+            last_seen_at: Some(YEAR_ONE_MS),
+        };
+        assert_eq!(assert_writeable(&person), Ok(()));
+        assert!(
+            Utc.timestamp_millis_opt(YEAR_ONE_MS).single().is_some(),
+            "the writer converts with the same call, so year 1 binds"
+        );
+
+        // The bounds are Postgres's, not chrono's: both ends convert, and
+        // one millisecond past either end is refused.
+        let floor = Utc.timestamp_millis_opt(PG_TIMESTAMPTZ_MIN_MS).unwrap();
+        assert_eq!(
+            (floor.year(), floor.month(), floor.day()),
+            (-4713, 11, 24),
+            "Julian day 0 in the proleptic Gregorian calendar"
+        );
+        assert!(Utc
+            .timestamp_millis_opt(MAX_EPOCH_MS_YEAR_9999)
+            .single()
+            .is_some());
+        assert!(writeable_epoch_ms(PG_TIMESTAMPTZ_MIN_MS));
+        assert!(writeable_epoch_ms(MAX_EPOCH_MS_YEAR_9999));
+        assert!(!writeable_epoch_ms(PG_TIMESTAMPTZ_MIN_MS - 1));
+        assert!(!writeable_epoch_ms(MAX_EPOCH_MS_YEAR_9999 + 1));
+
+        for (field, created_at, last_seen_at) in [
+            ("created_at", i64::MIN, None),
+            ("created_at", PG_TIMESTAMPTZ_MIN_MS - 1, None),
+            ("created_at", i64::MAX, None),
+            ("last_seen_at", YEAR_ONE_MS, Some(-300_000_000_000_000)),
+            ("last_seen_at", YEAR_ONE_MS, Some(i64::MAX)),
+        ] {
+            let refused = CachedPerson {
+                created_at,
+                last_seen_at,
+                ..person.clone()
+            };
+            let reason = assert_writeable(&refused).expect_err(field);
+            assert!(reason.starts_with(field), "{reason}");
+        }
+    }
+
+    #[test]
+    fn last_seen_floors_to_the_hour_on_both_sides_of_the_epoch() {
+        assert_eq!(floor_to_hour(3_600_000 + 1), 3_600_000);
+        assert_eq!(floor_to_hour(YEAR_ONE_MS + 1234), YEAR_ONE_MS);
+        assert_eq!(floor_to_hour(-1), -MS_PER_HOUR);
+    }
+
+    fn make_key(team_id: i64, person_id: i64) -> PersonCacheKey {
+        PersonCacheKey { team_id, person_id }
+    }
+
+    fn wire_snapshot(person: Person, ordinal: i32) -> SealedSourceSnapshot {
+        SealedSourceSnapshot {
+            person: Some(person),
+            ordinal,
+        }
+    }
+
+    fn source_person(id: i64, properties: &serde_json::Value) -> Person {
+        Person {
+            id,
+            team_id: 7,
+            properties: serde_json::to_vec(properties).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sealed_snapshot_admission_rejects_implausible_sources() {
+        let valid = serde_json::json!({});
+        let cases: Vec<(&str, Vec<SealedSourceSnapshot>)> = vec![
+            (
+                "missing person",
+                vec![SealedSourceSnapshot {
+                    person: None,
+                    ordinal: 0,
+                }],
+            ),
+            (
+                "wrong team",
+                vec![wire_snapshot(
+                    Person {
+                        team_id: 8,
+                        ..source_person(2, &valid)
+                    },
+                    0,
+                )],
+            ),
+            (
+                "snapshot is the target",
+                vec![wire_snapshot(source_person(1, &valid), 0)],
+            ),
+            (
+                "death document",
+                vec![wire_snapshot(
+                    Person {
+                        is_deleted: true,
+                        ..source_person(2, &valid)
+                    },
+                    0,
+                )],
+            ),
+            (
+                "duplicate ordinal",
+                vec![
+                    wire_snapshot(source_person(2, &valid), 0),
+                    wire_snapshot(source_person(3, &valid), 0),
+                ],
+            ),
+            (
+                "non-object properties",
+                vec![wire_snapshot(
+                    Person {
+                        properties: b"[1]".to_vec(),
+                        ..source_person(2, &valid)
+                    },
+                    0,
+                )],
+            ),
+        ];
+        for (label, sealed) in cases {
+            let status = parse_sealed_snapshots(&sealed, 7, 1).expect_err(label);
+            assert_eq!(status.code(), Code::InvalidArgument, "{label}");
+        }
+    }
+
+    #[test]
+    fn sealed_snapshot_admission_sorts_by_ordinal_and_counts_sanitization() {
+        let nul_dirty = serde_json::json!({"a": "x\u{0000}y"});
+        let float_dirty = serde_json::json!({"b": 1e308});
+        let (snapshots, stats) = parse_sealed_snapshots(
+            &[
+                wire_snapshot(
+                    Person {
+                        version: 9,
+                        ..source_person(2, &nul_dirty)
+                    },
+                    1,
+                ),
+                wire_snapshot(
+                    Person {
+                        version: 4,
+                        ..source_person(3, &float_dirty)
+                    },
+                    0,
+                ),
+            ],
+            7,
+            1,
+        )
+        .expect("plausible snapshots admit");
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.version)
+                .collect::<Vec<_>>(),
+            vec![4, 9],
+            "returned in ordinal order, not request order"
+        );
+        assert_eq!(stats.nul_strings, 1);
+        assert_eq!(stats.clamped_numbers, 1);
+    }
+
+    /// A service with no PG pool and no reachable Kafka — enough to
+    /// exercise the miss path, where no test reaches Kafka or PG.
+    async fn make_test_service() -> PersonHogLeaderService {
+        let kafka = KafkaConfig::init_from_hashmap(&HashMap::new()).unwrap();
+        PersonHogLeaderService::new(
+            Arc::new(PartitionedCache::new(16)),
+            None,
+            Arc::new(DashMap::new()),
+            Arc::new(InflightTracker::new()),
+            // Partition 0 served under one partition.
+            Arc::new(DashMap::from_iter([(
+                0,
+                crate::coordination::Capture {
+                    cluster: None,
+                    topic: Arc::from("personhog_updates"),
+                    config: personhog_coordination::types::ChangelogConfig::new(
+                        "personhog_updates",
+                        1,
+                    ),
+                },
+            )])),
+            Arc::new(DirtyIndex::new(16)),
+            Arc::new(
+                ChangelogRecovery::new(RecoveryConfig {
+                    kafka,
+                    pod_name: "test".to_string(),
+                    recv_timeout: Duration::from_millis(10),
+                    pool_size: 1,
+                    cluster: None,
+                })
+                .expect("build recovery pool"),
+            ),
+            PropertySizeLimits::new(655360, 524288),
+            WarningsProducer::disabled(),
+            Arc::new(DashMap::new()),
+            // Lazily built: nothing here connects until a write acquires
+            // a partition, which these tests never do.
+            Arc::new(FencedChangelogProducers::new(FencedProducerConfig {
+                kafka: KafkaConfig::init_from_hashmap(&HashMap::new()).unwrap(),
+                init_timeout: Duration::from_secs(1),
+                commit_timeout: Duration::from_secs(1),
+                broker_txn_timeout: Duration::from_secs(10),
+                window: Duration::from_millis(5),
+                window_max_writes: 32,
+                settle_budget: Duration::from_secs(1),
+                lanes: 1,
+            })),
+            test_authority(),
+            Arc::new(EmittedVersions::new(1_000_000)),
+        )
+    }
+
+    /// A claim that stays valid for the whole of any test.
+    fn test_authority() -> Arc<AuthorityClock> {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(3600), Instant::now());
+        clock
+    }
+
+    /// The guarantee the clock exists for: a pod whose renewals have
+    /// stopped refuses to answer as the partition's owner, without
+    /// anything running to notice they stopped. The keepalive being
+    /// wedged is exactly the case the lease machinery cannot cover.
+    #[tokio::test]
+    async fn a_pod_whose_renewals_stopped_refuses_to_serve() {
+        // A clock whose renewals stopped longer ago than the margin —
+        // constructed stale rather than aged by sleeping, so no runner
+        // pace can blur which side of the margin the test is on.
+        let margin = Duration::from_secs(20);
+        let clock = Arc::new(AuthorityClock::stale_for(
+            margin,
+            margin + Duration::from_secs(1),
+        ));
+        let service = PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        };
+
+        let err = service
+            .check_authority(0)
+            .expect_err("a lapsed lease must not serve");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        clock.confirm(Instant::now());
+        service
+            .check_authority(0)
+            .expect("a confirmed renewal restores service");
+    }
+
+    /// Losing the lease is decided immediately, not after the margin:
+    /// the coordinator may already be reassigning.
+    #[tokio::test]
+    async fn surrendering_the_lease_stops_reads_at_once() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        };
+
+        service.check_authority(0).expect("still the owner");
+        clock.surrender();
+        assert_eq!(
+            service.check_authority(0).unwrap_err().code(),
+            Code::FailedPrecondition
+        );
+    }
+
+    /// The gate has to be wired into the RPC, not merely implemented:
+    /// this drives `get_person` itself rather than the check in
+    /// isolation.
+    ///
+    /// It does not distinguish the two checks — a read that finds its
+    /// person in cache never waits, so either one refuses it, and both
+    /// return the same status. `a_read_admitted_before_the_lapse_still_
+    /// refuses_to_answer` is what pins the second.
+    #[tokio::test]
+    async fn get_person_refuses_once_authority_lapses() {
+        let margin = Duration::from_secs(20);
+        let clock = Arc::new(AuthorityClock::stale_for(
+            margin,
+            margin + Duration::from_secs(1),
+        ));
+        let service = PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        };
+        // The fixture's single partition makes 0 the only routing answer.
+        let (team_id, person_id) = (7, 42);
+        service.cache.create_partition(0);
+        service.cache.put(
+            0,
+            PersonCacheKey { team_id, person_id },
+            CachedPerson {
+                id: person_id,
+                uuid: "00000000-0000-0000-0000-000000000007".to_string(),
+                team_id,
+                properties: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                created_at: 0,
+                version: 1,
+                is_identified: false,
+                is_deleted: false,
+                last_seen_at: None,
+            },
+        );
+
+        let request = || {
+            let mut request = Request::new(GetPersonRequest {
+                team_id,
+                person_id,
+                read_options: None,
+            });
+            request
+                .metadata_mut()
+                .insert("x-partition", "0".parse().unwrap());
+            request
+        };
+
+        let err = service
+            .get_person(request())
+            .await
+            .expect_err("a lapsed lease must refuse the read");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        clock.confirm(Instant::now());
+        service
+            .get_person(request())
+            .await
+            .expect("a confirmed renewal serves the read");
+    }
+
+    /// Wiring pin for `fence_person`: with both gates removed the fence
+    /// installs. Either gate alone satisfies it; the parked and
+    /// refused-before-work pins each single out one.
+    #[tokio::test]
+    async fn fence_person_refuses_once_authority_lapses() {
+        let margin = Duration::from_secs(20);
+        let clock = Arc::new(AuthorityClock::stale_for(
+            margin,
+            margin + Duration::from_secs(1),
+        ));
+        let service = PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        };
+        let (team_id, person_id) = (7, 42);
+        service.cache.create_partition(0);
+        service.cache.put(
+            0,
+            PersonCacheKey { team_id, person_id },
+            CachedPerson {
+                id: person_id,
+                uuid: "00000000-0000-0000-0000-000000000007".to_string(),
+                team_id,
+                properties: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                created_at: 0,
+                version: 1,
+                is_identified: false,
+                is_deleted: false,
+                last_seen_at: None,
+            },
+        );
+
+        let request = || {
+            let mut request = Request::new(FencePersonRequest {
+                team_id,
+                person_id,
+                op_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                op_type: LifecycleOpType::Delete as i32,
+            });
+            request
+                .metadata_mut()
+                .insert("x-partition", "0".parse().unwrap());
+            request
+        };
+
+        let err = service
+            .fence_person(request())
+            .await
+            .expect_err("a lapsed lease must not install a fence");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        clock.confirm(Instant::now());
+        service
+            .fence_person(request())
+            .await
+            .expect("a confirmed renewal installs the fence");
+    }
+
+    /// `release_fence`'s aborted arm acks without producing, so
+    /// `commit_document`'s re-check never runs; either release gate may
+    /// refuse here — the timeout test is the admission-specific pin.
+    #[tokio::test]
+    async fn release_fence_refuses_once_authority_lapses() {
+        let margin = Duration::from_secs(20);
+        let clock = Arc::new(AuthorityClock::stale_for(
+            margin,
+            margin + Duration::from_secs(1),
+        ));
+        let service = PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        };
+        let (team_id, person_id) = (7, 42);
+        service.cache.create_partition(0);
+
+        let request = || {
+            let mut request = Request::new(ReleaseFenceRequest {
+                team_id,
+                person_id,
+                op_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                outcome: ReleaseOutcome::Aborted as i32,
+                ..Default::default()
+            });
+            request
+                .metadata_mut()
+                .insert("x-partition", "0".parse().unwrap());
+            request
+        };
+
+        let err = service
+            .release_fence(request())
+            .await
+            .expect_err("a lapsed lease must not ack a release");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        clock.confirm(Instant::now());
+        service
+            .release_fence(request())
+            .await
+            .expect("a confirmed renewal acks the abort");
+    }
+
+    /// A fence admitted before the lapse must not install once parked
+    /// past it. The map assertion is the point: the install, not the
+    /// status, is the danger.
+    #[tokio::test]
+    async fn a_fence_admitted_before_the_lapse_does_not_install() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = Arc::new(PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        });
+        let (team_id, person_id) = (7, 42);
+        let cache_key = PersonCacheKey { team_id, person_id };
+        service.cache.create_partition(0);
+        // Seeded live, so a confirmed clock would seal successfully; the
+        // refusal must come from the lapse alone.
+        service.cache.put(
+            0,
+            cache_key.clone(),
+            CachedPerson {
+                id: person_id,
+                uuid: "00000000-0000-0000-0000-000000000007".to_string(),
+                team_id,
+                properties: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                created_at: 0,
+                version: 1,
+                is_identified: false,
+                is_deleted: false,
+                last_seen_at: None,
+            },
+        );
+
+        // Hold the per-key lock so the fence parks before its seal.
+        let mutex = service
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let held = mutex.lock().await;
+
+        let mut request = Request::new(FencePersonRequest {
+            team_id,
+            person_id,
+            op_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            op_type: LifecycleOpType::Delete as i32,
+        });
+        request
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let fencing = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.fence_person(request).await }
+        });
+        tokio::task::yield_now().await;
+
+        clock.surrender();
+        drop(held);
+
+        let err = fencing
+            .await
+            .unwrap()
+            .expect_err("a fence parked past the lapse must refuse");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            service.fences.is_empty(),
+            "no fence may install under a lapsed claim"
+        );
+    }
+
+    /// A release admitted while owned must not ack once parked past an
+    /// ordinary handoff: the partition (and its fences) are gone, so the
+    /// ack would report a removal that never happened. The lease stays
+    /// valid throughout — this pins the ownership re-check, not the clock.
+    #[tokio::test]
+    async fn a_release_parked_past_a_handoff_does_not_ack() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = Arc::new(PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        });
+        let (team_id, person_id) = (7, 42);
+        let cache_key = PersonCacheKey { team_id, person_id };
+        let op_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        service.cache.create_partition(0);
+        service.fences.insert(
+            cache_key.clone(),
+            FenceState {
+                op_id,
+                op_type: LifecycleOpType::Delete,
+                sealed_at: None,
+            },
+        );
+
+        let mutex = service
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let held = mutex.lock().await;
+
+        let mut request = Request::new(ReleaseFenceRequest {
+            team_id,
+            person_id,
+            op_id: op_id.to_string(),
+            outcome: ReleaseOutcome::Aborted as i32,
+            ..Default::default()
+        });
+        request
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let releasing = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.release_fence(request).await }
+        });
+        tokio::task::yield_now().await;
+
+        // The handoff completes while the release is parked.
+        service.cache.drop_partition(0);
+        crate::fence::drop_partition_fences(&service.fences, 0, 1, |_| false);
+        drop(held);
+
+        let err = releasing
+            .await
+            .unwrap()
+            .expect_err("a release parked past a handoff must refuse");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// A release admitted before the lapse must not ack once parked past
+    /// it: removing only this stale map's entry while the saga believes
+    /// the fence released would be a vacuous success.
+    #[tokio::test]
+    async fn a_release_admitted_before_the_lapse_does_not_ack() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = Arc::new(PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        });
+        let (team_id, person_id) = (7, 42);
+        let cache_key = PersonCacheKey { team_id, person_id };
+        let op_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        service.cache.create_partition(0);
+        service.fences.insert(
+            cache_key.clone(),
+            FenceState {
+                op_id,
+                op_type: LifecycleOpType::Delete,
+                sealed_at: None,
+            },
+        );
+
+        let mutex = service
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let held = mutex.lock().await;
+
+        let mut request = Request::new(ReleaseFenceRequest {
+            team_id,
+            person_id,
+            op_id: op_id.to_string(),
+            outcome: ReleaseOutcome::Aborted as i32,
+            ..Default::default()
+        });
+        request
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let releasing = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.release_fence(request).await }
+        });
+        tokio::task::yield_now().await;
+
+        clock.surrender();
+        drop(held);
+
+        let err = releasing
+            .await
+            .unwrap()
+            .expect_err("a release parked past the lapse must refuse");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            service.fences.contains_key(&cache_key),
+            "the fence must survive a refused release"
+        );
+    }
+
+    /// The admission gates on both fence RPCs refuse before any work;
+    /// only the wait distinguishes them from the later re-checks, so a
+    /// held per-key lock turns a dropped admission gate into a timeout.
+    #[tokio::test]
+    async fn fence_rpcs_arriving_after_the_lapse_are_refused_at_admission() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = Arc::new(PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        });
+        let (team_id, person_id) = (7, 42);
+        let cache_key = PersonCacheKey { team_id, person_id };
+        service.cache.create_partition(0);
+
+        let mutex = service
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let _held = mutex.lock().await;
+
+        clock.surrender();
+
+        let mut fence = Request::new(FencePersonRequest {
+            team_id,
+            person_id,
+            op_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            op_type: LifecycleOpType::Delete as i32,
+        });
+        fence
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let err = tokio::time::timeout(Duration::from_millis(200), service.fence_person(fence))
+            .await
+            .expect("the fence must be refused at admission, not behind the lock")
+            .expect_err("a lapsed claim must not fence");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        let mut release = Request::new(ReleaseFenceRequest {
+            team_id,
+            person_id,
+            op_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            outcome: ReleaseOutcome::Aborted as i32,
+            ..Default::default()
+        });
+        release
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let err = tokio::time::timeout(Duration::from_millis(200), service.release_fence(release))
+            .await
+            .expect("the release must be refused at admission, not behind the lock")
+            .expect_err("a lapsed claim must not release");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// A no-change update answers cached state, which is a read: parked
+    /// past the lapse it must refuse rather than answer updated:false.
+    #[tokio::test]
+    async fn a_no_change_update_refuses_once_parked_past_the_lapse() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = Arc::new(PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        });
+        let (team_id, person_id) = (7, 42);
+        let cache_key = PersonCacheKey { team_id, person_id };
+        service.cache.create_partition(0);
+        service.cache.put(
+            0,
+            cache_key.clone(),
+            CachedPerson {
+                id: person_id,
+                uuid: "00000000-0000-0000-0000-000000000007".to_string(),
+                team_id,
+                properties: serde_json::to_vec(&serde_json::json!({"plan": "pro"})).unwrap(),
+                created_at: 0,
+                version: 1,
+                is_identified: false,
+                is_deleted: false,
+                last_seen_at: None,
+            },
+        );
+
+        let mutex = service
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let held = mutex.lock().await;
+
+        // The same value the cache holds, so the no-change answer path runs.
+        let mut request = Request::new(UpdatePersonPropertiesRequest {
+            force_update: false,
+            team_id,
+            person_id,
+            event_name: "$pageview".to_string(),
+            set_properties: serde_json::to_vec(&serde_json::json!({"plan": "pro"})).unwrap(),
+            set_once_properties: vec![],
+            unset_properties: vec![],
+            is_identified: None,
+            last_seen_at: None,
+        });
+        request
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let updating = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.update_person_properties(request).await }
+        });
+        tokio::task::yield_now().await;
+
+        clock.surrender();
+        drop(held);
+
+        let err = updating
+            .await
+            .unwrap()
+            .expect_err("a no-change answer parked past the lapse must refuse");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// A fold parked past the lapse must refuse, not answer: its
+    /// not-found is a verdict the router delivers to the saga, unlike
+    /// the FailedPrecondition a refusal bounces.
+    #[tokio::test]
+    async fn a_fold_parked_past_the_lapse_refuses_instead_of_answering_destroyed() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = Arc::new(PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        });
+        let (team_id, person_id) = (7, 42);
+        let cache_key = PersonCacheKey { team_id, person_id };
+        service.cache.create_partition(0);
+        // A death document, so without the gate the fold answers a
+        // definitive not-found from a claim it no longer holds.
+        service.cache.put(
+            0,
+            cache_key.clone(),
+            CachedPerson {
+                id: person_id,
+                uuid: "00000000-0000-0000-0000-000000000007".to_string(),
+                team_id,
+                properties: b"{}".to_vec(),
+                created_at: 0,
+                version: 3,
+                is_identified: false,
+                is_deleted: true,
+                last_seen_at: None,
+            },
+        );
+
+        let mutex = service
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let held = mutex.lock().await;
+
+        let mut request = Request::new(FoldPersonDocumentRequest {
+            team_id,
+            person_id,
+            op_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            sealed_snapshots: vec![wire_snapshot(source_person(43, &serde_json::json!({})), 0)],
+            event_set: b"{}".to_vec(),
+            event_set_once: b"{}".to_vec(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let folding = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.fold_person_document(request).await }
+        });
+        tokio::task::yield_now().await;
+
+        clock.surrender();
+        drop(held);
+
+        let err = folding
+            .await
+            .unwrap()
+            .expect_err("a fold parked past the lapse must refuse");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// A write is serving too, and the lease-loss path surrenders before
+    /// it drains — so between the surrender and the local fence landing,
+    /// this check is what stops a pod that no longer holds its lease from
+    /// acking a mutation the successor will never see. Fencing covers the
+    /// same ground when it is on, but it cannot be enabled first, so this
+    /// is the only cover the intermediate rollout state has.
+    ///
+    /// Like its read-path counterpart it does not distinguish admission
+    /// from the pre-produce re-check; `a_write_admitted_before_the_lapse_
+    /// is_not_produced` pins the second.
+    ///
+    /// The person is seeded deliberately: without it a removed check
+    /// would still surface `FailedPrecondition` from the ownership guard
+    /// further down, and the test would pass having proved nothing.
+    /// Filtered-only lanes answer updated=false with no write or produce;
+    /// force writes. A demotion regression would produce, hang on the
+    /// absent broker, and time out rather than pass.
+    #[tokio::test]
+    async fn filtered_only_update_answers_without_writing() {
+        let service = make_test_service().await;
+        let (team_id, person_id) = (7, 43);
+        service.cache.create_partition(0);
+        service.cache.put(
+            0,
+            PersonCacheKey { team_id, person_id },
+            CachedPerson {
+                id: person_id,
+                uuid: "00000000-0000-0000-0000-000000000008".to_string(),
+                team_id,
+                properties: serde_json::to_vec(
+                    &serde_json::json!({"$current_url": "https://example.com/a"}),
+                )
+                .unwrap(),
+                created_at: 0,
+                version: 3,
+                is_identified: false,
+                is_deleted: false,
+                last_seen_at: None,
+            },
+        );
+
+        let request = |force: bool| {
+            let mut request = Request::new(UpdatePersonPropertiesRequest {
+                force_update: force,
+                team_id,
+                person_id,
+                event_name: "$pageview".to_string(),
+                set_properties: serde_json::to_vec(
+                    &serde_json::json!({"$current_url": "https://example.com/b"}),
+                )
+                .unwrap(),
+                set_once_properties: vec![],
+                unset_properties: vec![],
+                is_identified: None,
+                last_seen_at: None,
+            });
+            request
+                .metadata_mut()
+                .insert("x-partition", "0".parse().unwrap());
+            request
+        };
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.update_person_properties(request(false)),
+        )
+        .await
+        .expect("a demoted update must answer without producing")
+        .expect("demoted update answers ok")
+        .into_inner();
+        assert!(!response.updated);
+        assert_eq!(
+            response.person.expect("carries the person").version,
+            3,
+            "a discarded change must not bump the version"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_refuses_once_authority_is_surrendered() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        };
+        let (team_id, person_id) = (7, 42);
+        service.cache.create_partition(0);
+        service.cache.put(
+            0,
+            PersonCacheKey { team_id, person_id },
+            CachedPerson {
+                id: person_id,
+                uuid: "00000000-0000-0000-0000-000000000007".to_string(),
+                team_id,
+                properties: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                created_at: 0,
+                version: 1,
+                is_identified: false,
+                is_deleted: false,
+                last_seen_at: None,
+            },
+        );
+
+        let request = || {
+            let mut request = Request::new(UpdatePersonPropertiesRequest {
+                force_update: false,
+                team_id,
+                person_id,
+                event_name: "$set".to_string(),
+                set_properties: serde_json::to_vec(&serde_json::json!({"a": 1})).unwrap(),
+                set_once_properties: vec![],
+                unset_properties: vec![],
+                is_identified: None,
+                last_seen_at: None,
+            });
+            request
+                .metadata_mut()
+                .insert("x-partition", "0".parse().unwrap());
+            request
+        };
+
+        // Losing the lease is decided at once, not after the margin, so
+        // no sleep is needed to reach the state that matters.
+        clock.surrender();
+
+        // Bounded on purpose: with the check gone the handler runs on to
+        // produce against a broker that is not there, so an unbounded
+        // await would report this regression as a hung test rather than a
+        // failing one.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.update_person_properties(request()),
+        )
+        .await
+        .expect("the refusal must come from the claim check, not from a produce timeout");
+        let err = result.expect_err("a surrendered pod must not ack a write");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// `get_person` checks the claim twice, and asserting only on the
+    /// status code cannot tell the two apart: delete either and the other
+    /// still answers FailedPrecondition. This one pins the second.
+    ///
+    /// The load is what makes it distinct. A read that finds the person
+    /// in cache never waits, so the admission check is the only one it
+    /// can trip; a read that has to wait — on the per-key lock, or on a
+    /// changelog recovery — can be admitted under a claim that is gone by
+    /// the time there is an answer, and it is the answer, not the
+    /// arrival, that has to be backed by ownership.
+    #[tokio::test]
+    async fn a_read_admitted_before_the_lapse_still_refuses_to_answer() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = Arc::new(PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        });
+        let (team_id, person_id) = (7, 42);
+        let cache_key = PersonCacheKey { team_id, person_id };
+        service.cache.create_partition(0);
+
+        // Hold the per-key lock. The read misses the cache, reaches for
+        // this lock, and parks there — which is where a changelog
+        // recovery would leave it.
+        let mutex = service
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let held = mutex.lock().await;
+
+        let mut request = Request::new(GetPersonRequest {
+            team_id,
+            person_id,
+            read_options: None,
+        });
+        request
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let reading = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.get_person(request).await }
+        });
+        tokio::task::yield_now().await;
+
+        // The claim goes while the read is parked, and the answer it was
+        // waiting for arrives at the same time.
+        clock.surrender();
+        service.cache.put(
+            0,
+            cache_key.clone(),
+            CachedPerson {
+                id: person_id,
+                uuid: "00000000-0000-0000-0000-000000000007".to_string(),
+                team_id,
+                properties: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                created_at: 0,
+                version: 1,
+                is_identified: false,
+                is_deleted: false,
+                last_seen_at: None,
+            },
+        );
+        drop(held);
+
+        let err = reading
+            .await
+            .expect("the read task must not panic")
+            .expect_err("a claim that lapsed during the load must not be answered");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// The write path checks the claim twice for the same reason the read
+    /// path does, and asserting only on the status code cannot tell them
+    /// apart. This one pins the second.
+    ///
+    /// A write admitted under a valid claim can wait on the per-key lock
+    /// behind another produce, and on a changelog recovery — long enough
+    /// for a starved keepalive's stamp to age out, for the lease to
+    /// expire, and for a successor to warm past the point this record
+    /// would land. Acking it then is acked-write loss that needs only one
+    /// wedged pod, not a double zombie.
+    #[tokio::test]
+    async fn a_write_admitted_before_the_lapse_is_not_produced() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = Arc::new(PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        });
+        let (team_id, person_id) = (7, 42);
+        let cache_key = PersonCacheKey { team_id, person_id };
+        service.cache.create_partition(0);
+        service.cache.put(
+            0,
+            cache_key.clone(),
+            CachedPerson {
+                id: person_id,
+                uuid: "00000000-0000-0000-0000-000000000007".to_string(),
+                team_id,
+                properties: serde_json::to_vec(&serde_json::json!({})).unwrap(),
+                created_at: 0,
+                version: 1,
+                is_identified: false,
+                is_deleted: false,
+                last_seen_at: None,
+            },
+        );
+
+        // Hold the per-key lock so the write is admitted and then parks,
+        // where a concurrent produce for the same person would leave it.
+        let mutex = service
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let held = mutex.lock().await;
+
+        let mut request = Request::new(UpdatePersonPropertiesRequest {
+            force_update: false,
+            team_id,
+            person_id,
+            event_name: "$set".to_string(),
+            set_properties: serde_json::to_vec(&serde_json::json!({"a": 1})).unwrap(),
+            set_once_properties: vec![],
+            unset_properties: vec![],
+            is_identified: None,
+            last_seen_at: None,
+        });
+        request
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let writing = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.update_person_properties(request).await }
+        });
+        tokio::task::yield_now().await;
+
+        // The claim goes while the write is parked, then the lock frees.
+        clock.surrender();
+        drop(held);
+
+        // Bounded: without the re-check the handler runs on to produce
+        // against a broker that is not there, and an unbounded await
+        // would report the regression as a hang rather than a failure.
+        let result = tokio::time::timeout(Duration::from_secs(5), writing)
+            .await
+            .expect("the refusal must come from the claim check, not a produce timeout")
+            .expect("the write task must not panic");
+        let err = result.expect_err("a claim that lapsed during the wait must not be produced");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// The admission checks refuse *before* the request does any work, and
+    /// only the wait distinguishes them from the pre-answer re-checks: a
+    /// request that reaches the per-key lock has already been admitted.
+    ///
+    /// Holding that lock turns the difference into a deadline. With
+    /// admission intact neither call ever reaches it; without it they park
+    /// there and are refused only once the lock frees, having meanwhile
+    /// taken an inflight seat a handoff's drain must wait out and, on a
+    /// miss, driven a Postgres fallback or a changelog recovery for a
+    /// partition this pod no longer answers for.
+    #[tokio::test]
+    async fn a_request_arriving_after_the_lapse_is_refused_before_it_loads() {
+        let clock = Arc::new(AuthorityClock::unclaimed());
+        clock.begin_session(Duration::from_secs(30), Instant::now());
+        let service = Arc::new(PersonHogLeaderService {
+            authority: Arc::clone(&clock),
+            ..make_test_service().await
+        });
+        let (team_id, person_id) = (7, 42);
+        let cache_key = PersonCacheKey { team_id, person_id };
+        // Deliberately unseeded: the read reaches the lock only on a
+        // miss, and a hit would let a dropped admission check still be
+        // caught by the pre-answer one, proving nothing.
+        service.cache.create_partition(0);
+
+        // Anything admitted parks here; nothing admitted ever arrives.
+        let mutex = service
+            .locks
+            .entry(cache_key.clone())
+            .or_default()
+            .value()
+            .clone();
+        let _held = mutex.lock().await;
+
+        clock.surrender();
+
+        let mut read = Request::new(GetPersonRequest {
+            team_id,
+            person_id,
+            read_options: None,
+        });
+        read.metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let err = tokio::time::timeout(Duration::from_millis(200), service.get_person(read))
+            .await
+            .expect("the read must be refused at admission, not behind the load")
+            .expect_err("a lapsed claim must not be served");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+
+        let mut write = Request::new(UpdatePersonPropertiesRequest {
+            force_update: false,
+            team_id,
+            person_id,
+            event_name: "$set".to_string(),
+            set_properties: serde_json::to_vec(&serde_json::json!({"a": 1})).unwrap(),
+            set_once_properties: vec![],
+            unset_properties: vec![],
+            is_identified: None,
+            last_seen_at: None,
+        });
+        write
+            .metadata_mut()
+            .insert("x-partition", "0".parse().unwrap());
+        let err = tokio::time::timeout(
+            Duration::from_millis(200),
+            service.update_person_properties(write),
+        )
+        .await
+        .expect("the write must be refused at admission, not behind the load")
+        .expect_err("a lapsed claim must not be admitted");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not exceed")]
+    fn inverted_size_limits_refuse_to_construct() {
+        PropertySizeLimits::new(655_360, 655_361);
+    }
+
+    #[tokio::test]
+    async fn unmarked_miss_fails_closed_once_partition_is_released() {
+        let service = make_test_service().await;
+        let key = make_key(1, 1);
+
+        // Owned and unmarked: PG is trusted (NOT_FOUND, since the test
+        // service has no pool).
+        service.cache.create_partition(0);
+        let err = service.recover_or_load(0, &key).await.unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+
+        // Released mid-miss (cache dropped, then marks cleared — release
+        // order): the same lookup must fail closed rather than trust a
+        // possibly-stale PG row the cleared mark no longer guards.
+        service.cache.drop_partition(0);
+        service.dirty_index.clear_partition(0);
+        let err = service.recover_or_load(0, &key).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn sweep_removes_idle_entries() {
+        let locks = DashMap::new();
+        locks.insert(make_key(1, 1), Arc::new(Mutex::new(())));
+        locks.insert(make_key(1, 2), Arc::new(Mutex::new(())));
+        locks.insert(make_key(1, 3), Arc::new(Mutex::new(())));
+
+        let removed = sweep_idle_locks(&locks);
+
+        assert_eq!(removed, 3);
+        assert_eq!(locks.len(), 0);
+    }
+
+    #[test]
+    fn sweep_preserves_held_entries() {
+        let locks = DashMap::new();
+        locks.insert(make_key(1, 1), Arc::new(Mutex::new(())));
+        locks.insert(make_key(1, 2), Arc::new(Mutex::new(())));
+        locks.insert(make_key(1, 3), Arc::new(Mutex::new(())));
+
+        // Simulate an active holder cloning the Arc (as lookup_or_load does)
+        let _held = locks.get(&make_key(1, 2)).unwrap().clone();
+
+        let removed = sweep_idle_locks(&locks);
+
+        assert_eq!(removed, 2);
+        assert_eq!(locks.len(), 1);
+        assert!(locks.contains_key(&make_key(1, 2)));
+    }
+
+    #[test]
+    fn sweep_is_noop_when_empty() {
+        let locks: DashMap<PersonCacheKey, Arc<Mutex<()>>> = DashMap::new();
+
+        let removed = sweep_idle_locks(&locks);
+
+        assert_eq!(removed, 0);
+    }
+}

@@ -1,0 +1,520 @@
+import { z } from 'zod'
+
+import { LogEntry } from 'scenes/hog-functions/logs/logsViewerLogic'
+
+import { HogFlowAction } from '../types'
+import { isDuration, isSignedDuration } from './durations'
+
+const ActionFiltersSchema = z.object({
+    events: z.array(z.any()).optional(),
+    properties: z.array(z.any()).optional(),
+    actions: z.array(z.any()).optional(),
+})
+
+const PropertyGroupTypeSchema = z.enum(['AND', 'OR'])
+
+// Keep in sync with PropertyFiltersOrGroupField in products/cdp/backend/validation.py.
+const ConditionFiltersSchema = ActionFiltersSchema.extend({
+    properties: z
+        .union([
+            z.array(z.any()),
+            z.object({
+                type: PropertyGroupTypeSchema,
+                values: z.array(z.object({ type: PropertyGroupTypeSchema, values: z.array(z.any()) })),
+            }),
+        ])
+        .optional(),
+})
+
+const DURATION_STRING = z.string().superRefine((v, ctx) => {
+    if (!/\d/.test(v)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Please enter a duration' })
+        return
+    }
+    if (!isDuration(v)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Duration must be a number followed by s, m, h, or d' })
+        return
+    }
+    if (parseFloat(v) <= 0) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Duration must be greater than 0' })
+    }
+})
+
+// A delay offset points either side of the date it offsets, so unlike DURATION_STRING it is signed.
+const OFFSET_DURATION_STRING = z.string().superRefine((v, ctx) => {
+    if (!isSignedDuration(v)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Offset must be a number followed by s, m, h, or d' })
+    }
+})
+
+const _commonActionFields = {
+    id: z.string(),
+    name: z.string(),
+    // The server accepts actions without a description (agents routinely omit it), so an absent
+    // one must not fail the whole step's validation.
+    description: z.string().optional().default(''),
+    on_error: z.enum(['continue', 'abort']).optional().nullable(),
+    created_at: z.number().optional(),
+    updated_at: z.number().optional(),
+    filters: ActionFiltersSchema.optional().nullable(),
+    output_variable: z // The Hogflow-level variable to store the output of this action into
+        .union([
+            z.object({
+                key: z.string(),
+                result_path: z.string().optional().nullable(), // The path within the action result to store, e.g. 'body.user.id'
+                spread: z.boolean().optional().nullable(), // When true, spread object result into multiple variables as {key}_{property}
+                label: z.string().optional().nullable(), // Display label for the auto-created workflow variable
+            }),
+            z.array(
+                z.object({
+                    key: z.string(),
+                    result_path: z.string().optional().nullable(),
+                    spread: z.boolean().optional().nullable(),
+                    label: z.string().optional().nullable(),
+                })
+            ),
+        ])
+        .optional()
+        .nullable(),
+}
+
+const CyclotronInputSchema = z.object({
+    value: z.any(),
+    templating: z.enum(['hog', 'liquid']).optional(),
+    secret: z.boolean().optional(),
+    bytecode: z.any().optional(),
+    order: z.number().optional(),
+})
+
+export type CyclotronInputType = z.infer<typeof CyclotronInputSchema>
+
+export const CyclotronJobInputSchemaTypeSchema = z.object({
+    type: z.enum([
+        'string',
+        'number',
+        'boolean',
+        'dictionary',
+        'choice',
+        'json',
+        'integration',
+        'integration_multi',
+        'integration_field',
+        'email',
+        'native_email',
+        'posthog_assignee',
+        'posthog_ticket_tags',
+        'posthog_business_hours',
+        'non_failure_status_codes',
+        'customer_analytics_account_properties',
+        'customer_analytics_account_relationships',
+        'task_model',
+        'task_repository',
+        'task_mcp_installations',
+        'signals_scout',
+        'posthog_survey',
+        'replay_vision_scan',
+        'task_skills',
+    ]),
+    key: z.string(),
+    label: z.string(),
+    choices: z
+        .array(
+            z.object({
+                value: z.string(),
+                label: z.string(),
+            })
+        )
+        .optional(),
+    required: z.boolean().optional(),
+    default: z.any().optional(),
+    secret: z.boolean().optional(),
+    hidden: z.boolean().optional(),
+    templating: z.boolean().optional(),
+    description: z.string().optional(),
+    integration: z.string().optional(),
+    integration_key: z.string().optional(),
+    integration_field: z.string().optional(),
+    requires_field: z.string().optional(),
+    requiredScopes: z.string().optional(),
+})
+
+export type CyclotronJobInputSchemaType = z.infer<typeof CyclotronJobInputSchemaTypeSchema>
+
+export const CyclotronInputMappingSchema = z.object({
+    name: z.string(),
+    disabled: z.boolean().optional(),
+    inputs_schema: z.array(CyclotronJobInputSchemaTypeSchema).optional(),
+    inputs: z.record(z.string(), CyclotronInputSchema).optional().nullable(),
+    filters: z.any().optional().nullable(),
+})
+
+export type CyclotronInputMappingType = z.infer<typeof CyclotronInputMappingSchema>
+
+const EventTriggerFiltersSchema = ActionFiltersSchema.extend({
+    filter_test_accounts: z.boolean().optional(),
+})
+
+export const HogFlowTriggerSchema = z.discriminatedUnion('type', [
+    z.object({
+        type: z.literal('event'),
+        filters: EventTriggerFiltersSchema,
+    }),
+    z.object({
+        type: z.literal('webhook'),
+        template_uuid: z.string().optional(), // May be used later to specify a specific template version
+        template_id: z.string(),
+        inputs: z.record(z.string(), CyclotronInputSchema),
+    }),
+    z.object({
+        type: z.literal('manual'),
+        template_uuid: z.string().optional(), // May be used later to specify a specific template version
+        template_id: z.string(),
+        inputs: z.record(z.string(), CyclotronInputSchema),
+    }),
+    z.object({
+        type: z.literal('tracking_pixel'),
+        template_uuid: z.string().optional(), // May be used later to specify a specific template version
+        template_id: z.string(),
+        inputs: z.record(z.string(), CyclotronInputSchema),
+    }),
+    z.object({
+        type: z.literal('schedule'),
+    }),
+    // A transactional email: its message template's send endpoint runs the workflow once per call.
+    z.object({
+        type: z.literal('api'),
+    }),
+    z.object({
+        type: z.literal('cohort'),
+        // Null until a cohort is picked. The backend requires one before the workflow runs.
+        cohort_id: z.number().nullable(),
+        transition: z.enum(['entered', 'left']),
+    }),
+    z.object({
+        type: z.literal('batch'),
+        filters: z.object({
+            // 'accounts' fans out one run per customer analytics account instead of per person
+            audience_type: z.enum(['persons', 'accounts']).optional(),
+            properties: z.array(z.any()),
+            tag_names: z.array(z.string()).optional(),
+            assignment_status: z.enum(['all', 'assigned', 'unassigned']).optional(),
+            assigned_to_user_ids: z.array(z.number()).optional(),
+            all_roles_unassigned: z.boolean().optional(),
+        }),
+    }),
+    z.object({
+        type: z.literal('data-warehouse-table'),
+        // Dot-notated table name matching the Python CDPProducer naming
+        table_name: z.string(),
+        filters: z.object({
+            properties: z.array(z.any()).optional(),
+        }),
+        key_property: z.string().optional(),
+    }),
+    z.object({
+        type: z.literal('internal-event'),
+        filters: z.object({
+            source: z.literal('internal-events'),
+            events: z.array(z.any()).min(1),
+            properties: z.array(z.any()).optional(),
+        }),
+    }),
+    z.object({
+        type: z.literal('data-warehouse-view'),
+        // The materialized view's own name, which is also its HogQL name
+        table_name: z.string(),
+        filters: z.object({
+            properties: z.array(z.any()).optional(),
+        }),
+        key_property: z.string().optional(),
+    }),
+])
+
+/** Trigger types that use HogFlowSchedule for recurring execution */
+export const SCHEDULED_TRIGGER_TYPES: readonly string[] = ['batch', 'schedule'] as const
+
+export const HogFlowActionSchema = z.discriminatedUnion('type', [
+    // Trigger
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('trigger'),
+        config: HogFlowTriggerSchema,
+    }),
+    // Branching
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('conditional_branch'),
+        config: z.object({
+            conditions: z.array(
+                z.object({
+                    filters: ConditionFiltersSchema,
+                    name: z.string().optional(), // Custom name for the condition
+                })
+            ),
+        }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('random_cohort_branch'),
+        config: z.object({
+            cohorts: z.array(
+                z.object({
+                    percentage: z.number(),
+                    name: z.string().optional(), // Custom name for the cohort
+                })
+            ),
+        }),
+    }),
+
+    // Time based
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('delay'),
+        // Two ways to say when to continue, exactly one of which is set. `delay_duration` waits a fixed span
+        // from when the step starts; `delay_until` waits for an instant carried by the person or the event.
+        // Keep in sync with nodejs/src/cdp/schema/hogflow.ts and the server-side validation in hog_flow.py.
+        config: z
+            .object({
+                delay_duration: DURATION_STRING.optional(),
+                delay_until: z
+                    .object({
+                        // HogQL evaluating to a datetime. The builder composes it from a property picker,
+                        // but the API accepts any expression, so anything can turn up here.
+                        expression: z.string(),
+                        offset: OFFSET_DURATION_STRING.optional(),
+                        // Which zone a date carrying no offset of its own is read in, the same three
+                        // fields wait_until_time_window uses.
+                        timezone: z.string().nullish(),
+                        use_person_timezone: z.boolean().optional(),
+                        fallback_timezone: z.string().nullish(),
+                        // Compiled server-side at save; whatever the client sends is discarded.
+                        bytecode: z.any().optional(),
+                        bytecode_error: z.string().optional(),
+                    })
+                    .optional(),
+                max_delay_duration: DURATION_STRING.optional(),
+            })
+            .superRefine((config, ctx) => {
+                if (!config.delay_until) {
+                    if (config.delay_duration === undefined) {
+                        ctx.addIssue({
+                            code: z.ZodIssueCode.custom,
+                            path: ['delay_duration'],
+                            message: 'Please enter a duration',
+                        })
+                    }
+                    return
+                }
+                if (config.delay_duration !== undefined) {
+                    ctx.addIssue({
+                        code: z.ZodIssueCode.custom,
+                        path: ['delay_until'],
+                        message: 'A delay waits either for a duration or until a date, not both',
+                    })
+                }
+                if (!config.delay_until.expression.trim()) {
+                    ctx.addIssue({
+                        code: z.ZodIssueCode.custom,
+                        path: ['delay_until', 'expression'],
+                        message: 'Please choose a date to wait for',
+                    })
+                }
+            }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('wait_until_condition'),
+        config: z.object({
+            condition: z.object({
+                filters: ActionFiltersSchema.optional().nullable(),
+                name: z.string().optional(), // Custom name for the condition
+            }),
+            events: z
+                .array(
+                    z.object({
+                        filters: ActionFiltersSchema.optional().nullable(),
+                        name: z.string().optional(),
+                    })
+                )
+                .optional(),
+            max_wait_duration: DURATION_STRING,
+        }),
+    }),
+
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('wait_until_time_window'),
+        config: z.object({
+            timezone: z.string().nullable(),
+            // When true, use the person's $geoip_time_zone property for timezone
+            use_person_timezone: z.boolean().optional(),
+            // Fallback timezone when use_person_timezone is true but person has no timezone set
+            fallback_timezone: z.string().nullable().optional(),
+            // Day can be special values "weekday", "weekend" or a list of days of the week e.g. 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'
+            day: z.union([
+                z.literal('any'),
+                z.literal('weekday'),
+                z.literal('weekend'),
+                z
+                    .array(z.enum(['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']))
+                    .min(1, 'Choose at least one day'),
+            ]),
+            // time can be "any", or a time range [start, end]
+            time: z.union([
+                z.literal('any'),
+                z.tuple([z.string(), z.string()]), // e.g. ['10:00', '11:00']
+            ]),
+        }),
+    }),
+
+    // CDP functions
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('function'),
+        config: z.object({
+            template_uuid: z.string().optional(), // May be used later to specify a specific template version
+            template_id: z.string(),
+            inputs: z.record(z.string(), CyclotronInputSchema),
+            mappings: z.array(CyclotronInputMappingSchema).optional(),
+        }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('function_email'),
+        config: z.object({
+            message_category_id: z.string().nullish(),
+            message_category_type: z.enum(['marketing', 'transactional']).optional(),
+            // When false, no open pixel is injected, links are not rewritten, and the send uses the
+            // untracked SES configuration set. Absent/true means tracked. Keep in sync with
+            // nodejs/src/cdp/schema/hogflow.ts.
+            tracking_enabled: z.boolean().optional(),
+            // When true, links get the UTM tags they don't already carry. Keep in sync with nodejs/src/cdp/schema/hogflow.ts.
+            utm_tags_enabled: z.boolean().optional(),
+            // When true, a marketing send ignores the team's frequency cap. Keep in sync with nodejs/src/cdp/schema/hogflow.ts.
+            skip_frequency_cap: z.boolean().optional(),
+            // Templates that replace the default tag values. An empty value keeps the default.
+            utm_params: z
+                .object({
+                    utm_source: z.string().optional(),
+                    utm_medium: z.string().optional(),
+                    utm_campaign: z.string().optional(),
+                    utm_content: z.string().optional(),
+                })
+                .optional(),
+            // utm_params keys that follow the team default. Only the Django API reads it, so Node does not declare it.
+            utm_params_from_default: z
+                .array(z.enum(['utm_source', 'utm_medium', 'utm_campaign', 'utm_content']))
+                .optional(),
+            template_uuid: z.string().optional(), // May be used later to specify a specific template version
+            template_id: z.literal('template-email'),
+            inputs: z.record(z.string(), CyclotronInputSchema),
+        }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('function_sms'),
+        config: z.object({
+            message_category_id: z.string().optional(),
+            message_category_type: z.enum(['marketing', 'transactional']).optional(),
+            template_uuid: z.string().optional(),
+            template_id: z.literal('template-twilio'),
+            inputs: z.record(z.string(), CyclotronInputSchema),
+        }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('function_push'),
+        config: z.object({
+            message_category_id: z.string().optional(),
+            message_category_type: z.enum(['marketing', 'transactional']).optional(),
+            template_uuid: z.string().optional(),
+            template_id: z.literal('template-native-push'),
+            // When true, PostHog keeps no copy of the notification's content. Keep in sync with nodejs/src/cdp/schema/hogflow.ts.
+            sensitive: z.boolean().optional(),
+            inputs: z.record(z.string(), CyclotronInputSchema),
+        }),
+    }),
+
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('email_sandbox'),
+        config: z.object({
+            message_category_id: z.string().nullish(),
+            message_category_type: z.enum(['marketing', 'transactional']).nullish(),
+            inputs: z.object({
+                email: z.object({
+                    templating: z.enum(['hog', 'liquid']).optional(),
+                    value: z.object({
+                        to: z.object({ email: z.string(), name: z.string().optional() }).optional(),
+                        subject: z.string().optional(),
+                        preheader: z.string().optional(),
+                        text: z.string().optional(),
+                        html: z.string().optional(),
+                        design: z.any().optional(),
+                    }),
+                }),
+            }),
+        }),
+    }),
+
+    // Exit
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('exit'),
+        config: z.object({
+            reason: z.string().optional(),
+        }),
+    }),
+])
+
+export const isOptOutEligibleAction = (
+    action: HogFlowAction
+): action is Extract<
+    HogFlowAction,
+    { type: 'function_email' | 'function_sms' | 'function_push' | 'email_sandbox' }
+> => {
+    return ['function_email', 'function_sms', 'function_push', 'email_sandbox'].includes(action.type)
+}
+
+export const isEmailAction = (action: HogFlowAction): action is Extract<HogFlowAction, { type: 'function_email' }> => {
+    return ['function_email'].includes(action.type)
+}
+
+export const isPushAction = (action: HogFlowAction): action is Extract<HogFlowAction, { type: 'function_push' }> => {
+    return ['function_push'].includes(action.type)
+}
+
+export const isFunctionAction = (
+    action: HogFlowAction
+): action is Extract<HogFlowAction, { type: 'function' | 'function_sms' | 'function_email' | 'function_push' }> => {
+    return ['function', 'function_sms', 'function_email', 'function_push'].includes(action.type)
+}
+
+export const isTriggerFunction = (
+    action: HogFlowAction
+): action is Extract<HogFlowAction, { type: 'trigger'; config: { type: 'webhook' | 'tracking_pixel' | 'manual' } }> => {
+    if (action.type !== 'trigger') {
+        return false
+    }
+    const trigger = action as Extract<HogFlowAction, { type: 'trigger' }>
+    return ['webhook', 'tracking_pixel', 'manual'].includes(trigger.config.type)
+}
+
+export const isScheduleTrigger = (action: HogFlowAction): boolean => {
+    if (action.type !== 'trigger') {
+        return false
+    }
+    const trigger = action as Extract<HogFlowAction, { type: 'trigger' }>
+    return trigger.config.type === 'schedule'
+}
+
+export interface HogflowTestResult {
+    emailSendResult?: { status: 'accepted' | 'skipped' | 'failed'; reason?: string }
+    status: 'success' | 'error' | 'skipped'
+    logs?: LogEntry[]
+    nextActionId: string | null
+    errors?: string[]
+    variables?: Record<string, any>
+    execResult?: unknown
+    mocked?: boolean
+}

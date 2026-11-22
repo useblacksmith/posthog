@@ -1,0 +1,801 @@
+import pytest
+from posthog.test.base import APIBaseTest, BaseTest, ClickhouseTestMixin, _create_event, flush_persons_and_events
+
+from parameterized import parameterized
+
+from posthog.schema import HogQLQueryModifiers
+
+from posthog.hogql import ast
+from posthog.hogql.context import HogQLContext
+from posthog.hogql.parser import parse_select
+from posthog.hogql.printer import prepare_ast_for_printing
+from posthog.hogql.query import execute_hogql_query
+from posthog.hogql.transforms.projection_pushdown import pushdown_projections
+
+from posthog.models.instance_setting import override_instance_config
+
+
+class TestProjectionPushdown(BaseTest):
+    maxDiff = None
+    snapshot: object
+
+    def _optimize(self, query_str: str):
+        """Helper: parse, resolve, and optimize a query"""
+        modifiers = HogQLQueryModifiers(optimizeProjections=False)  # Disable automatic optimization
+        context = HogQLContext(team_id=self.team.pk, enable_select_queries=True, modifiers=modifiers)
+        query = parse_select(query_str)
+        prepared = prepare_ast_for_printing(query, context, dialect="hogql")
+        assert prepared is not None
+        optimized = pushdown_projections(prepared, context)
+        return optimized
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_simple_pushdown(self):
+        """SELECT event FROM (SELECT * FROM events)"""
+        optimized = self._optimize("SELECT event FROM (SELECT * FROM events) AS sub")
+
+        # Inner query should only select 'event'
+        inner_query = optimized.select_from.table
+        assert len(inner_query.select) == 1
+
+        # The column might be aliased
+        first_col = inner_query.select[0]
+        if hasattr(first_col, "alias"):
+            assert first_col.alias == "event"
+        else:
+            assert first_col.chain == ["event"]
+        assert first_col.from_asterisk if isinstance(first_col, ast.Field) else first_col.expr.from_asterisk
+
+        assert optimized.to_hogql() == self.snapshot
+
+    def _col_name(self, col):
+        """Helper to get column name for debugging"""
+        if hasattr(col, "alias"):
+            return col.alias
+        if hasattr(col, "chain") and col.chain:
+            return col.chain[-1]
+        return "?"
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_preserves_used_columns(self):
+        """Columns in WHERE/GROUP BY also needed"""
+        optimized = self._optimize("""
+            SELECT event, count()
+            FROM (SELECT * FROM events) AS sub
+            WHERE distinct_id = 'test'
+            GROUP BY timestamp
+        """)
+
+        inner_query = optimized.select_from.table
+        column_names = {self._col_name(col) for col in inner_query.select}
+        assert column_names >= {"event", "distinct_id", "timestamp"}
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_no_pushdown_without_asterisk(self):
+        """Don't modify queries without asterisk"""
+        optimized = self._optimize("SELECT event FROM (SELECT event, distinct_id FROM events) AS sub")
+
+        inner_query = optimized.select_from.table
+        assert len(inner_query.select) == 2
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_nested_pushdown(self):
+        """Pushdown through multiple levels"""
+        optimized = self._optimize("""
+            SELECT event FROM (
+                SELECT * FROM (
+                    SELECT * FROM events
+                ) AS inner
+            ) AS outer
+        """)
+
+        # Both inner queries should only have 'event'
+        # Check outer subquery
+        outer_query = optimized.select_from.table
+        assert len(outer_query.select) == 1
+        assert self._col_name(outer_query.select[0]) == "event"
+
+        # Check inner subquery
+        inner_query = outer_query.select_from.table
+        assert len(inner_query.select) == 1
+        assert self._col_name(inner_query.select[0]) == "event"
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_preserves_explicit_columns(self):
+        """Don't prune columns user explicitly wrote"""
+        optimized = self._optimize("""
+            SELECT event FROM (
+                SELECT event, distinct_id, timestamp FROM events
+            ) AS sub
+        """)
+
+        # Should keep all columns (none have from_asterisk=True)
+        inner_query = optimized.select_from.table
+        assert len(inner_query.select) == 3
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @parameterized.expand(
+        [
+            ("asterisk", "SELECT count() FROM (SELECT * FROM events) AS sub", ["uuid"]),
+            ("explicit_and_asterisk", "SELECT count() FROM (SELECT *, 1 AS one FROM events) AS sub", ["one"]),
+            ("distinct_asterisk", "SELECT count() FROM (SELECT DISTINCT * FROM events) AS sub", None),
+        ]
+    )
+    def test_unread_subquery_keeps_only_what_holds_its_rows(self, _name, query, expected_columns):
+        optimized = self._optimize(query)
+        inner_query = optimized.select_from.table
+        column_names = [self._col_name(col) for col in inner_query.select]
+        if expected_columns is None:
+            assert len(column_names) > 1
+        else:
+            assert column_names == expected_columns
+
+    @parameterized.expand(
+        [
+            ("distinct", "SELECT event FROM (SELECT DISTINCT * FROM events) AS sub"),
+            ("union_distinct", "SELECT event FROM (SELECT * FROM events UNION DISTINCT SELECT * FROM events) AS sub"),
+            ("intersect", "SELECT event FROM (SELECT * FROM events INTERSECT SELECT * FROM events) AS sub"),
+            (
+                "group_by_all",
+                "SELECT count() FROM (SELECT * FROM (SELECT distinct_id, event FROM events) GROUP BY ALL) AS sub",
+            ),
+            (
+                "positional_group_by",
+                "SELECT count() FROM (SELECT * FROM (SELECT distinct_id, event FROM events) GROUP BY 1, 2) AS sub",
+            ),
+            (
+                "grouping_sets_ordinals",
+                "SELECT count() FROM (SELECT * FROM (SELECT distinct_id, event FROM events) GROUP BY GROUPING SETS ((1, 2))) AS sub",
+            ),
+        ]
+    )
+    def test_row_comparison_keeps_every_column(self, _name, query):
+        optimized = self._optimize(query)
+        inner_query = optimized.select_from.table
+        if isinstance(inner_query, ast.SelectSetQuery):
+            inner_query = inner_query.initial_select_query
+        assert len(inner_query.select) > 1
+
+    def test_set_query_branches_keep_lining_up(self):
+        optimized = self._optimize(
+            "SELECT event FROM (SELECT DISTINCT * FROM events UNION ALL SELECT * FROM events) AS sub"
+        )
+        set_query = optimized.select_from.table
+        first = set_query.initial_select_query.select
+        second = set_query.subsequent_select_queries[0].select_query.select
+        assert len(first) == len(second) > 1
+
+    @parameterized.expand(
+        [
+            (
+                "same_names_in_another_order",
+                "SELECT a, count() FROM (SELECT * FROM (SELECT event AS a, distinct_id AS b FROM events) "
+                "UNION ALL SELECT * FROM (SELECT distinct_id AS b, event AS a FROM events)) AS sub GROUP BY a",
+                [["a"], ["a"]],
+            ),
+            (
+                "explicit_column_after_asterisks_of_different_counts",
+                "SELECT region, sum(n) FROM (SELECT *, 'US' AS region FROM (SELECT 1 AS n, event AS a FROM events) "
+                "UNION ALL SELECT *, 'EU' AS region FROM (SELECT distinct_id AS b, uuid AS c, 1 AS n FROM events)) "
+                "AS sub GROUP BY region",
+                [["n", "region"], ["n", "region"]],
+            ),
+            (
+                "name_past_the_end_of_a_shorter_branch",
+                "SELECT c FROM (SELECT * FROM (SELECT event AS a, distinct_id AS b, uuid AS c FROM events) "
+                "UNION ALL SELECT * FROM (SELECT uuid AS c, event AS a FROM events)) AS sub",
+                [["c"], ["c"]],
+            ),
+            (
+                "branch_without_the_name_keeps_the_position",
+                "SELECT a FROM (SELECT * FROM (SELECT event AS a, distinct_id AS x FROM events) "
+                "UNION ALL SELECT * FROM (SELECT event AS b, distinct_id AS y FROM events)) AS sub",
+                [["a"], ["b"]],
+            ),
+        ]
+    )
+    def test_set_query_branches_keep_the_same_columns(self, _name, query, expected):
+        set_query = self._optimize(query).select_from.table
+        branches = [set_query.initial_select_query, *(s.select_query for s in set_query.subsequent_select_queries)]
+        assert [[self._col_name(col) for col in branch.select] for branch in branches] == expected
+
+    def test_cte_union_branches_keep_the_same_columns(self):
+        optimized = self._optimize(
+            "WITH sources AS (SELECT * FROM (SELECT event AS a, distinct_id AS b FROM events) "
+            "UNION ALL SELECT * FROM (SELECT distinct_id AS b, event AS a FROM events)) "
+            "SELECT a, count() FROM sources GROUP BY a ORDER BY 2 DESC"
+        )
+        set_query = optimized.ctes["sources"].expr
+        branches = [set_query.initial_select_query, *(s.select_query for s in set_query.subsequent_select_queries)]
+        assert [[self._col_name(col) for col in branch.select] for branch in branches] == [["a"], ["a"]]
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_prewhere_clause(self):
+        """PREWHERE clause columns should be preserved"""
+        optimized = self._optimize("""
+            SELECT event
+            FROM (SELECT * FROM events) AS sub
+            PREWHERE distinct_id = 'test'
+        """)
+
+        # Should include both event and distinct_id
+        inner_query = optimized.select_from.table
+        column_names = {self._col_name(col) for col in inner_query.select}
+        assert "event" in column_names
+        assert "distinct_id" in column_names
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_order_by_clause(self):
+        """ORDER BY clause columns should be preserved"""
+        optimized = self._optimize("""
+            SELECT event
+            FROM (SELECT * FROM events) AS sub
+            ORDER BY timestamp DESC
+        """)
+
+        # Should include both event and timestamp
+        inner_query = optimized.select_from.table
+        column_names = {self._col_name(col) for col in inner_query.select}
+        assert "event" in column_names
+        assert "timestamp" in column_names
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_join_constraint_columns(self):
+        """Columns in JOIN conditions should be preserved"""
+        optimized = self._optimize("""
+            SELECT e.event, e.distinct_id
+            FROM (SELECT * FROM events) AS e
+            LEFT JOIN sessions ON sessions.id = e.`$session_id`
+        """)
+
+        # Should include event, distinct_id, AND $session_id (from JOIN)
+        inner_query = optimized.select_from.table
+        column_names = {self._col_name(col) for col in inner_query.select}
+        assert "event" in column_names
+        assert "distinct_id" in column_names
+        assert "$session_id" in column_names
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_join_constraint_in_subquery(self):
+        """Subquery JOIN constraints should preserve columns"""
+        optimized = self._optimize("""
+            SELECT * FROM (
+                SELECT e.event, e.distinct_id, sessions.id
+                FROM (SELECT * FROM events) AS e
+                LEFT JOIN sessions ON sessions.id = e.`$session_id`
+            )
+        """)
+
+        assert optimized.select_from is not None
+        nested_query = optimized.select_from.table
+
+        assert nested_query.select_from is not None
+        inner_query = nested_query.select_from.table
+
+        # Should include event, distinct_id, AND $session_id (from JOIN)
+        column_names = {self._col_name(col) for col in inner_query.select}
+        assert "event" in column_names
+        assert "distinct_id" in column_names
+        assert "$session_id" in column_names, f"Got columns: {column_names}"
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_multiple_joins_with_mixed_columns(self):
+        """Complex query with multiple JOINs and mixed SELECT/WHERE demands"""
+        optimized = self._optimize("""
+            SELECT e.event, e2.event as event2
+            FROM (SELECT * FROM events) AS e
+            LEFT JOIN (SELECT * FROM events) AS e2 ON e2.distinct_id = e.distinct_id
+            WHERE e.timestamp > '2024-01-01'
+            ORDER BY e.created_at
+        """)
+
+        # First events subquery should have: event, distinct_id (JOIN), timestamp (WHERE), created_at (ORDER BY)
+        events_query = optimized.select_from.table
+        events_cols = {self._col_name(col) for col in events_query.select}
+        assert events_cols >= {"event", "distinct_id", "timestamp", "created_at"}
+
+        # Second events subquery should have: event (SELECT) and distinct_id (JOIN constraint)
+        events2_query = optimized.select_from.next_join.table
+        events2_cols = {self._col_name(col) for col in events2_query.select}
+        assert events2_cols >= {"event", "distinct_id"}
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_deeply_nested_with_multiple_demands(self):
+        """4 levels deep with demands at each level"""
+        optimized = self._optimize("""
+            SELECT event FROM (
+                SELECT event, distinct_id FROM (
+                    SELECT event, distinct_id, timestamp FROM (
+                        SELECT * FROM events
+                    ) AS l3
+                    WHERE timestamp > '2024-01-01'
+                ) AS l2
+                WHERE distinct_id = 'user1'
+            ) AS l1
+        """)
+
+        # Level 1: event, distinct_id
+        l1 = optimized.select_from.table
+        l1_cols = {self._col_name(col) for col in l1.select}
+        assert l1_cols == {"event", "distinct_id"}
+
+        # Level 2: event, distinct_id, timestamp
+        l2 = l1.select_from.table
+        l2_cols = {self._col_name(col) for col in l2.select}
+        assert l2_cols == {"event", "distinct_id", "timestamp"}
+
+        # Level 3: Only event, distinct_id, timestamp (pruned from asterisk)
+        l3 = l2.select_from.table
+        l3_cols = {self._col_name(col) for col in l3.select}
+        assert l3_cols == {"event", "distinct_id", "timestamp"}
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_mixed_asterisk_and_explicit_columns(self):
+        """Query with both SELECT *, col1, col2 pattern"""
+        optimized = self._optimize("""
+            SELECT event FROM (
+                SELECT distinct_id, *, timestamp FROM events
+            ) AS sub
+        """)
+
+        # Should keep distinct_id and timestamp (explicit) plus event (demanded from asterisk)
+        inner_query = optimized.select_from.table
+        column_names = {self._col_name(col) for col in inner_query.select}
+        assert "event" in column_names
+        assert "distinct_id" in column_names
+        assert "timestamp" in column_names
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_group_by_and_having_demands(self):
+        """Ensure GROUP BY and HAVING columns are preserved"""
+        optimized = self._optimize("""
+            SELECT event, count() as cnt
+            FROM (SELECT * FROM events) AS sub
+            GROUP BY event, distinct_id
+            HAVING count() > 10 AND timestamp > '2024-01-01'
+        """)
+
+        # Should include event (SELECT + GROUP BY), distinct_id (GROUP BY), timestamp (HAVING)
+        inner_query = optimized.select_from.table
+        column_names = {self._col_name(col) for col in inner_query.select}
+        assert column_names >= {"event", "distinct_id", "timestamp"}
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_subquery_in_join_with_demands(self):
+        """Nested subqueries in both sides of JOIN"""
+        optimized = self._optimize("""
+            SELECT e1.event, e2.timestamp
+            FROM (
+                SELECT * FROM (SELECT * FROM events) AS inner_e1
+            ) AS e1
+            LEFT JOIN (
+                SELECT * FROM (SELECT * FROM events) AS inner_e2
+            ) AS e2 ON e2.distinct_id = e1.distinct_id
+            WHERE e1.properties != '{}'
+        """)
+
+        # Outer e1 subquery
+        outer_e1 = optimized.select_from.table
+        outer_e1_cols = {self._col_name(col) for col in outer_e1.select}
+        assert outer_e1_cols >= {"event", "distinct_id", "properties"}
+
+        # Inner e1 subquery should have same demands propagated
+        inner_e1 = outer_e1.select_from.table
+        inner_e1_cols = {self._col_name(col) for col in inner_e1.select}
+        assert inner_e1_cols >= {"event", "distinct_id", "properties"}
+
+        # Outer e2 subquery
+        outer_e2 = optimized.select_from.next_join.table
+        outer_e2_cols = {self._col_name(col) for col in outer_e2.select}
+        assert outer_e2_cols >= {"timestamp", "distinct_id"}
+
+        # Inner e2 subquery
+        inner_e2 = outer_e2.select_from.table
+        inner_e2_cols = {self._col_name(col) for col in inner_e2.select}
+        assert inner_e2_cols >= {"timestamp", "distinct_id"}
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_union_all_without_alias(self):
+        """UNION ALL without subquery alias should still be pruned"""
+        optimized = self._optimize("""
+            SELECT event FROM (
+                SELECT * FROM events UNION ALL SELECT * FROM events
+            )
+        """)
+
+        # The UNION subquery should be a SelectSetQuery
+        union_query = optimized.select_from.table
+        assert isinstance(union_query, ast.SelectSetQuery)
+
+        # Both branches should only have 'event' column
+        first_branch = union_query.initial_select_query
+        assert isinstance(first_branch, ast.SelectQuery)
+        first_cols = {self._col_name(col) for col in first_branch.select}
+        assert first_cols == {"event"}, f"Expected only 'event' but got {first_cols}"
+
+        second_branch = union_query.subsequent_select_queries[0].select_query
+        assert isinstance(second_branch, ast.SelectQuery)
+        second_cols = {self._col_name(col) for col in second_branch.select}
+        assert second_cols == {"event"}, f"Expected only 'event' but got {second_cols}"
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_union_all_with_asterisk(self):
+        """UNION ALL branches with asterisk should be pruned uniformly"""
+        optimized = self._optimize("""
+            SELECT event, distinct_id FROM (
+                SELECT * FROM events WHERE event = 'click'
+                UNION ALL
+                SELECT * FROM events WHERE event = 'pageview'
+            ) AS sub
+        """)
+
+        # The UNION subquery should be a SelectSetQuery
+        union_query = optimized.select_from.table
+        assert isinstance(union_query, ast.SelectSetQuery)
+
+        # Both branches should have the same columns (event, distinct_id)
+        first_branch = union_query.initial_select_query
+        assert isinstance(first_branch, ast.SelectQuery)
+        first_cols = {self._col_name(col) for col in first_branch.select}
+        assert first_cols == {"event", "distinct_id"}
+
+        second_branch = union_query.subsequent_select_queries[0].select_query
+        assert isinstance(second_branch, ast.SelectQuery)
+        second_cols = {self._col_name(col) for col in second_branch.select}
+        assert second_cols == {"event", "distinct_id"}
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_union_all_multiple_branches(self):
+        """UNION ALL with 3+ branches should all be pruned uniformly"""
+        optimized = self._optimize("""
+            SELECT event FROM (
+                SELECT * FROM events WHERE event = 'click'
+                UNION ALL
+                SELECT * FROM events WHERE event = 'pageview'
+                UNION ALL
+                SELECT * FROM events WHERE event = 'submit'
+            ) AS sub
+        """)
+
+        union_query = optimized.select_from.table
+        assert isinstance(union_query, ast.SelectSetQuery)
+
+        # All three branches should only have 'event' column
+        all_branches = [union_query.initial_select_query] + [
+            sn.select_query for sn in union_query.subsequent_select_queries
+        ]
+
+        for branch in all_branches:
+            assert isinstance(branch, ast.SelectQuery)
+            cols = {self._col_name(col) for col in branch.select}
+            assert cols == {"event"}, f"Expected only 'event' but got {cols}"
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_cte_with_asterisk_pushdown(self):
+        """CTEs with asterisk should have projection pushdown applied to the CTE"""
+        optimized = self._optimize("""
+            WITH events_cte AS (
+                SELECT * FROM events
+            )
+            SELECT event, distinct_id FROM events_cte
+            WHERE timestamp > '2024-01-01'
+        """)
+
+        # CTEs are now kept as CTEs (not inlined), so check the CTE itself
+        # The CTE should only have the columns we actually need
+        assert optimized.ctes is not None
+        assert "events_cte" in optimized.ctes
+        cte_query = optimized.ctes["events_cte"].expr
+        assert isinstance(cte_query, ast.SelectQuery)
+        column_names = {self._col_name(col) for col in cte_query.select}
+        assert column_names >= {"event", "distinct_id", "timestamp"}
+        # Verify columns have from_asterisk marker
+
+        from_asterisk_arr = []
+        for col in cte_query.select:
+            if isinstance(col, ast.Field):
+                from_asterisk_arr.append(col.from_asterisk)
+            elif isinstance(col, ast.Alias) and isinstance(col.expr, ast.Field):
+                from_asterisk_arr.append(col.expr.from_asterisk)
+
+        assert any(from_asterisk_arr)
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_union_cte_with_select_star_and_order_by(self):
+        """Nested UNION in CTE with select * and order by - tests asterisk propagation to union branches"""
+        optimized = self._optimize("""
+            with us as (
+               select properties, timestamp from events limit 20
+            ),
+            eu as (
+               select properties, timestamp from events limit 20
+            ),
+            all_exports as (select * from us union all select * from eu)
+            select * from all_exports order by timestamp desc
+            limit 20
+        """)
+
+        # The all_exports CTE should be a union query in the CTEs (not inlined)
+        assert optimized.ctes is not None
+        assert "all_exports" in optimized.ctes
+        union_query = optimized.ctes["all_exports"].expr
+        assert isinstance(union_query, ast.SelectSetQuery)
+
+        # Both branches should have properties and timestamp (not just timestamp)
+        first_branch = union_query.initial_select_query
+        assert isinstance(first_branch, ast.SelectQuery)
+        first_cols = {self._col_name(col) for col in first_branch.select}
+        assert first_cols == {"properties", "timestamp"}, f"Expected properties and timestamp but got {first_cols}"
+
+        second_branch = union_query.subsequent_select_queries[0].select_query
+        assert isinstance(second_branch, ast.SelectQuery)
+        second_cols = {self._col_name(col) for col in second_branch.select}
+        assert second_cols == {"properties", "timestamp"}, f"Expected properties and timestamp but got {second_cols}"
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_root_union_with_nested_union_cte(self):
+        """Root query is UNION with nested UNION CTEs - tests asterisk propagation through union branches"""
+        optimized = self._optimize("""
+            with us as (
+               select properties, timestamp from events limit 20
+            ),
+            eu as (
+               select properties, timestamp from events limit 20
+            ),
+            all_exports as (select * from us union all select * from eu)
+            select * from all_exports union all select * from all_exports order by timestamp desc
+        """)
+
+        # The all_exports CTE should contain the union of us and eu
+        # Check CTEs instead of inlined subqueries
+        first_branch = optimized.initial_select_query
+        assert isinstance(first_branch, ast.SelectQuery)
+
+        # all_exports should be in the CTEs of the first branch
+        assert first_branch.ctes is not None
+        assert "all_exports" in first_branch.ctes
+        all_exports_cte = first_branch.ctes["all_exports"].expr
+        assert isinstance(all_exports_cte, ast.SelectSetQuery)
+
+        # Check that both branches of all_exports have properties and timestamp
+        branch_1_1 = all_exports_cte.initial_select_query
+        assert isinstance(branch_1_1, ast.SelectQuery)
+        cols_1_1 = {self._col_name(col) for col in branch_1_1.select}
+        assert cols_1_1 == {"properties", "timestamp"}, f"Expected properties and timestamp but got {cols_1_1}"
+
+        branch_1_2 = all_exports_cte.subsequent_select_queries[0].select_query
+        assert isinstance(branch_1_2, ast.SelectQuery)
+        cols_1_2 = {self._col_name(col) for col in branch_1_2.select}
+        assert cols_1_2 == {"properties", "timestamp"}, f"Expected properties and timestamp but got {cols_1_2}"
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_cte_direct_projection_pushdown(self):
+        """Test that projection pushdown works on CTEs that are kept as CTEs (not inlined)"""
+        optimized = self._optimize("""
+            WITH my_cte AS (SELECT * FROM events)
+            SELECT event FROM my_cte
+        """)
+
+        # The CTE should still be a CTE (not inlined as a subquery)
+        assert optimized.ctes is not None
+        assert len(optimized.ctes) == 1
+
+        # The CTE query should only select 'event' column
+        cte_query = optimized.ctes["my_cte"].expr
+        assert isinstance(cte_query, ast.SelectQuery)
+        column_names = {self._col_name(col) for col in cte_query.select}
+        assert column_names == {"event"}, f"Expected only 'event' but got {column_names}"
+
+        # Verify the column has from_asterisk marker
+        from_asterisk_arr = []
+        for col in cte_query.select:
+            if isinstance(col, ast.Field):
+                from_asterisk_arr.append(col.from_asterisk)
+            elif isinstance(col, ast.Alias) and isinstance(col.expr, ast.Field):
+                from_asterisk_arr.append(col.expr.from_asterisk)
+
+        assert any(from_asterisk_arr)
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_cte_with_join_projection_pushdown(self):
+        """Test projection pushdown with CTEs used in JOINs"""
+        optimized = self._optimize("""
+            WITH
+                exposures AS (SELECT * FROM events),
+                conversions AS (SELECT * FROM events)
+            SELECT e.event, c.timestamp
+            FROM exposures AS e
+            LEFT JOIN conversions AS c ON e.person_id = c.person_id
+        """)
+
+        # Both CTEs should be present
+        assert optimized.ctes is not None
+        assert len(optimized.ctes) == 2
+
+        # exposures CTE should have event and person_id (used in SELECT and JOIN)
+        exposures_cte = optimized.ctes["exposures"].expr
+        assert isinstance(exposures_cte, ast.SelectQuery)
+        exposures_cols = {self._col_name(col) for col in exposures_cte.select}
+        assert exposures_cols >= {"event", "person_id"}, f"Expected event and person_id but got {exposures_cols}"
+
+        # conversions CTE should have timestamp and person_id (used in SELECT and JOIN)
+        conversions_cte = optimized.ctes["conversions"].expr
+        assert isinstance(conversions_cte, ast.SelectQuery)
+        conversions_cols = {self._col_name(col) for col in conversions_cte.select}
+        assert conversions_cols >= {
+            "timestamp",
+            "person_id",
+        }, f"Expected timestamp and person_id but got {conversions_cols}"
+
+        assert optimized.to_hogql() == self.snapshot
+
+    @pytest.mark.usefixtures("unittest_snapshot")
+    def test_cte_multiple_references_projection_pushdown(self):
+        """Test projection pushdown with CTE referenced multiple times"""
+        optimized = self._optimize("""
+            WITH base AS (SELECT * FROM events)
+            SELECT b1.event, b2.timestamp
+            FROM base AS b1
+            LEFT JOIN base AS b2 ON b1.person_id = b2.person_id
+        """)
+
+        # CTE should be present
+        assert optimized.ctes is not None
+        assert len(optimized.ctes) == 1
+
+        # base CTE should have all demanded columns: event, timestamp, person_id
+        base_cte = optimized.ctes["base"].expr
+        assert isinstance(base_cte, ast.SelectQuery)
+        base_cols = {self._col_name(col) for col in base_cte.select}
+        assert base_cols >= {
+            "event",
+            "timestamp",
+            "person_id",
+        }, f"Expected event, timestamp, and person_id but got {base_cols}"
+
+        assert optimized.to_hogql() == self.snapshot
+
+    def test_cte_shared_by_union_branches_keeps_all_demanded_columns(self):
+        # The WITH lives on the first UNION branch but every sibling branch consumes it, so
+        # pruning before all branches register their demands drops columns the siblings need.
+        optimized = self._optimize(
+            "WITH base AS (SELECT * FROM (SELECT 1 AS a, 2 AS b, 3 AS d)) "
+            "SELECT a FROM base "
+            "UNION ALL SELECT b FROM base "
+            "UNION ALL SELECT d FROM base"
+        )
+
+        first_branch = optimized.initial_select_query
+        assert isinstance(first_branch, ast.SelectQuery)
+        assert first_branch.ctes is not None
+        base_cte = first_branch.ctes["base"].expr
+        assert isinstance(base_cte, ast.SelectQuery)
+        base_cols = {self._col_name(col) for col in base_cte.select}
+        assert base_cols == {"a", "b", "d"}, f"CTE dropped columns demanded by sibling branches: got {base_cols}"
+
+    @parameterized.expand(
+        [
+            ("subquery", "SELECT event, properties.foo FROM (SELECT * FROM events) AS sub"),
+            ("cte", "WITH cte AS (SELECT * FROM events) SELECT event, properties.foo FROM cte"),
+        ]
+    )
+    def test_property_access_keeps_base_column(self, _name: str, query_str: str):
+        # A blob column read only via `properties.foo` still demands `properties`. Its node type is a
+        # PropertyType, not a FieldType, so if demand collection ignores it the `*` pruner drops
+        # `properties` (only `event` is demanded), leaving a dangling reference that later crashes
+        # property lowering with 'Field "properties" not found on table Table'.
+        optimized = self._optimize(query_str)
+
+        inner = optimized.ctes["cte"].expr if optimized.ctes else optimized.select_from.table
+        assert isinstance(inner, ast.SelectQuery)
+        column_names = {self._col_name(col) for col in inner.select}
+        assert column_names == {"event", "properties"}, f"pruner dropped the property base column: got {column_names}"
+
+
+class TestProjectionPushdownExecution(ClickhouseTestMixin, APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        _create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="u0",
+            timestamp="2024-01-02T10:00:00",
+            properties={"plan": "free"},
+        )
+        _create_event(
+            team=self.team,
+            event="signup",
+            distinct_id="u1",
+            timestamp="2024-01-02T11:00:00",
+            properties={"plan": "paid"},
+        )
+        flush_persons_and_events()
+
+    @parameterized.expand(
+        [
+            (
+                "same_names_in_another_order",
+                "SELECT a, count() FROM (SELECT * FROM (SELECT event AS a, distinct_id AS b FROM events) "
+                "UNION ALL SELECT * FROM (SELECT distinct_id AS b, event AS a FROM events)) AS sub GROUP BY a ORDER BY a",
+                [("$pageview", 2), ("signup", 2)],
+            ),
+            (
+                "explicit_column_after_asterisks_of_different_counts",
+                "SELECT region, sum(n) FROM (SELECT *, 'US' AS region FROM (SELECT 1 AS n, event AS a FROM events) "
+                "UNION ALL SELECT *, 'EU' AS region FROM (SELECT distinct_id AS b, uuid AS c, 1 AS n FROM events)) "
+                "AS sub GROUP BY region ORDER BY region",
+                [("EU", 2), ("US", 2)],
+            ),
+            (
+                "name_past_the_end_of_a_shorter_branch",
+                "SELECT c FROM (SELECT * FROM (SELECT distinct_id AS a, 1 AS b, event AS c FROM events) "
+                "UNION ALL SELECT * FROM (SELECT event AS c, distinct_id AS a FROM events)) AS sub ORDER BY c",
+                [("$pageview",), ("$pageview",), ("signup",), ("signup",)],
+            ),
+            (
+                "branch_without_the_name_keeps_the_position",
+                "SELECT a FROM (SELECT * FROM (SELECT event AS a, distinct_id AS x FROM events) "
+                "UNION ALL SELECT * FROM (SELECT event AS b, distinct_id AS y FROM events)) AS sub ORDER BY a",
+                [("$pageview",), ("$pageview",), ("signup",), ("signup",)],
+            ),
+            (
+                "cte_union",
+                "WITH sources AS (SELECT * FROM (SELECT event AS a, distinct_id AS b FROM events) "
+                "UNION ALL SELECT * FROM (SELECT distinct_id AS b, event AS a FROM events)) "
+                "SELECT a, count() FROM sources GROUP BY a ORDER BY a",
+                [("$pageview", 2), ("signup", 2)],
+            ),
+            (
+                "properties_through_both_branches",
+                "SELECT properties.plan AS plan, count() FROM (SELECT * FROM (SELECT event AS a, properties FROM events) "
+                "UNION ALL SELECT * FROM (SELECT event AS a, properties FROM events)) AS sub GROUP BY plan ORDER BY plan",
+                [("free", 2), ("paid", 2)],
+            ),
+        ]
+    )
+    def test_set_query_branches_return_the_named_columns(self, _name: str, query: str, expected: list[tuple]) -> None:
+        for narrowing in (True, False):
+            with override_instance_config("HOGQL_PROPERTIES_NARROWING_ENABLED", narrowing):
+                response = execute_hogql_query(
+                    query, team=self.team, modifiers=HogQLQueryModifiers(optimizeProjections=True)
+                )
+            assert response.results == expected, f"narrowing={narrowing}: {response.results}"

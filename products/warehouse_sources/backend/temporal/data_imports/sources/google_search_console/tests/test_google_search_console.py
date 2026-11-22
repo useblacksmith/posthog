@@ -1,0 +1,922 @@
+import json
+import datetime as dt
+
+import pytest
+from unittest import mock
+
+from django.db import OperationalError
+
+import requests
+from google.auth.exceptions import RefreshError, TransportError
+from google.oauth2.credentials import Credentials as OAuthCredentials
+
+from posthog.integrations import IntegrationNotFound
+
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.testing import (
+    RecordedRequest,
+    ScriptedResponse,
+    SourceDriver,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.googlesearchconsole import (
+    GoogleSearchConsoleSourceConfig,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console import (
+    google_search_console as gsc,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.google_search_console import (
+    FRESHNESS_LAG_DAYS,
+    QUOTA_MAX_RETRIES,
+    GoogleSearchConsoleQuotaExceededError,
+    GoogleSearchConsoleResumeConfig,
+    GoogleSearchConsoleServerError,
+    _credentials,
+    _get_integration,
+    _initial_start_date,
+    _is_daily_quota_error,
+    _is_quota_error,
+    _is_transient_refresh_error,
+    _iter_dates,
+    _query_search_analytics,
+    _quota_backoff_seconds,
+    _resolve_window,
+    _row_to_dict,
+    google_search_console_source,
+    normalize_site_url,
+    suggest_registered_site,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.source import (
+    GoogleSearchConsoleSource,
+)
+
+TODAY = dt.date(2026, 4, 30)
+
+
+@pytest.mark.parametrize(
+    "last_value,expected_start",
+    [
+        # No last value → full history window from today backwards.
+        (None, _initial_start_date(TODAY)),
+        # Very old last value → clamped to the history floor.
+        (TODAY - dt.timedelta(days=10_000), _initial_start_date(TODAY)),
+        # Recent date → used as-is.
+        (TODAY - dt.timedelta(days=10), TODAY - dt.timedelta(days=10)),
+        # ISO string is accepted and parsed.
+        ("2026-04-15", dt.date(2026, 4, 15)),
+        # Datetime is accepted and truncated to its date.
+        (dt.datetime(2026, 4, 15, 12, 0, 0), dt.date(2026, 4, 15)),
+    ],
+)
+def test_resolve_window_start(last_value, expected_start):
+    start, end = _resolve_window(TODAY, last_value)
+    assert start == expected_start
+    assert end == TODAY - dt.timedelta(days=FRESHNESS_LAG_DAYS)
+
+
+@pytest.mark.parametrize(
+    "start,end,expected",
+    [
+        (
+            dt.date(2026, 4, 1),
+            dt.date(2026, 4, 3),
+            [dt.date(2026, 4, 1), dt.date(2026, 4, 2), dt.date(2026, 4, 3)],
+        ),
+        # start > end yields no dates.
+        (dt.date(2026, 4, 5), dt.date(2026, 4, 1), []),
+    ],
+)
+def test_iter_dates(start, end, expected):
+    assert list(_iter_dates(start, end)) == expected
+
+
+def test_row_to_dict_injects_iter_date_when_date_not_in_dimensions():
+    # `searchAppearance` schema can't include date in its API request, so the iterator
+    # supplies the date externally to keep the per-day partition.
+    row = {"keys": ["RICH_RESULT"], "clicks": 5, "impressions": 50, "ctr": 0.1, "position": 3.0}
+    out = _row_to_dict(row, ["searchAppearance"], iter_date=dt.date(2026, 4, 15))
+
+    assert out["date"] == dt.date(2026, 4, 15)
+    assert out["searchAppearance"] == "RICH_RESULT"
+
+
+def test_credentials_refreshes_stale_db_connection_before_query(monkeypatch):
+    # The ORM read runs lazily inside `get_rows` on a worker thread whose pooled
+    # Django connection may have been closed server-side, surfacing as
+    # `OperationalError: the connection is closed`. We must drop the stale
+    # connection before querying, so the read happens on a fresh connection.
+    calls: list[str] = []
+
+    monkeypatch.setattr(gsc, "close_old_connections", lambda: calls.append("close_old_connections"))
+
+    integration = mock.MagicMock()
+    integration.refresh_token = "refresh-token"
+
+    def fake_get(*args, **kwargs):
+        calls.append("IntegrationManager.get")
+        return integration
+
+    monkeypatch.setattr(gsc.IntegrationManager.google_search_console.oauth, "get", fake_get)
+
+    creds = _credentials(integration_id=1, team_id=1)
+
+    assert calls == ["close_old_connections", "IntegrationManager.get"]
+    assert creds.refresh_token == "refresh-token"
+
+
+def test_get_integration_reraises_after_exhausting_attempts(monkeypatch):
+    get = mock.Mock(side_effect=OperationalError("query_wait_timeout"))
+
+    monkeypatch.setattr(gsc, "close_old_connections", lambda: None)
+    monkeypatch.setattr(gsc.IntegrationManager.google_search_console.oauth, "get", get)
+    sleeps: list[float] = []
+    monkeypatch.setattr(gsc.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(OperationalError):
+        _get_integration(integration_id=1, team_id=2)
+
+    # Bounded attempts: it gives up rather than looping forever, leaving Temporal to retry the activity.
+    assert get.call_count == 4
+    assert sleeps == [2, 4, 6]
+
+
+def test_get_integration_raises_a_stable_missing_text_without_retry(monkeypatch):
+    get = mock.Mock(side_effect=IntegrationNotFound("SDK text"))
+    monkeypatch.setattr(gsc, "close_old_connections", lambda: None)
+    monkeypatch.setattr(gsc.IntegrationManager.google_search_console.oauth, "get", get)
+
+    with pytest.raises(IntegrationNotFound, match="^Integration not found: 1$"):
+        _get_integration(integration_id=1, team_id=2)
+
+    assert get.call_count == 1
+
+
+def _make_response(config: GoogleSearchConsoleSourceConfig, rows_per_call: list[list[dict]]):
+    """Build a SourceResponse where _query_search_analytics returns the given pages in order."""
+    inputs = mock.MagicMock()
+    inputs.team_id = 1
+    inputs.job_id = "job-1"
+
+    manager = mock.MagicMock()
+    manager.can_resume.return_value = False
+
+    saved_states: list[GoogleSearchConsoleResumeConfig] = []
+    manager.save_state.side_effect = lambda state: saved_states.append(state)
+
+    response = google_search_console_source(
+        config=config,
+        resource_name="search_analytics_by_date",
+        team_id=1,
+        resumable_source_manager=manager,
+        should_use_incremental_field=True,
+        db_incremental_field_last_value=dt.date(2026, 4, 25),
+    )
+    return response, manager, saved_states
+
+
+def test_source_yields_rows_and_advances_dates(monkeypatch):
+    config = GoogleSearchConsoleSourceConfig(
+        site_url="https://example.com/",
+        google_search_console_integration_id=1,
+    )
+
+    fake_today = dt.date(2026, 4, 30)
+    pages_per_date: dict[str, list[list[dict]]] = {
+        "2026-04-25": [[{"keys": ["2026-04-25"], "clicks": 1, "impressions": 5, "ctr": 0.2, "position": 3.0}]],
+        "2026-04-26": [[{"keys": ["2026-04-26"], "clicks": 2, "impressions": 6, "ctr": 0.33, "position": 2.5}]],
+        "2026-04-27": [[]],
+    }
+    end_date = fake_today - dt.timedelta(days=FRESHNESS_LAG_DAYS)
+    # Fill any remaining dates with empty pages
+    cursor = dt.date(2026, 4, 25)
+    while cursor <= end_date:
+        pages_per_date.setdefault(cursor.isoformat(), [[]])
+        cursor += dt.timedelta(days=1)
+
+    queries: list[tuple[str, int]] = []
+
+    def fake_query(
+        session,
+        site_url,
+        start_date,
+        end_date,
+        dimensions,
+        start_row,
+        row_limit=25000,
+        data_state="final",
+        search_type="web",
+    ):
+        queries.append((start_date, start_row))
+        pages = pages_per_date.get(start_date, [[]])
+        return pages.pop(0) if pages else []
+
+    response, _manager, saved_states = _make_response(config, [])
+
+    monkeypatch.setattr(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.google_search_console._today",
+        lambda: fake_today,
+    )
+    monkeypatch.setattr(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.google_search_console.google_search_console_session",
+        lambda *a, **kw: mock.MagicMock(),
+    )
+    monkeypatch.setattr(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.google_search_console._query_search_analytics",
+        fake_query,
+    )
+
+    batches = list(response.items())
+
+    yielded_dates = [batch[0]["date"] for batch in batches]
+    assert dt.date(2026, 4, 25) in yielded_dates
+    assert dt.date(2026, 4, 26) in yielded_dates
+    # Each non-empty date that had a single page advances state to the *next* date with start_row=0
+    advance_to_next_states = [s for s in saved_states if s.start_row == 0]
+    assert any(s.current_date == "2026-04-26" for s in advance_to_next_states)
+    assert any(s.current_date == "2026-04-27" for s in advance_to_next_states)
+
+
+def test_source_resumes_from_saved_state(monkeypatch):
+    config = GoogleSearchConsoleSourceConfig(
+        site_url="https://example.com/",
+        google_search_console_integration_id=1,
+    )
+
+    fake_today = dt.date(2026, 4, 30)
+    queries: list[tuple[str, int]] = []
+
+    def fake_query(
+        session,
+        site_url,
+        start_date,
+        end_date,
+        dimensions,
+        start_row,
+        row_limit=25000,
+        data_state="final",
+        search_type="web",
+    ):
+        queries.append((start_date, start_row))
+        return []
+
+    manager = mock.MagicMock()
+    manager.can_resume.return_value = True
+    manager.load_state.return_value = GoogleSearchConsoleResumeConfig(current_date="2026-04-26", start_row=5000)
+
+    monkeypatch.setattr(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.google_search_console._today",
+        lambda: fake_today,
+    )
+    monkeypatch.setattr(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.google_search_console.google_search_console_session",
+        lambda *a, **kw: mock.MagicMock(),
+    )
+    monkeypatch.setattr(
+        "products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.google_search_console._query_search_analytics",
+        fake_query,
+    )
+
+    response = google_search_console_source(
+        config=config,
+        resource_name="search_analytics_by_date",
+        team_id=1,
+        resumable_source_manager=manager,
+        should_use_incremental_field=True,
+        db_incremental_field_last_value=dt.date(2026, 4, 1),
+    )
+
+    list(response.items())  # type: ignore[arg-type]
+
+    # Earliest query should be the resumed date+offset
+    assert queries[0] == ("2026-04-26", 5000)
+    # No queries at earlier dates
+    assert all(q[0] >= "2026-04-26" for q in queries)
+
+
+def test_row_to_dict_tolerates_unparseable_hour():
+    row = {"keys": ["not-a-timestamp"], "clicks": 0, "impressions": 0, "ctr": 0, "position": 0}
+    out = _row_to_dict(row, ["hour"], iter_date=dt.date(2026, 4, 15))
+
+    assert out["hour"] is None
+
+
+def test_sitemap_to_dict_fills_omitted_counters_and_flags():
+    # Google omits zero counters and false flags entirely. Left missing, the first sync would
+    # store the column with whatever type the first present value had (or not at all), so a
+    # later sitemap with errors could not be merged in.
+    out = gsc._sitemap_to_dict(
+        {
+            "path": "https://example.com/sitemap.xml",
+            "type": "SITEMAP",
+            "lastSubmitted": "2026-04-15T10:30:00.000Z",
+        }
+    )
+
+    assert out["errors"] == 0
+    assert out["warnings"] == 0
+    assert out["isPending"] is False
+    assert out["isSitemapsIndex"] is False
+    assert out["lastSubmitted"] == dt.datetime(2026, 4, 15, 10, 30, tzinfo=dt.UTC)
+    assert out["lastDownloaded"] is None
+
+
+@pytest.mark.parametrize(
+    "resource_name,expected",
+    [
+        (
+            "sites",
+            [{"siteUrl": "https://example.com/", "permissionLevel": "siteOwner"}],
+        ),
+        (
+            "sitemap_contents",
+            [{"path": "https://example.com/sitemap.xml", "type": "WEB", "submitted": 5}],
+        ),
+    ],
+)
+def test_property_source_yields_rows(monkeypatch, resource_name, expected):
+    config = GoogleSearchConsoleSourceConfig(
+        site_url="https://example.com/",
+        google_search_console_integration_id=1,
+    )
+    monkeypatch.setattr(gsc, "google_search_console_session", lambda *a, **kw: mock.MagicMock())
+    monkeypatch.setattr(
+        gsc,
+        "list_sites",
+        lambda _session: [{"siteUrl": "https://example.com/", "permissionLevel": "siteOwner"}],
+    )
+    monkeypatch.setattr(
+        gsc,
+        "list_sitemaps",
+        lambda _session, _site: [
+            {"path": "https://example.com/sitemap.xml", "contents": [{"type": "WEB", "submitted": 5}]}
+        ],
+    )
+
+    response = google_search_console_source(
+        config=config,
+        resource_name=resource_name,
+        team_id=1,
+        resumable_source_manager=mock.MagicMock(),
+    )
+
+    assert list(response.items()) == [expected]  # type: ignore[arg-type]
+
+
+def test_property_source_yields_nothing_when_property_has_no_sitemaps(monkeypatch):
+    config = GoogleSearchConsoleSourceConfig(
+        site_url="https://example.com/",
+        google_search_console_integration_id=1,
+    )
+    monkeypatch.setattr(gsc, "google_search_console_session", lambda *a, **kw: mock.MagicMock())
+    monkeypatch.setattr(gsc, "list_sitemaps", lambda _session, _site: [])
+
+    response = google_search_console_source(
+        config=config,
+        resource_name="sitemaps",
+        team_id=1,
+        resumable_source_manager=mock.MagicMock(),
+    )
+
+    assert list(response.items()) == []  # type: ignore[arg-type]
+
+
+def test_list_sitemaps_percent_encodes_the_property(monkeypatch):
+    session = mock.MagicMock()
+    session.get.return_value = _fake_response(200, {"sitemap": [{"path": "https://example.com/sitemap.xml"}]})
+
+    sitemaps = gsc.list_sitemaps(session, "sc-domain:example.com")
+
+    assert sitemaps == [{"path": "https://example.com/sitemap.xml"}]
+    # The property is a path segment, so `sc-domain:` and any `/` in a URL-prefix property
+    # must be escaped or Google resolves a different (or non-existent) route.
+    session.get.assert_called_once_with(f"{gsc.GSC_API_BASE}/sites/sc-domain%3Aexample.com/sitemaps")
+
+
+def _fake_response(status_code: int, json_body: dict | None = None, headers: dict | None = None):
+    resp = mock.MagicMock(spec=requests.Response)
+    resp.status_code = status_code
+    resp.ok = status_code < 400
+    resp.headers = headers or {}
+    resp.text = "" if json_body is None else str(json_body)
+    resp.json.return_value = json_body if json_body is not None else {}
+
+    def raise_for_status():
+        if not resp.ok:
+            raise requests.HTTPError(f"{status_code} Client Error: Forbidden for url: https://example", response=resp)
+
+    resp.raise_for_status.side_effect = raise_for_status
+    return resp
+
+
+_QUOTA_BODY = {"error": {"code": 403, "errors": [{"domain": "usageLimits", "reason": "quotaExceeded"}]}}
+_PERMISSION_BODY = {"error": {"code": 403, "errors": [{"domain": "global", "reason": "forbidden"}]}}
+_DAILY_QUOTA_BODY = {"error": {"code": 403, "errors": [{"domain": "usageLimits", "reason": "dailyLimitExceeded"}]}}
+
+
+@pytest.mark.parametrize(
+    "response,expected",
+    [
+        (_fake_response(200, {"rows": []}), False),
+        (_fake_response(429), True),
+        (_fake_response(403, _QUOTA_BODY), True),
+        (_fake_response(403, {"error": {"errors": [{"reason": "rateLimitExceeded"}]}}), True),
+        (_fake_response(403, _PERMISSION_BODY), False),
+        (_fake_response(403, {}), False),
+        (_fake_response(403, {"error": None}), False),
+        (_fake_response(403, {"error": "Forbidden"}), False),
+        (_fake_response(401), False),
+    ],
+)
+def test_is_quota_error(response, expected):
+    assert _is_quota_error(response) is expected
+
+
+@pytest.mark.parametrize(
+    "response,expected",
+    [
+        (_fake_response(403, _DAILY_QUOTA_BODY), True),
+        (_fake_response(403, _QUOTA_BODY), False),
+        (_fake_response(403, {"error": None}), False),
+        (_fake_response(403, {"error": "Forbidden"}), False),
+        (_fake_response(429), False),
+        (_fake_response(200, {"rows": []}), False),
+    ],
+)
+def test_is_daily_quota_error(response, expected):
+    assert _is_daily_quota_error(response) is expected
+
+
+# A Bad Gateway from Google's OAuth token endpoint arrives as an HTML page, not JSON.
+_HTML_502_BODY = (
+    "<!DOCTYPE html>\n<html lang=en>\n  <title>Error 502 (Server Error)!!1</title>\n"
+    "  <p><b>502.</b> That's an error.\n  <p>The server encountered a temporary error "
+    "and could not complete your request."
+)
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        # 502 gateway page: google-auth omits 502 from its retryable status codes, but it's transient.
+        (RefreshError(_HTML_502_BODY), True),
+        # google-auth flags 500/503/504/408/429 (and JSON server errors) retryable itself.
+        (RefreshError("temporarily_unavailable: try again later", retryable=True), True),
+        # Revoked/expired refresh token — permanent, must not be retried inline.
+        (RefreshError("invalid_grant: Token has been expired or revoked."), False),
+        (RefreshError("invalid_scope: Bad Request"), False),
+    ],
+)
+def test_is_transient_refresh_error(error, expected):
+    assert _is_transient_refresh_error(error) is expected
+
+
+def test_quota_backoff_prefers_retry_after_header():
+    resp = _fake_response(403, _QUOTA_BODY, headers={"Retry-After": "30"})
+    assert _quota_backoff_seconds(resp, attempt=0) == 30.0
+
+
+def test_quota_backoff_falls_back_to_exponential():
+    resp = _fake_response(403, _QUOTA_BODY)
+    assert _quota_backoff_seconds(resp, attempt=0) == 2.0
+    assert _quota_backoff_seconds(resp, attempt=2) == 8.0
+
+
+def test_query_retries_quota_then_succeeds(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.side_effect = [
+        _fake_response(403, _QUOTA_BODY),
+        _fake_response(403, _QUOTA_BODY),
+        _fake_response(200, {"rows": [{"keys": ["2026-04-15"], "clicks": 1}]}),
+    ]
+
+    rows = _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    assert rows == [{"keys": ["2026-04-15"], "clicks": 1}]
+    assert session.post.call_count == 3
+
+
+def test_query_raises_quota_error_after_max_retries(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.return_value = _fake_response(403, _QUOTA_BODY)
+
+    with pytest.raises(GoogleSearchConsoleQuotaExceededError):
+        _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    # Initial attempt + QUOTA_MAX_RETRIES retries.
+    assert session.post.call_count == QUOTA_MAX_RETRIES + 1
+
+
+def test_query_daily_quota_raises_without_retry(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.return_value = _fake_response(403, _DAILY_QUOTA_BODY)
+
+    with pytest.raises(GoogleSearchConsoleQuotaExceededError):
+        _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    assert session.post.call_count == 1
+
+
+def test_query_permission_error_is_not_retried(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.return_value = _fake_response(403, _PERMISSION_BODY)
+
+    with pytest.raises(requests.HTTPError, match="403 Client Error"):
+        _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    # Fatal on the first response — no retries.
+    assert session.post.call_count == 1
+
+
+def test_query_server_error_marks_retryable_after_max_retries(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.return_value = _fake_response(500)
+
+    # A persistent 5xx exhausts the inline budget. A bare HTTPError here used to reach
+    # get_non_retryable_errors/error tracking unmarked and get reported as a bug even though
+    # Temporal retries it anyway — raising the same marked error list_sites/list_sitemaps use
+    # keeps it classified as a self-recovering retry instead of noise.
+    with pytest.raises(GoogleSearchConsoleServerError, match=r"\(retryable\)"):
+        _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    assert session.post.call_count == QUOTA_MAX_RETRIES + 1
+
+
+def test_query_connection_error_bubbles_after_max_retries(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.side_effect = requests.ConnectionError("Connection aborted.")
+
+    # A persistent connection reset exhausts the inline budget and surfaces the real
+    # ConnectionError (retryable at the activity level).
+    with pytest.raises(requests.ConnectionError):
+        _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    assert session.post.call_count == QUOTA_MAX_RETRIES + 1
+
+
+def test_query_read_timeout_bubbles_after_max_retries(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.side_effect = requests.ReadTimeout("Read timed out.")
+
+    # A persistent read timeout exhausts the inline budget and surfaces the real
+    # ReadTimeout (retryable at the activity level).
+    with pytest.raises(requests.ReadTimeout):
+        _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    assert session.post.call_count == QUOTA_MAX_RETRIES + 1
+
+
+def test_query_truncated_body_bubbles_after_max_retries(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    truncated = _fake_response(200)
+    truncated.json.side_effect = requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead(...)")
+    session = mock.MagicMock()
+    session.post.return_value = truncated
+
+    # A persistently truncated response body (chunked transfer cut off mid-read) exhausts the
+    # inline budget and surfaces the real ChunkedEncodingError (retryable at the activity level).
+    with pytest.raises(requests.exceptions.ChunkedEncodingError):
+        _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    assert session.post.call_count == QUOTA_MAX_RETRIES + 1
+
+
+def test_query_retries_transient_token_refresh_error_then_succeeds(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.side_effect = [
+        # AuthorizedSession raises RefreshError from post() when the token endpoint 502s mid-refresh.
+        RefreshError(_HTML_502_BODY),
+        _fake_response(200, {"rows": [{"keys": ["2026-04-15"], "clicks": 1}]}),
+    ]
+
+    rows = _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    assert rows == [{"keys": ["2026-04-15"], "clicks": 1}]
+    assert session.post.call_count == 2
+
+
+def test_query_permanent_token_refresh_error_bubbles_without_retry(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.side_effect = RefreshError("invalid_grant: Token has been expired or revoked.")
+
+    # A revoked/expired refresh token never recovers, so it must bubble on the first attempt
+    # (matching get_non_retryable_errors' "invalid_grant") rather than burning the inline budget.
+    with pytest.raises(RefreshError, match="invalid_grant"):
+        _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    assert session.post.call_count == 1
+
+
+def test_query_token_refresh_transport_error_bubbles_after_max_retries(monkeypatch):
+    monkeypatch.setattr(gsc.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(gsc, "_throttle", lambda _site: None)
+
+    session = mock.MagicMock()
+    session.post.side_effect = TransportError("Cannot connect to proxy.")
+
+    # A persistent token-refresh transport failure exhausts the inline budget and surfaces the
+    # real TransportError (retryable at the activity level).
+    with pytest.raises(TransportError):
+        _query_search_analytics(session, "sc-domain:example.com", "2026-04-15", "2026-04-15", ["date"], 0)
+
+    assert session.post.call_count == QUOTA_MAX_RETRIES + 1
+
+
+def test_throttle_spaces_requests_per_site(monkeypatch):
+    gsc._next_request_at.clear()
+    fake_now = {"t": 100.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(gsc.time, "monotonic", lambda: fake_now["t"])
+    monkeypatch.setattr(gsc.time, "sleep", lambda s: sleeps.append(s))
+
+    # First call for a site doesn't wait; the next is spaced by the min interval.
+    gsc._throttle("sc-domain:example.com")
+    gsc._throttle("sc-domain:example.com")
+
+    assert sleeps == [pytest.approx(gsc._MIN_REQUEST_INTERVAL_SECONDS)]
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Already canonical — left untouched.
+        ("https://example.com/", "https://example.com/"),
+        ("sc-domain:example.com", "sc-domain:example.com"),
+        # Domain property with a capitalised prefix or domain, extra whitespace or a trailing slash.
+        ("Sc-domain:example.com", "sc-domain:example.com"),
+        ("SC-DOMAIN:Example.COM", "sc-domain:example.com"),
+        ("sc-domain: example.com", "sc-domain:example.com"),
+        ("sc-domain:example.com/", "sc-domain:example.com"),
+        ("Sc-Domain%3AExample.com", "sc-domain:example.com"),
+        # Percent-encoded values copied from a URL bar.
+        ("sc-domain%3Abidsstack.com", "sc-domain:bidsstack.com"),
+        ("sc-domain%3Atopol.io", "sc-domain:topol.io"),
+        ("https%3A%2F%2Fexample.com%2F", "https://example.com/"),
+        # URL-prefix property missing its trailing slash.
+        ("https://agentic30.app", "https://agentic30.app/"),
+        ("https://docebo.com", "https://docebo.com/"),
+        # Capitalized scheme/host — Google stores both lowercase, so an exact match needs them lowered.
+        ("Https://www.veteranpcs.com/", "https://www.veteranpcs.com/"),
+        ("HTTPS://Example.com", "https://example.com/"),
+        # Path case is preserved — it can be significant for a URL-prefix property.
+        ("Https://example.com/Blog", "https://example.com/Blog/"),
+        # Surrounding whitespace.
+        ("  https://example.com/  ", "https://example.com/"),
+        # Quotes copied along with the value, matched or not.
+        ("'sc-domain:example.com'", "sc-domain:example.com"),
+        ("'sc-domain:example.com", "sc-domain:example.com"),
+        ('"https://example.com"', "https://example.com/"),
+        ("\u2018sc-domain:example.com\u2019", "sc-domain:example.com"),
+        # A quote inside a URL path is part of the property, not a wrapper.
+        ("https://example.com/blog'", "https://example.com/blog'/"),
+        # The full Search Console UI URL — the property lives in resource_id.
+        (
+            "https://search.google.com/search-console/performance/search-analytics"
+            "?resource_id=https%3A%2F%2Fwww.viamar.ca%2F&metrics=CLICKS%2CIMPRESSIONS",
+            "https://www.viamar.ca/",
+        ),
+        # Bare hostname is ambiguous (URL-prefix vs domain) — left untouched.
+        ("agentic30.app", "agentic30.app"),
+        ("agentic30.app/", "agentic30.app/"),
+    ],
+)
+def test_normalize_site_url(raw, expected):
+    assert normalize_site_url(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "site_url,registered,expected",
+    [
+        # Bare hostname matches a registered URL-prefix property.
+        ("plotlens.ai", ["https://plotlens.ai/"], "https://plotlens.ai/"),
+        ("buyticketbrasil.com", ["https://buyticketbrasil.com/"], "https://buyticketbrasil.com/"),
+        # Bare hostname matches a registered domain property.
+        ("autocomply.dev", ["sc-domain:autocomply.dev"], "sc-domain:autocomply.dev"),
+        # URL-prefix preferred when both forms are registered.
+        ("example.com", ["sc-domain:example.com", "https://example.com/"], "https://example.com/"),
+        # A trailing slash on the bare hostname is tolerated.
+        ("plotlens.ai/", ["https://plotlens.ai/"], "https://plotlens.ai/"),
+        # An uppercase bare hostname is lowercased to match Google's canonical property names.
+        ("PlotLens.AI", ["https://plotlens.ai/"], "https://plotlens.ai/"),
+        ("EXAMPLE.COM", ["sc-domain:example.com"], "sc-domain:example.com"),
+        # A bare www hostname matches the domain property of the bare domain.
+        ("www.example.com", ["sc-domain:example.com"], "sc-domain:example.com"),
+        ("www.example.com/blog", ["sc-domain:example.com"], None),
+        # No registered property matches — nothing to suggest.
+        ("plotlens.ai", ["https://other.com/"], None),
+        # A root URL whose site is registered only as a domain property.
+        ("https://example.com/", ["sc-domain:example.com"], "sc-domain:example.com"),
+        ("https://www.example.com/", ["sc-domain:example.com"], "sc-domain:example.com"),
+        # A URL with a path would widen to the whole domain, so no suggestion.
+        ("https://example.com/blog/", ["sc-domain:example.com"], None),
+        ("https://plotlens.ai/", ["https://other.com/"], None),
+        ("sc-domain:plotlens.ai", ["sc-domain:plotlens.ai"], None),
+        # A domain property whose site is registered only as a root URL-prefix property.
+        ("sc-domain:example.com", ["https://example.com/"], "https://example.com/"),
+        ("sc-domain:example.com", ["http://www.example.com/"], "http://www.example.com/"),
+        ("sc-domain:example.com", ["https://example.com/blog/"], None),
+    ],
+)
+def test_suggest_registered_site(site_url, registered, expected):
+    assert suggest_registered_site(site_url, registered) == expected
+
+
+@pytest.mark.parametrize(
+    "resource_name",
+    [
+        "not_a_real_schema_image",
+        # `discover` is not an offered search type, so this is not a suffixed name.
+        "search_analytics_by_query_discover",
+        # Hourly data only exists for web search.
+        "search_analytics_by_hour_image",
+        "search_analytics_by_search_appearance_news",
+    ],
+)
+def test_unavailable_schema_names_raise(resource_name):
+    config = GoogleSearchConsoleSourceConfig(
+        site_url="https://example.com/",
+        google_search_console_integration_id=1,
+    )
+    with pytest.raises(ValueError):
+        google_search_console_source(
+            config=config,
+            resource_name=resource_name,
+            team_id=1,
+            resumable_source_manager=mock.MagicMock(),
+        )
+
+
+@pytest.mark.parametrize("resource_name", ["sites", "sitemaps"])
+@pytest.mark.parametrize(
+    "body,expected_error,expected_match",
+    [
+        (_QUOTA_BODY, GoogleSearchConsoleQuotaExceededError, r"\(retryable\)"),
+        (_PERMISSION_BODY, requests.HTTPError, "403 Client Error"),
+    ],
+)
+def test_property_listing_separates_quota_from_permission_denial(
+    monkeypatch, resource_name, body, expected_error, expected_match
+):
+    # A spent quota and a denied permission share the 403, and only the body separates them.
+    # The quota case reaching `raise_for_status` is what disabled the table over a condition
+    # that refills on its own.
+    config = GoogleSearchConsoleSourceConfig(
+        site_url="https://example.com/",
+        google_search_console_integration_id=1,
+    )
+    session = mock.MagicMock()
+    session.get.return_value = _fake_response(403, body)
+    monkeypatch.setattr(gsc, "google_search_console_session", lambda *a, **kw: session)
+
+    response = google_search_console_source(
+        config=config,
+        resource_name=resource_name,
+        team_id=1,
+        resumable_source_manager=mock.MagicMock(),
+    )
+
+    with pytest.raises(expected_error, match=expected_match):
+        list(response.items())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("resource_name", ["sites", "sitemaps"])
+@pytest.mark.parametrize(
+    "configure_session",
+    [
+        # A bare Google-side 5xx response used to reach `get_non_retryable_errors` as an
+        # unmarked HTTPError and get reported as an exception even though Temporal retries it anyway.
+        lambda session: setattr(session.get, "return_value", _fake_response(500)),
+        # `AuthorizedSession` refreshes the token before `session.get` returns anything, so a
+        # 502 from the token endpoint raised `RefreshError` here with no inline retry budget,
+        # same as the 5xx response case.
+        lambda session: setattr(session.get, "side_effect", RefreshError(_HTML_502_BODY)),
+    ],
+    ids=["5xx_response", "refresh_error_502"],
+)
+def test_property_listing_marks_server_error_retryable(monkeypatch, resource_name, configure_session):
+    config = GoogleSearchConsoleSourceConfig(
+        site_url="https://example.com/",
+        google_search_console_integration_id=1,
+    )
+    session = mock.MagicMock()
+    configure_session(session)
+    monkeypatch.setattr(gsc, "google_search_console_session", lambda *a, **kw: session)
+
+    response = google_search_console_source(
+        config=config,
+        resource_name=resource_name,
+        team_id=1,
+        resumable_source_manager=mock.MagicMock(),
+    )
+
+    with pytest.raises(GoogleSearchConsoleServerError, match=r"\(retryable\)"):
+        list(response.items())  # type: ignore[arg-type]
+
+
+def _appearance_row(appearance: str) -> dict:
+    return {"keys": [appearance], "clicks": 1, "impressions": 4, "ctr": 0.25, "position": 2.0}
+
+
+@pytest.mark.parametrize(
+    "last_value,resume_state,window_rows,expected_request_windows,expected_dates",
+    [
+        # No rich results in 16 months: one call over the window replaces one call per day.
+        (
+            None,
+            None,
+            [],
+            [("2025-01-05", "2026-04-27")],
+            [],
+        ),
+        (
+            dt.date(2026, 4, 25),
+            None,
+            [_appearance_row("VIDEO")],
+            [
+                ("2026-04-25", "2026-04-27"),
+                ("2026-04-25", "2026-04-25"),
+                ("2026-04-26", "2026-04-26"),
+                ("2026-04-27", "2026-04-27"),
+            ],
+            [dt.date(2026, 4, 25), dt.date(2026, 4, 26), dt.date(2026, 4, 27)],
+        ),
+        # A one-day window would ask the same question twice, so it skips the window call.
+        (
+            dt.date(2026, 4, 27),
+            None,
+            [],
+            [("2026-04-27", "2026-04-27")],
+            [dt.date(2026, 4, 27)],
+        ),
+        # A resumed run only asks about the days it has left.
+        (
+            dt.date(2026, 4, 20),
+            GoogleSearchConsoleResumeConfig(current_date="2026-04-26", start_row=0),
+            [],
+            [("2026-04-26", "2026-04-27")],
+            [],
+        ),
+        (
+            dt.date(2026, 4, 20),
+            GoogleSearchConsoleResumeConfig(current_date="2026-04-28", start_row=0),
+            [],
+            [],
+            [],
+        ),
+    ],
+)
+def test_search_appearance_skips_the_daily_walk_when_the_window_is_empty(
+    monkeypatch, last_value, resume_state, window_rows, expected_request_windows, expected_dates
+):
+    monkeypatch.setattr(gsc, "_today", lambda: TODAY)
+    monkeypatch.setattr(gsc, "_credentials", lambda *a, **kw: OAuthCredentials(token="token"))
+    monkeypatch.setattr(gsc, "_MIN_REQUEST_INTERVAL_SECONDS", 0.0)
+
+    def answer(request: RecordedRequest) -> ScriptedResponse:
+        body = json.loads(request.body or b"{}")
+        assert body["dimensions"] == ["searchAppearance"]
+        if body["startDate"] != body["endDate"]:
+            return ScriptedResponse(json={"rows": window_rows} if window_rows else {})
+        return ScriptedResponse(json={"rows": [_appearance_row("VIDEO")]})
+
+    config = GoogleSearchConsoleSourceConfig(site_url="https://example.com/", google_search_console_integration_id=1)
+    result = SourceDriver(GoogleSearchConsoleSource(), config).run(
+        "search_analytics_by_search_appearance",
+        answer,
+        resume_state=resume_state,
+        incremental_field="date",
+        db_incremental_field_last_value=last_value,
+    )
+
+    assert result.raised is None
+    request_windows = [
+        (json.loads(r.body or b"{}")["startDate"], json.loads(r.body or b"{}")["endDate"]) for r in result.requests
+    ]
+    assert request_windows == expected_request_windows
+    assert [row["date"] for row in result.rows] == expected_dates

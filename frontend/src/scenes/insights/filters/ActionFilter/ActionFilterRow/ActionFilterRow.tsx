@@ -1,0 +1,954 @@
+import './ActionFilterRow.scss'
+
+import { DraggableSyntheticListeners } from '@dnd-kit/core'
+import { useSortable } from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
+import clsx from 'clsx'
+import { useActions, useValues } from 'kea'
+import posthog from 'posthog-js'
+import { useCallback, useEffect } from 'react'
+
+import { IconCopy, IconFilter, IconGroupIntersect, IconPencil, IconTrash } from '@posthog/icons'
+import { lemonToast } from '@posthog/lemon-ui'
+import { Button } from '@posthog/quill'
+
+import { DefinitionView } from 'lib/components/DefinitionPopover/DefinitionPopoverContents'
+import { EntityFilterInfo } from 'lib/components/EntityFilterInfo'
+import { AddBehavioralFilterButton } from 'lib/components/PropertyFilters/components/AddBehavioralFilterButton'
+import { PropertyFilters } from 'lib/components/PropertyFilters/PropertyFilters'
+import { useQuillSurface } from 'lib/components/QuillSurface/quillSurfaceContext'
+import { SeriesGlyph, SeriesLetter } from 'lib/components/SeriesGlyph'
+import { defaultDataWarehousePopoverFields } from 'lib/components/TaxonomicFilter/taxonomicFilterLogic'
+import {
+    DataWarehousePopoverField,
+    DefinitionPopoverRenderer,
+    TaxonomicFilterGroupType,
+    isQuickFilterItem,
+    quickFilterToPropertyFilters,
+} from 'lib/components/TaxonomicFilter/types'
+import { TaxonomicPopover, TaxonomicPopoverProps } from 'lib/components/TaxonomicPopover/TaxonomicPopover'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { IconWithCount, SortableDragIcon } from 'lib/lemon-ui/icons'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { getEventNamesForAction } from 'lib/utils/events'
+import { databaseTableListLogic } from 'scenes/data-management/database/databaseTableListLogic'
+import {
+    FEATURE_FLAG_CALLED_EVENT,
+    FLAG_EVALUATIONS_TABLE,
+    readsFlagEvaluationsTable,
+    storesFlagCallsOutsideEvents,
+} from 'scenes/feature-flags/flagEvaluationsTable'
+import { insightDataLogic } from 'scenes/insights/insightDataLogic'
+import { insightLogic } from 'scenes/insights/insightLogic'
+import { teamLogic } from 'scenes/teamLogic'
+
+import { actionsModel } from '~/models/actionsModel'
+import { PropValue } from '~/models/propertyDefinitionsModel'
+import { DatabaseSerializedFieldType, NodeKind } from '~/queries/schema/schema-general'
+import {
+    AnyPropertyFilter,
+    BaseMathType,
+    InsightShortId,
+    PropertyFilterType,
+    PropertyFilterValue,
+    PropertyOperator,
+} from '~/types'
+
+import { funnelDataLogic } from 'products/product_analytics/frontend/insights/funnels/funnelDataLogic'
+import {
+    MathCategory,
+    mathTypeToApiValues,
+    mathsLogic,
+} from 'products/product_analytics/frontend/insights/trends/mathsLogic'
+
+import {
+    FLAG_CALLS_SERIES_DESCRIPTION,
+    flagCallsSeriesName,
+    FLAG_CALLS_UNSUPPORTED_MATH_TYPES,
+    FLAG_EVALUATIONS_SERIES_FIELDS,
+    flagCallsFiltersFromEventFilters,
+} from '../flagCallsSeries'
+import {
+    isActionsSeriesNode,
+    isAllEventsSeriesNode,
+    isEventsSeriesNode,
+    isWarehouseSeriesNode,
+    isWarehouseSeriesNodeKind,
+    seriesNodeKey,
+} from '../seriesNode'
+import { ActionFilterRowMenu } from './ActionFilterRowMenu'
+import { getValue, taxonomicGroupTypeToSeriesNodeKind } from './actionFilterRowUtils'
+import { HogQLMathEditorDropdown } from './HogQLMathEditor'
+import { MathSelector } from './MathSelector'
+import { getDefaultMathHogQLExpression } from './mathUtils'
+import { PropertyValueMathSelector } from './PropertyValueMathSelector'
+import { QuillActionFilterRowMenu } from './QuillActionFilterRowMenu'
+import { SaveAsActionBanner } from './SaveAsActionBanner'
+import type { ActionFilterRowProps } from './types'
+import { MathAvailability } from './types'
+
+// Re-export for backward compatibility
+export { MathSelector } from './MathSelector'
+
+interface DragHandleProps {
+    listeners: DraggableSyntheticListeners | undefined
+}
+
+const DragHandle = ({ listeners }: DragHandleProps): JSX.Element => (
+    <span className="ActionFilterRowDragHandle" {...listeners}>
+        <SortableDragIcon />
+    </span>
+)
+
+// The taxonomic filter's showNumericalPropsOnly flag doesn't filter warehouse schema columns,
+// so numeric-only pickers must not be fed non-numeric columns in the first place.
+const NUMERIC_SCHEMA_FIELD_TYPES: DatabaseSerializedFieldType[] = ['integer', 'float', 'decimal']
+
+// A warehouse series filter without a warehouse values endpoint falls back to the event values endpoint.
+// That endpoint scans recent events for a column that events do not carry, so these filters fetch no values.
+const NO_VALUE_SUGGESTIONS = (): PropValue[] => []
+
+function picksFlagCalledEvent(groupType: TaxonomicFilterGroupType | undefined, value: unknown): boolean {
+    return groupType === TaxonomicFilterGroupType.Events && value === FEATURE_FLAG_CALLED_EVENT
+}
+
+function withFlagCallsDescription(renderer: DefinitionPopoverRenderer | undefined): DefinitionPopoverRenderer {
+    return (props) =>
+        picksFlagCalledEvent(props.group.type, props.group.getValue?.(props.item)) ? (
+            <DefinitionView group={props.group} description={FLAG_CALLS_SERIES_DESCRIPTION} />
+        ) : (
+            (renderer?.(props) ?? props.defaultView)
+        )
+}
+
+// Which warehouse tables a row's picker may offer, by the caller's typeKey. Anything not listed
+// gets the unrestricted data warehouse group.
+const DATA_WAREHOUSE_GROUP_TYPE_BY_TYPE_KEY: Record<string, TaxonomicFilterGroupType> = {
+    'plugin-filters': TaxonomicFilterGroupType.DataWarehouseSourceTables,
+    'plugin-filters-view': TaxonomicFilterGroupType.DataWarehouseMaterializedViews,
+}
+
+export function ActionFilterRow({
+    logic,
+    node,
+    uuid,
+    index,
+    typeKey,
+    mathAvailability,
+    singleFilter,
+    hideFilter,
+    hideRename,
+    hideDuplicate = false,
+    hideDeleteBtn = false,
+    showCombine = false,
+    insightType,
+    allowBehavioralPropertyFilter = false,
+    propertyFiltersPopover = false,
+    onRenameClick = () => {},
+    showSeriesIndicator,
+    seriesIndicatorType = 'alpha',
+    filterCount,
+    sortable,
+    customRowSuffix,
+    hasBreakdown,
+    showNestedArrow = false,
+    actionsTaxonomicGroupTypes = [TaxonomicFilterGroupType.Events, TaxonomicFilterGroupType.Actions],
+    propertiesTaxonomicGroupTypes,
+    disabled = false,
+    readOnly = false,
+    renderRow,
+    trendsDisplayCategory,
+    showNumericalPropsOnly,
+    allowedMathTypes,
+    dataWarehousePopoverFields = defaultDataWarehousePopoverFields,
+    dataWarehouseNodeKind,
+    filtersLeftPadding = false,
+    addFilterDocLink,
+    excludedProperties,
+    includeHiddenEvents,
+    allowNonCapturedEvents,
+    flagCallsFromFlagEvaluations,
+    hogQLGlobals,
+    inlineEventsDocLink,
+    definitionPopoverRenderer,
+    operatorAllowlist,
+}: ActionFilterRowProps &
+    Pick<TaxonomicPopoverProps, 'excludedProperties' | 'includeHiddenEvents' | 'allowNonCapturedEvents'>): JSX.Element {
+    const effectiveActionsTaxonomicGroupTypes = [
+        TaxonomicFilterGroupType.SuggestedFilters,
+        ...actionsTaxonomicGroupTypes,
+    ]
+
+    const { currentTeam, currentTeamId } = useValues(teamLogic)
+    const buildsFlagCallsSeries = !!flagCallsFromFlagEvaluations && readsFlagEvaluationsTable(currentTeam)
+    const rowDefinitionPopoverRenderer = buildsFlagCallsSeries
+        ? withFlagCallsDescription(definitionPopoverRenderer)
+        : definitionPopoverRenderer
+    const { entityFilterVisible } = useValues(logic)
+    const {
+        updateSeriesEntity,
+        selectSeries,
+        updateSeriesOptional,
+        updateSeriesMath,
+        removeSeries,
+        updateSeriesProperties,
+        setEntityFilterVisibility,
+        duplicateSeries,
+        convertToGroup,
+    } = useActions(logic)
+    const { actions } = useValues(actionsModel({ shouldLoad: isActionsSeriesNode(node) }))
+    const { mathDefinitions } = useValues(mathsLogic)
+    const { allTablesMap } = useValues(databaseTableListLogic)
+    const { ensureAllTableFields } = useActions(databaseTableListLogic)
+    const isDataWarehouseFilter = isWarehouseSeriesNode(node)
+    // A flag calls series stands in for the event, so the picker reopens on the event row, not on the table.
+    const isFlagCallsSeries = isDataWarehouseFilter && node.table_name === FLAG_EVALUATIONS_TABLE
+    // The data warehouse map leaves out PostHog tables, which a flag calls series reads.
+    const seriesTable = isDataWarehouseFilter ? allTablesMap[node.table_name] : undefined
+    // The property values endpoint only serves warehouse tables and views.
+    const seriesValuesTableName =
+        seriesTable?.type === 'data_warehouse' || seriesTable?.type === 'view' ? seriesTable.name : undefined
+    useEffect(() => {
+        if (isDataWarehouseFilter) {
+            ensureAllTableFields()
+        }
+    }, [isDataWarehouseFilter, ensureAllTableFields])
+    const { featureFlags } = useValues(featureFlagLogic)
+    const quillSurface = useQuillSurface()
+
+    const mountedInsightDataLogic = insightDataLogic.findMounted({ dashboardItemId: typeKey })
+    const query = mountedInsightDataLogic?.values?.query
+
+    const isFunnelContext = mathAvailability === MathAvailability.FunnelsOnly
+    // Box plot has no math aggregation to pick — the property selector stands alone in place of the math selector.
+    const isBoxPlotContext = mathAvailability === MathAvailability.BoxPlotOnly
+    const isTrendsContext = trendsDisplayCategory != null
+    const suggestedFiltersLabel = isFunnelContext ? 'Suggested step' : isTrendsContext ? 'Suggested series' : undefined
+
+    // Always call hooks for React compliance - provide safe defaults for non-funnel contexts
+    // dashboardItemId should be the insight's id, but the typeKey might contain a /on-dashboard- suffix
+    const dashboardItemId = typeKey.split('/')[0] as InsightShortId
+    const { insightProps: funnelInsightProps } = useValues(
+        insightLogic({ dashboardItemId: isFunnelContext ? dashboardItemId : 'new' })
+    )
+    const { isStepOptional: funnelIsStepOptional } = useValues(funnelDataLogic(funnelInsightProps))
+
+    // Only use the funnel results when in funnel context
+    const isStepOptional = isFunnelContext ? funnelIsStepOptional : () => false
+
+    const {
+        setNodeRef,
+        attributes: { 'aria-disabled': _, ...attributes },
+        transform,
+        transition,
+        listeners,
+        isDragging,
+    } = useSortable({ id: uuid })
+
+    const propertyFiltersVisible = entityFilterVisible[index]
+
+    let name: string | null | undefined, value: PropertyFilterValue
+    const {
+        math,
+        math_property: mathProperty,
+        math_property_type: mathPropertyType,
+        math_hogql: mathHogQL,
+        math_group_type_index: mathGroupTypeIndex,
+    } = node
+    const defaultMathHogQLExpression = getDefaultMathHogQLExpression(insightType)
+
+    const onClose = (): void => {
+        removeSeries(index)
+    }
+
+    const onRename = (): void => {
+        selectSeries(index, node, uuid)
+        onRenameClick()
+    }
+
+    const onDuplicate = (): void => {
+        duplicateSeries(index)
+    }
+
+    const onCombine = (): void => {
+        convertToGroup(index)
+        posthog.capture('combine_events', {
+            insight_type: insightType,
+            team_id: currentTeamId,
+        })
+    }
+
+    const onPropertyChange = useCallback(
+        (properties: AnyPropertyFilter[]) => updateSeriesProperties(index, properties),
+        [updateSeriesProperties, index]
+    )
+
+    /**
+     * The pseudo-event groups (Pageview / Screen / Autocapture events) and
+     * quick filters don't map to a plain `EntityType` — they expand into a
+     * base event plus a property filter.
+     */
+    const applyTaxonomicSelection = useCallback(
+        (
+            taxonomicGroupType: TaxonomicFilterGroupType,
+            changedValue: string | number | null | undefined,
+            item: any
+        ): void => {
+            if (isQuickFilterItem(item)) {
+                if (item.eventName) {
+                    updateSeriesEntity(index, { kind: NodeKind.EventsNode, key: item.eventName, name: item.eventName })
+                }
+                updateSeriesProperties(index, quickFilterToPropertyFilters(item))
+                return
+            }
+            if (taxonomicGroupType === TaxonomicFilterGroupType.PageviewEvents) {
+                updateSeriesEntity(index, { kind: NodeKind.EventsNode, key: '$pageview', name: '$pageview' })
+                updateSeriesProperties(index, [
+                    {
+                        key: '$current_url',
+                        value: changedValue ? String(changedValue) : '',
+                        operator: PropertyOperator.IContains,
+                        type: PropertyFilterType.Event,
+                    },
+                ])
+                return
+            }
+            if (taxonomicGroupType === TaxonomicFilterGroupType.ScreenEvents) {
+                updateSeriesEntity(index, { kind: NodeKind.EventsNode, key: '$screen', name: '$screen' })
+                updateSeriesProperties(index, [
+                    {
+                        key: '$screen_name',
+                        value: changedValue ? String(changedValue) : '',
+                        operator: PropertyOperator.Exact,
+                        type: PropertyFilterType.Event,
+                    },
+                ])
+                return
+            }
+            if (buildsFlagCallsSeries && picksFlagCalledEvent(taxonomicGroupType, changedValue)) {
+                updateSeriesEntity(index, {
+                    kind: dataWarehouseNodeKind ?? NodeKind.DataWarehouseNode,
+                    key: FLAG_EVALUATIONS_TABLE,
+                    name: flagCallsSeriesName(),
+                    ...FLAG_EVALUATIONS_SERIES_FIELDS,
+                })
+                if (isEventsSeriesNode(node) && node.event === FEATURE_FLAG_CALLED_EVENT) {
+                    const flagCallsFilters = flagCallsFiltersFromEventFilters(node.properties)
+                    updateSeriesProperties(index, flagCallsFilters)
+                    const removedCount = (node.properties?.length ?? 0) - flagCallsFilters.length
+                    if (removedCount > 0) {
+                        lemonToast.info(
+                            `${flagCallsSeriesName()} supports only flag key, response and SQL filters, so ${removedCount} other ${removedCount === 1 ? 'filter was' : 'filters were'} removed.`
+                        )
+                    }
+                }
+                if (node.math && FLAG_CALLS_UNSUPPORTED_MATH_TYPES.has(node.math)) {
+                    updateSeriesMath(index, {
+                        math: undefined,
+                        math_group_type_index: undefined,
+                        math_property: undefined,
+                        math_property_type: undefined,
+                        math_hogql: undefined,
+                    })
+                }
+                return
+            }
+            if (taxonomicGroupType === TaxonomicFilterGroupType.AutocaptureEvents) {
+                updateSeriesEntity(index, { kind: NodeKind.EventsNode, key: '$autocapture', name: '$autocapture' })
+                updateSeriesProperties(index, [
+                    {
+                        key: '$el_text',
+                        value: changedValue ? String(changedValue) : '',
+                        operator: PropertyOperator.Exact,
+                        type: PropertyFilterType.Event,
+                    },
+                ])
+                return
+            }
+            const kind = taxonomicGroupTypeToSeriesNodeKind(taxonomicGroupType, dataWarehouseNodeKind)
+            if (isWarehouseSeriesNodeKind(kind)) {
+                const extraValues = Object.fromEntries(dataWarehousePopoverFields.map(({ key }) => [key, item?.[key]]))
+                updateSeriesEntity(index, {
+                    kind,
+                    key: item?.name ?? (changedValue ? String(changedValue) : null),
+                    name: item?.name ?? '',
+                    ...extraValues,
+                })
+            } else {
+                updateSeriesEntity(index, {
+                    kind,
+                    key: changedValue ?? null,
+                    name: item?.name ?? '',
+                })
+            }
+        },
+        [
+            updateSeriesEntity,
+            updateSeriesProperties,
+            updateSeriesMath,
+            index,
+            dataWarehousePopoverFields,
+            dataWarehouseNodeKind,
+            buildsFlagCallsSeries,
+            node,
+        ]
+    )
+
+    const onMathSelect = (_: unknown, selectedMath?: string): void => {
+        let mathProperties
+        if (selectedMath) {
+            const math_property =
+                mathDefinitions[selectedMath]?.category === MathCategory.PropertyValue
+                    ? (mathProperty ?? '$time')
+                    : undefined
+            const math_hogql =
+                mathDefinitions[selectedMath]?.category === MathCategory.HogQLExpression
+                    ? (mathHogQL ?? defaultMathHogQLExpression)
+                    : undefined
+            mathProperties = {
+                ...mathTypeToApiValues(selectedMath),
+                math_property,
+                math_hogql,
+                math_property_type: mathPropertyType,
+            }
+        } else {
+            mathProperties = {
+                math_property: undefined,
+                math_property_type: undefined,
+                math_hogql: undefined,
+                math_group_type_index: undefined,
+                math: undefined,
+            }
+        }
+
+        updateSeriesMath(index, mathProperties)
+    }
+
+    const onMathPropertySelect = (_: unknown, property: string, groupType: TaxonomicFilterGroupType): void => {
+        updateSeriesMath(index, {
+            math,
+            math_hogql: undefined,
+            math_property: property,
+            math_property_type: groupType,
+            math_group_type_index: mathGroupTypeIndex,
+        })
+    }
+
+    const onMathHogQLSelect = (_: unknown, hogql: string): void => {
+        updateSeriesMath(index, {
+            math,
+            math_property: undefined,
+            math_property_type: undefined,
+            math_hogql: hogql,
+            math_group_type_index: mathGroupTypeIndex,
+        })
+    }
+
+    const nodeKey = seriesNodeKey(node)
+    if (isActionsSeriesNode(node)) {
+        const action = actions.find((action) => action.id === node.id)
+        name = action?.name || node.name
+        value = action?.id || node.id
+    } else {
+        name = node.name || String(nodeKey)
+        // The node's own key is the event actually queried — `name` can be a rename (e.g. set via
+        // the API), and committing it as the taxonomic value would select a non-existent event.
+        value = isFlagCallsSeries
+            ? FEATURE_FLAG_CALLED_EVENT
+            : nodeKey != null && nodeKey !== ''
+              ? nodeKey
+              : (node.name ?? null)
+    }
+
+    const seriesIndicator =
+        seriesIndicatorType === 'numeric' ? (
+            <SeriesGlyph style={{ borderColor: 'var(--color-border-primary)' }}>{index + 1}</SeriesGlyph>
+        ) : (
+            <SeriesLetter seriesIndex={index} hasBreakdown={hasBreakdown} />
+        )
+
+    // A behavioral filter compiles to a person_id subquery over the events table, which a warehouse series has no key for
+    const behavioralFiltersEnabled =
+        allowBehavioralPropertyFilter &&
+        !!featureFlags[FEATURE_FLAGS.BEHAVIORAL_PROPERTY_FILTER] &&
+        !isDataWarehouseFilter
+    // CDP destination/workflow filters restrict the picker to the one warehouse table family their
+    // trigger fires on, so each family gets its own typeKey.
+    const dataWarehouseGroupType =
+        DATA_WAREHOUSE_GROUP_TYPE_BY_TYPE_KEY[typeKey] ?? TaxonomicFilterGroupType.DataWarehouse
+    // The committed value's real group — it drives the picker's committed-selection
+    // affordance (selected row floats to the top, with the series' rename applied).
+    // The picker still opens on the suggested-filters surface either way. All-events
+    // and inline-group series have no single committed row to promote.
+    const initialGroupType = isFlagCallsSeries
+        ? TaxonomicFilterGroupType.Events
+        : isDataWarehouseFilter
+          ? dataWarehouseGroupType
+          : isActionsSeriesNode(node)
+            ? TaxonomicFilterGroupType.Actions
+            : isEventsSeriesNode(node) && !isAllEventsSeriesNode(node) && nodeKey != null && nodeKey !== ''
+              ? TaxonomicFilterGroupType.Events
+              : TaxonomicFilterGroupType.SuggestedFilters
+
+    // DWH events are not supported in inline events yet
+    const canCombine = showCombine && !singleFilter && !isDataWarehouseFilter
+
+    const filterElement = (
+        <TaxonomicPopover
+            data-attr={'trend-element-subject-' + index}
+            fullWidth
+            truncate
+            groupType={initialGroupType}
+            value={getValue(value, node)}
+            filter={node}
+            suggestedFiltersLabel={suggestedFiltersLabel}
+            enableKeywordShortcuts
+            promoteSelectedItemToFirstPosition
+            selectingKeyOnly
+            onChange={(changedValue, taxonomicGroupType, item) =>
+                applyTaxonomicSelection(taxonomicGroupType, changedValue, item)
+            }
+            renderValue={() => <EntityFilterInfo filter={node} showIcon />}
+            groupTypes={effectiveActionsTaxonomicGroupTypes}
+            placeholder="All events"
+            placeholderClass=""
+            disabled={disabled || readOnly}
+            showNumericalPropsOnly={showNumericalPropsOnly}
+            dataWarehousePopoverFields={
+                typeKey === 'plugin-filters' ? ([] as DataWarehousePopoverField[]) : dataWarehousePopoverFields
+            }
+            excludedProperties={excludedProperties}
+            // The hidden flag-call event shows again, because picking it builds the flag_evaluations series.
+            // On mode 2 a stand-in row replaces it in search results, because the team may have no definition left to list.
+            includeHiddenEvents={includeHiddenEvents || flagCallsFromFlagEvaluations}
+            offerHiddenEventStandIns={buildsFlagCallsSeries && storesFlagCallsOutsideEvents(currentTeam)}
+            allowNonCapturedEvents={allowNonCapturedEvents}
+            definitionPopoverRenderer={rowDefinitionPopoverRenderer}
+        />
+    )
+
+    const suffix = typeof customRowSuffix === 'function' ? customRowSuffix({ node, index, onClose }) : customRowSuffix
+
+    const propertyFilterCount = node.properties?.length || 0
+    const propertyFiltersDisabledReason = nodeKey === 'empty' ? 'Please select an event first' : undefined
+    const togglePropertyFilters = (): void => {
+        setEntityFilterVisibility(index, !propertyFiltersVisible)
+    }
+    const propertyFiltersLabel = propertyFilterCount ? `Show filters (${propertyFilterCount})` : 'Show filters'
+
+    const propertyFiltersButton = quillSurface ? (
+        <Button
+            key="property-filter"
+            size="icon"
+            indicator={propertyFilterCount > 0 ? 'default' : undefined}
+            aria-label={propertyFiltersLabel}
+            tooltip={propertyFiltersLabel}
+            aria-expanded={propertyFiltersVisible}
+            data-attr={`show-prop-filter-${index}`}
+            disabledReason={propertyFiltersDisabledReason}
+            onClick={togglePropertyFilters}
+        >
+            <IconFilter />
+        </Button>
+    ) : (
+        <IconWithCount key="property-filter" count={propertyFilterCount} showZero={false}>
+            <LemonButton
+                icon={<IconFilter />}
+                title="Show filters"
+                data-attr={`show-prop-filter-${index}`}
+                noPadding
+                active={propertyFiltersVisible}
+                onClick={togglePropertyFilters}
+                disabledReason={propertyFiltersDisabledReason}
+                tooltip="Show filters"
+                tooltipDocLink={addFilterDocLink}
+            />
+        </IconWithCount>
+    )
+
+    // Enable popup menu for funnels and trends contexts where we want to show rename/duplicate/delete/etc in a menu
+    const enablePopup = mathAvailability === MathAvailability.FunnelsOnly || isTrendsContext
+
+    const renameRowButton = quillSurface ? (
+        <Button
+            key="rename"
+            size="icon"
+            aria-label="Rename graph series"
+            tooltip="Rename graph series"
+            data-attr={`show-prop-rename-${index}`}
+            onClick={onRename}
+        >
+            <IconPencil />
+        </Button>
+    ) : (
+        <LemonButton
+            key="rename"
+            icon={<IconPencil />}
+            title="Rename graph series"
+            data-attr={`show-prop-rename-${index}`}
+            noPadding={!enablePopup}
+            onClick={onRename}
+            fullWidth={enablePopup}
+        >
+            {enablePopup ? 'Rename' : undefined}
+        </LemonButton>
+    )
+
+    const duplicateRowButton = quillSurface ? (
+        <Button
+            key="duplicate"
+            size="icon"
+            aria-label="Duplicate graph series"
+            tooltip="Duplicate graph series"
+            data-attr={`show-prop-duplicate-${index}`}
+            onClick={onDuplicate}
+        >
+            <IconCopy />
+        </Button>
+    ) : (
+        <LemonButton
+            key="duplicate"
+            icon={<IconCopy />}
+            title="Duplicate graph series"
+            data-attr={`show-prop-duplicate-${index}`}
+            noPadding={!enablePopup}
+            onClick={onDuplicate}
+            fullWidth={enablePopup}
+        >
+            {enablePopup ? 'Duplicate' : undefined}
+        </LemonButton>
+    )
+
+    const combineInlineButton = quillSurface ? (
+        <Button
+            key="combine-inline"
+            size="icon"
+            aria-label="Count multiple events as a single event"
+            tooltip="Count multiple events as a single event"
+            data-attr={`show-prop-combine-${index}`}
+            onClick={onCombine}
+        >
+            <IconGroupIntersect />
+        </Button>
+    ) : (
+        <LemonButton
+            key="combine-inline"
+            icon={<IconGroupIntersect />}
+            data-attr={`show-prop-combine-${index}`}
+            noPadding={!enablePopup}
+            onClick={onCombine}
+            tooltip="Count multiple events as a single event"
+            tooltipDocLink={inlineEventsDocLink}
+            fullWidth={enablePopup}
+        >
+            {enablePopup ? 'Combine' : undefined}
+        </LemonButton>
+    )
+
+    const deleteButton = quillSurface ? (
+        <Button
+            key="delete"
+            size="icon"
+            aria-label="Delete graph series"
+            tooltip="Delete graph series"
+            data-attr={`delete-prop-filter-${index}`}
+            onClick={onClose}
+        >
+            <IconTrash />
+        </Button>
+    ) : (
+        <LemonButton
+            key="delete"
+            status={enablePopup ? 'danger' : 'default'}
+            icon={<IconTrash />}
+            title="Delete graph series"
+            data-attr={`delete-prop-filter-${index}`}
+            noPadding={!enablePopup}
+            onClick={onClose}
+            fullWidth={enablePopup}
+        >
+            {enablePopup ? 'Delete' : undefined}
+        </LemonButton>
+    )
+
+    const rowStartElements = [
+        sortable && filterCount > 1 ? <DragHandle key="drag-handle" listeners={listeners} /> : null,
+        showSeriesIndicator && <div key="series-indicator">{seriesIndicator}</div>,
+    ].filter(Boolean)
+
+    // Check if popup would have any menu items (excluding filter button which is always outside the menu)
+    const hasMenuItems =
+        isFunnelContext ||
+        !hideRename ||
+        (!hideDuplicate && !singleFilter) ||
+        (!hideDeleteBtn && !singleFilter) ||
+        canCombine
+    const showPopupMenu = !readOnly && enablePopup && hasMenuItems
+
+    // When not using popup, show elements inline
+    const rowEndElements =
+        !readOnly && !showPopupMenu
+            ? [
+                  !hideFilter && propertyFiltersButton,
+                  canCombine && combineInlineButton,
+                  !hideRename && renameRowButton,
+                  !hideDuplicate && !singleFilter && duplicateRowButton,
+                  !hideDeleteBtn && !singleFilter && deleteButton,
+              ].filter(Boolean)
+            : []
+
+    return (
+        <li
+            className={clsx(
+                'ActionFilterRow relative @max-[400px]/editor-panel:border @max-[400px]/editor-panel:rounded @max-[400px]/editor-panel:p-2',
+                quillSurface && 'ActionFilterRow--quill'
+            )}
+            ref={setNodeRef}
+            {...attributes}
+            // eslint-disable-next-line react/forbid-dom-props
+            style={{
+                zIndex: isDragging ? 1 : undefined,
+                transform: CSS.Translate.toString(transform),
+                transition,
+            }}
+        >
+            <div className="ActionFilterRow-content @max-[400px]/editor-panel:flex-wrap @max-[400px]/editor-panel:gap-2 @max-[400px]/editor-panel:w-full @max-[400px]/editor-panel:items-center @max-[400px]/editor-panel:justify-between @max-[400px]/editor-panel:[&>*+*]:ml-0">
+                {renderRow ? (
+                    renderRow({
+                        seriesIndicator,
+                        filter: filterElement,
+                        suffix,
+                        propertyFiltersButton: propertyFiltersButton,
+                        renameRowButton,
+                        deleteButton,
+                    })
+                ) : (
+                    <>
+                        {/* left section fixed */}
+                        {rowStartElements.length ? (
+                            <div className="ActionFilterRow__start @max-[400px]/editor-panel:[height:auto]">
+                                {rowStartElements}
+                            </div>
+                        ) : null}
+                        {/* central section flexible */}
+                        <div
+                            className={clsx(
+                                'ActionFilterRow__center',
+                                rowStartElements.length > 0 &&
+                                    '@max-[400px]/editor-panel:basis-full @max-[400px]/editor-panel:order-1 @max-[400px]/editor-panel:min-w-0 @max-[400px]/editor-panel:[&>*]:basis-full'
+                            )}
+                        >
+                            <div className="flex-1 min-w-36 overflow-hidden">{filterElement}</div>
+                            {customRowSuffix !== undefined && <>{suffix}</>}
+                            {mathAvailability !== MathAvailability.None &&
+                                mathAvailability !== MathAvailability.FunnelsOnly && (
+                                    <>
+                                        {!isBoxPlotContext && (
+                                            <div className="@min-[0px]/editor-panel:shrink @min-[0px]/editor-panel:min-w-28 @min-[0px]/editor-panel:overflow-hidden">
+                                                <MathSelector
+                                                    math={math}
+                                                    mathGroupTypeIndex={mathGroupTypeIndex}
+                                                    index={index}
+                                                    onMathSelect={onMathSelect}
+                                                    disabled={readOnly}
+                                                    style={{ maxWidth: '100%', width: 'initial' }}
+                                                    mathAvailability={mathAvailability}
+                                                    trendsDisplayCategory={trendsDisplayCategory}
+                                                    allowedMathTypes={allowedMathTypes}
+                                                    excludedMathTypes={
+                                                        isFlagCallsSeries
+                                                            ? FLAG_CALLS_UNSUPPORTED_MATH_TYPES
+                                                            : undefined
+                                                    }
+                                                    query={query || {}}
+                                                    fullWidth
+                                                    truncateText={{ maxWidthClass: 'max-w-full' }}
+                                                />
+                                            </div>
+                                        )}
+                                        {(isBoxPlotContext ||
+                                            mathDefinitions[math || BaseMathType.TotalCount]?.category ===
+                                                MathCategory.PropertyValue) && (
+                                            <PropertyValueMathSelector
+                                                mathPropertyType={
+                                                    // For warehouse series, don't trust mathPropertyType — a swap from an
+                                                    // event series can leave a stale non-warehouse group on the filter.
+                                                    isDataWarehouseFilter
+                                                        ? TaxonomicFilterGroupType.DataWarehouseProperties
+                                                        : (mathPropertyType as TaxonomicFilterGroupType) ||
+                                                          TaxonomicFilterGroupType.NumericalEventProperties
+                                                }
+                                                mathPropertyTypes={
+                                                    isDataWarehouseFilter
+                                                        ? [TaxonomicFilterGroupType.DataWarehouseProperties]
+                                                        : [
+                                                              TaxonomicFilterGroupType.NumericalEventProperties,
+                                                              TaxonomicFilterGroupType.SessionProperties,
+                                                              TaxonomicFilterGroupType.PersonProperties,
+                                                              TaxonomicFilterGroupType.DataWarehousePersonProperties,
+                                                          ]
+                                                }
+                                                mathProperty={mathProperty}
+                                                mathName={name}
+                                                index={index}
+                                                onMathPropertySelect={onMathPropertySelect}
+                                                showNumericalPropsOnly={isBoxPlotContext || showNumericalPropsOnly}
+                                                schemaColumns={
+                                                    seriesTable
+                                                        ? Object.values(seriesTable.fields).filter(
+                                                              (field) =>
+                                                                  !(isBoxPlotContext || showNumericalPropsOnly) ||
+                                                                  NUMERIC_SCHEMA_FIELD_TYPES.includes(field.type)
+                                                          )
+                                                        : []
+                                                }
+                                                mathDisplayName={
+                                                    isBoxPlotContext
+                                                        ? undefined
+                                                        : mathDefinitions[math ?? '']?.name.toLowerCase()
+                                                }
+                                                placeholder={isBoxPlotContext ? 'Select numeric property' : undefined}
+                                                dataAttr={isBoxPlotContext ? 'box-plot-property-select' : undefined}
+                                            />
+                                        )}
+                                        {mathDefinitions[math || BaseMathType.TotalCount]?.category ===
+                                            MathCategory.HogQLExpression && (
+                                            <HogQLMathEditorDropdown
+                                                mathHogQL={mathHogQL}
+                                                index={index}
+                                                onMathHogQLSelect={onMathHogQLSelect}
+                                            />
+                                        )}
+                                    </>
+                                )}
+                        </div>
+                        {/* right section fixed */}
+                        {(rowEndElements.length > 0 || showPopupMenu) && (
+                            <div className="ActionFilterRow__end @max-[400px]/editor-panel:gap-1 @max-[400px]/editor-panel:[height:auto]">
+                                {showPopupMenu ? (
+                                    <>
+                                        {!hideFilter && propertyFiltersButton}
+                                        {quillSurface ? (
+                                            <QuillActionFilterRowMenu
+                                                index={index}
+                                                isTrendsContext={isTrendsContext}
+                                                isFunnelContext={isFunnelContext}
+                                                isStepOptional={isStepOptional}
+                                                mathSelectorProps={{
+                                                    math,
+                                                    mathGroupTypeIndex,
+                                                    index,
+                                                    onMathSelect,
+                                                    disabled: readOnly,
+                                                    mathAvailability,
+                                                    trendsDisplayCategory,
+                                                    query: query || {},
+                                                }}
+                                                optionalInFunnel={node.optionalInFunnel}
+                                                onUpdateOptional={(checked) => {
+                                                    updateSeriesOptional(index, checked)
+                                                }}
+                                                onCombine={canCombine ? onCombine : undefined}
+                                                onRename={!hideRename ? onRename : undefined}
+                                                onDuplicate={!hideDuplicate && !singleFilter ? onDuplicate : undefined}
+                                                onDelete={!hideDeleteBtn && !singleFilter ? onClose : undefined}
+                                            />
+                                        ) : (
+                                            <ActionFilterRowMenu
+                                                index={index}
+                                                isTrendsContext={isTrendsContext}
+                                                isFunnelContext={isFunnelContext}
+                                                isStepOptional={isStepOptional}
+                                                math={math}
+                                                mathGroupTypeIndex={mathGroupTypeIndex}
+                                                mathAvailability={mathAvailability}
+                                                trendsDisplayCategory={trendsDisplayCategory}
+                                                readOnly={readOnly}
+                                                query={query || {}}
+                                                filter={node}
+                                                hideRename={!!hideRename}
+                                                hideDuplicate={hideDuplicate}
+                                                hideDeleteBtn={hideDeleteBtn}
+                                                singleFilter={!!singleFilter}
+                                                onMathSelect={onMathSelect}
+                                                onUpdateOptional={(checked) => {
+                                                    updateSeriesOptional(index, checked)
+                                                }}
+                                                renameRowButton={renameRowButton}
+                                                duplicateRowButton={duplicateRowButton}
+                                                deleteButton={deleteButton}
+                                                combineButton={canCombine ? combineInlineButton : null}
+                                            />
+                                        )}
+                                    </>
+                                ) : (
+                                    rowEndElements
+                                )}
+                            </div>
+                        )}
+                    </>
+                )}
+            </div>
+
+            {propertyFiltersVisible && (
+                <div className={`ActionFilterRow-filters${filtersLeftPadding ? ' pl-7' : ''}`}>
+                    <PropertyFilters
+                        pageKey={`${index}-${value}-${typeKey}-filter`}
+                        propertyFilters={node.properties}
+                        onChange={onPropertyChange}
+                        showNestedArrow={showNestedArrow}
+                        disablePopover={!propertyFiltersPopover}
+                        metadataSource={
+                            isWarehouseSeriesNode(node)
+                                ? {
+                                      kind: NodeKind.HogQLQuery,
+                                      // The SQL check appends the filter expression to this select list. Select a
+                                      // constant, because only some warehouse node kinds carry an aggregation target.
+                                      query: `select 1 from ${node.table_name}`,
+                                  }
+                                : undefined
+                        }
+                        taxonomicGroupTypes={
+                            isDataWarehouseFilter
+                                ? [
+                                      TaxonomicFilterGroupType.DataWarehouseProperties,
+                                      TaxonomicFilterGroupType.HogQLExpression,
+                                  ]
+                                : propertiesTaxonomicGroupTypes
+                        }
+                        eventNames={
+                            isEventsSeriesNode(node) && node.event
+                                ? [String(node.event)]
+                                : isActionsSeriesNode(node) && node.id
+                                  ? getEventNamesForAction(node.id, actions)
+                                  : []
+                        }
+                        schemaColumns={seriesTable ? Object.values(seriesTable.fields) : []}
+                        dataWarehouseTableName={seriesValuesTableName}
+                        staticValueOptions={
+                            isDataWarehouseFilter && !seriesValuesTableName ? NO_VALUE_SUGGESTIONS : undefined
+                        }
+                        addFilterDocLink={addFilterDocLink}
+                        excludedProperties={excludedProperties}
+                        hogQLGlobals={hogQLGlobals}
+                        operatorAllowlist={operatorAllowlist}
+                        framedRows={behavioralFiltersEnabled}
+                        addText={behavioralFiltersEnabled ? 'Filter' : undefined}
+                        addFilterSuffix={
+                            behavioralFiltersEnabled
+                                ? (addFilter) => (
+                                      <AddBehavioralFilterButton
+                                          data-attr={`${index}-${value}-${typeKey}-add-behavioral-filter`}
+                                          onAdd={addFilter}
+                                      />
+                                  )
+                                : null
+                        }
+                    />
+                    <SaveAsActionBanner node={node} />
+                </div>
+            )}
+        </li>
+    )
+}

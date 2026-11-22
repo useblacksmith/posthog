@@ -1,0 +1,362 @@
+from enum import StrEnum
+from typing import Literal
+
+from semantic_version import Version
+
+FROZEN_POSTHOG_VERSION = Version("1.43.0")  # Frozen at the last self-hosted version, just for backwards compat now
+INTERNAL_BOT_EMAIL_SUFFIX = "@posthogbot.user"
+POSTHOG_INTERNAL_EMAIL_SUFFIX = "@posthog.com"
+
+# Any `$ai_*` event is an AI event: capture and the AI pipeline route on it, and billing meters
+# it as LLM analytics. nodejs `AI_EVENT_NAME_PREFIX` and Rust `AI_LANE_NAME_PREFIX` pin the same literal.
+AI_EVENT_NAME_PREFIX = "$ai_"
+
+MCP_EVENT_NAME_PREFIX = "$mcp_"
+
+
+# N.B. Keep this in sync with frontend enum (types.ts)
+# AND ensure it is added to the Billing Service
+class AvailableFeature(StrEnum):
+    ZAPIER = "zapier"
+    ORGANIZATIONS_PROJECTS = "organizations_projects"
+    SOCIAL_SSO = "social_sso"
+    SAML = "saml"
+    OIDC = "oidc"
+    SCIM = "scim"
+    SSO_ENFORCEMENT = "sso_enforcement"
+    ADVANCED_PERMISSIONS = "advanced_permissions"  # TODO: Remove this once access_control is propagated
+    ACCESS_CONTROL = "access_control"
+    PROPERTY_ACCESS_CONTROL = "property_access_control"
+    INGESTION_TAXONOMY = "ingestion_taxonomy"
+    PATHS_ADVANCED = "paths_advanced"
+    CORRELATION_ANALYSIS = "correlation_analysis"
+    GROUP_ANALYTICS = "group_analytics"
+    BEHAVIORAL_COHORT_FILTERING = "behavioral_cohort_filtering"
+    WHITE_LABELLING = "white_labelling"
+    SUBSCRIPTIONS = "subscriptions"
+    APP_METRICS = "app_metrics"
+    RECORDINGS_PLAYLISTS = "recordings_playlists"
+    ROLE_BASED_ACCESS = "role_based_access"
+    RECORDINGS_FILE_EXPORT = "recordings_file_export"
+    RECORDINGS_PERFORMANCE = "recordings_performance"
+    SURVEYS_STYLING = "surveys_styling"
+    SURVEYS_TEXT_HTML = "surveys_text_html"
+    SURVEYS_RECURRING = "surveys_recurring"
+    SURVEYS_MULTIPLE_QUESTIONS = "surveys_multiple_questions"
+    AUTOMATIC_PROVISIONING = "automatic_provisioning"
+    HIPAA_BAA = "hipaa_baa"
+    MANAGED_REVERSE_PROXY = "managed_reverse_proxy"
+    DATA_PIPELINES = "data_pipelines"
+    ALERTS = "alerts"
+    HIGH_FREQUENCY_ALERTS = "high_frequency_alerts"
+    REAL_TIME_ALERTS = "real_time_alerts"
+    DATA_MODELING_REFRESH_INTERVAL = "data_modeling_refresh_interval"
+    REALTIME_COHORTS = "realtime_cohorts"
+    REALTIME_COHORTS_HISTORY = "realtime_cohorts_history"
+    DATA_COLOR_THEMES = "data_color_themes"
+    API_QUERIES_CONCURRENCY = "api_queries_concurrency"
+    ORGANIZATION_INVITE_SETTINGS = "organization_invite_settings"
+    TWO_FACTOR_ENFORCEMENT = "2fa_enforcement"
+    ORGANIZATION_SECURITY_SETTINGS = "organization_security_settings"
+    IP_RESTRICTIONS = "ip_restrictions"
+    MEMBER_GOVERNANCE = "member_governance"
+    SSF = "ssf"
+    ORGANIZATION_APP_QUERY_CONCURRENCY_LIMIT = "organization_app_query_concurrency_limit"
+    SESSION_REPLAY_DATA_RETENTION = "session_replay_data_retention"
+    PRODUCT_ANALYTICS_DATA_RETENTION = "product_analytics_data_retention"
+    PRODUCT_ANALYTICS_STANDARD_DATA_RETENTION = "product_analytics_standard_data_retention"
+    LOGS_RETENTION_30D = "logs_retention_30d"
+    AUDIT_LOGS = "audit_logs"
+    APPROVALS = "approvals"
+    XAA_AUTHENTICATION = "xaa_authentication"
+    POSTHOG_CODE_USAGE = "posthog_code_usage"
+    TOOLBAR_HEATMAPS = "toolbar_heatmaps"
+    PERSONAL_API_KEYS = "personal_api_keys"
+    SELF_DRIVING_TRIAL_ALLOWANCE_MICROUSD = "self_driving_trial_allowance_microusd"
+    SELF_DRIVING_TRIAL_REPORTS = "self_driving_trial_reports"
+
+
+TREND_FILTER_TYPE_ACTIONS = "actions"
+TREND_FILTER_TYPE_EVENTS = "events"
+TREND_FILTER_TYPE_DATA_WAREHOUSE = "data_warehouse"
+
+TRENDS_CUMULATIVE = "ActionsLineGraphCumulative"
+TRENDS_TABLE = "ActionsTable"
+TRENDS_PIE = "ActionsPie"
+TRENDS_DONUT = "ActionsDonut"
+TRENDS_PROPORTION_BAR = "ActionsProportionBar"
+TRENDS_BAR = "ActionsBar"
+TRENDS_BAR_VALUE = "ActionsBarValue"
+TRENDS_WORLD_MAP = "WorldMap"
+TRENDS_BOLD_NUMBER = "BoldNumber"
+TRENDS_METRIC = "Metric"
+TRENDS_CALENDAR_HEATMAP = "CalendarHeatmap"
+TRENDS_BOX_PLOT = "BoxPlot"
+
+# Sync with frontend NON_TIME_SERIES_DISPLAY_TYPES
+NON_TIME_SERIES_DISPLAY_TYPES = [
+    TRENDS_TABLE,
+    TRENDS_PIE,
+    TRENDS_DONUT,
+    TRENDS_PROPORTION_BAR,
+    TRENDS_BAR_VALUE,
+    TRENDS_WORLD_MAP,
+    TRENDS_BOLD_NUMBER,
+    TRENDS_CALENDAR_HEATMAP,
+]
+# Sync with frontend NON_BREAKDOWN_DISPLAY_TYPES
+NON_BREAKDOWN_DISPLAY_TYPES = [TRENDS_BOLD_NUMBER, TRENDS_METRIC, TRENDS_CALENDAR_HEATMAP, TRENDS_BOX_PLOT]
+
+# CONSTANTS
+INSIGHT_FUNNELS = "FUNNELS"
+
+DEPRECATED_DISPLAY_TYPES = Literal[
+    "PathsViz",
+    "FunnelViz",
+]
+
+
+TRENDS_STICKINESS = "Stickiness"
+TRENDS_LIFECYCLE = "Lifecycle"
+
+SCREEN_EVENT = "$screen"
+AUTOCAPTURE_EVENT = "$autocapture"
+PAGEVIEW_EVENT = "$pageview"
+CUSTOM_EVENT = "custom_event"
+HOGQL = "hogql"
+
+
+ENTITIES = "entities"
+ACTIONS = "actions"
+EVENTS = "events"
+DATA_WAREHOUSE_ENTITIES = "data_warehouse_entities"
+EXCLUSIONS = "exclusions"
+PROPERTIES = "properties"
+PROPERTY_GROUPS = "property_groups"
+INTERVAL = "interval"
+SHOWN_AS = "shown_as"
+CLIENT_QUERY_ID = "client_query_id"
+FILTER_TEST_ACCOUNTS = "filter_test_accounts"
+COMPARE = "compare"
+COMPARE_TO = "compare_to"
+INSIGHT = "insight"
+SESSION = "session"
+FROM_DASHBOARD = "from_dashboard"
+PATH_TYPE = "path_type"
+RETENTION_TYPE = "retention_type"
+TOTAL_INTERVALS = "total_intervals"
+SELECTED_INTERVAL = "selected_interval"
+START_POINT = "start_point"
+END_POINT = "end_point"
+STEP_LIMIT = "step_limit"
+TARGET_ENTITY = "target_entity"
+RETURNING_ENTITY = "returning_entity"
+OFFSET = "offset"
+LIMIT = "limit"
+PERIOD = "period"
+STICKINESS_DAYS = "stickiness_days"
+ENTITY_ID = "entity_id"
+ENTITY_TYPE = "entity_type"
+ENTITY_MATH = "entity_math"
+FUNNEL_WINDOW_INTERVAL_UNIT = "funnel_window_interval_unit"
+FUNNEL_WINDOW_INTERVAL = "funnel_window_interval"
+FUNNEL_FROM_STEP = "funnel_from_step"
+FUNNEL_TO_STEP = "funnel_to_step"
+FUNNEL_STEP = "funnel_step"
+FUNNEL_CUSTOM_STEPS = "funnel_custom_steps"
+FUNNEL_WINDOW_INTERVAL_TYPES = Literal["DAY", "SECOND", "MINUTE", "HOUR", "WEEK", "MONTH"]
+FUNNEL_PATHS = "funnel_paths"
+PATHS_HOGQL_EXPRESSION = "paths_hogql_expression"
+PATHS_INCLUDE_EVENT_TYPES = "include_event_types"
+PATHS_INCLUDE_CUSTOM_EVENTS = "include_custom_events"
+PATHS_EXCLUDE_EVENTS = "exclude_events"
+FUNNEL_PATH_AFTER_STEP = "funnel_path_after_step"
+FUNNEL_PATH_BEFORE_STEP = "funnel_path_before_step"
+FUNNEL_PATH_BETWEEN_STEPS = "funnel_path_between_steps"
+PATH_GROUPINGS = "path_groupings"
+PATH_REPLACEMENTS = "path_replacements"
+LOCAL_PATH_CLEANING_FILTERS = "local_path_cleaning_filters"
+PATH_START_KEY = "path_start_key"
+PATH_END_KEY = "path_end_key"
+PATH_DROPOFF_KEY = "path_dropoff_key"
+PATH_EDGE_LIMIT = "edge_limit"
+PATH_MIN_EDGE_WEIGHT = "min_edge_weight"
+PATH_MAX_EDGE_WEIGHT = "max_edge_weight"
+AGGREGATION_GROUP_TYPE_INDEX = "aggregation_group_type_index"
+SAMPLING_FACTOR = "sampling_factor"
+
+
+BREAKDOWN_TYPES = Literal["event", "person", "cohort", "group", "session", "hogql"]
+
+
+class FunnelOrderType(StrEnum):
+    STRICT = "strict"
+    UNORDERED = "unordered"
+    ORDERED = "ordered"
+
+
+class FunnelVizType(StrEnum):
+    TRENDS = "trends"
+    TIME_TO_CONVERT = "time_to_convert"
+    STEPS = "steps"
+
+
+RETENTION_RECURRING = "retention_recurring"
+RETENTION_FIRST_OCCURRENCE_MATCHING_FILTERS = "retention_first_time"
+RETENTION_FIRST_EVER_OCCURRENCE = "retention_first_ever_occurrence"
+
+DISTINCT_ID_FILTER = "distinct_id"
+PERSON_UUID_FILTER = "person_uuid"
+
+
+class AnalyticsDBMS(StrEnum):
+    POSTGRES = "postgres"
+    CLICKHOUSE = "clickhouse"
+
+
+UNIQUE_USERS = "dau"
+UNIQUE_GROUPS = "unique_group"
+WEEKLY_ACTIVE = "weekly_active"
+MONTHLY_ACTIVE = "monthly_active"
+
+
+class PropertyOperatorType(StrEnum):
+    AND = "AND"
+    OR = "OR"
+
+
+class BreakdownAttributionType(StrEnum):
+    FIRST_TOUCH = "first_touch"
+    # FIRST_TOUCH attribution means the breakdown value is the first property value found within all funnel steps
+    LAST_TOUCH = "last_touch"
+    # LAST_TOUCH attribution means the breakdown value is the last property value found within all funnel steps
+    STEP = "step"
+    # STEP attribution means the breakdown value is the X'th step property value found within the funnel.
+    # where X is the `breakdown_attribution_value`
+    ALL_EVENTS = "all_events"
+    # ALL_EVENTS attribution means the breakdown value is valid only when it exists on all funnel steps
+
+
+MAX_SLUG_LENGTH = 48
+GROUP_TYPES_LIMIT = 5
+GroupTypeIndex = Literal[0, 1, 2, 3, 4]
+
+
+class EventDefinitionType(StrEnum):
+    # Mimics EventDefinitionType in frontend/src/types.ts
+    ALL = "all"
+    ACTION_EVENT = "action_event"
+    EVENT = "event"
+    EVENT_POSTHOG = "event_posthog"
+    EVENT_CUSTOM = "event_custom"
+
+
+class FlagRequestType(StrEnum):
+    DECIDE = "decide"
+    LOCAL_EVALUATION = "local-evaluation"
+    LOCAL_EVALUATION_NOT_MODIFIED = "local-evaluation-not-modified"
+    REMOTE_CONFIG = "remote-config"
+
+
+SURVEY_TARGETING_FLAG_PREFIX = "survey-targeting-"
+PRODUCT_TOUR_TARGETING_FLAG_PREFIX = "product-tour-targeting-"
+
+# Server-side evaluation via posthoganalytics; keep in sync with frontend FEATURE_FLAGS.
+SUBSCRIPTION_AI_PROMPT_FEATURE_FLAG_KEY = "ai-subscriptions"
+# Enable only after every subscriptions worker has deployed the gallery claim boundary. Older workers
+# share the v2 activity name and would otherwise send the legacy layout during a rolling deployment.
+SUBSCRIPTION_SLACK_GALLERY_FEATURE_FLAG_KEY = "subscription-slack-gallery"
+EXPERIMENTS_RATIO_METRIC_EVENTS_PREAGGREGATION_FEATURE_FLAG_KEY = "experiments-ratio-metric-events-preaggregation"
+EXPERIMENTS_CUPED_METRIC_EVENTS_PREAGGREGATION_FEATURE_FLAG_KEY = "experiments-cuped-metric-events-preaggregation"
+EXPERIMENTS_PRECOMPUTE_PERSON_RESOLUTION_FEATURE_FLAG_KEY = "experiments-precompute-person-resolution"
+GENERATED_DASHBOARD_PREFIX = "Generated Dashboard"
+
+ENRICHED_DASHBOARD_INSIGHT_IDENTIFIER = "Feature Viewed"
+
+PERMITTED_FORUM_DOMAINS = ["localhost", "posthog.com"]
+
+INVITE_DAYS_VALIDITY = 3  # number of days for which team invites are valid
+
+# Sync with frontend/src/scenes/surveys/constants.tsx
+DEFAULT_SURVEY_APPEARANCE = {
+    "fontFamily": "inherit",
+    "backgroundColor": "#eeeded",
+    "submitButtonColor": "black",
+    "submitButtonTextColor": "white",
+    "ratingButtonColor": "white",
+    "ratingButtonActiveColor": "black",
+    "borderColor": "#c9c6c6",
+    "placeholder": "Start typing...",
+    "whiteLabel": False,
+    "displayThankYouMessage": True,
+    "thankYouMessageHeader": "Thank you for your feedback!",
+    "position": "right",
+    "tabPosition": "right",
+    "widgetType": "tab",
+    "widgetLabel": "Feedback",
+    "widgetColor": "black",
+    "zIndex": "2147482647",
+    "disabledButtonOpacity": "0.6",
+    "maxWidth": "300px",
+    "textSubtleColor": "#939393",
+    "inputBackground": "white",
+    "boxPadding": "20px 24px",
+    "boxShadow": "0 4px 12px rgba(0, 0, 0, 0.15)",
+    "borderRadius": "10px",
+    "shuffleQuestions": False,
+    "surveyPopupDelaySeconds": None,
+}
+
+LOGIN_METHODS = [
+    {
+        "key": "password",
+        "display": "Email/password",
+        "backends": ["django.contrib.auth.backends.ModelBackend"],
+    },
+    {
+        "key": "google-oauth2",
+        "display": "Google OAuth",
+        # The `ee.` path is only carried by sessions issued before the move to `posthog.api.sso`.
+        "backends": [
+            "google-oauth2",
+            "posthog.api.sso.CustomGoogleOAuth2",
+            "ee.api.authentication.CustomGoogleOAuth2",
+        ],
+    },
+    {
+        "key": "github",
+        "display": "GitHub",
+        "backends": ["github"],
+    },
+    {
+        "key": "gitlab",
+        "display": "GitLab",
+        "backends": ["gitlab"],
+    },
+    {
+        "key": "saml",
+        "display": "SAML",
+        # The `ee.` path is only carried by sessions issued before the move to `posthog.api.sso`.
+        "backends": ["saml", "posthog.api.sso.MultitenantSAMLAuth", "ee.api.authentication.MultitenantSAMLAuth"],
+    },
+    {
+        "key": "oidc",
+        "display": "OIDC",
+        "backends": ["oidc", "posthog.api.oidc.MultitenantOIDCAuth"],
+    },
+    {
+        "key": "passkey",
+        "display": "Passkey",
+        "backends": ["posthog.auth.WebauthnBackend"],
+    },
+]
+
+# Mapping of auth backend names to login method display names
+AUTH_BACKEND_DISPLAY_NAMES = {backend: m["display"] for m in LOGIN_METHODS for backend in m["backends"]}
+
+AUTH_BACKEND_KEYS = {backend: m["key"] for m in LOGIN_METHODS for backend in m["backends"]}
+
+
+# PostHog's own posthog-js instance on PostHog Cloud. The app's CSP names these by exact path.
+POSTHOG_JS_CLOUD_HOST = "https://internal-cf.posthog.com"
+POSTHOG_JS_CLOUD_TOKEN = "sTMFPsFhdP1Ssg"

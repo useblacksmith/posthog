@@ -1,0 +1,56 @@
+import type { Series } from '@posthog/quill-charts'
+
+import { ActionNames, getResultSeries, getResultSeriesIndex } from 'scenes/insights/utils/resultSeries'
+
+import type { InsightQueryNode } from '~/queries/schema/schema-general'
+
+import type { IndexedTrendResult } from 'products/product_analytics/frontend/insights/trends/types'
+
+import { compareLegendTag } from '../shared/compareDimming'
+import { humanizeSeriesLabel } from '../shared/humanizeSeriesLabel'
+import type { TrendsSeriesMeta } from '../shared/trendsSeriesMeta'
+
+export interface BuildTrendsPieSeriesOpts<R> {
+    querySource: InsightQueryNode | null | undefined
+    actionNames?: ActionNames
+    /** Resolved color per result (typically `getTrendsColor`). */
+    getColor: (r: R, index: number) => string
+    /** True when the result should be excluded from rendering. */
+    getHidden?: (r: R, index: number) => boolean
+    /** Optional label override per result — used to format breakdown values. */
+    getLabel?: (r: R) => string
+}
+
+/** Maps the kea-side `IndexedTrendResult` list to hog-charts `Series<TrendsSeriesMeta>[]`,
+ *  one slice per result. The pie chart consumes each series's first `data` entry as the slice
+ *  magnitude via the default `sliceValue` resolver — see `PieChart`'s `sliceValue` config to
+ *  override when the input data isn't already aggregated to a single value (the Trends adapter
+ *  hits this path because `aggregated_value` is stored as `data[0]`). */
+export function buildTrendsPieSeries<R extends IndexedTrendResult>(
+    results: R[],
+    opts: BuildTrendsPieSeriesOpts<R>
+): Series<TrendsSeriesMeta>[] {
+    return results.map((r, index) => {
+        const excluded = opts.getHidden ? opts.getHidden(r, index) : false
+        const label = opts.getLabel ? opts.getLabel(r) : humanizeSeriesLabel(r.label)
+        return {
+            // Match the line/bar adapters — keying by `${r.id}` lets the click handler resolve
+            // back to the source IndexedTrendResult without stashing it on meta.
+            key: String(r.id),
+            label,
+            legendTag: compareLegendTag(r),
+            // Pie consumes `data[0]` as the magnitude (`aggregated_value` is the only numeric
+            // value Trends carries for pie). Wrapped in an array because `Series.data` is a list.
+            data: [r.aggregated_value ?? 0],
+            color: opts.getColor(r, index),
+            meta: {
+                series: getResultSeries(opts.querySource, r, opts.actionNames),
+                breakdown_value: r.breakdown_value,
+                compare_label: r.compare_label,
+                days: r.days,
+                order: getResultSeriesIndex(opts.querySource, r) ?? r.id,
+            },
+            visibility: excluded ? { excluded: true } : undefined,
+        }
+    })
+}

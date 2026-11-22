@@ -1,0 +1,196 @@
+import { MOCK_DEFAULT_TEAM } from 'lib/api.mock'
+
+import { Meta } from '@storybook/react'
+import { useActions, useMountedLogic } from 'kea'
+import { useEffect } from 'react'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+import { App } from 'scenes/App'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { mswDecorator } from '~/mocks/browser'
+
+import uniqueVisitorsMock from './__mocks__/UniqueVisitors.json'
+import webOverviewMock from './__mocks__/WebOverview.json'
+import { DeviceTab, SourceTab } from './common'
+import browserMock from './tiles/__mocks__/Browser.json'
+import pathMock from './tiles/__mocks__/Path.json'
+import referringDomainMock from './tiles/__mocks__/ReferringDomain.json'
+import retentionMock from './tiles/__mocks__/Retention.json'
+import { webAnalyticsLogic } from './webAnalyticsLogic'
+
+const meta: Meta = {
+    component: App,
+    title: 'Scenes-App/Web Analytics',
+    parameters: {
+        layout: 'fullscreen',
+        viewMode: 'story',
+        mockDate: '2023-02-01',
+        pageUrl: urls.webAnalytics(),
+        featureFlags: [FEATURE_FLAGS.WEB_ANALYTICS_FILTERS_V2],
+        testOptions: {
+            includeNavigationInSnapshot: true,
+            waitForLoadersToDisappear: true,
+            waitForSelector: '[data-attr=trend-line-graph] > canvas',
+        },
+    },
+    decorators: [
+        mswDecorator({
+            get: {
+                // Live count of users on product
+                '/stats': () => [200, { users_on_product: 2387 }],
+
+                // Avoid displaying error of missing $pageview/$pageleave/$web_vitals events
+                '/api/projects/:team_id/event_definitions': () => [200, { count: 5 }],
+            },
+            post: {
+                '/api/environments/:team_id/query/:kind': async ({ request }) => {
+                    const query = ((await request.json()) as any).query
+                    const queryKind = query.kind
+
+                    if (queryKind === 'DatabaseSchemaQuery') {
+                        return [200, { tables: {}, joins: [] }] // Empty schema, we don't care about this here
+                    } else if (queryKind === 'WebOverviewQuery') {
+                        return [200, webOverviewMock]
+                    } else if (queryKind === 'TrendsQuery') {
+                        return [200, uniqueVisitorsMock]
+                    } else if (queryKind === 'WebStatsTableQuery') {
+                        if (query.breakdownBy === 'Page') {
+                            return [200, pathMock]
+                        } else if (query.breakdownBy === 'InitialReferringDomain') {
+                            return [200, referringDomainMock]
+                        } else if (query.breakdownBy === 'Browser') {
+                            return [200, browserMock]
+                        }
+                    } else if (queryKind === 'RetentionQuery') {
+                        return [200, retentionMock]
+                    }
+                },
+            },
+        }),
+    ],
+}
+export default meta
+
+export function WebAnalyticsDashboard(): JSX.Element {
+    const { setSourceTab, setDeviceTab } = useActions(webAnalyticsLogic)
+
+    useEffect(() => {
+        // Set the source tab to referring domain
+        setSourceTab(SourceTab.REFERRING_DOMAIN)
+
+        // Set the device tab to browsers
+        setDeviceTab(DeviceTab.BROWSER)
+    }, [setDeviceTab, setSourceTab])
+
+    return <App />
+}
+
+WebAnalyticsDashboardTileHeaderV2Medium.parameters = {
+    featureFlags: {
+        [FEATURE_FLAGS.WEB_ANALYTICS_FILTERS_V2]: true,
+        [FEATURE_FLAGS.WEB_ANALYTICS_TILE_HEADER_V2]: 'test',
+    },
+    testOptions: {
+        includeNavigationInSnapshot: true,
+        waitForLoadersToDisappear: true,
+        waitForSelector: '[data-attr=trend-line-graph] > canvas',
+        viewport: { width: 900, height: 2000 },
+    },
+}
+export function WebAnalyticsDashboardTileHeaderV2Medium(): JSX.Element {
+    return <WebAnalyticsDashboard />
+}
+
+WebAnalyticsDashboardTileHeaderV2Wide.parameters = {
+    featureFlags: {
+        [FEATURE_FLAGS.WEB_ANALYTICS_FILTERS_V2]: true,
+        [FEATURE_FLAGS.WEB_ANALYTICS_TILE_HEADER_V2]: 'test',
+    },
+    testOptions: {
+        includeNavigationInSnapshot: true,
+        waitForLoadersToDisappear: true,
+        waitForSelector: '[data-attr=trend-line-graph] > canvas',
+        viewport: { width: 1600, height: 2000 },
+    },
+}
+export function WebAnalyticsDashboardTileHeaderV2Wide(): JSX.Element {
+    return <WebAnalyticsDashboard />
+}
+
+const NARROW_FEATURE_FLAGS = {
+    [FEATURE_FLAGS.WEB_ANALYTICS_FILTERS_V2]: true,
+    [FEATURE_FLAGS.WEB_ANALYTICS_TILE_HEADER_V2]: 'test',
+    [FEATURE_FLAGS.SCENE_MENU_BAR]: true,
+}
+
+WebAnalyticsDashboardNarrow.parameters = {
+    featureFlags: NARROW_FEATURE_FLAGS,
+    testOptions: {
+        includeNavigationInSnapshot: true,
+        waitForLoadersToDisappear: true,
+        waitForSelector: '[data-attr=trend-line-graph] > canvas',
+        viewport: { width: 400, height: 2400 },
+    },
+}
+export function WebAnalyticsDashboardNarrow(): JSX.Element {
+    return <WebAnalyticsDashboard />
+}
+
+WebAnalyticsEmptyOnboardingNarrow.parameters = {
+    featureFlags: { ...NARROW_FEATURE_FLAGS, [FEATURE_FLAGS.WEB_ANALYTICS_EMPTY_ONBOARDING]: true },
+    testOptions: {
+        includeNavigationInSnapshot: true,
+        waitForSelector: '[data-attr=web-analytics-onboarding]',
+        viewport: { width: 400, height: 900 },
+    },
+}
+WebAnalyticsEmptyOnboardingNarrow.decorators = [
+    mswDecorator({
+        get: {
+            '/api/environments/:team_id/': { ...MOCK_DEFAULT_TEAM, ingested_event: false },
+        },
+        patch: {
+            '/api/environments/:team_id/': { ...MOCK_DEFAULT_TEAM, ingested_event: false },
+        },
+    }),
+]
+export function WebAnalyticsEmptyOnboardingNarrow(): JSX.Element {
+    useMountedLogic(teamLogic)
+    useEffect(() => {
+        teamLogic.actions.loadCurrentTeamSuccess({ ...MOCK_DEFAULT_TEAM, ingested_event: false })
+    }, [])
+
+    return <App />
+}
+
+WebAnalyticsDashboardLoading.parameters = {
+    layout: 'fullscreen',
+    viewMode: 'story',
+    mockDate: '2023-02-01',
+    pageUrl: urls.webAnalytics(),
+    featureFlags: [FEATURE_FLAGS.WEB_ANALYTICS_FILTERS_V2, FEATURE_FLAGS.WEB_ANALYTICS_TILE_SKELETONS],
+    testOptions: {
+        includeNavigationInSnapshot: true,
+        waitForLoadersToDisappear: false,
+        waitForSelector: '[data-attr=web-analytics-skeleton-table], [data-attr=web-analytics-skeleton-chart]',
+    },
+    msw: {
+        handlers: [],
+    },
+}
+WebAnalyticsDashboardLoading.decorators = [
+    mswDecorator({
+        get: {
+            '/stats': () => [200, { users_on_product: 2387 }],
+            '/api/projects/:team_id/event_definitions': () => [200, { count: 5 }],
+        },
+        post: {
+            '/api/environments/:team_id/query/:kind': () => new Promise<never>(() => {}),
+        },
+    }),
+]
+export function WebAnalyticsDashboardLoading(): JSX.Element {
+    return <App />
+}

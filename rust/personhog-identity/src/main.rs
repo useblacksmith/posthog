@@ -1,0 +1,592 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use assignment_coordination::store::{EtcdStore, StoreConfig};
+use axum::{routing::get, Router};
+use common_database::get_pool_with_config;
+use common_metrics::{ETCD_OP_LATENCY_BUCKETS_MS, ETCD_PAYLOAD_SIZE_BUCKETS_BYTES};
+use envconfig::Envconfig;
+use lifecycle::{ComponentOptions, Manager};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use personhog_common::grpc::{
+    tracked_tcp_incoming_until, until_incoming_ends, GrpcLoadShedLayer, GrpcMetricsLayer,
+};
+use personhog_common::{spawn_pool_monitor, MonitoredPool};
+use personhog_proto::personhog::identity::v1::person_hog_identity_server::PersonHogIdentityServer;
+use personhog_proto::personhog::lifecycle::v1::person_hog_lifecycle_server::PersonHogLifecycleServer;
+use sqlx::postgres::PgPool;
+use tonic::codec::CompressionEncoding;
+use tonic::transport::Server;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
+
+use personhog_common::client::RouterClient;
+use personhog_common::query_tag;
+use personhog_coordination::changelog::{
+    keep_changelog_live, load_changelog_config, LiveChangelog, CHANGELOG_BOOT_POLL_INTERVAL,
+};
+use personhog_coordination::store::PersonhogStore;
+use personhog_identity::config::Config;
+use personhog_identity::leader::LifecycleLeader;
+use personhog_identity::lifecycle::delete::DeleteDriver;
+use personhog_identity::lifecycle::detach::DetachedDrives;
+use personhog_identity::lifecycle::engine::Engine;
+use personhog_identity::lifecycle::merge::{MergeDriver, MergeOpExecutor};
+use personhog_identity::lifecycle::PersonHogLifecycleService;
+use personhog_identity::pools::{IdentityPools, Lane};
+use personhog_identity::service::merge::MergeEntrance;
+use personhog_identity::service::PersonHogIdentityService;
+use personhog_identity::storage::coalesce::{CoalesceSettings, CoalescingIdentityStorage};
+use personhog_identity::storage::postgres::PostgresIdentityStorage;
+use personhog_identity::storage::IdentityStorage;
+use personhog_identity::warnings;
+use tokio_util::sync::CancellationToken;
+
+common_alloc::used!();
+
+fn create_pools(config: &Config) -> IdentityPools {
+    let fast = get_pool_with_config(&config.primary_database_url, config.fast_pool_config())
+        .expect("Failed to create fast database pool");
+    let heavy = get_pool_with_config(&config.primary_database_url, config.heavy_pool_config())
+        .expect("Failed to create heavy database pool");
+    tracing::info!("Created fast and heavy database pools");
+    IdentityPools::new(fast, heavy)
+}
+
+/// Hold `min_connections` connections and run a query on `server_warmup`
+/// of them. acquire() only establishes app → PgBouncer; in transaction
+/// pooling mode PgBouncer doesn't open a server connection until a query
+/// runs.
+async fn warm_pool(pool: &PgPool, lane: Lane, min_connections: u32, server_warmup: u32) {
+    if min_connections == 0 {
+        return;
+    }
+    let warmup_count = min_connections as usize;
+    let server_warmup_count = (server_warmup as usize).min(warmup_count);
+    tracing::info!(
+        pool = lane.label(),
+        count = warmup_count,
+        server_warmup = server_warmup_count,
+        "Warming database connection pool before accepting traffic"
+    );
+    let pool_start = std::time::Instant::now();
+    let mut conns = Vec::with_capacity(warmup_count);
+    for _ in 0..warmup_count {
+        match pool.acquire().await {
+            Ok(conn) => conns.push(conn),
+            Err(e) => {
+                tracing::warn!(pool = lane.label(), error = %e, "Failed to warm connection");
+                break;
+            }
+        }
+    }
+    let mut server_warmed = 0u32;
+    for conn in conns.iter_mut().take(server_warmup_count) {
+        match sqlx::query(&query_tag!("warm_pool", "SELECT 1"))
+            .execute(&mut **conn)
+            .await
+        {
+            Ok(_) => server_warmed += 1,
+            Err(e) => {
+                tracing::warn!(pool = lane.label(), error = %e, "Failed to warm server-side connection");
+            }
+        }
+    }
+    tracing::info!(
+        pool = lane.label(),
+        client_conns = conns.len(),
+        server_conns = server_warmed,
+        elapsed_ms = pool_start.elapsed().as_millis() as u64,
+        "Pool warmup complete"
+    );
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::init_from_env().expect("Invalid configuration");
+
+    let log_layer = fmt::layer()
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_level(true);
+
+    tracing_subscriber::registry()
+        .with(log_layer)
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
+
+    let tables = config.tables();
+    tables.validate().expect("Invalid identity table set");
+
+    tracing::info!("Starting personhog-identity service");
+    tracing::info!("gRPC address: {}", config.grpc_address);
+    tracing::info!("Metrics port: {}", config.metrics_port);
+    tracing::info!("Router URL: {}", config.router_url);
+    tracing::info!(
+        property_write_concurrency = config.property_write_concurrency,
+        leader_call_concurrency = config.lifecycle_leader_call_concurrency,
+        router_channels = config.router_channels,
+        "Leader fan-out concurrency"
+    );
+    tracing::info!("Tables: {:?}", tables);
+    let outbox_writes = config.outbox_writes();
+    if config.lifecycle_outbox_enabled {
+        tracing::info!(
+            outbox = %tables.person_publish_outbox,
+            "Lifecycle outbox enabled; a personhog-publisher on the same table set must drain it"
+        );
+        if tables.is_validation() {
+            tracing::warn!(
+                outbox = %tables.person_publish_outbox,
+                "Lifecycle outbox is on for the validation table set; the publisher draining it must point at capture topics, never the production names"
+            );
+        }
+    }
+
+    // The delete saga groups its fence calls by the leaders' partition
+    // count, which lives in etcd; a service that cannot read it would
+    // batch wrong, so refuse to start instead.
+    let etcd_store = EtcdStore::connect_with_member_failover(StoreConfig {
+        endpoints: config.etcd_endpoint_list(),
+        prefix: config.etcd_prefix.clone(),
+    })
+    .await
+    .expect("Failed to connect to etcd");
+    let store = Arc::new(PersonhogStore::new(etcd_store));
+    // No signal handler is installed until the lifecycle monitor starts,
+    // so SIGTERM ends the process during this wait.
+    let Some(loaded) = load_changelog_config(
+        &store,
+        CHANGELOG_BOOT_POLL_INTERVAL,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("Failed to load the changelog config from etcd") else {
+        return Ok(());
+    };
+    tracing::info!(
+        num_partitions = loaded.partitions,
+        epoch = loaded.epoch,
+        "loaded changelog config"
+    );
+    let changelog = LiveChangelog::new(loaded);
+
+    // Build lifecycle manager and register components
+    let mut manager = Manager::builder("personhog-identity").build();
+
+    let grpc_handle = manager.register(
+        "grpc_server",
+        ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(30)),
+    );
+    let metrics_handle = manager.register(
+        "metrics_server",
+        ComponentOptions::new().is_observability(true),
+    );
+    // Registered here because components must exist before monitoring
+    // starts; the sweeper task itself is spawned later, once the engine
+    // exists. Supervision matters: with one sweeper per fleet, a silently
+    // dead loop means abandoned ops are never resumed.
+    let sweeper_handle = config
+        .lifecycle_sweeper_enabled
+        .then(|| manager.register("lifecycle_sweeper", ComponentOptions::new()));
+    let warnings_handle = config.ingestion_warnings_enabled.then(|| {
+        manager.register(
+            "ingestion_warnings",
+            ComponentOptions::new()
+                .with_liveness_deadline(Duration::from_secs(30))
+                .is_advisory(true),
+        )
+    });
+    let changelog_handle = manager.register("changelog_config", ComponentOptions::new());
+
+    let readiness = manager.readiness_handler();
+    let liveness = manager.liveness_handler();
+
+    let monitor = manager.monitor_background();
+
+    // Dense from 250ms to 5s, where merge tails sit.
+    const BUCKETS: &[f64] = &[
+        1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 1500.0, 2000.0, 3000.0,
+        5000.0, 10000.0, 30000.0,
+    ];
+    // Lifecycle ops span "settled in one drive" (tens of ms) to
+    // "abandoned, parked, or leader-blocked and resumed by the sweeper"
+    // (minutes to an hour); the default latency ladder tops out at 10s
+    // and would collapse every resumed op into +Inf.
+    const OP_DURATION_BUCKETS: &[f64] = &[
+        10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0,
+        300000.0, 1800000.0, 3600000.0,
+    ];
+    // Batch sizes, not latency; the request caps are 250.
+    const PER_CALL_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0];
+    let recorder_handle = PrometheusBuilder::new()
+        .add_global_label("service", "personhog-identity")
+        .set_buckets(BUCKETS)
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("personhog_lifecycle_op_duration_ms".into()),
+            OP_DURATION_BUCKETS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(Matcher::Suffix("_per_call".into()), PER_CALL_BUCKETS)
+        .unwrap()
+        .set_buckets_for_metric(Matcher::Suffix("_per_batch".into()), PER_CALL_BUCKETS)
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("assignment_coordination_etcd_op_ms".into()),
+            ETCD_OP_LATENCY_BUCKETS_MS,
+        )
+        .unwrap()
+        .set_buckets_for_metric(
+            Matcher::Full("assignment_coordination_etcd_payload_bytes".into()),
+            ETCD_PAYLOAD_SIZE_BUCKETS_BYTES,
+        )
+        .unwrap()
+        .install_recorder()
+        .expect("Failed to install metrics recorder");
+    {
+        let store = Arc::clone(&store);
+        let changelog = changelog.clone();
+        tokio::spawn(async move {
+            let _guard = changelog_handle.process_scope();
+            let cancel = CancellationToken::new();
+            tokio::select! {
+                _ = changelog_handle.shutdown_signal() => cancel.cancel(),
+                _ = keep_changelog_live(store, changelog, cancel.clone()) => {}
+            }
+        });
+    }
+
+    // Metrics/health HTTP server (observability handle — stays alive during standard drain)
+    let metrics_port = config.metrics_port;
+    tokio::spawn(async move {
+        let _guard = metrics_handle.process_scope();
+
+        let health_router = Router::new()
+            .route(
+                "/_readiness",
+                get(move || {
+                    let r = readiness.clone();
+                    async move { r.check().await }
+                }),
+            )
+            .route("/_liveness", get(move || async move { liveness.check() }));
+        let metrics_router = health_router.route(
+            "/metrics",
+            get(move || std::future::ready(recorder_handle.render())),
+        );
+
+        let bind = format!("0.0.0.0:{metrics_port}");
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .expect("Failed to bind metrics port");
+        tracing::info!("Metrics server listening on {}", bind);
+        axum::serve(listener, metrics_router)
+            .with_graceful_shutdown(metrics_handle.shutdown_signal())
+            .await
+            .expect("Metrics server error");
+    });
+
+    let pools = create_pools(&config);
+    if config.lifecycle_outbox_enabled {
+        // With the outbox on, every create, attach and op completion names
+        // the table; refuse to start without it instead of failing each
+        // request once the pod is ready. Any other error is left to the
+        // request path, as warm_pool leaves a connection failure.
+        let probe = format!("SELECT 1 FROM {} LIMIT 0", tables.person_publish_outbox);
+        if let Err(e) = sqlx::query(&query_tag!("startup_outbox_probe", probe))
+            .execute(pools.fast())
+            .await
+        {
+            let undefined_table =
+                e.as_database_error().and_then(|db| db.code()).as_deref() == Some("42P01");
+            if undefined_table {
+                panic!(
+                    "LIFECYCLE_OUTBOX_ENABLED is set but {} does not exist; apply the persons migration first",
+                    tables.person_publish_outbox
+                );
+            }
+            tracing::warn!(
+                error = %e,
+                table = %tables.person_publish_outbox,
+                "Could not probe the publish outbox table at startup"
+            );
+        }
+    }
+    let postgres_storage = Arc::new(PostgresIdentityStorage::new(
+        pools.clone(),
+        config.tables(),
+        outbox_writes,
+    ));
+    let storage: Arc<dyn IdentityStorage> = if config.stub_create_workers == 0 {
+        postgres_storage
+    } else {
+        tracing::info!(
+            workers = config.stub_create_workers,
+            max_batch_distinct_ids = config.stub_create_max_batch_distinct_ids,
+            max_queued_calls = config.stub_create_max_queued_calls,
+            "Coalescing stub-creation transactions"
+        );
+        if config.stub_create_workers >= config.heavy_max_pg_connections as usize {
+            tracing::warn!(
+                workers = config.stub_create_workers,
+                heavy_max_pg_connections = config.heavy_max_pg_connections,
+                "STUB_CREATE_WORKERS can hold every heavy connection, which leaves none for attach, saga steps and GC"
+            );
+        }
+        Arc::new(CoalescingIdentityStorage::spawn(
+            postgres_storage,
+            CoalesceSettings {
+                workers: config.stub_create_workers,
+                max_batch_distinct_ids: config.stub_create_max_batch_distinct_ids,
+                max_queued_calls: config.stub_create_max_queued_calls,
+                max_queue_wait: Duration::from_secs(config.heavy_acquire_timeout_secs),
+            },
+        ))
+    };
+    let merge_warnings = warnings::install(&config.ingestion_warnings_settings(), warnings_handle);
+    let warnings_to_flush = merge_warnings.clone();
+
+    // Pre-warm the DB connection pools before accepting traffic.
+    // connect_lazy() starts with zero connections; without this, the first
+    // burst of requests after K8s routes traffic all pay the cold-start cost.
+    // Warming here is safe because the gRPC server hasn't bound its port yet.
+    warm_pool(
+        pools.fast(),
+        Lane::Fast,
+        config.min_pg_connections,
+        config.warmup_server_connections,
+    )
+    .await;
+    warm_pool(
+        pools.heavy(),
+        Lane::Heavy,
+        config.heavy_min_pg_connections,
+        config.warmup_server_connections,
+    )
+    .await;
+
+    spawn_pool_monitor(
+        vec![
+            MonitoredPool {
+                pool: pools.fast().clone(),
+                label: Lane::Fast.label().to_string(),
+                max_connections: config.max_pg_connections,
+            },
+            MonitoredPool {
+                pool: pools.heavy().clone(),
+                label: Lane::Heavy.label().to_string(),
+                max_connections: config.heavy_max_pg_connections,
+            },
+        ],
+        Duration::from_secs(config.pool_monitor_interval_secs),
+    );
+
+    let property_writer = Arc::new(
+        RouterClient::with_channels_and_windows(
+            &config.router_url,
+            config.leader_request_timeout(),
+            config.router_channels,
+            config.router_http2_windows(),
+        )
+        .expect("Invalid router URL")
+        .with_client_name("personhog-identity")
+        .with_attempts(config.leader_request_attempts),
+    );
+    // Both sagas' leader surface, reached through the router like the
+    // property writes.
+    let lifecycle_leader: Arc<dyn LifecycleLeader> = property_writer.clone();
+    let engine = Arc::new(Engine::new(
+        pools.clone(),
+        config.lifecycle_engine_config(),
+        config.tables(),
+    ));
+    if let Some(sweeper_handle) = sweeper_handle {
+        let sweeper_merge_driver = MergeDriver::new(
+            property_writer.clone(),
+            config.tables(),
+            config.lifecycle_leader_call_concurrency,
+            outbox_writes,
+        )
+        .with_warnings(merge_warnings.clone());
+        let sweeper_delete_driver = DeleteDriver::new(
+            lifecycle_leader.clone(),
+            config.tables(),
+            config.lifecycle_leader_call_concurrency,
+            changelog.clone(),
+            outbox_writes,
+        );
+        let sweeper_engine = engine.clone();
+        let sweep_interval = config.lifecycle_sweep_interval();
+        let retention = config.lifecycle_op_retention();
+        tracing::info!(
+            interval_secs = sweep_interval.as_secs(),
+            retention_hours = retention.as_secs() / 3600,
+            "Lifecycle sweeper enabled"
+        );
+        tokio::spawn(async move {
+            // The scope guard tells the manager if this task dies (e.g. a
+            // panic in a sweep pass), so the pod restarts instead of running
+            // on with no resumer.
+            let _guard = sweeper_handle.process_scope();
+            let mut ticker = tokio::time::interval(sweep_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = sweeper_handle.shutdown_recv() => break,
+                    _ = ticker.tick() => {}
+                }
+                match sweeper_engine
+                    .sweep(&[&sweeper_delete_driver, &sweeper_merge_driver])
+                    .await
+                {
+                    Ok(resumed) if resumed > 0 => {
+                        tracing::info!(resumed, "Lifecycle sweeper resumed abandoned ops")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "Lifecycle sweep pass failed"),
+                }
+                if let Err(e) = sweeper_engine.gc(retention).await {
+                    tracing::warn!(error = %e, "Lifecycle GC pass failed");
+                }
+            }
+        });
+    }
+
+    let detached_drives = DetachedDrives::new(config.lifecycle_detached_drive_limit);
+    // Separate proto service co-served on the same server so lifecycle
+    // callers are insulated from any future split.
+    let merge_entrance = MergeEntrance::new(
+        storage.clone(),
+        property_writer.clone(),
+        property_writer.clone(),
+        MergeOpExecutor::new(
+            engine.clone(),
+            MergeDriver::new(
+                property_writer.clone(),
+                config.tables(),
+                config.lifecycle_leader_call_concurrency,
+                outbox_writes,
+            )
+            .with_warnings(merge_warnings.clone()),
+            detached_drives.clone(),
+        ),
+    )
+    .with_warnings(merge_warnings);
+    let lifecycle_service = PersonHogLifecycleService::new(
+        engine,
+        lifecycle_leader,
+        config.tables(),
+        config.lifecycle_leader_call_concurrency,
+        changelog.clone(),
+        outbox_writes,
+    );
+    let service = PersonHogIdentityService::new(
+        storage,
+        property_writer,
+        config.request_limits(),
+        merge_entrance,
+        config.property_write_concurrency,
+    );
+
+    let grpc_addr = config.grpc_address;
+    let keepalive_interval = config.grpc_keepalive_interval();
+    let keepalive_timeout = config.grpc_keepalive_timeout();
+    let http2_windows = config.grpc_http2_windows();
+    let max_connection_age = config.grpc_max_connection_age();
+    let max_send = config.grpc_max_send_message_size;
+    let max_recv = config.grpc_max_recv_message_size;
+    let max_concurrent_requests = config.max_concurrent_requests;
+    let load_shed_wait = config.load_shed_wait();
+    let load_shed_max_waiters = if config.load_shed_max_waiters == 0 {
+        max_concurrent_requests
+    } else {
+        config.load_shed_max_waiters
+    };
+    if max_concurrent_requests > 0 {
+        tracing::info!(
+            limit = max_concurrent_requests,
+            wait_ms = load_shed_wait.as_millis() as u64,
+            max_waiters = load_shed_max_waiters,
+            "gRPC load shedding enabled"
+        );
+    }
+    tracing::info!("Starting gRPC server on {}", grpc_addr);
+
+    tokio::spawn(async move {
+        let _guard = grpc_handle.process_scope();
+        let listener = match tokio::net::TcpListener::bind(grpc_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                grpc_handle.signal_failure(format!("Failed to bind gRPC port: {e}"));
+                return;
+            }
+        };
+        let incoming = tracked_tcp_incoming_until(listener, grpc_handle.shutdown_token());
+        let mut server = http2_windows.apply_to_server(
+            Server::builder()
+                .http2_keepalive_interval(keepalive_interval)
+                .http2_keepalive_timeout(keepalive_timeout),
+        );
+        if let Some(age) = max_connection_age {
+            server = server.max_connection_age(age);
+        }
+        // accept_compressed only decodes gzip request frames from opted-in
+        // clients (never send_compressed — see the tonic entry in Cargo.toml).
+        // Note max_decoding_message_size bounds the wire (compressed) size, so
+        // a compressed request can decode larger than the limit; tonic 0.12
+        // does not cap the decompressed size (0.14 does — bounding this means
+        // upgrading the workspace tonic). Until then this trusts internal
+        // callers not to send pathological frames, same as the replica.
+        if let Err(e) = server
+            .layer(GrpcMetricsLayer::default().with_processing_time_header())
+            // Identity pods share one fleet-wide load, so a shed pod means the
+            // fleet is saturated. RESOURCE_EXHAUSTED stops the router from
+            // retrying the shed on another saturated pod.
+            .layer(
+                GrpcLoadShedLayer::new(max_concurrent_requests)
+                    .with_code(tonic::Code::ResourceExhausted)
+                    .with_wait(load_shed_wait, load_shed_max_waiters),
+            )
+            .add_service(
+                PersonHogIdentityServer::new(service)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .max_encoding_message_size(max_send)
+                    .max_decoding_message_size(max_recv),
+            )
+            .add_service(
+                PersonHogLifecycleServer::new(lifecycle_service)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .max_encoding_message_size(max_send)
+                    .max_decoding_message_size(max_recv),
+            )
+            .serve_with_incoming_shutdown(incoming, until_incoming_ends())
+            .await
+        {
+            grpc_handle.signal_failure(format!("gRPC server error: {e}"));
+        }
+        tracing::info!(
+            in_flight = detached_drives.in_flight(),
+            "waiting for detached merge drives before exit"
+        );
+        detached_drives.shutdown().await;
+    });
+
+    let waited = monitor.wait().await;
+
+    // Flush before the result propagates: a failed component or a timed-out
+    // drain is exactly the shutdown that leaves rows queued.
+    if let Err(e) = tokio::task::spawn_blocking(move || warnings_to_flush.flush()).await {
+        tracing::warn!(error = %e, "ingestion warnings flush task panicked");
+    }
+
+    waited?;
+    Ok(())
+}

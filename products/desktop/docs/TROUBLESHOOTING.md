@@ -1,0 +1,301 @@
+# Troubleshooting
+
+## An image in a local task does not load
+
+Local task messages can show PNG, JPEG, GIF, WebP, and AVIF files that are inside the task workspace. Use an absolute workspace path or a path relative to the workspace. Images outside the workspace and remote image URLs stay blocked.
+
+Cloud task files are not on your computer. Upload those files as task artifacts before you link to them.
+
+## Conversation is too large to continue
+
+A request can exceed the size limit when a conversation contains large images or tool output.
+The app keeps the session connected and reports the size error instead of restarting the agent and sending the same request again.
+Restarting the session does not reduce the request size.
+
+Start a new task with a short text summary of the work.
+Do not copy the old images or full tool output into the new task.
+
+## Completion sounds when resuming a task
+
+Resuming an idle sandbox does not trigger a completion sound or notification.
+For Pi sessions, completion notifications require an active turn and stay silent during restart setup.
+After a cloud restart, the server must confirm the resent message before a completion can notify.
+Returning to the task while the message is pending does not trigger a completion notification.
+Delayed completion events from restart setup stay silent while the message is pending.
+If you stop a pending message, a successful cancellation clears the running state even if the message never appears in the conversation.
+A completed reply or a request for input still follows your notification settings.
+
+## Codex asks for the same permissions again
+
+Codex Auto keeps approvals for actions outside its allowed scope.
+On macOS, it allows workspace writes but restricts network access.
+Auto is not Full access.
+These settings apply to all GPT models in the Codex adapter.
+
+Choose **Allow these permissions for this session** to reuse a permission grant across turns.
+**Allow for this turn** does not grant access for later turns.
+Both choices grant only the permissions shown in the request.
+
+For network approvals, Codex can offer an option to allow or block a host for future requests.
+The desktop app shows these options only when Codex supplies them and returns the selected decision unchanged.
+Codex owns rule storage and enforcement; the desktop app does not create a separate allowlist.
+
+These choices follow the native Codex 0.144.0 approval dialog.
+They preserve the current session permission mode and do not enable automatic approval review or remove sandbox limits.
+Compare clients with the same workspace, permission settings, saved rules, and approval reviewer.
+
+## The app made a sound and nothing was waiting
+
+Every notification writes one line before anything rings, at info level, so it is in packaged builds too. The log file is `~/.posthog-code/logs/main.log` (`logs-dev` for a dev build, `logs-test` for a test build).
+
+```bash
+grep -E "Notification|Playing completion sound|Speech notification" ~/.posthog-code/logs/main.log | tail -20
+```
+
+Read the fields in this order:
+
+- `reason` — what raised it: `task_completed`, `task_needs_input`, `canvas_generation`, `image_build`, `error`, `settings_test`.
+- `context.trigger` — for task notifications, the exact code path: a local prompt response, a cloud turn complete, or a local, cloud or pi permission request.
+- `channel` — `native` (app unfocused), `toast` (focused, looking elsewhere) or `suppress` (looking at the target, so nothing rings).
+- `soundPlayed` — whether the app played its own completion sound. A following `Completion sound failed to play` warning means it did not reach the speakers after all.
+- `osChimePlayed` — whether the operating system rang its own notification chime instead. This is what happens when the chosen sound is `none` or no longer resolves, so a `soundPlayed: false` line can still be the source of a noise.
+- `resolvedSound` on the `Playing completion sound` line — the concrete sound, which is the only way to identify one of the `random-*` modes. A `reason: settings_preview` on that line is the user pressing preview in settings, not a notification.
+- `target` and `viewingTarget` — the task or canvas the notification is about, and the one on screen. Equal targets are what makes `channel` suppress.
+
+The line carries no titles or message text on purpose, so identify the notification from `reason` and `target` rather than from what it said.
+
+A sound with no notification the user was waiting on shows up as a `reason`/`trigger` pair that does not match what they were doing. Take the task id from `target` and the `context.taskRunId` from the line and follow that run.
+
+## A cloud task asks for GitHub access
+
+Cloud tasks and investigations use GitHub to read the selected repository and keep later background runs current. Connect GitHub from the prompt in the task.
+
+If your organization needs an owner to approve the PostHog app, copy the access request from the prompt and send it to the owner. When the same repository is registered as a local folder, you can run the investigation against that local checkout. The result is a point-in-time view and can become stale after the run.
+
+## Black screen during development
+
+If the app launches but renders a blank/black screen, it's almost always a stale Vite cache.
+
+### Fix
+
+```sh
+pnpm clean
+pnpm dev
+```
+
+This clears all Vite caches, Turbo caches, and build output across every package in the monorepo, then starts fresh.
+
+### Why this happens
+
+Vite caches pre-bundled dependencies in `.vite/` and `node_modules/.vite/`. When dependencies change (e.g. after switching branches, updating packages, or modifying workspace packages), the cached bundles can become stale. The Electron renderer loads the old cached modules which fail silently, resulting in a black screen.
+
+## Electron failed to install correctly
+
+If you see this error when running `pnpm dev`:
+
+```
+Error: Electron failed to install correctly, please delete node_modules/electron and try installing again
+```
+
+The electron binary didn't download during install. Fix it by running the install script manually:
+
+```bash
+cd node_modules/electron && node install.js
+```
+
+Or nuke it and reinstall:
+
+```bash
+rm -rf node_modules/electron && pnpm install && cd node_modules/electron && node install.js
+```
+
+## Native module crash (libc++abi / Napi::Error)
+
+If the app crashes with something like:
+
+```
+libc++abi: terminating due to uncaught exception of type Napi::Error
+```
+
+A native module was built for the wrong runtime. Re-run the install, which rebuilds what Electron needs via `apps/code/scripts/postinstall.sh`:
+
+```bash
+pnpm install
+```
+
+## Codex agent crashes with GPU process errors
+
+If you see repeated errors like:
+
+```
+[ERROR:gpu_process_host.cc(997)] GPU process exited unexpectedly: exit_code=5
+[FATAL:gpu_data_manager_impl_private.cc(448)] GPU process isn't usable. Goodbye.
+```
+
+The codex-acp binary hasn't been downloaded. When it's missing, the app falls back to `npx` which spawns inside Electron's environment and triggers Chromium GPU process crashes.
+
+### Fix
+
+```bash
+node apps/code/scripts/download-binaries.mjs
+```
+
+Then restart the app. This downloads the codex-acp binary to `apps/code/resources/codex-acp/`, which gets copied to `.vite/build/codex-acp/` during build.
+
+## Database initialization failed (better-sqlite3)
+
+If you see any of these errors on startup:
+
+```
+Database initialization failed Error: Could not locate the bindings file.
+```
+
+```
+Database initialization failed Error: The module '.../better_sqlite3.node'
+was compiled against a different Node.js version using
+NODE_MODULE_VERSION 145. This version of Node.js requires
+NODE_MODULE_VERSION 123.
+```
+
+```
+Unhandled rejection Error: Unexpected error found when calling "initialize"
+@postConstruct decorated method on class "DatabaseService"
+```
+
+The last one is the same failure wrapped by the DI container; the underlying cause (with the bindings paths it tried) is in `~/.posthog-code/logs-dev/main.log`.
+
+The `better-sqlite3` native binary wasn't compiled for your Electron version. This commonly happens after a merge, branch switch or Electron upgrade. It also happens whenever the binary was last rebuilt for plain Node, for example to run the workspace-server DB tests (see "One binary, two ABIs" below).
+
+### Fix
+
+```bash
+pnpm rebuild:sqlite-electron
+```
+
+Then restart the app.
+
+The script (`scripts/rebuild-better-sqlite3-electron.mjs`) downloads the official Electron prebuild via `prebuild-install` and falls back to compiling with `node-gyp` against the Electron headers. It deliberately avoids `@electron/rebuild`: its CLI crashes on Node 26 and newer (it requires the legacy `yargs/yargs` entry, which new Node parses as ESM) and its module walker cannot find packages hoisted to the root `node_modules` by pnpm's `node-linker=hoisted` layout. The ABI comes from the Electron target, not your system Node, so the binary gets the right `NODE_MODULE_VERSION` even when the two differ. It lands at `node_modules/better-sqlite3/build/Release/better_sqlite3.node`.
+
+Also check that build scripts are allowed to run at all: if `~/.npmrc` contains `ignore-scripts=true`, pnpm silently skips every native build and postinstall, and nothing above can work.
+
+If the script itself won't run, the same prebuild download works manually (no toolchain needed):
+
+```bash
+ELECTRON_VERSION="$(node -p "require('./node_modules/electron/package.json').version")"
+cd node_modules/better-sqlite3
+rm -rf build prebuilds
+npx prebuild-install --runtime=electron --target="$ELECTRON_VERSION" --arch="$(node -p process.arch)"
+```
+
+### One binary, two ABIs (app vs tests)
+
+There is a single `better-sqlite3` binary in the repo but two runtimes that load it:
+
+- The Electron main process (`pnpm dev`, the packaged app) needs it compiled for **Electron's** ABI. The `apps/code` postinstall does this.
+- The workspace-server DB tests run under plain Node via vitest and need it compiled for **your system Node's** ABI.
+
+These ABIs differ, so the binary can only satisfy one side at a time and rebuilding for one breaks the other. The toggle is deliberate:
+
+```bash
+# Before running the workspace-server DB tests locally (CI does this in test.yml):
+node scripts/rebuild-better-sqlite3-node.mjs
+
+# Before running the app again, restore the Electron build:
+pnpm --filter code postinstall
+# (or any of the fixes above)
+```
+
+Symptoms map directly to the current state: the app failing with `DatabaseService` / `NODE_MODULE_VERSION` errors means the binary is in its Node state; `src/db/repositories/repositories.test.ts` failing with a `NODE_MODULE_VERSION` mismatch means it is in its Electron state. Note that `pnpm rebuild better-sqlite3` compiles for system Node, so it flips the binary to the test state even if you meant to fix the app.
+
+## node-gyp failed to rebuild @parcel/watcher
+
+If you see this error after pulling or switching branches:
+
+```
+Error: node-gyp failed to rebuild '/path/to/node_modules/@parcel/watcher'
+```
+
+`@parcel/watcher` ships prebuilt N-API binaries per platform (e.g. `@parcel/watcher-darwin-arm64`) and should not need recompilation. This error usually means a stale or partial install state is triggering a source rebuild that fails.
+
+### Fix
+
+```bash
+rm -rf node_modules/@parcel/watcher
+pnpm install
+```
+
+If that doesn't work, nuke and reinstall:
+
+```bash
+rm -rf node_modules && pnpm install
+```
+
+Do **not** run `npx @electron/rebuild` against `@parcel/watcher` — it doesn't need it and the rebuild will fail.
+
+## `pnpm i` shows "Packages: -198"
+
+You might see something like this every time you run `pnpm install`:
+
+```
+Packages: -198
+```
+
+This is cosmetic noise — nothing is broken. It's caused by `nodeLinker: hoisted` in `pnpm-workspace.yaml`, which gives us a flat `node_modules` layout (required for Electron). With hoisted mode, pnpm reorganizes the flat layout on each install and reports the churn as packages added/removed. The packages aren't actually disappearing. Safe to ignore.
+
+## Commit signing fails with Secretive ("private key not available")
+
+We require signed commits, and many of us sign via [Secretive](https://github.com/maxgoedjen/secretive) (SSH keys held in the macOS Secure Enclave). A commit — most often one an agent like Claude Code or Codex runs for you — fails with something like:
+
+```
+error: Load key "...": agent refused operation
+fatal: failed to write commit object
+```
+
+or a tool reports that "the Secretive SSH agent doesn't have the matching private key available."
+
+The usual cause is **not** that the key is missing — it's that the shell running `git commit` can't reach Secretive's agent socket. Git signs commits with `ssh-keygen -Y sign`, which finds the agent **only** through the `SSH_AUTH_SOCK` environment variable. It does **not** read `~/.ssh/config`'s `IdentityAgent`. A GUI-launched app (or an agent shell spawned from one) often doesn't inherit `SSH_AUTH_SOCK`, so signing fails intermittently even though Secretive is running and your terminal commits fine.
+
+### Fix
+
+**Quick setup — paste this.** Adds `SSH_AUTH_SOCK` to your `~/.claude/settings.json` (merging with anything already there) so every agent shell picks it up. Needs `jq`; otherwise use the manual edit below:
+
+```bash
+SOCK="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"; [ -S "$SOCK" ] || echo "⚠️  No Secretive socket at $SOCK — open Secretive → Setup and copy the path it shows"; mkdir -p ~/.claude; f=~/.claude/settings.json; [ -s "$f" ] || echo '{}' > "$f"; tmp=$(mktemp) && jq --arg s "$SOCK" '.env = (.env // {}) + {SSH_AUTH_SOCK: $s}' "$f" > "$tmp" && mv "$tmp" "$f" && echo "updated $f:" && cat "$f"
+```
+
+**Or set it by hand.** Find the socket path (Secretive also shows it in-app under its setup screen):
+
+```bash
+ls "$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
+```
+
+and add it to `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "SSH_AUTH_SOCK": "/Users/<you>/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
+  }
+}
+```
+
+Either way, for commits you run in a terminal yourself, also export it from your shell profile (`~/.zshrc`):
+
+```bash
+export SSH_AUTH_SOCK="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
+```
+
+Then verify it works, from inside a git repo — this prints your Secretive public key, then a signed commit:
+
+```bash
+export SSH_AUTH_SOCK="$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
+ssh-add -L
+git commit --allow-empty -m "test signing" && git log --show-signature -1
+```
+
+> **Note:** Claude Code reads `env` at session start, so restart the app (or start a new session) after editing `~/.claude/settings.json` for the change to take effect.
+
+Two things `SSH_AUTH_SOCK` can't fix, because only the machine owner controls them:
+
+- **Keep the Mac unlocked** while agents commit — the Secure Enclave is unavailable while the screen is locked.
+- For fully unattended signing, **turn off "Require Authentication before use"** for that key in the Secretive app (the trade-off is no per-signature Touch ID). Leave it on and you'll have to approve each commit's Touch ID prompt.

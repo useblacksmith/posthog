@@ -1,0 +1,872 @@
+import os
+import json
+import uuid
+import asyncio
+import ipaddress
+from collections.abc import AsyncIterator
+
+import pytest
+from posthog.test.base import APIBaseTest, ClickhouseTestMixin
+from unittest.mock import MagicMock, patch
+
+from django.test import SimpleTestCase, override_settings
+from django.utils import timezone
+
+import httpx
+from celery.exceptions import Retry
+from parameterized import parameterized
+
+from posthog.redis import get_client
+from posthog.security.url_validation import PinnedUrlVerdict
+
+from products.mcp_store.backend.models import MCPServerInstallation, MCPServerInstallationTool
+from products.mcp_store.backend.oauth import discover_oauth_metadata
+from products.mcp_store.backend.tasks.tasks import sync_installation_tools_task
+from products.mcp_store.backend.tools import (
+    CALL_TIMEOUT,
+    HANDSHAKE_TIMEOUT,
+    RESYNC_FAILURE_THROTTLE_SECONDS,
+    ToolCallError,
+    ToolsFetchError,
+    UpstreamToolList,
+    call_upstream_tool,
+    fetch_upstream_tools,
+    resync_installation_tools,
+    sync_installation_tools,
+)
+
+ALLOWED_VERDICT = PinnedUrlVerdict(allowed=True, reason=None, pinned_ips=set())
+
+
+class TestBoundedUpstreamResponses(SimpleTestCase):
+    def test_oauth_discovery_follows_bounded_metadata_redirects(self) -> None:
+        responses = [
+            httpx.Response(302, headers={"Location": "/metadata"}, stream=httpx.ByteStream(b"")),
+            httpx.Response(
+                200, stream=httpx.ByteStream(json.dumps({"authorization_servers": ["https://example.com"]}).encode())
+            ),
+            httpx.Response(
+                200,
+                stream=httpx.ByteStream(
+                    json.dumps(
+                        {
+                            "issuer": "https://example.com",
+                            "authorization_endpoint": "https://example.com/authorize",
+                            "token_endpoint": "https://example.com/token",
+                        }
+                    ).encode()
+                ),
+            ),
+        ]
+        with (
+            patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None)),
+            patch("products.mcp_store.backend.oauth.resolve_mcp_url_policy", return_value=ALLOWED_VERDICT),
+            patch("httpx.AsyncHTTPTransport.handle_async_request", side_effect=responses),
+        ):
+            metadata = discover_oauth_metadata("https://example.com/mcp")
+        self.assertEqual(metadata["issuer"], "https://example.com")
+        self.assertTrue(all(response.is_closed for response in responses))
+
+    @parameterized.expand([("discovery", True), ("handshake", False)])
+    def test_response_size_is_bounded(self, _name: str, discovery: bool) -> None:
+        response = httpx.Response(200, stream=httpx.ByteStream(b"x" * (9 * 1024 * 1024)))
+        installation = MCPServerInstallation(team_id=1, user_id=1, url="https://example.com/mcp", auth_type="api_key")
+        with (
+            patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None)),
+            patch("products.mcp_store.backend.oauth.resolve_mcp_url_policy", return_value=ALLOWED_VERDICT),
+            patch("products.mcp_store.backend.tools.resolve_mcp_url_policy", return_value=ALLOWED_VERDICT),
+            patch("httpx.AsyncHTTPTransport.handle_async_request", return_value=response),
+            patch(
+                "httpx.HTTPTransport.handle_request", return_value=httpx.Response(200, content=b"x" * (9 * 1024 * 1024))
+            ),
+            self.assertRaisesRegex(httpx.DecodingError if discovery else ToolsFetchError, "size limit"),
+        ):
+            if discovery:
+                discover_oauth_metadata(installation.url)
+            else:
+                fetch_upstream_tools(installation)
+        self.assertTrue(response.is_closed)
+
+    @parameterized.expand(
+        [
+            ("oversized", {}, 9 * 1024 * 1024, "size limit"),
+            ("compressed", {"Content-Encoding": "gzip"}, 1, "uncompressed"),
+        ]
+    )
+    def test_rejected_tool_results_raise_tool_call_error(
+        self, _name: str, headers: dict[str, str], body_size: int, message: str
+    ) -> None:
+        responses = [
+            httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": "test-session"},
+                stream=httpx.ByteStream(b'{"jsonrpc":"2.0","id":1,"result":{}}'),
+            ),
+            httpx.Response(202, stream=httpx.ByteStream(b"")),
+            httpx.Response(200, headers=headers, stream=httpx.ByteStream(b"x" * body_size)),
+            httpx.Response(200, stream=httpx.ByteStream(b"")),
+        ]
+        installation = MCPServerInstallation(team_id=1, user_id=1, url="https://example.com/mcp", auth_type="api_key")
+        with (
+            patch("products.mcp_store.backend.tools.resolve_mcp_url_policy", return_value=ALLOWED_VERDICT),
+            patch("httpx.AsyncHTTPTransport.handle_async_request", side_effect=responses),
+            self.assertRaisesRegex(ToolCallError, message),
+        ):
+            call_upstream_tool(installation, "search", {}, borrowed=False)
+        self.assertTrue(all(response.is_closed for response in responses))
+
+    @parameterized.expand([("discovery", True), ("handshake", False)])
+    def test_slow_response_has_a_total_deadline(self, _name: str, discovery: bool) -> None:
+        clock = [0.0]
+
+        class Body(httpx.AsyncByteStream):
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                for _ in range(100):
+                    clock[0] += 1
+                    await asyncio.sleep(0)
+                    yield b"x"
+
+        response = httpx.Response(200, stream=Body())
+        installation = MCPServerInstallation(team_id=1, user_id=1, url="https://example.com/mcp", auth_type="api_key")
+        with (
+            patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None)),
+            patch("products.mcp_store.backend.oauth.resolve_mcp_url_policy", return_value=ALLOWED_VERDICT),
+            patch("products.mcp_store.backend.tools.resolve_mcp_url_policy", return_value=ALLOWED_VERDICT),
+            patch("asyncio.BaseEventLoop.time", side_effect=lambda: clock[0]),
+            patch("httpx.AsyncHTTPTransport.handle_async_request", return_value=response),
+            patch("httpx.HTTPTransport.handle_request", return_value=httpx.Response(200, content=b"invalid")),
+            self.assertRaisesRegex(httpx.ReadTimeout if discovery else ToolsFetchError, "deadline|timed out"),
+        ):
+            if discovery:
+                discover_oauth_metadata(installation.url)
+            else:
+                fetch_upstream_tools(installation)
+        self.assertTrue(response.is_closed)
+
+
+def _build_response(
+    *, status: int = 200, body: str = "", content_type: str = "application/json", session_id: str | None = None
+) -> MagicMock:
+    """Build a MagicMock that looks enough like an httpx.Response for our code.
+
+    Our parser reads ``status_code``, ``text``, and ``headers`` — so we set those
+    explicitly rather than relying on MagicMock auto-spec.
+    """
+    response = MagicMock()
+    response.status_code = status
+    response.text = body
+    headers: dict[str, str] = {"content-type": content_type}
+    if session_id is not None:
+        headers["mcp-session-id"] = session_id
+    response.headers = headers
+    return response
+
+
+def _install_handshake_mock(
+    mock_client_cls: MagicMock, *, tools_list_response: MagicMock, session_id: str | None = "sess-1"
+) -> MagicMock:
+    """Wire up the httpx.Client mock for the full MCP handshake.
+
+    Returns the client mock so tests can assert against call order / arguments.
+    The handshake is: POST initialize → POST notifications/initialized → POST
+    tools/list → DELETE. Tests parameterize the tools/list response.
+    """
+    initialize_body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}})
+    initialize_resp = _build_response(body=initialize_body, session_id=session_id)
+    notify_resp = _build_response(status=202, body="")
+
+    client = MagicMock()
+    # Three POSTs in order: initialize, notifications/initialized, tools/list.
+    client.post.side_effect = [initialize_resp, notify_resp, tools_list_response]
+    client.delete.return_value = _build_response(status=200, body="")
+    mock_client_cls.return_value.__enter__.return_value = client
+    return client
+
+
+class TestFetchUpstreamTools(ClickhouseTestMixin, APIBaseTest):
+    def _installation(self, **overrides) -> MCPServerInstallation:
+        defaults = {
+            "team": self.team,
+            "user": self.user,
+            "url": f"https://mcp-{uuid.uuid4().hex[:8]}.example.com/mcp",
+            "display_name": "Test",
+            "auth_type": "api_key",
+            "sensitive_configuration": {"api_key": "sk-test"},
+        }
+        defaults.update(overrides)
+        return MCPServerInstallation.objects.create(**defaults)
+
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_uses_handshake_timeout(self, mock_client_cls, _allow):
+        # The handshake must not inherit the proxy's 180s budget — that would let a
+        # slow upstream hold a Django worker for minutes.
+        installation = self._installation()
+        tools_body = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "alpha"}]}})
+        _install_handshake_mock(mock_client_cls, tools_list_response=_build_response(body=tools_body))
+
+        fetch_upstream_tools(installation)
+
+        assert mock_client_cls.call_args.kwargs["timeout"] == HANDSHAKE_TIMEOUT
+        assert HANDSHAKE_TIMEOUT <= 30  # guard against accidental regression
+
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_parses_result(self, mock_client_cls, _allow):
+        installation = self._installation()
+        tools_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [
+                        {"name": "alpha", "description": "A", "inputSchema": {"type": "object"}},
+                        {"name": "beta", "title": "Beta!", "description": "B"},
+                        {"description": "no name"},  # invalid — dropped
+                    ]
+                },
+            }
+        )
+        client = _install_handshake_mock(mock_client_cls, tools_list_response=_build_response(body=tools_body))
+
+        tools = fetch_upstream_tools(installation).tools
+        assert [t["name"] for t in tools] == ["alpha", "beta"]
+
+        # Verify the handshake order and that the session id rode along on later calls.
+        assert client.post.call_count == 3
+        init_call, notify_call, list_call = client.post.call_args_list
+        assert json.loads(init_call.kwargs["content"])["method"] == "initialize"
+        assert "Mcp-Session-Id" not in init_call.kwargs["headers"]
+        assert json.loads(notify_call.kwargs["content"])["method"] == "notifications/initialized"
+        assert notify_call.kwargs["headers"]["Mcp-Session-Id"] == "sess-1"
+        assert json.loads(list_call.kwargs["content"])["method"] == "tools/list"
+        assert list_call.kwargs["headers"]["Authorization"] == "Bearer sk-test"
+        assert list_call.kwargs["headers"]["x-posthog-mcp-store"] == "true"
+        assert list_call.kwargs["headers"]["Mcp-Session-Id"] == "sess-1"
+        # DELETE cleans up the session afterwards.
+        assert client.delete.called
+        assert client.delete.call_args.kwargs["headers"]["Mcp-Session-Id"] == "sess-1"
+
+    @patch("products.mcp_store.backend.proxy.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_follows_same_origin_initialize_redirect(
+        self, mock_client_cls, _allow_tools, _allow_proxy
+    ):
+        installation = self._installation(url="https://mcp.example.com/mcp")
+        redirect_resp = _build_response(status=307, body="")
+        redirect_resp.headers["location"] = "/mcp/"
+        initialize_resp = _build_response(
+            body=json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}),
+            session_id="sess-1",
+        )
+        notify_resp = _build_response(status=202, body="")
+        tools_body = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "alpha"}]}})
+        tools_resp = _build_response(body=tools_body)
+
+        client = MagicMock()
+        client.post.side_effect = [redirect_resp, initialize_resp, notify_resp, tools_resp]
+        client.delete.return_value = _build_response(status=200, body="")
+        mock_client_cls.return_value.__enter__.return_value = client
+
+        tools = fetch_upstream_tools(installation).tools
+
+        assert [tool["name"] for tool in tools] == ["alpha"]
+        assert client.post.call_args_list[0].args[0] == "https://mcp.example.com/mcp"
+        assert client.post.call_args_list[1].args[0] == "https://mcp.example.com/mcp/"
+        assert client.post.call_args_list[2].args[0] == "https://mcp.example.com/mcp/"
+        assert client.post.call_args_list[3].args[0] == "https://mcp.example.com/mcp/"
+        assert client.delete.call_args.args[0] == "https://mcp.example.com/mcp/"
+
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_parses_sse_tools_list(self, mock_client_cls, _allow):
+        # Some MCP servers reply to tools/list over SSE even though initialize
+        # came back as JSON. Make sure we still extract the tool array.
+        installation = self._installation()
+        sse_body = 'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"alpha"}]}}\n\n'
+        _install_handshake_mock(
+            mock_client_cls,
+            tools_list_response=_build_response(body=sse_body, content_type="text/event-stream"),
+        )
+
+        tools = fetch_upstream_tools(installation).tools
+        assert [t["name"] for t in tools] == ["alpha"]
+
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_works_without_session_id(self, mock_client_cls, _allow):
+        # Servers that don't require a session simply omit Mcp-Session-Id on the
+        # initialize response. We should still complete the handshake and not
+        # send DELETE (nothing to terminate).
+        installation = self._installation()
+        tools_body = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "alpha"}]}})
+        client = _install_handshake_mock(
+            mock_client_cls,
+            tools_list_response=_build_response(body=tools_body),
+            session_id=None,  # no session id returned
+        )
+        # _install_handshake_mock still queues an initialize with a session id;
+        # overwrite that so this case is accurate.
+        init_resp = _build_response(body=json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}))
+        notify_resp = _build_response(status=202, body="")
+        client.post.side_effect = [init_resp, notify_resp, _build_response(body=tools_body)]
+
+        tools = fetch_upstream_tools(installation).tools
+        assert [t["name"] for t in tools] == ["alpha"]
+        assert not client.delete.called
+
+    @parameterized.expand(
+        [
+            ("direct", "fetch"),
+            ("trusted", "fetch"),
+            ("untrusted", "fetch"),
+            ("untrusted", "call"),
+            ("denied", "fetch"),
+            ("denied", "call"),
+        ]
+    )
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips")
+    def test_fetch_upstream_tools_connects_to_the_validated_address(
+        self, route: str, operation: str, mock_validate: MagicMock
+    ) -> None:
+        mock_validate.return_value = PinnedUrlVerdict(
+            allowed=True, reason=None, pinned_ips={ipaddress.ip_address("93.184.216.34")}
+        )
+        installation = self._installation(url="https://mcp.example.com/mcp")
+        seen: list[httpx.Request] = []
+
+        async def handle_request(_transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+            if route == "denied":
+                raise httpx.ProxyError("403 Forbidden")
+            seen.append(
+                httpx.Request(request.method, request.url, headers=request.headers, extensions=request.extensions)
+            )
+            request_id = json.loads(request.content).get("id") if request.content else None
+            if request.method == "DELETE":
+                response = httpx.Response(200)
+            elif request_id == 1:
+                response = httpx.Response(
+                    200,
+                    json={"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}},
+                    headers={"mcp-session-id": "sess-1", "Set-Cookie": "mcp_session=fake-session; Path=/; Secure"},
+                )
+            elif request_id == 2:
+                response = httpx.Response(
+                    200, json={"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "alpha"}]}}
+                )
+            else:
+                response = httpx.Response(202)
+            return httpx.Response(
+                response.status_code, headers=response.headers, stream=httpx.ByteStream(response.content)
+            )
+
+        no_proxies = {key: "" for key in os.environ if key.lower().endswith("_proxy")}
+        environment = {} if route == "direct" else {"HTTPS_PROXY": "http://egress.example:3128"}
+        trusted_proxies = ["http://egress.example:3128"] if route in {"trusted", "denied"} else []
+        with (
+            override_settings(SSRF_TRUSTED_PROXY_URLS=trusted_proxies),
+            patch.dict(os.environ, {**no_proxies, **environment}),
+            patch.object(httpx.AsyncHTTPTransport, "handle_async_request", handle_request),
+        ):
+            if route in {"untrusted", "denied"}:
+                error_type = ToolsFetchError if operation == "fetch" else ToolCallError
+                with pytest.raises(error_type, match="outbound proxy configuration"):
+                    if operation == "fetch":
+                        fetch_upstream_tools(installation)
+                    else:
+                        call_upstream_tool(installation, "alpha", {}, borrowed=False)
+                assert seen == []
+                return
+            tools = fetch_upstream_tools(installation).tools
+
+        assert [tool["name"] for tool in tools] == ["alpha"]
+        assert len(seen) == 4
+        assert {request.headers.get("Cookie") for request in seen[1:]} == {"mcp_session=fake-session"}
+        assert {request.url.host for request in seen} == {"93.184.216.34" if route == "direct" else "mcp.example.com"}
+        assert {request.headers["Host"] for request in seen} == {"mcp.example.com"}
+        assert {request.extensions.get("sni_hostname") for request in seen} == {
+            "mcp.example.com" if route == "direct" else None
+        }
+
+    @patch(
+        "products.mcp_store.backend.url_policy.validate_url_and_pin_ips",
+        return_value=PinnedUrlVerdict(allowed=False, reason="Private IP", pinned_ips=set()),
+    )
+    def test_fetch_upstream_tools_raises_on_blocked_url(self, _allow):
+        installation = self._installation()
+        with pytest.raises(ToolsFetchError, match="URL not allowed"):
+            fetch_upstream_tools(installation)
+
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_raises_on_connect_error(self, mock_client_cls, _allow):
+        installation = self._installation()
+        client = MagicMock()
+        client.post.side_effect = httpx.ConnectError("nope")
+        mock_client_cls.return_value.__enter__.return_value = client
+
+        with pytest.raises(ToolsFetchError, match="unreachable"):
+            fetch_upstream_tools(installation)
+
+    @parameterized.expand(
+        [
+            ("remote_protocol", httpx.RemoteProtocolError("server disconnected")),
+            ("too_many_redirects", httpx.TooManyRedirects("redirect loop")),
+        ]
+    )
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_reports_handshake_faults_as_fetch_errors(self, _name, error, mock_client_cls, _allow):
+        # Callers on the request path turn ToolsFetchError into a refusal, so an
+        # httpx error escaping here would become a 500 instead.
+        installation = self._installation()
+        client = MagicMock()
+        client.post.side_effect = error
+        mock_client_cls.return_value.__enter__.return_value = client
+
+        with pytest.raises(ToolsFetchError, match="handshake failed"):
+            fetch_upstream_tools(installation)
+
+    @parameterized.expand(
+        [
+            ("answers_the_offer", [{"protocolVersion": "2025-06-18"}], ["2025-06-18"], "2025-06-18"),
+            ("answers_an_older_version", [{"protocolVersion": "2025-03-26"}], ["2025-06-18"], "2025-03-26"),
+            ("rejects_with_400", [400, {"protocolVersion": "2025-03-26"}], ["2025-06-18", "2025-03-26"], "2025-03-26"),
+            (
+                "rejects_with_jsonrpc_error",
+                ["error", "error", {"protocolVersion": "2024-11-05"}],
+                ["2025-06-18", "2025-03-26", "2024-11-05"],
+                "2024-11-05",
+            ),
+            ("answers_an_unknown_version", [{"protocolVersion": "2099-01-01"}], ["2025-06-18"], None),
+        ]
+    )
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_negotiates_the_protocol_version(
+        self,
+        _name: str,
+        initialize_replies: list,
+        expected_offers: list[str],
+        expected_header: str | None,
+        mock_client_cls: MagicMock,
+        _allow: MagicMock,
+    ) -> None:
+        installation = self._installation()
+        initialize_responses = []
+        for reply in initialize_replies:
+            if reply == 400:
+                initialize_responses.append(_build_response(status=400, body="Unsupported protocol version"))
+            elif reply == "error":
+                error = {"code": -32602, "message": "Unsupported protocol version"}
+                initialize_responses.append(
+                    _build_response(body=json.dumps({"jsonrpc": "2.0", "id": 1, "error": error}))
+                )
+            else:
+                body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": reply})
+                initialize_responses.append(_build_response(body=body, session_id="sess-1"))
+        tools_body = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "alpha"}]}})
+        client = MagicMock()
+        client.post.side_effect = [
+            *initialize_responses,
+            _build_response(status=202, body=""),
+            _build_response(body=tools_body),
+        ]
+        client.delete.return_value = _build_response(status=200, body="")
+        mock_client_cls.return_value.__enter__.return_value = client
+
+        listing = fetch_upstream_tools(installation)
+
+        assert [tool["name"] for tool in listing.tools] == ["alpha"]
+        assert listing.protocol_version == expected_header
+        *initialize_calls, notify_call, list_call = client.post.call_args_list
+        offers = [json.loads(call.kwargs["content"])["params"]["protocolVersion"] for call in initialize_calls]
+        assert offers == expected_offers
+        assert all("MCP-Protocol-Version" not in call.kwargs["headers"] for call in initialize_calls)
+        for headers in (
+            notify_call.kwargs["headers"],
+            list_call.kwargs["headers"],
+            client.delete.call_args.kwargs["headers"],
+        ):
+            assert headers.get("MCP-Protocol-Version") == expected_header
+
+    @parameterized.expand([("auth_failure_stops", 401, 1), ("every_version_rejected", 400, 3)])
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_raises_on_initialize_error(
+        self, _name: str, status: int, expected_attempts: int, mock_client_cls: MagicMock, _allow: MagicMock
+    ) -> None:
+        installation = self._installation()
+        client = MagicMock()
+        client.post.return_value = _build_response(status=status, body="rejected")
+        mock_client_cls.return_value.__enter__.return_value = client
+
+        with pytest.raises(ToolsFetchError, match=f"initialize returned status {status}"):
+            fetch_upstream_tools(installation)
+        assert client.post.call_count == expected_attempts
+
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_drops_a_tool_whose_name_is_not_a_string(self, mock_client_cls, _allow):
+        # A non-string name is unhashable, so sync_installation_tools would raise
+        # TypeError on it — a 500 on the request path that re-lists.
+        installation = self._installation()
+        tools_body = json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": ["search"]}, {"name": "alpha"}]}}
+        )
+        _install_handshake_mock(mock_client_cls, tools_list_response=_build_response(body=tools_body))
+
+        assert [tool["name"] for tool in fetch_upstream_tools(installation).tools] == ["alpha"]
+
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_fetch_upstream_tools_raises_when_result_missing(self, mock_client_cls, _allow):
+        installation = self._installation()
+        tools_body = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {}})
+        _install_handshake_mock(mock_client_cls, tools_list_response=_build_response(body=tools_body))
+
+        with pytest.raises(ToolsFetchError, match="missing 'result.tools'"):
+            fetch_upstream_tools(installation)
+
+
+class TestCallUpstreamTool(ClickhouseTestMixin, APIBaseTest):
+    def _installation(self) -> MCPServerInstallation:
+        return MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            url=f"https://mcp-{uuid.uuid4().hex[:8]}.example.com/mcp",
+            display_name="Test",
+            auth_type="api_key",
+            sensitive_configuration={"api_key": "sk-test"},
+        )
+
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_call_carries_the_session_from_initialize(self, mock_client_cls, _allow):
+        # Most servers reject tools/call without the Mcp-Session-Id they handed out on
+        # initialize, so losing the session header would break every real call while
+        # still passing a test that only inspects the JSON body.
+        installation = self._installation()
+        call_body = json.dumps({"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": "ok"}]}})
+        client = _install_handshake_mock(mock_client_cls, tools_list_response=_build_response(body=call_body))
+
+        result = call_upstream_tool(installation, "create_issue", {"title": "Bug"}, borrowed=False)
+
+        assert result["content"] == [{"type": "text", "text": "ok"}]
+        call_post = client.post.call_args_list[2]
+        assert call_post.kwargs["headers"]["Mcp-Session-Id"] == "sess-1"
+        assert call_post.kwargs["headers"]["x-posthog-mcp-store"] == "true"
+        assert json.loads(call_post.kwargs["content"]) == {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "create_issue", "arguments": {"title": "Bug"}},
+        }
+        # A real tool call does upstream work, so it must not inherit the tight
+        # discovery timeout.
+        assert mock_client_cls.call_args.kwargs["timeout"] == CALL_TIMEOUT
+
+    @parameterized.expand(
+        [
+            (
+                "plain_json",
+                json.dumps({"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": "ok"}]}}),
+                "application/json",
+            ),
+            (
+                "sse_framed",
+                'event: message\ndata: {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}\n\n',
+                "text/event-stream",
+            ),
+        ]
+    )
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_call_parses_both_response_framings(self, _name, body, content_type, mock_client_cls, _allow):
+        installation = self._installation()
+        _install_handshake_mock(
+            mock_client_cls, tools_list_response=_build_response(body=body, content_type=content_type)
+        )
+
+        assert call_upstream_tool(installation, "create_issue", {}, borrowed=False)["content"] == [
+            {"type": "text", "text": "ok"}
+        ]
+
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_call_returns_tool_reported_errors_instead_of_raising(self, mock_client_cls, _allow):
+        # `isError` is the tool telling the model it failed (bad arguments, not found).
+        # Raising here would hide the reason the agent needs in order to retry.
+        installation = self._installation()
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {"content": [{"type": "text", "text": "title is required"}], "isError": True},
+            }
+        )
+        _install_handshake_mock(mock_client_cls, tools_list_response=_build_response(body=body))
+
+        result = call_upstream_tool(installation, "create_issue", {}, borrowed=False)
+
+        assert result["isError"] is True
+        assert result["content"] == [{"type": "text", "text": "title is required"}]
+
+    @parameterized.expand(
+        [
+            (
+                "jsonrpc_error",
+                json.dumps({"jsonrpc": "2.0", "id": 3, "error": {"code": -32602, "message": "bad params"}}),
+                "returned error",
+            ),
+            ("missing_result", json.dumps({"jsonrpc": "2.0", "id": 3}), "missing 'result'"),
+        ]
+    )
+    @patch("products.mcp_store.backend.url_policy.validate_url_and_pin_ips", return_value=ALLOWED_VERDICT)
+    @patch("products.mcp_store.backend.tools.pinned_client")
+    def test_call_raises_on_protocol_failures(self, _name, body, expected_message, mock_client_cls, _allow):
+        installation = self._installation()
+        _install_handshake_mock(mock_client_cls, tools_list_response=_build_response(body=body))
+
+        with pytest.raises(ToolCallError, match=expected_message):
+            call_upstream_tool(installation, "create_issue", {}, borrowed=False)
+
+    @patch(
+        "products.mcp_store.backend.url_policy.validate_url_and_pin_ips",
+        return_value=PinnedUrlVerdict(allowed=False, reason="Private IP", pinned_ips=set()),
+    )
+    def test_call_refuses_a_blocked_url(self, _allow):
+        installation = self._installation()
+        with pytest.raises(ToolCallError, match="URL not allowed"):
+            call_upstream_tool(installation, "create_issue", {}, borrowed=False)
+
+
+class TestSyncInstallationTools(ClickhouseTestMixin, APIBaseTest):
+    def _installation(self) -> MCPServerInstallation:
+        return MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            url=f"https://mcp-{uuid.uuid4().hex[:8]}.example.com/mcp",
+            display_name="Test",
+            auth_type="api_key",
+            sensitive_configuration={"api_key": "sk-test"},
+        )
+
+    @patch("products.mcp_store.backend.tools.fetch_upstream_tools")
+    def test_new_tools_default_to_needs_approval(self, mock_fetch):
+        installation = self._installation()
+        mock_fetch.return_value = UpstreamToolList(tools=[{"name": "search", "description": "Search something"}])
+
+        sync_installation_tools(installation)
+        tool = installation.tools.get(tool_name="search")
+        assert tool.approval_state == "needs_approval"
+        assert tool.description == "Search something"
+        assert tool.removed_at is None
+
+    @patch("products.mcp_store.backend.tools.fetch_upstream_tools")
+    def test_a_row_another_sync_created_is_updated_rather_than_duplicated(self, mock_fetch):
+        # The install task, "Refresh tools" and the request-path repair can overlap,
+        # and the loser of the (installation, tool_name) unique constraint would
+        # raise — a 500 out of the proxy, since nothing catches IntegrityError.
+        installation = self._installation()
+        mock_fetch.return_value = UpstreamToolList(tools=[{"name": "search", "description": "fresh"}])
+
+        def create_the_row_behind_this_sync(_installation):
+            MCPServerInstallationTool.objects.create(
+                installation=installation,
+                tool_name="search",
+                description="raced",
+                approval_state="approved",
+                last_seen_at=timezone.now(),
+            )
+            return mock_fetch.return_value
+
+        mock_fetch.side_effect = create_the_row_behind_this_sync
+        sync_installation_tools(installation)
+
+        tool = installation.tools.get(tool_name="search")
+        assert tool.description == "fresh"
+        # The row the other sync created keeps its approval state.
+        assert tool.approval_state == "approved"
+
+    @patch("products.mcp_store.backend.tools.fetch_upstream_tools")
+    def test_sync_persists_upstream_annotations(self, mock_fetch):
+        installation = self._installation()
+        mock_fetch.return_value = UpstreamToolList(tools=[{"name": "search", "annotations": {"destructiveHint": True}}])
+        sync_installation_tools(installation)
+        assert installation.tools.get(tool_name="search").annotations == {"destructiveHint": True}
+
+        mock_fetch.return_value = UpstreamToolList(
+            tools=[{"name": "search", "annotations": {"destructiveHint": False}}]
+        )
+        sync_installation_tools(installation)
+        assert installation.tools.get(tool_name="search").annotations == {"destructiveHint": False}
+
+    @patch("products.mcp_store.backend.tools.fetch_upstream_tools")
+    def test_disappeared_tool_marked_removed_state_preserved(self, mock_fetch):
+        installation = self._installation()
+        mock_fetch.return_value = UpstreamToolList(tools=[{"name": "search"}])
+        sync_installation_tools(installation)
+
+        tool = installation.tools.get(tool_name="search")
+        tool.approval_state = "approved"
+        tool.save(update_fields=["approval_state"])
+
+        mock_fetch.return_value = UpstreamToolList(tools=[])  # upstream dropped the tool
+        sync_installation_tools(installation)
+        tool.refresh_from_db()
+        assert tool.removed_at is not None
+        # Approval survives a disappearance so a returning tool isn't quietly downgraded.
+        assert tool.approval_state == "approved"
+
+    @patch("products.mcp_store.backend.tools.fetch_upstream_tools")
+    def test_reappearing_tool_clears_removed_and_keeps_state(self, mock_fetch):
+        installation = self._installation()
+        # Seed a removed tool with a manually-chosen approval state.
+        MCPServerInstallationTool.objects.create(
+            installation=installation,
+            tool_name="write",
+            description="old",
+            approval_state="do_not_use",
+            last_seen_at=timezone.now(),
+            removed_at=timezone.now(),
+        )
+
+        mock_fetch.return_value = UpstreamToolList(tools=[{"name": "write", "description": "updated"}])
+        sync_installation_tools(installation)
+
+        tool = installation.tools.get(tool_name="write")
+        assert tool.removed_at is None
+        # Returning tools keep whatever the user set last.
+        assert tool.approval_state == "do_not_use"
+        assert tool.description == "updated"
+
+    @patch("products.mcp_store.backend.tools.fetch_upstream_tools")
+    def test_existing_tool_metadata_updates_but_approval_preserved(self, mock_fetch):
+        installation = self._installation()
+        MCPServerInstallationTool.objects.create(
+            installation=installation,
+            tool_name="search",
+            description="old description",
+            input_schema={"type": "object"},
+            approval_state="approved",
+            last_seen_at=timezone.now(),
+        )
+
+        mock_fetch.return_value = UpstreamToolList(
+            tools=[
+                {
+                    "name": "search",
+                    "description": "new description",
+                    "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+                }
+            ]
+        )
+        sync_installation_tools(installation)
+
+        tool = installation.tools.get(tool_name="search")
+        assert tool.description == "new description"
+        assert "properties" in tool.input_schema
+        assert tool.approval_state == "approved"
+
+
+class TestResyncInstallationTools(ClickhouseTestMixin, APIBaseTest):
+    def _installation(self) -> MCPServerInstallation:
+        return MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            url=f"https://mcp-{uuid.uuid4().hex[:8]}.example.com/mcp",
+            display_name="Test",
+            auth_type="api_key",
+            sensitive_configuration={"api_key": "sk-test"},
+        )
+
+    @patch("products.mcp_store.backend.tools.fetch_upstream_tools")
+    def test_upstream_is_listed_once_per_throttle_window(self, mock_fetch):
+        # Callers re-list on a miss, so without the throttle an agent looping on a
+        # name the server does not have opens one handshake per call.
+        installation = self._installation()
+        mock_fetch.return_value = UpstreamToolList(tools=[{"name": "search"}])
+
+        assert resync_installation_tools(installation) is True
+        assert resync_installation_tools(installation) is False
+        assert mock_fetch.call_count == 1
+        assert installation.tools.filter(tool_name="search").exists()
+
+    @patch("products.mcp_store.backend.tools.fetch_upstream_tools", side_effect=ToolsFetchError("upstream down"))
+    def test_failed_listing_is_reported_rather_than_raised(self, _mock_fetch):
+        # This runs inside the proxy request path, where raising turns a refused
+        # tool call into a 500.
+        installation = self._installation()
+
+        assert resync_installation_tools(installation) is False
+
+        # A listing that failed refreshed nothing, so holding the full window would
+        # keep both repair paths shut long after a transient fault cleared.
+        remaining = get_client().ttl(f"mcp_store:tools_resync:{installation.id}")
+        assert 0 < remaining <= RESYNC_FAILURE_THROTTLE_SECONDS
+
+
+class TestSyncInstallationToolsTask(ClickhouseTestMixin, APIBaseTest):
+    @parameterized.expand(
+        [
+            ("synced", None, 0, "mcp_store tools synced", {"tool_count": 2, "protocol_version": "2025-06-18"}),
+            (
+                "failed_first_attempt",
+                Retry,
+                0,
+                "mcp_store tools sync failed",
+                {"attempt": 1, "will_retry": True},
+            ),
+            (
+                "failed_last_attempt",
+                ToolsFetchError,
+                5,
+                "mcp_store tools sync failed",
+                {"attempt": 6, "will_retry": False},
+            ),
+        ]
+    )
+    @patch("products.mcp_store.backend.tools.fetch_upstream_tools")
+    def test_reports_the_sync_outcome(
+        self,
+        _name: str,
+        raised: type[Exception] | None,
+        retries: int,
+        expected_event: str,
+        expected_properties: dict,
+        mock_fetch: MagicMock,
+    ) -> None:
+        installation = MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            url="https://mcp.example.com/mcp",
+            display_name="Test",
+            auth_type="api_key",
+            sensitive_configuration={"api_key": "sk-test"},
+        )
+        if raised is None:
+            mock_fetch.return_value = UpstreamToolList(
+                tools=[{"name": "search"}, {"name": "fetch"}], protocol_version="2025-06-18"
+            )
+        else:
+            mock_fetch.side_effect = ToolsFetchError("Upstream initialize returned status 400")
+        capture = MagicMock()
+        scoped_capture = MagicMock()
+        scoped_capture.return_value.__enter__.return_value = capture
+
+        with patch("products.mcp_store.backend.tasks.tasks.ph_scoped_capture", scoped_capture):
+            if raised is None:
+                sync_installation_tools_task.apply(args=[str(installation.id)], retries=retries)
+            else:
+                with pytest.raises(raised):
+                    sync_installation_tools_task.apply(args=[str(installation.id)], retries=retries)
+
+        capture.assert_called_once()
+        event = capture.call_args.kwargs
+        assert event["event"] == expected_event
+        assert event["distinct_id"] == self.user.distinct_id
+        assert event["properties"]["server_host"] == "mcp.example.com"
+        assert event["properties"]["$update_person_last_seen_at"] is False
+        assert expected_properties.items() <= event["properties"].items()

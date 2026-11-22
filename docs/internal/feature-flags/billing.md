@@ -1,0 +1,403 @@
+# Feature flag billing
+
+This document explains how the Rust feature flags service tracks usage for billing purposes, including Redis counter management, scheduled aggregation, event processing, and quota enforcement.
+
+## Architecture overview
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           Feature Flag Request Flow                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌──────────────┐     ┌─────────────┐     ┌───────────────┐     ┌───────────────┐  │
+│  │ SDK Request  │────▶│ Rust /flags │────▶│ Redis Counter │────▶│ Time-bucketed │  │
+│  │ (/decide)    │     │ Service     │     │ Increment     │     │ Hash Storage  │  │
+│  └──────────────┘     └─────────────┘     └───────────────┘     └───────────────┘  │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    Aggregation (every 30 minutes)                            │  │
+│  │  ┌─────────────┐     ┌─────────────┐     ┌───────────────┐     ┌──────────┐  │  │
+│  │  │ Celery Task │────▶│ Read Redis  │────▶│ Emit PostHog  │────▶│ Store in │  │  │
+│  │  │             │     │ Counters    │     │ Events        │     │ CH       │  │  │
+│  │  └─────────────┘     └─────────────┘     └───────────────┘     └──────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    Usage Report Generation                                   │  │
+│  │  ┌─────────────┐     ┌─────────────┐     ┌───────────────┐     ┌──────────┐  │  │
+│  │  │ Query CH    │────▶│ Aggregate   │────▶│ Calculate     │────▶│ Send to  │  │  │
+│  │  │ Events      │     │ by Team     │     │ Billable      │     │ Billing  │  │  │
+│  │  └─────────────┘     └─────────────┘     └───────────────┘     └──────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Step 1: Redis counter increment (Rust service)
+
+When a feature flag request is processed, the Rust service increments Redis counters to track usage.
+
+**Source files:**
+
+- `rust/feature-flags/src/flags/flag_analytics.rs` - Counter increment logic, shared `is_billable_flag_key` predicate
+- `rust/feature-flags/src/handler/billing.rs` - Billable flag detection for `/decide`
+- `rust/feature-flags/src/api/flag_definitions.rs` - Billable flag detection and quota enforcement for `/flags/definitions`
+
+### Redis key structure
+
+The service stores counts in Redis hashes using time-bucketed fields:
+
+| Request Type           | Team Key                                                   | SDK Key                                                                   |
+| ---------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `/decide`              | `posthog:decide_requests:{team_id}`                        | `posthog:decide_requests:sdk:{team_id}:{sdk_name}`                        |
+| Local evaluation (200) | `posthog:local_evaluation_requests:{team_id}`              | `posthog:local_evaluation_requests:sdk:{team_id}:{sdk_name}`              |
+| Local evaluation (304) | `posthog:local_evaluation_not_modified_requests:{team_id}` | `posthog:local_evaluation_not_modified_requests:sdk:{team_id}:{sdk_name}` |
+
+### Time bucketing
+
+Counts are grouped into 2-minute (120-second) time buckets:
+
+```rust
+const CACHE_BUCKET_SIZE: u64 = 60 * 2; // 120 seconds
+
+let time_bucket = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap()
+    .as_secs()
+    / CACHE_BUCKET_SIZE;
+```
+
+Each hash field is the time bucket number (Unix seconds / 120), and the value is the count for that bucket.
+
+### Billable flag detection
+
+Not all flag evaluations are billable. The following flags are excluded:
+
+- **Survey targeting flags**: Keys starting with `survey-targeting-`
+- **Product tour targeting flags**: Keys starting with `product-tour-targeting-`
+- **Inactive flags**: Flags where `active = false`
+
+A request is only counted for billing if it contains at least one active, non-survey, non-product-tour flag.
+
+The billable flag key check is implemented as a shared predicate (`is_billable_flag_key` in `flag_analytics.rs`) used by both the `/decide` handler (`contains_billable_flags`) and the `/flags/definitions` handler (`has_billable_flags`). This ensures the filtering logic stays consistent across endpoints.
+
+### Quota enforcement
+
+Rust's `/flags/definitions` endpoint enforces billing quotas. When a team exceeds their feature flag request quota, the endpoint returns **HTTP 402** with a JSON body:
+
+```json
+{
+  "type": "quota_limited",
+  "code": "payment_required",
+  "detail": "You have exceeded your feature flag request quota",
+  "attr": null
+}
+```
+
+The Rust endpoint checks `FeatureFlagsLimiter.is_limited(token)` before the ETag comparison and cache fetch. If the quota is exceeded, all requests (including conditional ones) return HTTP 402 — no 304 is issued while a team is over quota.
+
+### Conditional requests (ETag)
+
+A request that passes the quota check and results in a 304 (ETag match) is counted on the separate `local_evaluation_not_modified_requests` counter. The usage report bills these at 1 unit each, the same as a `/decide` request, instead of the 10 units a full local evaluation response costs. The usage record key is `feature_flag_local_evaluation_not_modified_requests`, apart from `feature_flag_requests`, because each key has its own usage counter and a shared key would count a 304 twice.
+
+A 304 for definitions that hold only survey or product tour flags is not billed, the same as a 200. The service memoizes per team and ETag whether the definitions hold a billable flag, so it reads the payload once per pod per ETag rather than on every poll. The memo is sized by `DEFINITIONS_BILLABLE_CACHE_CAPACITY` and an entry lives for `DEFINITIONS_BILLABLE_CACHE_TTL_SECONDS` (default one hour), which bounds how long a wrong answer can last. Only a payload served from Redis decides, because an S3 copy can lag the ETag by a version. A payload that came from S3, failed to read, or took longer than 500 ms leaves that poll unbilled, and the miss is remembered for 30 seconds so a degraded payload tier is not hammered by every poll. These unbilled polls show as `flags_flag_definitions_not_modified_billing_total{outcome="unknown"}`, which is why the 304 billing counter can run below the ETag hit counter.
+
+### SDK tracking
+
+The service extracts the SDK type from the request's user-agent header and increments a separate SDK-specific counter. Supported SDKs:
+
+| SDK Name               | Description             |
+| ---------------------- | ----------------------- |
+| `posthog-js`           | Web browsers            |
+| `posthog-node`         | Server-side Node.js     |
+| `posthog-python`       | Python SDK              |
+| `posthog-php`          | PHP SDK                 |
+| `posthog-laravel`      | Laravel SDK             |
+| `posthog-ruby`         | Ruby SDK                |
+| `posthog-go`           | Go SDK                  |
+| `posthog-java`         | Java SDK                |
+| `posthog-dotnet`       | .NET SDK                |
+| `posthog-elixir`       | Elixir SDK              |
+| `posthog-android`      | Android SDK             |
+| `posthog-ios`          | iOS SDK                 |
+| `posthog-react-native` | React Native SDK        |
+| `posthog-flutter`      | Flutter SDK             |
+| `other`                | Unknown or unrecognized |
+
+### Django flag list endpoint
+
+The Django flag list endpoint counts each request made with a personal API key as a local evaluation request.
+This applies to `/api/feature_flag/` and to `/api/projects/:project_id/feature_flags/`.
+Browser-session and unauthenticated requests are not counted.
+
+Each counted request increments two Redis hashes in one pipelined round trip:
+
+- The legacy team counter, `posthog:local_evaluation_requests:{team_id}`, which the 30-minute aggregation reads.
+- `posthog:django_local_evaluation_usage`, which holds one per-team count of the requests that Django served.
+
+The second hash exists because the Rust definitions service also writes to the legacy team counter and reports its own usage records.
+
+Every minute, `report_django_local_evaluation_usage_task` reads and deletes `posthog:django_local_evaluation_usage` in one Redis transaction.
+It then sends one `feature_flag_local_evaluation_requests` record per team as the `feature-flags-django` producer.
+The task sends at most 500 records in each request, because usage ingestion rejects a request above its batch limit.
+The task runs on the `feature_flags_long_running` queue, so a stalled usage-ingestion service cannot delay the cache rebuilds on the `feature_flags` queue.
+
+The workers on that queue need `USAGE_INGESTION_ADDR` with an explicit port, and an enabled `USAGE_INGESTION_REPORT_TEAMS` allowlist.
+The Python gRPC client connects to port 443 when the address has no port, but the usage-ingestion Service listens on port 80.
+The task discards counts for teams that the allowlist does not enable.
+Delivery is best effort: the shared usage-ingestion client logs a failed send, and the task does not put the counts back.
+Usage records from before this task omit the requests that Django served. [Step 4](#step-4-usage-report-generation) lists this gap with the other gaps that keep a counter off `realtime`.
+
+### Redis pipelining
+
+Both the team-level and SDK-level counters are incremented in a single Redis round-trip using pipelining:
+
+```rust
+let mut commands = vec![PipelineCommand::HIncrBy {
+    key: team_key,
+    field: time_bucket_str.clone(),
+    count,
+}];
+
+if let Some(lib) = library {
+    commands.push(PipelineCommand::HIncrBy {
+        key: library_key,
+        field: time_bucket_str,
+        count,
+    });
+}
+
+redis_client.execute_pipeline(commands).await?;
+```
+
+## Step 2: Scheduled aggregation task
+
+A Celery task aggregates Redis counters and emits PostHog events every 30 minutes.
+
+**Source files:**
+
+- `posthog/models/feature_flag/flag_analytics.py` - Aggregation logic
+- `posthog/tasks/tasks.py` - Task definition (`calculate_decide_usage`)
+- `posthog/tasks/scheduled.py` - Schedule configuration
+
+### Task schedule
+
+```python
+# posthog/tasks/scheduled.py
+sender.add_periodic_task(
+    crontab(minute="*/30"),
+    calculate_decide_usage.s(),
+    name="calculate decide usage",
+)
+```
+
+### Aggregation process
+
+The task reads the teams 1,000 at a time, excluding internal metrics and demo teams.
+For each batch, one pipelined `EXISTS` call finds the teams that have a team key for any request type.
+The task skips the teams with no team key.
+Those teams also have no SDK keys, because the service writes the SDK key in the same pipeline as the team key.
+When the `EXISTS` call fails, the task reports the error and exports every team in that batch.
+
+For each team with a team key:
+
+1. **Acquire distributed lock**: `posthog:decide_analytics:lock:{team_id}` with 60-second timeout
+2. **Extract counters**: Read all time buckets except the current one (still being filled)
+3. **Extract SDK breakdown**: Read all SDK-specific counters using pipelining
+4. **Consume buckets**: Delete processed buckets from Redis
+5. **Emit events**: Send `decide usage` and `local evaluation usage` events to PostHog
+
+The "skip current bucket" behavior prevents counting requests that are still being recorded:
+
+```python
+# The latest bucket is still being filled, so we don't want to delete it nor count it.
+# It will be counted in a later iteration, when it's not being filled anymore.
+if time_buckets and len(time_buckets) > 1:
+    for time_bucket in sorted(time_buckets, key=lambda bucket: int(bucket))[:-1]:
+        # Process and delete this bucket
+```
+
+## Step 3: Event emission
+
+The aggregation task emits events to PostHog's internal analytics instance.
+
+### Event types
+
+| Event Name                            | Description                                             |
+| ------------------------------------- | ------------------------------------------------------- |
+| `decide usage`                        | Counts from `/decide` endpoint requests                 |
+| `local evaluation usage`              | Counts from local evaluation requests answered with 200 |
+| `local evaluation not modified usage` | Counts from local evaluation requests answered with 304 |
+
+### Event properties
+
+```json
+{
+  "count": 1234,
+  "team_id": 42,
+  "team_uuid": "0189abcd-1234-5678-9abc-def012345678",
+  "min_time": 1705000000,
+  "max_time": 1705001800,
+  "token": "<billing_token>",
+  "sdk_breakdown": {
+    "posthog-js": 800,
+    "posthog-python": 300,
+    "posthog-node": 134
+  }
+}
+```
+
+- **count**: Total number of requests in this aggregation period
+- **team_id/team_uuid**: Team identifiers
+- **min_time/max_time**: Unix timestamps of the earliest and latest buckets processed
+- **token**: Billing validation token (`DECIDE_BILLING_ANALYTICS_TOKEN`)
+- **sdk_breakdown**: Optional object mapping SDK names to request counts
+
+### Storage location
+
+Events are stored in ClickHouse under a specific team based on region:
+
+- **EU region**: team_id = 1
+- **Other regions**: team_id = 2
+
+## Step 4: Usage report generation
+
+The usage report task queries ClickHouse for aggregated billing data.
+
+**Source file:** `posthog/tasks/usage_report.py`
+
+Daily reports, usage reports v2, and quota limiting read the billed request counters through `posthog.usage_counters.UsageCounterService`.
+The daily report and quota limiting always query billing events.
+Only usage reports v2 reads the counter feature flags.
+There, each counter's feature flag selects `legacy`, `both`, or `realtime`.
+`legacy` queries billing events. `both` queries billing events and `billing_usage_records`, and keeps the legacy count authoritative.
+`realtime` uses the usage record count. A finalized run covers a complete day and also queries billing events, for the comparison. An intraday run covers a partial day and skips that query.
+Reports retain both totals in `counter_comparisons` for every counter that ran both queries. Both totals count each team under its current organization, the same as the report fields. A failed comparison query omits that counter's pair. A failure in a query needed for normal report fields still fails the report.
+The usage record query checks units separately for each usage key and discards all totals for a key with incompatible units.
+A mismatch in a comparison-only source omits that counter's pair and records a shadow validation failure; other counters remain available.
+A mismatch in a source used for a realtime total fails the report.
+Removing the complete-day legacy query will be a later code change.
+The mode selects the authoritative count for finalized and intraday runs.
+Each run keeps its resolved plan, and flag lookups are cached for 60 seconds per process.
+Usage reports v2 saves each completed legacy query in S3 under its workflow run.
+Each legacy counter runs in its own activity, sharing the workflow's four-query limit with other queries.
+Activity retries reuse checkpoints and rerun only unfinished legacy queries.
+The counter-report activity reads those checkpoints before its shared usage-record scan, without rerunning legacy queries.
+Cancellation stops the counter worker between queries and before checkpoint or report writes; an in-flight query or write can still finish.
+Usage reports v2 records query latency and failures under the existing query names, plus `usage_records` for the shared scan and `usage_counters` for the combined activity.
+A failed counter activity or remaining query fails the workflow without waiting for the other queries to finish.
+Missing-organization diagnostics use size-bounded events. Temporal runs their capture and flush outside the event loop.
+
+Usage records still differ from the legacy queries for every counter.
+Set a counter's flag to `realtime` only after a change removes its gap below.
+The team can also agree to bill the usage record count with the gap.
+
+- Events, enhanced person events, and exceptions: usage records use capture time, and the legacy queries use the event timestamp. The switch must not count an event on both dates or on neither date.
+- Feature flag requests: usage records use the flush time of the Rust flags service. The legacy query uses the later Celery export time.
+- Feature flag local evaluation 304 requests: the same clock difference as feature flag requests.
+- Feature flag local evaluation requests: usage records from before [#118814](https://github.com/PostHog/posthog/pull/118814) omit the requests that the Django feature flag list endpoint served. Compare both producers over a complete window before you switch this counter.
+- CDP invocations and workflow emails, push, and SMS: usage records and app metrics flush on separate clocks. Each source can put one dispatch on a different date.
+- Workflow invocations: the legacy query counts fetch and push dispatches. Before [#118809](https://github.com/PostHog/posthog/pull/118809), a push dispatch wrote only a `workflow_push_sent` record, so `workflow_billable_invocations` held only fetches. Now a push dispatch writes both records. The clock difference above also applies.
+- Web and mobile recordings: the replay pipeline marks a session as seen before it parses the first message. When that message fails, the later messages of the session bill nothing. The fix is [#121613](https://github.com/PostHog/posthog/pull/121613), which bills each saved session once.
+- Survey responses: usage records include product tour responses, which the legacy query exempts.
+- AI events: usage records do not apply the legacy exemptions for wallet-billed gateway events and sponsored relay events.
+
+### Billable calculation
+
+Local evaluation requests that return full flag definitions are weighted 10x compared to decide requests. Local evaluation requests answered with 304 are weighted like decide requests:
+
+```python
+billable_feature_flag_requests_count_in_period = (
+    decide_requests_count_in_period
+    + (local_evaluation_requests_count_in_period * 10)
+    + local_evaluation_not_modified_requests_count_in_period
+)
+```
+
+This reflects the higher resource cost of full local evaluation responses, which return full flag definitions rather than just evaluation results.
+
+### Token validation
+
+Legacy queries filter events by the billing token to ensure only legitimate usage events are counted:
+
+```sql
+AND has([%(validity_token)s], replaceRegexpAll(JSONExtractRaw(properties, 'token'), '^"|"$', ''))
+```
+
+## Key design decisions
+
+| Decision                         | Rationale                                                                          |
+| -------------------------------- | ---------------------------------------------------------------------------------- |
+| 2-minute time buckets            | Balance between granularity and Redis memory usage                                 |
+| Skip current bucket              | Avoid counting in-flight requests that may still be incrementing                   |
+| Distributed lock                 | Prevent concurrent processing of the same team's data                              |
+| Redis pipelining                 | Minimize network round-trips for better performance                                |
+| 10x local evaluation weight      | Local evaluation returns full flag definitions, requiring more server resources    |
+| 1x weight for 304 responses      | A 304 serves no definitions payload, so it costs the same as a `/decide` request   |
+| Selective billing                | Survey and product tour flags are internal features, not customer-billable         |
+| SDK breakdown for analytics only | Billing charges per request regardless of SDK; breakdown is for internal analytics |
+
+## Customer request usage view
+
+The feature flags **Usage** tab shows the existing billing events grouped by SDK and request type. It does not add counters or work to the request path.
+
+- Daily queries cover up to 31 days. Hourly queries cover up to 8 days so calendar-aligned 30-day and 7-day presets fit.
+- Remote evaluation combines `/flags` and legacy `/decide` traffic.
+- Local evaluation combines `/flags/definitions` and its legacy alias.
+- Counts include billable requests only. They are not raw HTTP traffic totals.
+- A full local evaluation response contributes 10 billing units. A 304 contributes 1.
+- The SDK breakdown comes from the request user-agent and unknown SDKs appear as `other`.
+- Aggregation means recent usage can take approximately 30 minutes to appear. Hourly buckets use aggregation event time, so they approximate rather than preserve exact request time.
+
+The view cannot attribute a request to an individual flag lookup. `$feature_flag_called` events describe evaluation activity, but their totals do not map one-to-one to request usage.
+
+## Billing service processing
+
+The usage report is sent daily to the billing service (`billing.posthog.com`), which:
+
+1. **Extracts** `billable_feature_flag_requests_count_in_period` from the report
+2. **Stores** it as `feature_flag_requests` in the `UsageReport` model
+3. **Aggregates** daily values across the billing period
+4. **Reports to Stripe** via `stripe.SubscriptionItem.create_usage_record()`
+5. **Triggers** usage limit emails (80%, 100% thresholds) and spike detection
+
+The SDK breakdown (`sdk_breakdown` property) is stored in the events but not used by billing. Customers are charged per request regardless of which SDK made the request.
+
+## Debugging
+
+### Check Redis counters
+
+```bash
+# View current counters for a team
+redis-cli HGETALL "posthog:decide_requests:123"
+redis-cli HGETALL "posthog:decide_requests:sdk:123:posthog-js"
+
+# View all SDK keys for a team
+redis-cli KEYS "posthog:decide_requests:sdk:123:*"
+```
+
+### Query usage events
+
+```sql
+SELECT
+    distinct_id as team_id,
+    JSONExtractInt(properties, 'count') as count,
+    JSONExtractString(properties, 'sdk_breakdown') as sdk_breakdown,
+    timestamp
+FROM events
+WHERE event = 'decide usage'
+  AND team_id = 1  -- or 2 for non-EU
+  AND timestamp > now() - INTERVAL 1 DAY
+ORDER BY timestamp DESC
+LIMIT 100
+```
+
+### Force aggregation for a team
+
+```python
+from posthog.models.feature_flag.flag_analytics import capture_team_decide_usage
+from posthoganalytics import Posthog
+
+ph_client = Posthog(project_api_key='...', host='...')
+capture_team_decide_usage(ph_client, team_id=123, team_uuid='...')
+```

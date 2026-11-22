@@ -1,0 +1,257 @@
+import { Combobox } from '@base-ui/react/combobox'
+import { useActions, useValues } from 'kea'
+import { useCallback, useRef } from 'react'
+
+import { IconCheck, IconPlusSmall, IconSearch, IconX } from '@posthog/icons'
+
+import { upgradeModalLogic } from 'lib/components/UpgradeModal/upgradeModalLogic'
+import { IconBlank } from 'lib/lemon-ui/icons'
+import { KeyboardShortcut } from 'lib/lemon-ui/KeyboardShortcut/KeyboardShortcut'
+import { ScrollableShadows } from 'lib/lemon-ui/ScrollableShadows/ScrollableShadows'
+import { preflightLogic } from 'lib/logic/preflightLogic'
+import { ButtonPrimitive } from 'lib/ui/Button/ButtonPrimitives'
+import { MenuSeparator } from 'lib/ui/Menus/Menus'
+import { cn } from 'lib/utils/css-classes'
+import { getProjectSwitchTargetUrl } from 'lib/utils/kea-router'
+import { identifierToHuman } from 'lib/utils/strings'
+import { organizationLogic } from 'scenes/organizationLogic'
+import { isAuthenticatedTeam, teamLogic } from 'scenes/teamLogic'
+
+import { globalModalsLogic } from '~/layout/globalModalsLogic'
+import { AvailableFeature } from '~/types'
+
+import { CreateProjectItem, ListItem, newAccountMenuLogic, ProjectListItem } from './newAccountMenuLogic'
+import { ProjectFreshnessIndicator } from './ProjectFreshnessIndicator'
+import { ProjectName } from './ProjectMenu'
+
+export function ProjectSwitcher({ dialog = true }: { dialog?: boolean }): JSX.Element | null {
+    const { preflight } = useValues(preflightLogic)
+    const { guardAvailableFeature } = useValues(upgradeModalLogic)
+    const { showCreateProjectModal } = useActions(globalModalsLogic)
+    const { currentTeam } = useValues(teamLogic)
+    const { currentOrganizationProjectCount, projectCreationForbiddenReason } = useValues(organizationLogic)
+    const { closeProjectSwitcher, setAccountMenuOpen, setProjectSearchValue } = useActions(newAccountMenuLogic)
+    const {
+        projectSearchValue: searchValue,
+        filteredProjectItems: filteredItems,
+        projectGroups,
+        hasProjectGroups,
+    } = useValues(newAccountMenuLogic)
+    const inputRef = useRef<HTMLInputElement>(null!)
+    const createItem = filteredItems.find((p): p is CreateProjectItem => p.type === 'create')
+
+    const canCreateProject = preflight?.can_create_org !== false && !projectCreationForbiddenReason
+
+    const handleItemClick = useCallback(
+        (item: ListItem) => {
+            if (item.type === 'create') {
+                // The create row is rendered disabled when the user can't create projects, but the
+                // Combobox still fires onClick/Enter — enforce the disabled state here too.
+                if (!canCreateProject) {
+                    return
+                }
+                guardAvailableFeature(
+                    AvailableFeature.ORGANIZATIONS_PROJECTS,
+                    () => {
+                        showCreateProjectModal()
+                        setAccountMenuOpen(false)
+                    },
+                    {
+                        currentUsage: currentOrganizationProjectCount,
+                    }
+                )
+                closeProjectSwitcher()
+            } else if (!item.isCurrent) {
+                const targetUrl = getProjectSwitchTargetUrl(
+                    location.pathname,
+                    item.team.id,
+                    currentTeam?.project_id,
+                    item.team.project_id
+                )
+                closeProjectSwitcher()
+                window.location.href = targetUrl
+            }
+        },
+        [
+            currentTeam?.project_id,
+            closeProjectSwitcher,
+            guardAvailableFeature,
+            showCreateProjectModal,
+            currentOrganizationProjectCount,
+            setAccountMenuOpen,
+            canCreateProject,
+        ]
+    )
+
+    const getItemString = useCallback((item: ListItem | null): string => {
+        if (!item) {
+            return ''
+        }
+        if (item.type === 'create') {
+            return item.label
+        }
+        return item.team.name
+    }, [])
+
+    if (!isAuthenticatedTeam(currentTeam)) {
+        return null
+    }
+
+    const spacingClass = dialog ? 'p-2' : 'p-1'
+
+    return (
+        <Combobox.Root
+            items={filteredItems}
+            filter={null}
+            itemToStringValue={getItemString}
+            inline
+            defaultOpen
+            autoHighlight
+        >
+            <div className="flex flex-col overflow-hidden">
+                {/* Search Input */}
+                <div className={`${spacingClass} ${dialog && 'border-b border-primary'}`}>
+                    <label
+                        className={cn(
+                            'group input-like flex gap-1 items-center relative w-full bg-fill-input border border-primary focus-within:ring-primary py-1 px-2',
+                            {
+                                'h-[30px]': !dialog,
+                            }
+                        )}
+                    >
+                        <Combobox.Icon
+                            render={
+                                <IconSearch className="size-4 shrink-0 text-tertiary group-focus-within:text-primary" />
+                            }
+                        />
+                        <Combobox.Input
+                            ref={inputRef}
+                            value={searchValue}
+                            onChange={(e) => setProjectSearchValue(e.target.value)}
+                            aria-label="Search projects"
+                            placeholder="Search projects..."
+                            className="w-full px-1 py-1 text-sm focus:outline-none border-transparent"
+                            autoFocus
+                        />
+                        {searchValue && (
+                            <Combobox.Clear
+                                render={
+                                    <ButtonPrimitive
+                                        iconOnly
+                                        size="sm"
+                                        onClick={() => setProjectSearchValue('')}
+                                        aria-label="Clear search"
+                                        className="-mr-1"
+                                    >
+                                        <IconX className="size-4 text-tertiary" />
+                                    </ButtonPrimitive>
+                                }
+                            />
+                        )}
+                    </label>
+                </div>
+
+                {/* Results */}
+                <ScrollableShadows
+                    direction="vertical"
+                    styledScrollbars
+                    className="flex-1 overflow-y-auto max-h-[400px]"
+                >
+                    <Combobox.List
+                        className={`flex flex-col gap-px ${spacingClass} bg-surface-primary ${!dialog && 'pt-0.5'}`}
+                        tabIndex={-1}
+                    >
+                        {projectGroups.map(({ name, projects }) => (
+                            <Combobox.Group key={name === null ? 'ungrouped' : `group:${name}`} items={projects}>
+                                {hasProjectGroups && (
+                                    <Combobox.GroupLabel className="px-2 pt-2 pb-1 text-xxs text-tertiary font-medium">
+                                        {name ? identifierToHuman(name, 'sentence') : 'Other projects'}
+                                    </Combobox.GroupLabel>
+                                )}
+                                <Combobox.Collection>
+                                    {(item: ProjectListItem) => (
+                                        <Combobox.Item
+                                            key={item.id}
+                                            value={item}
+                                            onClick={() => handleItemClick(item)}
+                                            render={(props) => (
+                                                <ButtonPrimitive
+                                                    {...props}
+                                                    menuItem
+                                                    active={item.isCurrent}
+                                                    className="flex-1"
+                                                    tabIndex={-1}
+                                                    hasSideActionRight
+                                                >
+                                                    {item.isCurrent ? (
+                                                        <IconCheck className="text-tertiary" />
+                                                    ) : (
+                                                        <IconBlank />
+                                                    )}
+                                                    <ProjectName team={item.team} className="flex-1 min-w-0" />
+                                                    <ProjectFreshnessIndicator teamId={item.team.id} />
+                                                </ButtonPrimitive>
+                                            )}
+                                        />
+                                    )}
+                                </Combobox.Collection>
+                            </Combobox.Group>
+                        ))}
+
+                        <MenuSeparator />
+
+                        {/* Create New Project */}
+                        {createItem && (
+                            <Combobox.Group items={[createItem]}>
+                                <Combobox.Collection>
+                                    {(item: CreateProjectItem) => (
+                                        <Combobox.Item
+                                            key={item.id}
+                                            value={item}
+                                            onClick={() => handleItemClick(item)}
+                                            render={(props) => (
+                                                <ButtonPrimitive
+                                                    {...props}
+                                                    menuItem
+                                                    fullWidth
+                                                    disabled={!canCreateProject}
+                                                    tooltip={
+                                                        !canCreateProject
+                                                            ? projectCreationForbiddenReason ||
+                                                              'You do not have permission to create a project'
+                                                            : undefined
+                                                    }
+                                                    tooltipPlacement="right"
+                                                >
+                                                    <IconPlusSmall className="text-tertiary" />
+                                                    <span className="truncate">{item.label}</span>
+                                                </ButtonPrimitive>
+                                            )}
+                                        />
+                                    )}
+                                </Combobox.Collection>
+                            </Combobox.Group>
+                        )}
+                    </Combobox.List>
+                </ScrollableShadows>
+
+                {/* Footer */}
+                {dialog && (
+                    <div className="menu-legend border-t border-primary p-1">
+                        <div className="px-2 py-1 text-xxs text-tertiary font-medium flex items-center gap-2">
+                            <span>
+                                <KeyboardShortcut arrowup arrowdown preserveOrder /> navigate
+                            </span>
+                            <span>
+                                <KeyboardShortcut enter /> select
+                            </span>
+                            <span>
+                                <KeyboardShortcut escape /> close
+                            </span>
+                        </div>
+                    </div>
+                )}
+            </div>
+        </Combobox.Root>
+    )
+}

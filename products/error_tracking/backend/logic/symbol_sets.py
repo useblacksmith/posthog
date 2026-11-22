@@ -1,0 +1,718 @@
+"""Symbol set storage, ORM and upload operations for error tracking.
+
+These encapsulate the object-storage interactions, transaction boundaries and upload
+analytics that previously lived in the presentation layer, so the views can stay thin
+(parse -> facade -> serialize). The DRF ``ValidationError`` codes raised here are part of
+the CLI-facing upload contract and are surfaced verbatim by the views.
+"""
+
+import hashlib
+import datetime
+import itertools
+from collections import Counter
+from collections.abc import Iterator
+from typing import Any
+
+from django.conf import settings
+from django.db import OperationalError, transaction
+from django.db.models import Q, QuerySet
+from django.utils import timezone
+
+import psycopg
+import structlog
+import posthoganalytics
+from rest_framework.exceptions import ValidationError
+
+from posthog.dataclasses import frozen
+from posthog.event_usage import AnalyticsProps, groups
+from posthog.hogql_queries.utils.caller_context import map_in_caller_context
+from posthog.models.team.team import Team
+from posthog.models.utils import uuid7
+from posthog.storage import object_storage
+from posthog.uuidt import UUIDT
+
+from products.error_tracking.backend.models import ErrorTrackingRelease, ErrorTrackingStackFrame, ErrorTrackingSymbolSet
+
+logger = structlog.get_logger(__name__)
+
+ONE_HUNDRED_MEGABYTES = 1024 * 1024 * 100
+PRESIGNED_MULTIPLE_UPLOAD_TIMEOUT = 60 * 5
+
+# An upload rewrites `last_used` only when the stored value is older than this. `last_used` is part
+# of `et_symset_bucket_cleanup_idx`, so every write churns that index, and a monorepo that uploads
+# thousands of chunks per merge would rewrite all of them on each run. Cymbal throttles its own
+# `last_used` writes over the same window for the same reason.
+LAST_USED_UPLOAD_REFRESH_INTERVAL = datetime.timedelta(hours=12)
+
+DEADLOCK_RETRY_ATTEMPTS = 3
+
+HEAD_OBJECT_PARALLELISM = 8
+
+# The ID tiebreak keeps LIMIT/OFFSET paging stable when rows share a timestamp.
+# The reference is unique within a team, so it does not need a tiebreak.
+SYMBOL_SET_ORDERINGS: dict[str, tuple[str, ...]] = {
+    "created_at": ("created_at", "id"),
+    "-created_at": ("-created_at", "-id"),
+    "last_used": ("last_used", "id"),
+    "-last_used": ("-last_used", "-id"),
+    "ref": ("ref",),
+    "-ref": ("-ref",),
+}
+
+DEFAULT_SYMBOL_SET_ORDERING = SYMBOL_SET_ORDERINGS["-created_at"]
+
+
+class SymbolSetNotFoundError(Exception):
+    pass
+
+
+@frozen
+class SymbolSetUpload:
+    chunk_id: str
+    release_id: str | None
+    content_hash: str | None
+    # Declaring the byte count earns a presigned PUT signed for exactly that length.
+    content_length: int | None = None
+
+
+def _extract_failure_code(error_codes: object) -> str | None:
+    if isinstance(error_codes, str):
+        return error_codes
+
+    if isinstance(error_codes, list):
+        for error_code in error_codes:
+            failure_code = _extract_failure_code(error_code)
+            if failure_code:
+                return failure_code
+
+    if isinstance(error_codes, dict):
+        for error_code in error_codes.values():
+            failure_code = _extract_failure_code(error_code)
+            if failure_code:
+                return failure_code
+
+    return None
+
+
+def _get_failure_code(exception: Exception) -> str | None:
+    if isinstance(exception, ValidationError):
+        return _extract_failure_code(exception.get_codes())
+
+    return None
+
+
+def generate_symbol_set_file_key() -> str:
+    return f"{settings.OBJECT_STORAGE_ERROR_TRACKING_SOURCE_MAPS_FOLDER}/{str(uuid7())}"
+
+
+def generate_symbol_set_upload_presigned_urls(file_key: str, content_length: int | None = None) -> dict[str, Any]:
+    pair = object_storage.get_presigned_post_pair(
+        file_key=file_key,
+        conditions=[["content-length-range", 0, ONE_HUNDRED_MEGABYTES]],
+        expiration=PRESIGNED_MULTIPLE_UPLOAD_TIMEOUT,
+    )
+    urls: dict[str, Any] = {"presigned_url": pair.primary}
+    if pair.fallback is not None:
+        # Some networks (firewalls, egress allowlists) reset connections to the
+        # transfer-acceleration domain while regular S3 works, so the CLI needs a
+        # standard-endpoint presigned POST to retry against.
+        urls["fallback_presigned_url"] = pair.fallback
+
+    if content_length is not None:
+        # Presigned POST is an AWS S3 extension, and a store without it (Cloudflare R2 answers
+        # `501 NotImplemented`) can never receive a symbol set. Every store implements PUT, whose
+        # signed `content-length` stands in for the POST policy's `content-length-range`.
+        put_pair = object_storage.get_presigned_put_pair(
+            file_key=file_key,
+            content_length=content_length,
+            expiration=PRESIGNED_MULTIPLE_UPLOAD_TIMEOUT,
+        )
+        if put_pair.primary is not None:
+            urls["presigned_put_url"] = put_pair.primary
+            if put_pair.fallback is not None:
+                urls["fallback_presigned_put_url"] = put_pair.fallback
+    return urls
+
+
+def check_upload_size(size: int) -> None:
+    if size > ONE_HUNDRED_MEGABYTES:
+        raise ValidationError(
+            code="file_too_large", detail="Combined source map and symbol set must be less than 100MB"
+        )
+
+
+def upload_content(content: bytearray) -> tuple[str, str]:
+    if not settings.OBJECT_STORAGE_ENABLED:
+        raise ValidationError(
+            code="object_storage_required",
+            detail="Object storage must be available to allow source map uploads.",
+        )
+
+    check_upload_size(len(content))
+    content_hash = hashlib.sha512(content).hexdigest()
+
+    upload_path = generate_symbol_set_file_key()
+    object_storage.write(upload_path, bytes(content))
+    return (upload_path, content_hash)
+
+
+def create_symbol_set(
+    chunk_id: str, team: Team, release_id: str | None, storage_ptr: str, content_hash: str | None = None
+) -> ErrorTrackingSymbolSet:
+    if release_id:
+        objects = ErrorTrackingRelease.objects.all().filter(team=team, id=release_id)
+        if len(objects) < 1:
+            raise ValueError(f"Unknown release: {release_id}")
+        release = objects[0]
+    else:
+        release = None
+
+    with transaction.atomic():
+        try:
+            symbol_set = ErrorTrackingSymbolSet.objects.get(team=team, ref=chunk_id)
+            if symbol_set.release is None:
+                symbol_set.release = release
+            elif symbol_set.release != release:
+                raise ValidationError("Symbol set has already been uploaded for a different release")
+            symbol_set.storage_ptr = storage_ptr
+            symbol_set.content_hash = content_hash
+            symbol_set.save()
+
+        except ErrorTrackingSymbolSet.DoesNotExist:
+            symbol_set = ErrorTrackingSymbolSet.objects.create(
+                team=team,
+                ref=chunk_id,
+                release=release,
+                storage_ptr=storage_ptr,
+                content_hash=content_hash,
+            )
+
+        # Delete any existing frames associated with this symbol set
+        ErrorTrackingStackFrame.objects.filter(team=team, symbol_set=symbol_set).delete()
+
+        return symbol_set
+
+
+def refresh_last_used(team: Team, chunk_ids: list[str]) -> None:
+    """Mark every symbol set the upload referenced as still in use.
+
+    Retention deletes a symbol set once `last_used` falls outside its window. In event release
+    mode the chunk id is derived from the chunk content, so one row serves every release that
+    ships that chunk, and re-uploading an unchanged chunk writes nothing. Without this call the
+    row ages out while the chunk is still deployed, and the next exception from it cannot be
+    symbolicated until a later deploy recreates the row.
+    """
+    now = timezone.now()
+    with transaction.atomic():
+        stale_ids = list(
+            ErrorTrackingSymbolSet.objects.filter(
+                Q(last_used__isnull=True) | Q(last_used__lt=now - LAST_USED_UPLOAD_REFRESH_INTERVAL),
+                team=team,
+                ref__in=chunk_ids,
+            )
+            .order_by("ref")
+            .select_for_update(no_key=True)
+            .values_list("id", flat=True)
+        )
+        ErrorTrackingSymbolSet.objects.filter(team=team, id__in=stale_ids).update(last_used=now)
+
+
+def _validate_uploads(new_symbol_sets: list[SymbolSetUpload], team: Team) -> None:
+    chunk_ids = [x.chunk_id for x in new_symbol_sets]
+    duplicates = sorted(chunk_id for chunk_id, count in Counter(chunk_ids).items() if count > 1)
+    if duplicates:
+        raise ValidationError(
+            code="invalid_chunk_ids",
+            detail=f"Duplicate chunk IDs provided: {', '.join(duplicates)}",
+        )
+
+    release_ids = {ss.release_id for ss in new_symbol_sets if ss.release_id}
+    # A release ID that is not a UUID makes the `pk__in` lookup below raise before it reaches the
+    # database, and that error leaves as a 500 instead of telling the client what to correct.
+    malformed = sorted(release_id for release_id in release_ids if not UUIDT.is_valid_uuid(release_id))
+    if malformed:
+        raise ValidationError(
+            code="invalid_release_id",
+            detail=f"Invalid release ID provided: {', '.join(malformed)}",
+        )
+
+    fetched_releases = {str(r.id) for r in ErrorTrackingRelease.objects.all().filter(team=team, pk__in=release_ids)}
+    for release_id in release_ids:
+        if release_id not in fetched_releases:
+            raise ValidationError(
+                code="invalid_release_id",
+                detail=f"Unknown release ID provided: {release_id}",
+            )
+
+    # Refuse an oversized chunk before the client spends the bandwidth and `bulk_finish_upload`
+    # deletes the row it already created.
+    oversized = sorted(
+        ss.chunk_id
+        for ss in new_symbol_sets
+        if ss.content_length is not None and ss.content_length > ONE_HUNDRED_MEGABYTES
+    )
+    if oversized:
+        raise ValidationError(
+            code="file_too_large",
+            detail=f"Symbol sets larger than 100MB cannot be uploaded: {', '.join(oversized)}",
+        )
+
+
+def _binds_release(existing: ErrorTrackingSymbolSet, upload: SymbolSetUpload) -> bool:
+    """Whether the upload binds a release to a symbol set that has none.
+
+    An orphan symbol set may join a release, but a bound one never moves between releases.
+    """
+    if not upload.release_id:
+        return False
+    if existing.release_id is None:
+        return True
+    if str(existing.release_id) != upload.release_id:
+        raise ValidationError(
+            code="release_id_mismatch",
+            detail=f"Symbol set {existing.ref} already has a release ID",
+        )
+    return False
+
+
+def _needs_upload(
+    existing: ErrorTrackingSymbolSet,
+    upload: SymbolSetUpload,
+    team_id: int,
+    force: bool,
+    skip_on_conflict: bool,
+) -> bool:
+    if upload.content_hash is None:
+        if existing.content_hash is not None:
+            # Old CLI (no content hash) trying to re-upload a symbol set
+            # that was already fully uploaded. We can't determine safety,
+            # so reject rather than silently overwrite production data.
+            raise ValidationError(
+                code="content_hash_required",
+                detail=f"Symbol set {existing.ref} already has content; provide a content_hash to update it.",
+            )
+        # Both sides have no hash: this is a pending upload being restarted.
+        return True
+    if existing.content_hash is None:
+        # Existing record has no hash (pending upload or uploaded by old CLI
+        # without hash support). Allow the new upload to supply one.
+        return True
+    if existing.content_hash == upload.content_hash:
+        return False
+    if force:
+        return True
+    if skip_on_conflict:
+        # Content has changed, but the caller explicitly asked to keep
+        # the already-uploaded symbol set.
+        logger.warning(
+            "symbol_set_content_changed_skipped",
+            ref=existing.ref,
+            team_id=team_id,
+        )
+        return False
+    raise ValidationError(
+        code="content_hash_mismatch",
+        detail=f"Symbol set {existing.ref} already exists with different content.",
+    )
+
+
+# The DRF ValidationErrors on this path are the CLI upload contract, not server faults, so
+# error tracking must not see them. Real faults are still captured, by DRF's global reporting
+# hook (posthog.exceptions.exception_reporting), which reports every non-APIException.
+@posthoganalytics.scoped(capture_exceptions=False)
+def bulk_check_symbol_sets(
+    new_symbol_sets: list[SymbolSetUpload],
+    team: Team,
+    force: bool = False,
+    skip_on_conflict: bool = False,
+) -> list[str]:
+    """Return the chunk ids `bulk_create_symbol_sets` would act on, without creating rows or
+    issuing upload URLs. It raises the same validation errors, so a conflict fails the client
+    before it uploads anything. The other chunks are marked as still in use here, because the
+    client drops them from the upload and nothing else touches their rows.
+    """
+    _validate_uploads(new_symbol_sets, team)
+    chunk_ids = [x.chunk_id for x in new_symbol_sets]
+    existing_by_ref = {s.ref: s for s in ErrorTrackingSymbolSet.objects.filter(team=team, ref__in=chunk_ids)}
+
+    chunk_ids_to_upload: list[str] = []
+    unchanged_chunk_ids: list[str] = []
+    for upload in new_symbol_sets:
+        existing = existing_by_ref.get(upload.chunk_id)
+        if existing is None:
+            chunk_ids_to_upload.append(upload.chunk_id)
+            continue
+        binds_release = _binds_release(existing, upload)
+        needs_upload = _needs_upload(existing, upload, team.id, force, skip_on_conflict)
+        if binds_release or needs_upload:
+            chunk_ids_to_upload.append(upload.chunk_id)
+        else:
+            unchanged_chunk_ids.append(upload.chunk_id)
+
+    if unchanged_chunk_ids:
+        refresh_last_used(team, unchanged_chunk_ids)
+    return chunk_ids_to_upload
+
+
+def _lock_symbol_sets(team: Team, refs: list[str]) -> list[ErrorTrackingSymbolSet]:
+    return list(
+        ErrorTrackingSymbolSet.objects.filter(team=team, ref__in=refs).order_by("ref").select_for_update(no_key=True)
+    )
+
+
+def _create_or_reuse_symbol_sets(
+    new_symbol_sets: list[SymbolSetUpload],
+    team: Team,
+    force: bool,
+    skip_on_conflict: bool,
+) -> dict[str, dict[str, Any]]:
+    chunk_ids = sorted(x.chunk_id for x in new_symbol_sets)
+
+    id_url_map: dict[str, dict[str, Any]] = {}
+    new_symbol_set_map = {x.chunk_id: x for x in new_symbol_sets}
+
+    def reissue_upload(existing: ErrorTrackingSymbolSet) -> None:
+        # Pending uploads share an object key so a retry cannot invalidate an in-flight upload URL.
+        storage_ptr = (
+            existing.storage_ptr
+            if existing.content_hash is None and existing.storage_ptr
+            else generate_symbol_set_file_key()
+        )
+        id_url_map[existing.ref] = {
+            **generate_symbol_set_upload_presigned_urls(storage_ptr, new_symbol_set_map[existing.ref].content_length),
+            "symbol_set_id": str(existing.id),
+        }
+        existing.storage_ptr = storage_ptr
+        # bulk_finish_upload stores the hash once the new file is confirmed in object storage.
+        existing.content_hash = None
+
+    with transaction.atomic():
+        existing_symbol_sets = _lock_symbol_sets(team, chunk_ids)
+        existing_symbol_set_refs = {s.ref for s in existing_symbol_sets}
+        missing_sets = [chunk_id for chunk_id in chunk_ids if chunk_id not in existing_symbol_set_refs]
+
+        symbol_sets_to_be_created = []
+        for chunk_id in missing_sets:
+            storage_ptr = generate_symbol_set_file_key()
+            id_url_map[chunk_id] = generate_symbol_set_upload_presigned_urls(
+                storage_ptr, new_symbol_set_map[chunk_id].content_length
+            )
+            # Note that on creation, we /do not set/ the content hash. We use content hashes included in
+            # the create request only to see if we can skip updated - we set the content hash when we
+            # get upload confirmation, during `bulk_finish_upload`, not before
+            to_create = ErrorTrackingSymbolSet(
+                team=team,
+                ref=chunk_id,
+                storage_ptr=storage_ptr,
+                release_id=new_symbol_set_map[chunk_id].release_id,
+            )
+            symbol_sets_to_be_created.append(to_create)
+
+        # create missing symbol sets
+        ErrorTrackingSymbolSet.objects.bulk_create(symbol_sets_to_be_created, ignore_conflicts=True)
+        storage_ptrs_we_created = {s.ref: s.storage_ptr for s in symbol_sets_to_be_created}
+
+        for symbol_set in _lock_symbol_sets(team, missing_sets):
+            if symbol_set.storage_ptr == storage_ptrs_we_created[symbol_set.ref]:
+                id_url_map[symbol_set.ref]["symbol_set_id"] = str(symbol_set.pk)
+            else:
+                del id_url_map[symbol_set.ref]
+                existing_symbol_sets.append(symbol_set)
+
+        # update existing symbol sets
+        to_update = []
+        for existing in existing_symbol_sets:
+            upload = new_symbol_set_map[existing.ref]
+            dirty = False
+
+            if _binds_release(existing, upload):
+                existing.release_id = upload.release_id
+                dirty = True
+
+            if _needs_upload(existing, upload, team.id, force, skip_on_conflict):
+                reissue_upload(existing)
+                dirty = True
+
+            if dirty:
+                to_update.append(existing)
+
+        # We update only the symbol sets we modified the release of - for all others, this is a no-op (we assume they were uploaded
+        # during a prior attempt or something).
+        ErrorTrackingSymbolSet.objects.bulk_update(to_update, ["release", "content_hash", "storage_ptr"])
+
+        refresh_last_used(team, chunk_ids)
+
+    return id_url_map
+
+
+@posthoganalytics.scoped(capture_exceptions=False)
+def bulk_create_symbol_sets(
+    new_symbol_sets: list[SymbolSetUpload],
+    team: Team,
+    force: bool = False,
+    skip_on_conflict: bool = False,
+) -> dict[str, dict[str, Any]]:
+    _validate_uploads(new_symbol_sets, team)
+    for attempt in range(1, DEADLOCK_RETRY_ATTEMPTS):
+        try:
+            return _create_or_reuse_symbol_sets(new_symbol_sets, team, force, skip_on_conflict)
+        except OperationalError as e:
+            if not isinstance(e.__cause__, psycopg.errors.DeadlockDetected):
+                raise
+            logger.warning("symbol_set_upload_deadlock_retry", team_id=team.id, attempt=attempt)
+    return _create_or_reuse_symbol_sets(new_symbol_sets, team, force, skip_on_conflict)
+
+
+def list_symbol_sets(
+    team_id: int,
+    *,
+    ref: str | None,
+    search: str | None,
+    symbol_set_status: str | None,
+    order_by: str | None,
+) -> QuerySet[ErrorTrackingSymbolSet]:
+    queryset = ErrorTrackingSymbolSet.objects.filter(team_id=team_id).select_related("release")
+
+    if ref:
+        queryset = queryset.filter(ref=ref)
+
+    if search:
+        # Two single-table filters rather than one OR across the join: the release side collapses
+        # to a membership test against the much smaller release table, so Postgres no longer has
+        # to join every symbol set the team owns just to evaluate the OR.
+        matching_releases = ErrorTrackingRelease.objects.filter(
+            Q(version__icontains=search) | Q(project__icontains=search) | Q(metadata__git__commit_id__icontains=search),
+            team_id=team_id,
+        ).values("id")
+        queryset = queryset.filter(Q(ref__icontains=search) | Q(release_id__in=matching_releases))
+
+    if symbol_set_status == "valid":
+        queryset = queryset.filter(storage_ptr__isnull=False)
+    elif symbol_set_status == "invalid":
+        queryset = queryset.filter(storage_ptr__isnull=True)
+
+    return queryset.order_by(*SYMBOL_SET_ORDERINGS.get(order_by or "", DEFAULT_SYMBOL_SET_ORDERING))
+
+
+def get_symbol_set(team_id: int, symbol_set_id: str) -> ErrorTrackingSymbolSet | None:
+    return ErrorTrackingSymbolSet.objects.filter(team_id=team_id, id=symbol_set_id).select_related("release").first()
+
+
+def _get_or_raise(team_id: int, symbol_set_id: str) -> ErrorTrackingSymbolSet:
+    symbol_set = (
+        ErrorTrackingSymbolSet.objects.filter(team_id=team_id, id=symbol_set_id).select_related("release").first()
+    )
+    if symbol_set is None:
+        raise SymbolSetNotFoundError
+    return symbol_set
+
+
+def delete_symbol_set(team_id: int, symbol_set_id: str) -> bool:
+    symbol_set = ErrorTrackingSymbolSet.objects.filter(team_id=team_id, id=symbol_set_id).first()
+    if symbol_set is None:
+        return False
+    symbol_set.delete()
+    return True
+
+
+def bulk_delete_symbol_sets(team_id: int, ids: list[str]) -> int:
+    deleted_count, _ = ErrorTrackingSymbolSet.objects.filter(team_id=team_id, id__in=ids).delete()
+    return deleted_count
+
+
+def get_download_url(team_id: int, symbol_set_id: str) -> tuple[bool, str | None]:
+    """Returns ``(has_file, presigned_url)`` for a team-scoped symbol set.
+
+    Raises ``SymbolSetNotFoundError`` if the symbol set does not exist for the team.
+    ``has_file`` is False when no source map has been uploaded; ``presigned_url`` is None
+    when the URL could not be generated.
+    """
+    symbol_set = _get_or_raise(team_id, symbol_set_id)
+    if not symbol_set.storage_ptr:
+        return False, None
+    presigned_url = object_storage.get_presigned_url(file_key=symbol_set.storage_ptr, expiration=3600)
+    return True, presigned_url
+
+
+def create_deprecated_symbol_set(team: Team, chunk_id: str, release_id: str | None, data: bytearray) -> None:
+    (storage_ptr, content_hash) = upload_content(data)
+    create_symbol_set(chunk_id, team, release_id, storage_ptr, content_hash)
+
+
+def start_deprecated_upload(team: Team, chunk_id: str, release_id: str | None) -> tuple[object, str]:
+    if not settings.OBJECT_STORAGE_ENABLED:
+        raise ValidationError(
+            code="object_storage_required",
+            detail="Object storage must be available to allow source map uploads.",
+        )
+
+    file_key = generate_symbol_set_file_key()
+    presigned_url = object_storage.get_presigned_post(
+        file_key=file_key,
+        conditions=[["content-length-range", 0, ONE_HUNDRED_MEGABYTES]],
+    )
+
+    symbol_set = create_symbol_set(chunk_id, team, release_id, file_key)
+    return presigned_url, str(symbol_set.pk)
+
+
+def finish_upload(team_id: int, symbol_set_id: str, content_hash: str) -> None:
+    if not settings.OBJECT_STORAGE_ENABLED:
+        raise ValidationError(
+            code="object_storage_required",
+            detail="Object storage must be available to allow source map uploads.",
+        )
+
+    symbol_set = _get_or_raise(team_id, symbol_set_id)
+    s3_upload = object_storage.head_object(file_key=symbol_set.storage_ptr) if symbol_set.storage_ptr else None
+
+    if s3_upload:
+        content_length = s3_upload.get("ContentLength")
+
+        if not content_length or content_length > ONE_HUNDRED_MEGABYTES:
+            symbol_set.delete()
+
+            raise ValidationError(
+                code="file_too_large",
+                detail="The uploaded symbol set file was too large.",
+            )
+    else:
+        raise ValidationError(
+            code="file_not_found",
+            detail="No file has been uploaded for the symbol set.",
+        )
+
+    if not symbol_set.content_hash:
+        symbol_set.content_hash = content_hash
+        symbol_set.save()
+
+
+def bulk_start_upload(
+    team: Team,
+    *,
+    symbol_sets: list[dict],
+    chunk_ids: list[str],
+    release_id: str | None,
+    force: bool,
+    skip_on_conflict: bool,
+) -> dict[str, dict[str, Any]]:
+    uploads = [SymbolSetUpload(**data) for data in symbol_sets]
+    uploads.extend(
+        [SymbolSetUpload(chunk_id=chunk_id, release_id=release_id, content_hash=None) for chunk_id in chunk_ids]
+    )
+
+    if not settings.OBJECT_STORAGE_ENABLED:
+        raise ValidationError(
+            code="object_storage_required",
+            detail="Object storage must be available to allow source map uploads.",
+        )
+
+    return bulk_create_symbol_sets(
+        uploads,
+        team,
+        force=force,
+        skip_on_conflict=skip_on_conflict,
+    )
+
+
+def bulk_check_upload(
+    team: Team,
+    *,
+    symbol_sets: list[dict],
+    force: bool,
+    skip_on_conflict: bool,
+) -> list[str]:
+    uploads = [SymbolSetUpload(**data) for data in symbol_sets]
+    return bulk_check_symbol_sets(uploads, team, force=force, skip_on_conflict=skip_on_conflict)
+
+
+def _head_uploaded_file(symbol_set: ErrorTrackingSymbolSet) -> dict[str, Any] | None:
+    if not symbol_set.storage_ptr:
+        return None
+    return object_storage.head_object(file_key=symbol_set.storage_ptr)
+
+
+def _head_uploaded_files_in_batches(
+    symbol_sets: list[ErrorTrackingSymbolSet],
+) -> Iterator[tuple[ErrorTrackingSymbolSet, dict[str, Any] | None]]:
+    for batch in itertools.batched(symbol_sets, HEAD_OBJECT_PARALLELISM, strict=False):
+        s3_uploads = map_in_caller_context(
+            _head_uploaded_file,
+            batch,
+            max_workers=HEAD_OBJECT_PARALLELISM,
+            thread_name_prefix="symbol_set_head",
+        )
+        yield from zip(batch, s3_uploads, strict=True)
+
+
+def bulk_finish_upload(
+    team: Team, content_hashes: dict[str, str], *, analytics_props: AnalyticsProps | None = None
+) -> None:
+    if not settings.OBJECT_STORAGE_ENABLED:
+        raise ValidationError(
+            code="object_storage_required",
+            detail="Object storage must be available to allow source map uploads.",
+        )
+
+    file_count = len(content_hashes)
+    symbol_set_ids = set(content_hashes.keys())
+    total_file_size = 0
+    try:
+        symbol_sets = list(ErrorTrackingSymbolSet.objects.filter(team=team, id__in=symbol_set_ids))
+        found_symbol_set_ids = {str(symbol_set.id) for symbol_set in symbol_sets}
+        missing_symbol_set_ids = symbol_set_ids - found_symbol_set_ids
+        if missing_symbol_set_ids:
+            raise ValidationError(
+                code="symbol_set_not_found",
+                detail=f"Unknown symbol set IDs: {', '.join(sorted(missing_symbol_set_ids))}",
+            )
+
+        for symbol_set, s3_upload in _head_uploaded_files_in_batches(symbol_sets):
+            if s3_upload:
+                content_length = s3_upload.get("ContentLength")
+                if content_length:
+                    total_file_size += content_length
+
+                if not content_length or content_length > ONE_HUNDRED_MEGABYTES:
+                    symbol_set.delete()
+
+                    raise ValidationError(
+                        code="file_too_large",
+                        detail="The uploaded symbol set file was too large.",
+                    )
+            else:
+                raise ValidationError(
+                    code="file_not_found",
+                    detail="No file has been uploaded for the symbol set.",
+                )
+
+            content_hash = content_hashes[str(symbol_set.id)]
+            symbol_set.content_hash = content_hash
+        with transaction.atomic():
+            _lock_symbol_sets(team, [symbol_set.ref for symbol_set in symbol_sets])
+            ErrorTrackingSymbolSet.objects.bulk_update(symbol_sets, ["content_hash"])
+    except Exception as e:
+        posthoganalytics.capture(
+            "error_tracking_symbol_set_uploaded",
+            properties={
+                **(analytics_props or {}),
+                "file_size": total_file_size,
+                "success": False,
+                "file_count": file_count,
+                "failure_reason": type(e).__name__,
+                "failure_code": _get_failure_code(e),
+            },
+            groups=groups(team.organization, team),
+        )
+        raise
+
+    posthoganalytics.capture(
+        "error_tracking_symbol_set_uploaded",
+        properties={
+            **(analytics_props or {}),
+            "file_size": total_file_size,
+            "success": True,
+            "file_count": file_count,
+        },
+        groups=groups(team.organization, team),
+    )

@@ -1,0 +1,121 @@
+import type { Sorting } from 'lib/lemon-ui/LemonTable/sorting'
+
+import { HeatmapSortOrder, type HeatmapSettings } from '~/queries/schema/schema-general'
+
+export const HEATMAP_ROW_LABEL_SORT_KEY = '__heatmap_row_label__'
+
+export type HeatmapCellValues = Record<string, Record<string, number | null>>
+
+export function getDistinctHeatmapLabels(values: unknown[], nullLabel: string): Map<unknown, string> {
+    const labels = new Map<unknown, string>()
+    const reserved = new Set(values.map((value) => String(value ?? nullLabel)))
+    const used = new Set<string>()
+    for (const value of values) {
+        if (labels.has(value)) {
+            continue
+        }
+        const base = String(value ?? nullLabel)
+        let label = base
+        let suffix = 2
+        while (used.has(label)) {
+            label = `${base} (${suffix++})`
+            while (reserved.has(label)) {
+                label = `${base} (${suffix++})`
+            }
+        }
+        labels.set(value, label)
+        used.add(label)
+    }
+    return labels
+}
+
+const compareHeatmapLabels = (left: string, right: string): number =>
+    left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' })
+
+const compareHeatmapColumnLabels = (left: string, right: string): number => {
+    const leftNumber = left.trim() === '' ? NaN : Number(left)
+    const rightNumber = right.trim() === '' ? NaN : Number(right)
+    const leftIsNumber = Number.isFinite(leftNumber)
+    const rightIsNumber = Number.isFinite(rightNumber)
+    if (leftIsNumber && rightIsNumber) {
+        return leftNumber - rightNumber
+    }
+    if (leftIsNumber !== rightIsNumber) {
+        return leftIsNumber ? -1 : 1
+    }
+    return compareHeatmapLabels(left, right)
+}
+
+export const sortHeatmapColumns = (columnLabels: string[], order?: HeatmapSortOrder): string[] =>
+    order
+        ? [...columnLabels].sort(
+              (left, right) => compareHeatmapColumnLabels(left, right) * (order === HeatmapSortOrder.Asc ? 1 : -1)
+          )
+        : columnLabels
+
+const compareHeatmapValues = (
+    left: number | null | undefined,
+    right: number | null | undefined,
+    order: Sorting['order']
+): number => {
+    if (left === null || left === undefined) {
+        return right === null || right === undefined ? 0 : 1
+    }
+
+    if (right === null || right === undefined) {
+        return -1
+    }
+
+    return (left - right) * order
+}
+
+export const sortHeatmapRows = (
+    rowLabels: string[],
+    cellValues: HeatmapCellValues,
+    sorting: Sorting | null
+): string[] => {
+    if (!sorting) {
+        return rowLabels
+    }
+
+    const originalIndexes = new Map(rowLabels.map((label, index) => [label, index]))
+
+    return [...rowLabels].sort((leftLabel, rightLabel) => {
+        const comparison =
+            sorting.columnKey === HEATMAP_ROW_LABEL_SORT_KEY
+                ? compareHeatmapLabels(leftLabel, rightLabel)
+                : compareHeatmapValues(
+                      cellValues[leftLabel]?.[sorting.columnKey],
+                      cellValues[rightLabel]?.[sorting.columnKey],
+                      sorting.order
+                  )
+
+        if (comparison !== 0) {
+            return sorting.columnKey === HEATMAP_ROW_LABEL_SORT_KEY ? comparison * sorting.order : comparison
+        }
+
+        return (originalIndexes.get(leftLabel) ?? 0) - (originalIndexes.get(rightLabel) ?? 0)
+    })
+}
+
+export const getSortingFromHeatmapSettings = (
+    heatmapSettings: Pick<HeatmapSettings, 'sortColumn' | 'sortOrder'>
+): Sorting | null => {
+    if (!heatmapSettings.sortColumn || !heatmapSettings.sortOrder) {
+        return null
+    }
+
+    return {
+        columnKey: heatmapSettings.sortColumn,
+        order: heatmapSettings.sortOrder === HeatmapSortOrder.Asc ? 1 : -1,
+    }
+}
+
+export const getHeatmapSettingsWithSorting = (
+    heatmapSettings: HeatmapSettings,
+    sorting: Sorting | null
+): HeatmapSettings => ({
+    ...heatmapSettings,
+    sortColumn: sorting?.columnKey,
+    sortOrder: sorting?.order === 1 ? HeatmapSortOrder.Asc : sorting?.order === -1 ? HeatmapSortOrder.Desc : undefined,
+})

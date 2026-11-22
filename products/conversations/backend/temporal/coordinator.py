@@ -1,0 +1,404 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
+
+from temporalio import activity, workflow
+from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
+from temporalio.exceptions import WorkflowAlreadyStartedError
+
+if TYPE_CHECKING:
+    from posthog.models import Team
+
+    from products.conversations.backend.models import Ticket
+
+with workflow.unsafe.imports_passed_through():
+    from django.db.models import Q
+    from django.utils import timezone
+
+    import structlog
+    import posthoganalytics
+
+    from posthog.models.comment import Comment
+    from posthog.sync import database_sync_to_async
+    from posthog.temporal.common.heartbeat import Heartbeater
+
+    from products.business_knowledge.backend.logic import has_ready_sources
+    from products.conversations.backend.models import Ticket
+    from products.conversations.backend.models.constants import Channel, Status
+    from products.conversations.backend.temporal.ai_reply.constants import MAX_CLARIFICATION_ROUNDS
+    from products.conversations.backend.temporal.pipeline import SupportReplyInput, SupportReplyWorkflow
+
+logger = structlog.get_logger(__name__)
+
+COORDINATOR_INTERVAL_MINUTES = 1
+
+# Settle/debounce window: don't draft until the customer has been quiet (no new message) for this
+# long. Lets someone raise a ticket and immediately fire off 1-2 follow-ups without the AI drafting
+# off only the first message. The reference is max(ticket.created_at, latest customer comment), so a
+# brand-new ticket also waits this long before its first draft — the latency we trade for completeness.
+TICKET_SETTLE_MINUTES = 1
+
+# Channels drafted on the first tick after a customer message, without the settle window. Email
+# customers rarely send a second message within a minute, so the wait only delays the draft.
+SETTLE_EXEMPT_CHANNELS: tuple[str, ...] = (Channel.EMAIL,)
+
+# Scan window. Keyed on last_message_at (the same axis the settle gate uses), so a ticket stays
+# eligible until SETTLE after its *last* customer message, regardless of how long ago it was created
+# — a late follow-up can't push the settle deadline past the scan window and silently drop the
+# ticket. Only needs to exceed SETTLE + interval + a little slack for a slow tick.
+TICKET_LOOKBACK_MINUTES = 5
+
+# Fanout caps so public ticket volume can't directly turn into unbounded sandbox/LLM work.
+# A single opted-in team that gets flooded with externally-created tickets can only spend
+# MAX_TICKETS_PER_TEAM_PER_RUN drafts per tick; the global cap bounds total work across teams.
+# Anything over the cap simply rolls to the next tick (the lookback window keeps it eligible).
+MAX_TICKETS_PER_TEAM_PER_RUN = 10
+MAX_TICKETS_PER_RUN = 50
+
+MASTER_FLAG = "product-support-ai-suggestion-orgs"
+
+# Minimum number of READY BK sources required before the coordinator will draft replies.
+# Set to 0 locally to skip the BK readiness check entirely.
+MIN_READY_BK_SOURCES = 0
+
+SKIPPED_TEAM_REPLIED = "skipped_team_replied"
+SKIPPED_CHANNEL_EXCLUDED = "skipped_channel_excluded"
+
+
+@dataclass
+class CoordinatorInput:
+    pass
+
+
+@dataclass
+class CoordinatorOutput:
+    eligible_count: int
+    started_count: int
+    skipped_count: int
+
+
+@dataclass(frozen=False)
+class EligibleTicket:
+    team_id: int
+    ticket_id: str
+    clarification_round: int = 0
+
+
+def _child_workflow_id(ticket_id: str, clarification_round: int = 0) -> str:
+    # Round 0 keeps the pre-clarify id so in-flight runs and ALLOW_DUPLICATE_FAILED_ONLY
+    # still collide across the deploy. Later rounds must use a new id or a completed
+    # round-0 run would block the follow-up forever.
+    if clarification_round >= 1:
+        return f"support-reply-{ticket_id}-r{clarification_round}"
+    return f"support-reply-{ticket_id}"
+
+
+def _awaiting_clarification_round(ticket: Ticket) -> tuple[bool, int]:
+    triage = ticket.ai_triage if isinstance(ticket.ai_triage, dict) else {}
+    if triage.get("status") != "awaiting_clarification":
+        return False, 0
+    raw_rounds = triage.get("clarification_rounds")
+    try:
+        stored = int(raw_rounds or 0)
+    except (TypeError, ValueError):
+        stored = 0
+    return True, max(stored, 1)
+
+
+@dataclass
+class CollectEligibleTicketsOutput:
+    tickets: list[EligibleTicket]
+
+
+def _is_master_flag_enabled(team: Team) -> bool:
+    # The flag is targeted by organization group, the same as `product-business-knowledge`. The headless
+    # worker only sends the group properties listed here (unlike posthog-js, which auto-attaches full
+    # group properties), so a release condition on any other organization property never matches.
+    try:
+        return bool(
+            posthoganalytics.feature_enabled(
+                MASTER_FLAG,
+                str(team.organization_id),
+                groups={"organization": str(team.organization_id)},
+                group_properties={"organization": {"id": str(team.organization_id)}},
+                only_evaluate_locally=False,
+                send_feature_flag_events=False,
+            )
+        )
+    except Exception:
+        # A flag-service blip must skip the ticket, not throw inside the scan loop and fail the
+        # whole coordinator tick. Fail closed: treat as disabled.
+        logger.warning("support_reply coordinator: master flag eval failed", team_id=team.id, exc_info=True)
+        return False
+
+
+def _collect_eligible(lookback_minutes: int = TICKET_LOOKBACK_MINUTES) -> list[EligibleTicket]:
+    """Sync DB scan for eligible tickets. Runs in a worker thread."""
+    now = timezone.now()
+    cutoff = now - timedelta(minutes=lookback_minutes)
+    # last_message_at is the debounce axis; fall back to created_at for tickets whose denormalized
+    # timestamp hasn't landed yet (set via a post-commit signal, so there's a brief null window).
+    # Pending is included only when the AI asked a public question and is waiting; a human-snoozed
+    # pending ticket has no awaiting_clarification and stays out.
+    recent_tickets = Ticket.objects.filter(
+        Q(last_message_at__gte=cutoff) | Q(last_message_at__isnull=True, created_at__gte=cutoff),
+        Q(status__in=[Status.NEW, Status.OPEN]) | Q(status=Status.PENDING, ai_triage__status="awaiting_clarification"),
+    ).select_related("team__organization")
+
+    # First pass: the cheap per-ticket gates that don't touch the comments table. We keep
+    # created_at around so a ticket with no customer comments yet still settles from its own
+    # creation time (the initial message), not just from follow-up comments.
+    candidates: list[tuple[int, str, datetime, bool, int, bool]] = []
+    untriaged_ticket_ids: set[str] = set()
+    skipped_ticket_ids_by_result: dict[str, list[str]] = {SKIPPED_TEAM_REPLIED: [], SKIPPED_CHANNEL_EXCLUDED: []}
+    # The flag is org-keyed, so evaluate it once per org per scan instead of once per ticket.
+    master_flag_by_org: dict[str, bool] = {}
+    for ticket in recent_tickets:
+        team = ticket.team
+
+        org_key = str(team.organization_id)
+        if org_key not in master_flag_by_org:
+            master_flag_by_org[org_key] = _is_master_flag_enabled(team)
+        if not master_flag_by_org[org_key]:
+            continue
+
+        settings_dict = team.conversations_settings or {}
+        if not settings_dict.get("ai_suggestions_enabled", False):
+            continue
+
+        if not team.organization.is_ai_data_processing_approved:
+            continue
+
+        if MIN_READY_BK_SOURCES > 0 and not has_ready_sources(team.id):
+            continue
+
+        is_untriaged = not ticket.ai_triage
+        allowed_channels = settings_dict.get("ai_resolution_channels")
+        if allowed_channels is not None and ticket.channel_source not in allowed_channels:
+            if is_untriaged:
+                skipped_ticket_ids_by_result[SKIPPED_CHANNEL_EXCLUDED].append(str(ticket.id))
+            continue
+
+        if is_untriaged:
+            untriaged_ticket_ids.add(str(ticket.id))
+
+        awaiting, clarification_round = _awaiting_clarification_round(ticket)
+        if awaiting and clarification_round > MAX_CLARIFICATION_ROUNDS:
+            continue
+
+        candidates.append(
+            (
+                team.id,
+                str(ticket.id),
+                ticket.created_at,
+                awaiting,
+                clarification_round,
+                ticket.channel_source in SETTLE_EXEMPT_CHANNELS,
+            )
+        )
+
+    if not candidates:
+        _record_skipped_tickets(skipped_ticket_ids_by_result, now=now)
+        return []
+
+    # One comment query per team instead of round-trips per ticket. Two things come out of it:
+    #   1. Dedupe: a ticket is "already engaged" iff it has our own AI note ("AI", private or not)
+    #      or a public human/team/workflow reply. A private note from a human or workflow is not a
+    #      reply to the customer, so it is ignored here. This lets automations that log new tickets
+    #      as private notes keep the AI draft. Engaged tickets are excluded below for first-draft
+    #      tickets. Awaiting tickets already have an AI question, so they skip that gate and
+    #      re-engage only on a newer settled customer reply with no human after it.
+    #      A team-opened ticket (compose, or a team member starting the thread) has a team comment
+    #      before the first customer comment. That opener is not engagement, so such a ticket is
+    #      engaged only by an engaging comment newer than the first customer comment.
+    #   2. Settle/debounce: the latest customer comment timestamp per ticket.
+    by_team: dict[int, list[str]] = {}
+    for team_id, ticket_id_str, _created_at, _awaiting, _round, _settle_exempt in candidates:
+        by_team.setdefault(team_id, []).append(ticket_id_str)
+
+    engaged: set[str] = set()
+    first_customer_msg: dict[str, datetime] = {}
+    latest_customer_msg: dict[str, datetime] = {}
+    earliest_non_customer_msg: dict[str, datetime] = {}
+    latest_ai_msg: dict[str, datetime] = {}
+    latest_human_msg: dict[str, datetime] = {}
+    for team_id, ticket_ids in by_team.items():
+        for item_id, author_type, is_private, comment_created_at in Comment.objects.filter(
+            team_id=team_id,
+            scope="conversations_ticket",
+            item_id__in=ticket_ids,
+            item_context__automated_update_key__isnull=True,
+        ).values_list("item_id", "item_context__author_type", "item_context__is_private", "created_at"):
+            if author_type == "customer":
+                prev = latest_customer_msg.get(item_id)
+                if prev is None or comment_created_at > prev:
+                    latest_customer_msg[item_id] = comment_created_at
+                first = first_customer_msg.get(item_id)
+                if first is None or comment_created_at < first:
+                    first_customer_msg[item_id] = comment_created_at
+                continue
+            if author_type != "AI" and is_private is True:
+                continue
+            engaged.add(item_id)
+            earliest = earliest_non_customer_msg.get(item_id)
+            if earliest is None or comment_created_at < earliest:
+                earliest_non_customer_msg[item_id] = comment_created_at
+            if author_type == "AI":
+                prev_ai = latest_ai_msg.get(item_id)
+                if prev_ai is None or comment_created_at > prev_ai:
+                    latest_ai_msg[item_id] = comment_created_at
+                continue
+            prev_human = latest_human_msg.get(item_id)
+            if prev_human is None or comment_created_at > prev_human:
+                latest_human_msg[item_id] = comment_created_at
+
+    # Per-team and global caps bound how many child workflows a single tick can fan out so
+    # externally-created ticket volume can't directly translate into unbounded LLM work; overflow
+    # rolls to the next tick (still in lookback).
+    settle_cutoff = now - timedelta(minutes=TICKET_SETTLE_MINUTES)
+    eligible: list[EligibleTicket] = []
+    per_team_counts: dict[int, int] = {}
+    for team_id, ticket_id_str, created_at, awaiting, clarification_round, settle_exempt in candidates:
+        if awaiting:
+            last_customer = latest_customer_msg.get(ticket_id_str)
+            last_ai = latest_ai_msg.get(ticket_id_str)
+            last_human = latest_human_msg.get(ticket_id_str)
+            if last_customer is None or last_ai is None or last_customer <= last_ai:
+                continue
+            if last_human is not None and last_human > last_ai:
+                continue
+            if not settle_exempt and last_customer > settle_cutoff:
+                continue
+        else:
+            first_customer = first_customer_msg.get(ticket_id_str)
+            earliest_team = earliest_non_customer_msg.get(ticket_id_str)
+            team_opened = earliest_team is not None and (first_customer is None or earliest_team < first_customer)
+            if team_opened:
+                # Wait for the customer without recording a skip, because no team reply exists yet.
+                if first_customer is None:
+                    continue
+                last_human = latest_human_msg.get(ticket_id_str)
+                if last_human is not None and last_human > first_customer:
+                    if ticket_id_str in untriaged_ticket_ids:
+                        skipped_ticket_ids_by_result[SKIPPED_TEAM_REPLIED].append(ticket_id_str)
+                    continue
+                last_ai = latest_ai_msg.get(ticket_id_str)
+                if last_ai is not None and last_ai > first_customer:
+                    continue
+            elif ticket_id_str in engaged:
+                if ticket_id_str in untriaged_ticket_ids and ticket_id_str in latest_human_msg:
+                    skipped_ticket_ids_by_result[SKIPPED_TEAM_REPLIED].append(ticket_id_str)
+                continue
+            # Settle: wait until the customer has gone quiet. Reference is the most recent customer
+            # activity — max(ticket creation, latest customer comment). If that's newer than the
+            # cutoff the ticket is still settling; skip it and let a later tick pick it up.
+            last_activity = max(created_at, latest_customer_msg.get(ticket_id_str, created_at))
+            if not settle_exempt and last_activity > settle_cutoff:
+                continue
+        if len(eligible) >= MAX_TICKETS_PER_RUN:
+            continue
+        if per_team_counts.get(team_id, 0) >= MAX_TICKETS_PER_TEAM_PER_RUN:
+            continue
+        per_team_counts[team_id] = per_team_counts.get(team_id, 0) + 1
+        eligible.append(
+            EligibleTicket(
+                team_id=team_id,
+                ticket_id=ticket_id_str,
+                clarification_round=clarification_round,
+            )
+        )
+
+    _record_skipped_tickets(skipped_ticket_ids_by_result, now=now)
+    return eligible
+
+
+def _record_skipped_tickets(skipped_ticket_ids_by_result: dict[str, list[str]], *, now: datetime) -> None:
+    for result, ticket_ids in skipped_ticket_ids_by_result.items():
+        if not ticket_ids:
+            continue
+        Ticket.objects.filter(id__in=ticket_ids, ai_triage={}).update(
+            ai_triage={"schema_version": 1, "status": "done", "result": result, "finished_at": now.isoformat()}
+        )
+
+
+@activity.defn
+async def support_collect_eligible_tickets_activity(_input: CoordinatorInput) -> CollectEligibleTicketsOutput:
+    """Scan for recent tickets and gate them through all eligibility checks."""
+    async with Heartbeater():
+        tickets = await database_sync_to_async(_collect_eligible, thread_sensitive=False)()
+    logger.info("support_reply coordinator: eligible tickets", count=len(tickets))
+    return CollectEligibleTicketsOutput(tickets=tickets)
+
+
+@workflow.defn(name="support-reply-coordinator")
+class SupportReplyCoordinatorWorkflow:
+    """Coordinator: polls for new tickets, gates them, fans out child reply workflows.
+
+    Dispatch is fire-and-forget via ParentClosePolicy.ABANDON. Child workflow IDs are
+    deterministic per ticket (`support-reply-<ticket_id>`, or `...-rN` after a clarifying
+    question), so the same ticket can't be drafted twice while a run is in flight (the lookback
+    window intentionally overlaps the schedule interval): a running child conflicts on its id
+    before its AI note lands and the DB dedupe can see it. ALLOW_DUPLICATE_FAILED_ONLY still lets
+    a later tick retry a ticket whose prior pipeline run failed. ScheduleOverlapPolicy.SKIP only
+    guards against a slow tick overlapping the next one.
+    """
+
+    @staticmethod
+    def parse_inputs(inputs: list[str]) -> CoordinatorInput:
+        if not inputs:
+            return CoordinatorInput()
+        loaded = json.loads(inputs[0])
+        return CoordinatorInput(**loaded)
+
+    @workflow.run
+    async def run(self, _input: CoordinatorInput) -> CoordinatorOutput:
+        result = await workflow.execute_activity(
+            support_collect_eligible_tickets_activity,
+            _input,
+            start_to_close_timeout=timedelta(minutes=3),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+
+        tickets = result.tickets
+        if not tickets:
+            return CoordinatorOutput(eligible_count=0, started_count=0, skipped_count=0)
+
+        started = 0
+        skipped = 0
+
+        for ticket in tickets:
+            # Keyed on ticket id only (not the tick id) so the id guard dedupes the same ticket
+            # across overlapping ticks, not just within a single coordinator run. A still-running
+            # child always conflicts on its id regardless of reuse policy; ALLOW_DUPLICATE_FAILED_ONLY
+            # additionally lets a tick re-dispatch a ticket whose prior pipeline run *failed* (which
+            # leaves no AI note for the DB dedupe to catch), while a succeeded/escalated run stays
+            # de-duped — the success case also leaves an AI note that the DB gate catches first.
+            child_id = _child_workflow_id(ticket.ticket_id, ticket.clarification_round)
+            try:
+                await workflow.start_child_workflow(
+                    SupportReplyWorkflow.run,
+                    SupportReplyInput(
+                        team_id=ticket.team_id,
+                        ticket_id=ticket.ticket_id,
+                        clarification_round=ticket.clarification_round,
+                    ),
+                    id=child_id,
+                    id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+                    parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+                )
+                started += 1
+            except WorkflowAlreadyStartedError:
+                workflow.logger.info(
+                    "support_reply coordinator: child already running",
+                    extra={"ticket_id": ticket.ticket_id, "child_id": child_id},
+                )
+                skipped += 1
+
+        return CoordinatorOutput(
+            eligible_count=len(tickets),
+            started_count=started,
+            skipped_count=skipped,
+        )

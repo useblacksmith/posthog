@@ -1,0 +1,1581 @@
+"""Check framework and all product lint checks.
+
+Lint checks are pass/fail structural correctness checks. They answer "is anything
+broken?" — missing files, broken scripts, misplaced code.
+
+Progress/maturity scoring lives in maturity.py instead.
+"""
+
+from __future__ import annotations
+
+import re
+import ast
+import json
+import shlex
+import tomllib
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .ast_helpers import ast_parse_safe, module_import_targets
+from .crossings import driven_wiring_locations, facade_shape_use, facade_wiring_use, recorded_facade_shape_rows
+from .isolation import (
+    GARAGE_PREFIXES,
+    FacadeShapeFinding,
+    IsolationRung,
+    IsolationStatus,
+    UnapprovedWiringClass,
+    compute_isolation_status,
+    facade_shape_findings,
+    has_contracts_module,
+    has_legacy_interface_leaks,
+    has_routes_module,
+    has_tach_interface,
+    ignored_import_edges,
+    iter_interface_blocks as _iter_interface_blocks,
+    location_input_glob,
+    names_from_pattern as _names_from_pattern,
+    pattern_targets_public_surface as _pattern_targets_public_surface,
+    routes_in_turbo_inputs,
+    unwatched_modules,
+    webhook_consumers_unwatched,
+)
+from .paths import TACH_TOML, get_tach_block
+from .watched_channels import unwatched_channel_issue
+from .wiring_interfaces import APPROVED_WIRING_BASES, APPROVED_WIRING_DECORATORS, WiringVerdict
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
+def check_file_exists(backend_dir: Path, path: str) -> bool:
+    """Check if a file or its folder equivalent exists."""
+    file_path = backend_dir / path
+    if file_path.exists():
+        return True
+    if path.endswith(".py"):
+        folder_path = backend_dir / path.replace(".py", "")
+        if folder_path.exists() and folder_path.is_dir():
+            return True
+    return False
+
+
+def _iter_module_blocks(tach_content: str) -> Iterator[tuple[str, list[str]]]:
+    """Yield (path, depends_on) for every [[modules]] block.
+
+    Reads the parsed TOML because a comment inside a depends_on list can name `[[interfaces]]`,
+    which ends a text match early and drops the rest of the list.
+    """
+    for module in tomllib.loads(tach_content).get("modules", []):
+        path = module.get("path")
+        if not path:
+            continue
+        # tach accepts a dependency as a bare path or as a table such as {path = "...", deprecated = true}.
+        depends_on = [dep if isinstance(dep, str) else dep["path"] for dep in module.get("depends_on", [])]
+        yield path, depends_on
+
+
+# ---------------------------------------------------------------------------
+# Canonical facade alternation validation (global, not per-product)
+# ---------------------------------------------------------------------------
+
+
+def _targets_facade_or_presentation(pattern: str) -> bool:
+    """True if a pattern targets backend.facade or backend.presentation specifically.
+
+    Narrower than `_pattern_targets_public_surface`, which also accepts
+    backend.routes. A routes-only block is a registration hook, not a canonical
+    facade surface, so it must not be treated as one (it would otherwise demand
+    facade/contracts.py isolation scaffolding the product may not have).
+    """
+    normalized = pattern.replace("\\", "")
+    return normalized.startswith("backend.facade") or normalized.startswith("backend.presentation")
+
+
+def _is_canonical_facade_expose(expose_patterns: list[str]) -> bool:
+    """Canonical = a public-surface block that actually exposes facade/presentation.
+
+    Every pattern must be public surface (facade/presentation/routes) and at
+    least one must be facade/presentation — so a routes-only registration block
+    does not get treated as a canonical facade alternation entry.
+    """
+    if not expose_patterns:
+        return False
+    if not all(_pattern_targets_public_surface(p) for p in expose_patterns):
+        return False
+    return any(_targets_facade_or_presentation(p) for p in expose_patterns)
+
+
+def validate_facade_alternation(tach_content: str, products_dir: Path) -> list[str]:
+    """Validate the canonical facade `[[interfaces]]` block(s).
+
+    Catches stale entries:
+      1. Every product named in the canonical alternation must exist as
+         products/<name>/.
+      2. Every product named in the canonical alternation must have
+         backend/facade/contracts.py (the Strict rung or above). A product
+         that also has a legacy-leak block is exempt: its facade block only
+         stops new reach-ins while the listed leaks drain.
+      3. Names in alternation regexes must be sorted alphabetically.
+
+    The inverse direction ("every Strict product must be listed") is not
+    enforced — having `facade/contracts.py` is just scaffolding and doesn't
+    mean the product is ready for canonical exposure.
+    """
+    issues: list[str] = []
+
+    canonical_names: set[str] = set()
+    found_canonical_block = False
+    for expose_patterns, from_patterns in _iter_interface_blocks(tach_content):
+        if not _is_canonical_facade_expose(expose_patterns):
+            continue
+        found_canonical_block = True
+        for pattern in from_patterns:
+            names = _names_from_pattern(pattern)
+            if not names:
+                issues.append(
+                    f"canonical [[interfaces]] block has unparseable from pattern '{pattern}' — "
+                    "expected 'products.<name>' or 'products\\.(name1|name2|...)'"
+                )
+                continue
+            canonical_names |= names
+            names_list = _ordered_names_from_alternation(pattern)
+            if names_list and names_list != sorted(names_list):
+                issues.append(
+                    f"canonical alternation is not sorted alphabetically — expected '{('|'.join(sorted(names_list)))}'"
+                )
+
+    if not found_canonical_block:
+        return issues
+
+    for name in sorted(canonical_names):
+        product_dir = products_dir / name
+        if not product_dir.is_dir():
+            issues.append(
+                f"canonical facade alternation lists '{name}' but products/{name}/ does not exist — "
+                "remove the stale entry from tach.toml"
+            )
+            continue
+        if has_legacy_interface_leaks(tach_content, f"products.{name}"):
+            continue
+        if not has_contracts_module(product_dir / "backend"):
+            issues.append(
+                f"canonical facade alternation lists '{name}' but products/{name}/backend/facade/contracts.py "
+                "is missing — either add contracts.py or remove the entry from tach.toml"
+            )
+
+    return issues
+
+
+def _ordered_names_from_alternation(pattern: str) -> list[str] | None:
+    """Return names in their original order if the pattern is an alternation, else None."""
+    normalized = pattern.replace("\\", "")
+    m = re.match(r"^products\.\(([^)]+)\)$", normalized)
+    if m:
+        return [n.strip() for n in m.group(1).split("|") if n.strip()]
+    return None
+
+
+def validate_interface_blocks(tach_content: str) -> list[str]:
+    """Validate individual [[interfaces]] blocks for structural problems.
+
+    Checks:
+      1. No mixed facade + internal expose in a single block.
+      2. No overly broad expose patterns (backend.* catches everything).
+    """
+    issues: list[str] = []
+
+    for expose_patterns, from_patterns in _iter_interface_blocks(tach_content):
+        products = set()
+        for p in from_patterns:
+            products |= _names_from_pattern(p)
+        product_label = ", ".join(sorted(products)) or ", ".join(from_patterns)
+
+        has_facade = any(_pattern_targets_public_surface(p) for p in expose_patterns)
+        has_internal = any(not _pattern_targets_public_surface(p) for p in expose_patterns)
+        if has_facade and has_internal:
+            issues.append(
+                f"[[interfaces]] for {product_label} mixes facade/presentation exposes with "
+                "internal exposes — split into separate blocks or remove the facade patterns "
+                "from the legacy leak block"
+            )
+
+        for pattern in expose_patterns:
+            normalized = pattern.replace("\\", "")
+            if re.match(r"^backend\.{0,2}\*", normalized):
+                issues.append(
+                    f"[[interfaces]] for {product_label} has overly broad expose "
+                    f"'{pattern}' — enumerate specific submodules instead"
+                )
+
+    return issues
+
+
+def validate_tach_references(tach_content: str) -> list[str]:
+    """Validate referential integrity in tach.toml.
+
+    Checks:
+      1. Every [[interfaces]] from must reference an existing [[modules]] path.
+      2. Every [[modules]] depends_on entry must reference an existing module.
+    """
+    issues: list[str] = []
+
+    module_paths: set[str] = set()
+    for path, _deps in _iter_module_blocks(tach_content):
+        module_paths.add(path)
+
+    for _expose, from_patterns in _iter_interface_blocks(tach_content):
+        for pattern in from_patterns:
+            names = _names_from_pattern(pattern)
+            for name in names:
+                module_path = f"products.{name}"
+                if module_path not in module_paths:
+                    issues.append(
+                        f"[[interfaces]] references '{module_path}' but no [[modules]] "
+                        f"block with that path exists — dangling interface declaration"
+                    )
+
+    for path, depends_on in _iter_module_blocks(tach_content):
+        for dep in depends_on:
+            if dep not in module_paths:
+                issues.append(
+                    f"[[modules]] '{path}' depends on '{dep}' but no [[modules]] "
+                    f"block with that path exists — dangling dependency"
+                )
+
+    return issues
+
+
+def validate_tach_toml(tach_content: str, products_dir: Path) -> list[str]:
+    """Run all tach.toml validation checks."""
+    issues: list[str] = []
+    issues.extend(validate_facade_alternation(tach_content, products_dir))
+    issues.extend(validate_interface_blocks(tach_content))
+    issues.extend(validate_tach_references(tach_content))
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Check framework
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CheckContext:
+    name: str
+    product_dir: Path
+    backend_dir: Path
+    has_facade_contracts: bool
+    structure: dict
+    detailed: bool  # True = single-product run, False = --all
+    _isolation: IsolationStatus | None = field(default=None, repr=False, compare=False)
+
+    def isolation_status(self) -> IsolationStatus:
+        """Memoized isolation seal status, shared across checks within one product run.
+
+        Several checks need it; computing once avoids re-reading tach.toml/pyproject.toml/
+        package.json per check (files don't change mid-run).
+        """
+        if self._isolation is None:
+            self._isolation = compute_isolation_status(
+                self.name,
+                self.product_dir,
+                self.backend_dir,
+                has_facade_contracts=self.has_facade_contracts,
+                driven_wiring_locations=driven_wiring_locations(self.name),
+            )
+        return self._isolation
+
+
+@dataclass
+class CheckResult:
+    lines: list[str] = field(default_factory=list)  # lines printed to stdout
+    issues: list[str] = field(default_factory=list)  # blocking issues returned to caller
+    warnings: list[str] = field(default_factory=list)  # non-blocking warnings
+    file: str | None = None  # file path for GitHub annotations
+    skip: bool = False  # silently skip this check
+
+
+class ProductCheck(ABC):
+    label: str
+    for_strict: bool = True
+    for_lenient: bool = True
+
+    def should_run(self, ctx: CheckContext) -> bool:
+        if ctx.has_facade_contracts and not self.for_strict:
+            return False
+        if not ctx.has_facade_contracts and not self.for_lenient:
+            return False
+        return True
+
+    @abstractmethod
+    def run(self, ctx: CheckContext) -> CheckResult: ...
+
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+
+
+class RequiredRootFilesCheck(ProductCheck):
+    label = "required root files"
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        required_key = "required" if ctx.has_facade_contracts else "required_lenient"
+        missing = [
+            filename
+            for filename, config in ctx.structure.get("root_files", {}).items()
+            if config.get(required_key, False) and not (ctx.product_dir / filename).exists()
+        ]
+        if missing:
+            return CheckResult(
+                lines=[f"✗ missing: {', '.join(missing)}"],
+                issues=[f"Missing required root file: {f}" for f in missing],
+            )
+        return CheckResult(lines=["✓ ok"])
+
+
+class BackendPackageMarkerCheck(ProductCheck):
+    """backend/ needs an __init__.py or every import contract silently skips the product.
+
+    import-linter builds its graph from `products`, which is a regular package (it carries an
+    __init__.py so file-based mypy resolves `products.<name>.backend` rather than `<name>.backend`).
+    grimp does not descend from a regular package into PEP 420 namespace sub-directories, so a
+    backend without the marker is absent from the graph entirely — and a contract that never sees a
+    module reports success for it. The failure is silent in both directions: nothing warns, and the
+    contract passes.
+    """
+
+    label = "backend package marker"
+
+    # Only the paths import contracts actually target. Test directories and generated trees
+    # (warehouse_sources' per-source connectors) are namespace dirs on purpose and stay that way.
+    CONTRACT_TREES = ("facade", "presentation")
+
+    def should_run(self, ctx: CheckContext) -> bool:
+        return ctx.backend_dir.is_dir()
+
+    def _missing_markers(self, ctx: CheckContext) -> list[str]:
+        missing = []
+        if not (ctx.backend_dir / "__init__.py").exists():
+            missing.append("backend/")
+        for tree in self.CONTRACT_TREES:
+            root = ctx.backend_dir / tree
+            if not root.is_dir():
+                continue
+            for directory in sorted(d for d in root.rglob("*") if d.is_dir()):
+                if directory.name == "__pycache__" or not any(directory.glob("*.py")):
+                    continue
+                if not (directory / "__init__.py").exists():
+                    missing.append(f"backend/{directory.relative_to(ctx.backend_dir)}/")
+            if not (root / "__init__.py").exists():
+                missing.append(f"backend/{tree}/")
+        return sorted(set(missing))
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        missing = self._missing_markers(ctx)
+        if not missing:
+            return CheckResult(lines=["✓ ok"])
+        return CheckResult(
+            lines=[f"✗ missing __init__.py: {', '.join(missing)}"],
+            issues=[
+                f"missing __init__.py in {', '.join(missing)} — grimp stops descending at the first "
+                "directory without one, so import-linter cannot see what is below it and every "
+                "contract passes there vacuously. Add the marker (empty, like every other product's)"
+            ],
+        )
+
+
+def _has_test_files(backend_dir: Path) -> bool:
+    """Check if backend/ contains any pytest-discoverable test files."""
+    return any(backend_dir.rglob("test_*.py")) or any(backend_dir.rglob("*_test.py"))
+
+
+def _is_noop_script(script: str) -> bool:
+    """Check if a script is a no-op (echo, true, exit 0, etc.)."""
+    stripped = script.strip()
+    return stripped.startswith("echo ") or stripped in ("true", "exit 0", ":")
+
+
+def _parse_pytest_paths(script: str) -> list[str]:
+    """Extract test path arguments from a pytest command.
+
+    Given something like:
+        pytest -c ../../pytest.ini --rootdir ../.. backend/tests -v --tb=short
+    Returns:
+        ["backend/tests"]
+    """
+    try:
+        parts = shlex.split(script)
+    except ValueError:
+        parts = script.split()
+    if not parts or parts[0] != "pytest":
+        return []
+
+    paths: list[str] = []
+    skip_next = False
+    for part in parts[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        # flags that consume the next token
+        if part in ("-c", "--rootdir", "-k", "-m", "-p", "--override-ini", "-o"):
+            skip_next = True
+            continue
+        # skip flags
+        if part.startswith("-"):
+            continue
+        paths.append(part)
+    return paths
+
+
+def _contract_check_withheld_note(status: IsolationStatus) -> str | None:
+    """Why the contract-check skip is correctly withheld for an isolated product.
+
+    Surfaced on a passing single-product lint so a reader sees the decision, not just
+    its silent absence. Returns None when there's nothing meaningful to explain.
+    """
+    if status.facade_leaks:
+        classes = ", ".join(sorted({v.class_name for v in status.facade_leaks}))
+        return f"facade hands out non-contract class(es) ({classes}) — not soundly isolated (see § Wiring couplings)"
+    if status.deferred_count > 0 and status.has_legacy_leaks:
+        return f"legacy interface leaks + {status.deferred_count} presentation bypass(es) still open"
+    if status.deferred_count > 0:
+        plural = "bypass" if status.deferred_count == 1 else "bypasses"
+        return f"{status.deferred_count} presentation {plural} still open (internal seal incomplete)"
+    if status.has_legacy_leaks:
+        return "legacy interface leak block present (external seal incomplete)"
+    if not status.has_real_facade:
+        return "facade/api.py is a re-export, not real functions"
+    if status.skip_withheld_reason:
+        return f"DevEx decision: {status.skip_withheld_reason}"
+    return None
+
+
+class ImportSurfaceCheck(ProductCheck):
+    """Hold the three import-linter contracts by AST, so a namespace package cannot dodge them.
+
+    The contracts say routes.py imports only presentation/, presentation/ imports only facade/
+    and itself, and webhook_consumers.py imports only facade/. import-linter enforces them all
+    through grimp, and grimp does not descend into a directory without an __init__.py — so
+    `from ...backend.services.views import X` with no `services/__init__.py` is invisible to it
+    and the contract passes vacuously.
+    That is a live view outside presentation/ that the narrowed contract-check inputs do not
+    watch. This check reads the same imports straight from the AST, honors the same
+    ignore_imports deferrals, and fails on what grimp cannot see.
+
+    The contracts name `products.*.backend.<surface>`, so they hold for every product whether or
+    not it has facade/contracts.py, and this check holds every surface for every product too.
+    """
+
+    label = "import surface"
+
+    # (source subtree or module, allowed destination subtrees)
+    SURFACES = (
+        ("routes", ("presentation",)),
+        ("presentation", ("presentation", "facade")),
+        ("webhook_consumers", ("facade",)),
+    )
+
+    def _surface_files(self, ctx: CheckContext, source: str) -> list[Path]:
+        root = ctx.backend_dir / source
+        files = [root.with_suffix(".py")] if root.with_suffix(".py").exists() else []
+        if root.is_dir():
+            files += sorted(f for f in root.rglob("*.py") if "__pycache__" not in f.parts)
+        return files
+
+    def should_run(self, ctx: CheckContext) -> bool:
+        if not super().should_run(ctx) or not ctx.backend_dir.is_dir():
+            return False
+        return any(self._surface_files(ctx, source) for source, _ in self.SURFACES)
+
+    def _module_name(self, ctx: CheckContext, path: Path) -> str:
+        rel = path.relative_to(ctx.backend_dir).with_suffix("")
+        parts = [p for p in rel.parts if p != "__init__"]
+        return ".".join([f"products.{ctx.name}.backend", *parts]) if parts else f"products.{ctx.name}.backend"
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        prefix = f"products.{ctx.name}.backend"
+        ignored = ignored_import_edges()
+        issues = []
+        for source, allowed in self.SURFACES:
+            allowed_prefixes = tuple(f"{prefix}.{a}" for a in allowed)
+            for f in self._surface_files(ctx, source):
+                importer = self._module_name(ctx, f)
+                for line, target in module_import_targets(f, ctx.backend_dir, prefix):
+                    # Segment boundary on purpose: `facade_legacy` must not pass as `facade`.
+                    under_surface = any(target == p or target.startswith(f"{p}.") for p in allowed_prefixes)
+                    if under_surface or f"{importer} -> {target}" in ignored:
+                        continue
+                    issues.append(
+                        f"{f.relative_to(ctx.product_dir)}:{line} imports {target} — {source} may only import "
+                        f"{'/'.join(allowed)}. If import-linter did not flag this, the target sits under a "
+                        "directory without __init__.py, which grimp cannot see. To defer the edge, add that "
+                        "__init__.py first: import-linter rejects an ignore_imports entry it cannot match"
+                    )
+        if issues:
+            return CheckResult(
+                lines=[f"✗ {len(issues)} import(s) outside the surface"] + [f"  → {i}" for i in issues], issues=issues
+            )
+        return CheckResult(lines=["✓ ok"])
+
+
+class PackageJsonScriptsCheck(ProductCheck):
+    label = "package.json scripts"
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        if not ctx.backend_dir.exists():
+            return CheckResult(skip=True)
+
+        package_json = ctx.product_dir / "package.json"
+        try:
+            scripts = json.loads(package_json.read_text()).get("scripts", {}) if package_json.exists() else {}
+        except json.JSONDecodeError:
+            return CheckResult(
+                lines=["✗ package.json is not valid JSON"],
+                issues=["package.json is not valid JSON"],
+            )
+
+        result = CheckResult()
+
+        # --- presence checks (legacy leaks exempt from contract-check) ---
+        # While a product has deferred presentation-wave ignore_imports entries, its
+        # views still bypass the facade and reach internals directly. The skip only
+        # re-runs the full suite on facade/presentation changes, so an internals
+        # change flowing to HTTP through such a view would be hidden. The skip is the
+        # reward for finishing — it can't be enabled until the wave empties them.
+        status = ctx.isolation_status()
+        # This gate leaves out the tach interface on purpose. The external boundary is required too,
+        # but TachCheck demands the interface and IsolationChainCheck blocks a script without it, so
+        # this gate does not report the same gap a third time.
+        needs_contract_check = status.internally_sealed and status.has_real_facade and not status.has_legacy_leaks
+        # The wiring gate also withholds the skip script: a facade that still hands out unsanctioned
+        # classes can't soundly narrow, so don't nag it to carry 'backend:contract-check' (the script
+        # would be inert, and IsolationChainCheck blocks the narrowing that would make it bite). The
+        # absence check below still keys on plain eligibility, so the five products that deliberately
+        # keep script+broad while un-narrowed aren't told to drop it.
+        require_contract_check_script = (
+            needs_contract_check
+            and not status.facade_leaks
+            and not status.unapproved_wiring
+            and status.skip_withheld_reason is None
+        )
+        required = ["backend:test"] + (["backend:contract-check"] if require_contract_check_script else [])
+        for script in required:
+            if script not in scripts:
+                result.lines.append(f"✗ missing '{script}'")
+                result.issues.append(
+                    f"Product has backend/ but package.json is missing '{script}' script — "
+                    "turbo cannot discover this product"
+                )
+
+        # --- absence check: must NOT have contract-check when not safe for isolation ---
+        if status.skip_withheld_reason and "backend:contract-check" in scripts:
+            result.lines.append("✗ must not have 'backend:contract-check'")
+            result.issues.append(
+                f"the contract-check skip is withheld for this product ({status.skip_withheld_reason}). "
+                "Remove 'backend:contract-check' from package.json. Only a DevEx-reviewed change to "
+                "SKIP_WITHHELD in hogli_commands/product/isolation.py can turn the skip on"
+            )
+        elif not needs_contract_check and "backend:contract-check" in scripts:
+            if status.has_legacy_leaks:
+                reason = "has legacy interface leaks (core imports internals directly)"
+            elif status.deferred_count > 0:
+                plural = "entry" if status.deferred_count == 1 else "entries"
+                reason = (
+                    f"has {status.deferred_count} deferred presentation-wave ignore_imports {plural} — its "
+                    "presentation still bypasses the facade, so finish the presentation wave (empty the "
+                    "ignore_imports TODO section) before opting into the skip"
+                )
+            else:
+                reason = "non-isolated product must not have 'backend:contract-check' script"
+            result.lines.append("✗ must not have 'backend:contract-check'")
+            result.issues.append(
+                f"{reason} — remove 'backend:contract-check' from package.json. "
+                "turbo-discover uses this to classify products as isolated, which causes "
+                "the full Django test suite to be skipped when this product changes"
+            )
+
+        # --- surface the withholding decision (single-product view only; keep the CI sweep quiet) ---
+        if (
+            ctx.detailed
+            and ctx.has_facade_contracts
+            and not require_contract_check_script
+            and "backend:contract-check" not in scripts
+        ):
+            note = _contract_check_withheld_note(status)
+            if note:
+                result.lines.append(f"ℹ contract-check skip withheld — {note}")
+
+        # --- content checks on backend:test ---
+        test_script = scripts.get("backend:test", "")
+        if test_script:
+            # strip trailing || true / || exit 0 before further checks
+            base_script = test_script.split("||")[0].strip()
+
+            # check: || true / || exit 0 swallows failures
+            if "||" in test_script:
+                tail = test_script.split("||", 1)[1].strip()
+                if tail in ("true", "exit 0"):
+                    result.lines.append(f"✗ 'backend:test' uses '|| {tail}'")
+                    result.issues.append(f"'backend:test' script uses '|| {tail}' which swallows test failures in CI")
+
+            # check: no-op script but test files exist
+            if _is_noop_script(base_script) and _has_test_files(ctx.backend_dir):
+                result.lines.append("✗ 'backend:test' is a no-op but test files exist")
+                result.issues.append(
+                    "'backend:test' is a no-op (e.g. echo) but backend/ contains test files "
+                    "that will never run — update the script to use pytest"
+                )
+
+            # check: pytest paths exist on disk
+            if base_script.startswith("pytest"):
+                test_paths = _parse_pytest_paths(base_script)
+                for tp in test_paths:
+                    resolved = ctx.product_dir / tp
+                    if not resolved.exists():
+                        result.lines.append(f"✗ test path '{tp}' does not exist")
+                        result.issues.append(
+                            f"'backend:test' references path '{tp}' which does not exist — "
+                            "pytest will fail or silently collect zero tests"
+                        )
+
+        if not result.issues:
+            result.lines.append("✓ ok")
+        result.file = f"products/{ctx.name}/package.json"
+        return result
+
+
+class MisplacedFilesCheck(ProductCheck):
+    label = "misplaced backend files"
+    for_lenient = False
+
+    # Only the root-level files in `backend_known_files` are checked here. Directory
+    # names are deliberately not: which internal packages a product has (`logic/`,
+    # `services/`, `reviewer/`) is its own business, and the thing that must not
+    # drift — presentation code outside presentation/ — is enforced by shape in
+    # pyproject.toml: routes.py may only import presentation, and presentation may
+    # only import facade, so a view anywhere else cannot be routed. ImportSurfaceCheck
+    # holds the same two rules by AST where grimp cannot see.
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        if not ctx.backend_dir.exists():
+            return CheckResult(skip=True)
+
+        misplaced = []
+        for filename, correct_path in ctx.structure.get("backend_known_files", {}).items():
+            wrong = ctx.backend_dir / filename
+            correct = ctx.backend_dir / correct_path
+            if wrong.exists() and wrong.is_file():
+                if correct.exists():
+                    misplaced.append(f"'{filename}' at backend/ root conflicts with correct location '{correct_path}'")
+                else:
+                    misplaced.append(f"backend/{filename} should be at backend/{correct_path}")
+
+        if misplaced:
+            return CheckResult(
+                lines=[f"✗ {len(misplaced)} misplaced file(s)"] + [f"  → {m}" for m in misplaced],
+                issues=misplaced,
+            )
+        return CheckResult(lines=["✓ ok"])
+
+
+class FileFolderConflictsCheck(ProductCheck):
+    label = "file/folder conflicts"
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        if not ctx.backend_dir.exists():
+            return CheckResult(skip=True)
+
+        # Collect "<name>" stems that may be expressed as either a file or a
+        # package, from two structure shapes:
+        #   - "<name>.py" with `can_be_folder: true`        (e.g. models.py)
+        #   - "<name>/" as a top-level backend_files entry  (e.g. logic/, facade/)
+        # Subdirectories qualify whether or not they declare an `__init__.py`
+        # in the structure — namespace packages are fine, and this also catches
+        # a stray `tasks.py` next to `tasks/`, which is always a mistake.
+        stems: set[str] = set()
+        for name, config in ctx.structure.get("backend_files", {}).items():
+            if name.endswith("/"):
+                stems.add(name.rstrip("/"))
+            elif name.endswith(".py") and isinstance(config, dict) and config.get("can_be_folder", False):
+                stems.add(name[: -len(".py")])
+
+        # Conflict if both `<stem>.py` and `<stem>/` directory exist on disk.
+        # Check the directory itself (not `__init__.py`) so a half-migrated state
+        # without `__init__.py` is still flagged.
+        conflicts = []
+        for stem in sorted(stems):
+            file_form = ctx.backend_dir / f"{stem}.py"
+            dir_form = ctx.backend_dir / stem
+            if file_form.is_file() and dir_form.is_dir():
+                conflicts.append(f"Both 'backend/{stem}.py' and 'backend/{stem}/' exist — pick one")
+
+        if conflicts:
+            return CheckResult(
+                lines=[f"✗ {len(conflicts)} conflict(s)"] + [f"  → {c}" for c in conflicts],
+                issues=conflicts,
+            )
+        return CheckResult(lines=["✓ ok"])
+
+
+class TachCheck(ProductCheck):
+    label = "tach boundaries"
+
+    def _has_python_files(self, product_dir: Path) -> bool:
+        return any(p for p in product_dir.rglob("*.py") if p.name != "__init__.py")
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        if not self._has_python_files(ctx.product_dir):
+            return CheckResult(skip=True)
+
+        module_path = f"products.{ctx.name}"
+        tach_block = get_tach_block(module_path)
+
+        if not tach_block:
+            return CheckResult(
+                lines=["✗ missing from tach.toml"],
+                issues=[
+                    f"Product has Python files but no [[modules]] entry in tach.toml — "
+                    f'add a block with path = "{module_path}"'
+                ],
+            )
+
+        tach_content = TACH_TOML.read_text() if TACH_TOML.exists() else ""
+        if ctx.has_facade_contracts and not has_tach_interface(ctx.name, tach_content):
+            return CheckResult(
+                lines=["✗ missing interfaces declaration"],
+                issues=[
+                    f"Strict product (it has facade/contracts.py) missing interface definition in tach.toml — "
+                    f'add a [[interfaces]] block with from = ["{module_path}"]'
+                ],
+            )
+
+        if has_legacy_interface_leaks(tach_content, module_path):
+            return CheckResult(lines=["⚠ has legacy interface leaks — core bypasses facade (not tested in isolation)"])
+
+        return CheckResult(lines=["✓ ok"])
+
+
+class IsolationChainCheck(ProductCheck):
+    """Validates the isolation prerequisite chain is consistent — and finished.
+
+    The chain: real facade → tach interfaces → contract-check script → narrowed turbo.json.
+    Each step requires the previous one, so a product can't claim a CI benefit it hasn't
+    earned (the Django suite skipped on changes). The final step also can't be left
+    half-wired: once a product is Sealed, it must actually turn the skip
+    on by narrowing turbo.json inputs — otherwise the contract-check script is inert
+    (inputs default to all of backend/, so every change still re-runs the Django suite).
+    """
+
+    label = "isolation chain"
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        facade_api = ctx.backend_dir / "facade" / "api.py"
+        status = ctx.isolation_status()
+        real_facade = status.has_real_facade
+        has_tach = status.has_tach_interface
+        has_script = status.has_contract_check_script
+        has_narrowed = status.has_narrowed_turbo
+        facade_violations = status.facade_leaks
+
+        result = CheckResult()
+
+        if has_script and not real_facade:
+            result.issues.append(
+                "has 'backend:contract-check' but facade/api.py has no function definitions — "
+                "re-exporting from logic is not a facade. turbo-discover classifies this product "
+                "as isolated, which may cause the Django test suite to be skipped on changes"
+            )
+
+        if has_script and not has_tach:
+            result.issues.append(
+                "has 'backend:contract-check' but no tach interfaces — isolation requires tach boundary enforcement"
+            )
+
+        if has_narrowed and not has_script:
+            result.issues.append(
+                "turbo.json narrows contract-check inputs but package.json has no "
+                "'backend:contract-check' script — dead config, remove the turbo.json override"
+            )
+
+        if has_narrowed and not real_facade:
+            result.issues.append(
+                "turbo.json narrows contract-check inputs to facade/presentation but "
+                "facade/api.py has no function definitions — internal changes won't trigger "
+                "Django suite even though the facade boundary isn't real"
+            )
+
+        if not has_script and facade_api.exists() and not real_facade:
+            result.warnings.append(
+                "facade/api.py exists but has no function definitions — "
+                "a real facade should convert models to contracts, not just re-export"
+            )
+
+        # The wiring-doctrine gate. Facade class re-exports from outside a wiring location gate NARROWING,
+        # not the script: while a product is un-narrowed the skip is inert (everything is watched), so
+        # a leak there is guidance, not breakage. Once narrowed, the same leak means core can reach an
+        # unsanctioned class the suite may not re-test — a hard error. See products/architecture.md
+        # § Wiring couplings.
+        def format_facade_imports(imports) -> str:
+            return "; ".join(f"{v.class_name} (from {v.source_path}, via facade/{v.facade_module})" for v in imports)
+
+        def format_crossings_by_class(imports) -> str:
+            # the allowance is keyed per class, so report one entry per class even when several
+            # facade modules re-export it — otherwise the count reads higher than the sanctioned list
+            by_class: dict[str, tuple[str, list[str]]] = {}
+            for v in imports:
+                _, modules = by_class.setdefault(v.class_name, (v.source_path, []))
+                modules.append(f"facade/{v.facade_module}")
+            return "; ".join(
+                f"{name} (from {source_path}, via {', '.join(sorted(modules))})"
+                for name, (source_path, modules) in sorted(by_class.items())
+            )
+
+        if facade_violations:
+            detail = format_facade_imports(facade_violations)
+            remedies = (
+                "move it to a wiring location (backend/hogql_queries/, backend/max_tools.py, backend/temporal/, "
+                "backend/tasks.py) if it implements a core-owned base; move it to facade/contracts.py "
+                "if it's a data/error type; or drop the turbo.json narrowing to watch everything"
+            )
+            if has_narrowed:
+                result.issues.append(
+                    f"facade re-exports class(es) from outside the wiring locations: {detail} — {remedies}"
+                )
+            elif has_script:
+                result.warnings.append(
+                    f"facade re-exports class(es) from outside the wiring locations: {detail}. The skip is "
+                    f"inert while un-narrowed, but narrowing is blocked until this is fixed — {remedies}"
+                )
+
+        # The watched-models allowance (MODEL_CROSSINGS). Crossing model classes are
+        # sanctioned interim debt, so they never block narrowing — but the debt stays visible as a
+        # standing warning, and a narrowed product must keep the whole model surface watched or the
+        # skip is unsound (a model or migration change core observes would run no Django suite).
+        if status.model_crossings:
+            crossing_detail = format_crossings_by_class(status.model_crossings)
+            result.warnings.append(
+                f"facade hands out Django model class(es) under the watched-models allowance: {crossing_detail}. "
+                "Sanctioned interim debt (products/architecture.md § Wiring couplings) — the model surface stays "
+                "in the contract-check inputs so the skip is sound; convert crossings to facade contracts to "
+                "retire the allowance entry"
+            )
+        if has_narrowed and status.uncovered_model_surface:
+            surface_globs = ", ".join(location_input_glob(p) for p in status.uncovered_model_surface)
+            result.issues.append(
+                "turbo.json narrows contract-check inputs but omits the model surface "
+                f"{', '.join(status.uncovered_model_surface)} — a model is reachable without an import "
+                "(apps.get_model, migrations, admin), so a model or migration change must re-run the Django "
+                f"suite. Add the matching input(s) ({surface_globs})"
+            )
+
+        # Earned but not turned on: a Sealed product that already carries
+        # 'backend:contract-check' (real facade, tach interface, no legacy leaks, presentation
+        # wave emptied). Without a turbo.json narrowing its inputs to facade/presentation, that
+        # script inherits the root task's all-of-backend inputs, so every internal change still
+        # re-runs the full Django suite — the skip is inert. Force the narrowing so READY
+        # products land on ON. Gating on has_script keeps this distinct from
+        # PackageJsonScriptsCheck, which is what nags a still-eligible product to add the script.
+        # Suppressed when the facade still hands out unsanctioned classes: narrowing would be
+        # rejected by the gate above, so nagging toward it is counterproductive — say what blocks it.
+        needs_turn_on = (
+            has_script
+            and status.is_sealed
+            and not has_narrowed
+            and not facade_violations
+            and not status.unapproved_wiring
+        )
+        if needs_turn_on:
+            result.issues.append(
+                "product is Sealed and carries "
+                "'backend:contract-check', but turbo.json does not narrow contract-check inputs to "
+                "facade/presentation — the skip is inert (every change still re-runs the full Django "
+                'suite). Add a turbo.json narrowing inputs to ["backend/facade/**", '
+                '"backend/presentation/**"] plus the model surface (backend/models.py or '
+                "backend/models/**, and backend/migrations/**), backend/webhook_consumers.py if the "
+                "product declares webhook consumers, and any wiring locations the product has "
+                "(backend/tasks/**, backend/temporal/**, …) to turn the skip on"
+            )
+        # When needs_turn_on is suppressed purely because of a facade violation (the other four
+        # conjuncts hold), the facade_violations warning above already explains what blocks narrowing,
+        # so there's nothing more to say here — the nag is silently withheld, not replaced. The same
+        # holds for unapproved wiring classes, which WiringInterfaceCheck lists below Isolated.
+
+        # Watching the route registration: routes.py is the product's route-registration entry
+        # point (public API surface, imported by core to assemble the router), but it lives at
+        # backend/ root — outside the facade/presentation globs. A narrowed product that has one
+        # must add it to the inputs, or a routes-only change is invisible to the skip and runs no
+        # Django suite. (Mutually exclusive with needs_turn_on, which requires no narrowing.)
+        routes_unwatched = (
+            has_narrowed and has_routes_module(ctx.backend_dir) and not routes_in_turbo_inputs(ctx.product_dir)
+        )
+        if routes_unwatched:
+            routes_glob = "backend/routes/**" if (ctx.backend_dir / "routes").is_dir() else "backend/routes.py"
+            result.issues.append(
+                f"turbo.json narrows contract-check inputs but omits {routes_glob} — the routes module is the "
+                "product's route-registration entry point (public API surface, imported by core), so a "
+                f'routes-only change would skip the Django suite. Add "{routes_glob}" to the contract-check inputs'
+            )
+
+        # Watching the consumer declarations: posthog/ingress/ imports webhook_consumers.py by name
+        # on the first delivery, so a consumer change a narrowing does not watch would skip the
+        # Django suite. Reported on its own condition, not folded into needs_turn_on: an unwatched
+        # consumer module is itself what makes has_narrowed False, so every other turbo-omission
+        # issue goes quiet with it, and needs_turn_on is ANDed with eligibility, sealing and the
+        # facade-violation gate — any one of those would hide the omission that caused the silence.
+        consumers_unwatched = webhook_consumers_unwatched(ctx.product_dir)
+        if consumers_unwatched:
+            result.issues.append(
+                "turbo.json narrows contract-check inputs but omits backend/webhook_consumers.py — "
+                "posthog/ingress imports the module by name on the first delivery, so a consumer "
+                "change (a new handler, a new event type) would skip the Django suite. Add "
+                '"backend/webhook_consumers.py" to the contract-check inputs'
+            )
+
+        # Watching the permanent-interface exposures: a marked [[interfaces]] block lets core
+        # depend on these modules outside the import graph (ClickHouse DDL in the schema registry
+        # and frozen migrations). That coupling can't be sealed, so the skip stays sound only if a
+        # change to those modules still re-runs the suite — they must be in the contract-check
+        # inputs. Mirrors routes_unwatched.
+        if has_narrowed and status.uncovered_permanent_exposures:
+            globs = ", ".join(f"{m.replace('.', '/')}.py" for m in status.uncovered_permanent_exposures)
+            result.issues.append(
+                "turbo.json narrows contract-check inputs but omits the permanently-exposed module(s) "
+                f"{', '.join(status.uncovered_permanent_exposures)} — core depends on them outside the import "
+                "graph (ClickHouse DDL in the schema registry and frozen migrations), so a change to them "
+                f"would skip the Django suite. Add the matching input(s) ({globs}) to keep the skip sound"
+            )
+
+        # Watching the wiring locations: a location the product has must stay in the contract-check
+        # inputs, or a change to a query runner / Max tool / Temporal defn / Celery task the facade
+        # wires would skip the Django suite. Presence-based, except for the computed locations,
+        # which are listed only while the crossings baseline records an outside test driving them.
+        if has_narrowed and status.unwatched_garages:
+            globs = ", ".join(location_input_glob(g) for g in status.unwatched_garages)
+            driven = [g for g in status.unwatched_garages if g in status.driven_wiring_locations]
+            evidence = (
+                f" Tests outside the product still execute what lives in {', '.join(driven)}: see the "
+                f"`{ctx.name}:` lines with a `drives(...)` kind in products/model_crossing_uses_baseline.txt, "
+                "and move those tests into the product to drop the input."
+                if driven
+                else ""
+            )
+            result.issues.append(
+                "turbo.json narrows contract-check inputs but omits the wiring location(s) "
+                f"{', '.join(status.unwatched_garages)} — implementations core registers and drives live there, "
+                f"so a change to them would skip the Django suite. Add the matching input(s) ({globs}).{evidence}"
+            )
+
+        # Watching the carve-out modules: a sanctioned model-registry carve-out crosses the facade by
+        # class identity, so its defining module must re-run the suite on change like any wiring.
+        if has_narrowed and status.uncovered_carveout_modules:
+            globs = ", ".join(location_input_glob(m) for m in status.uncovered_carveout_modules)
+            result.issues.append(
+                "turbo.json narrows contract-check inputs but omits the carve-out module(s) "
+                f"{', '.join(status.uncovered_carveout_modules)} — the class crosses the facade for a core "
+                f"registry keyed by class identity, so a change must re-run the suite. Add the matching input(s) ({globs})"
+            )
+
+        # Guarding against marker abuse: the permanent-interface marker is only legitimate for
+        # modules core depends on outside the import graph (ClickHouse DDL in a frozen migration or
+        # the schema registry). Without this check the marker is mechanically unrestricted — a
+        # product could mark backend.models/backend.logic permanent, list it in turbo inputs, and
+        # pass the chain. Fires regardless of has_narrowed: the abuse lives in tach.toml itself, not
+        # in turbo config, so it must block even before the product narrows.
+        if status.unqualified_permanent_exposures:
+            modules = ", ".join(status.unqualified_permanent_exposures)
+            result.issues.append(
+                f"permanent-interface marker covers module(s) {modules}, but they are not imported by any "
+                "frozen ClickHouse migration or the ClickHouse schema registry — so they don't qualify as a "
+                "permanent interface. Route them through the facade instead (or remove the marker)"
+            )
+
+        # Note: a product that has the contract-check script *and* deferred
+        # presentation-wave ignore_imports entries is hard-blocked by
+        # PackageJsonScriptsCheck — the skip can't be enabled until the wave empties them.
+
+        if result.issues or result.warnings:
+            # needs_turn_on, routes_unwatched and consumers_unwatched all point at turbo.json.
+            # needs_turn_on can't co-occur with the facade/turbo mismatch issues above (it requires
+            # a real facade, a script, and no narrowing). routes_unwatched and consumers_unwatched
+            # can co-occur with them, but turbo.json is still where those omissions are fixed, so
+            # they win; the co-firing mismatch issues still print in the lint output.
+            # An unqualified permanent exposure is a defect in the tach.toml marker itself, so point
+            # there; it takes precedence because it's the most fundamental of these issues.
+            turbo_omission = has_narrowed and (
+                status.unwatched_garages or status.uncovered_carveout_modules or status.uncovered_model_surface
+            )
+            if status.unqualified_permanent_exposures:
+                result.file = "tach.toml"
+            elif needs_turn_on or routes_unwatched or consumers_unwatched or turbo_omission:
+                result.file = f"products/{ctx.name}/turbo.json"
+            else:
+                result.file = f"products/{ctx.name}/backend/facade/api.py"
+        if result.issues:
+            result.lines = [f"✗ {len(result.issues)} issue(s)"] + [f"  → {i}" for i in result.issues]
+        elif result.warnings:
+            result.lines = [f"⚠ {len(result.warnings)} warning(s)"] + [f"  → {w}" for w in result.warnings]
+        else:
+            result.lines = ["✓ ok"]
+
+        return result
+
+
+_CROSSING_LEDGER = "products/model_crossing_uses_baseline.txt"
+
+# The remedy the lint prints per finding kind. Each one is the move that removes the row, not advice
+# to think about the row. The rule is products/architecture.md § Facades: The Public Interface.
+_FACADE_SHAPE_REMEDIES: dict[str, str] = {
+    "returns": "return a frozen contract from facade/contracts.py instead of the ORM object",
+    "accepts": "take ids and contracts, so the caller never holds a Django or a DRF object "
+    "(an `Any` row on team, request or user hides one behind the annotation)",
+    "logic": f"move each body to the wiring location that owns it ({', '.join(GARAGE_PREFIXES)}) "
+    "and leave the re-export in the facade",
+}
+
+
+def _facade_shape_issue(finding: FacadeShapeFinding) -> str:
+    """The lint line for one finding: where it is, what it is, and the move that removes it."""
+    if finding.kind == "logic":
+        what = f"holds {finding.count} definition(s) with a body: {', '.join(finding.bodies)}"
+    else:
+        symbol = f"{finding.symbol}({finding.parameter})" if finding.parameter else finding.symbol
+        what = f"{finding.kind} {finding.source}.{finding.type_name} at {symbol}"
+    return (
+        f"facade/{finding.facade_module} {what} — {_FACADE_SHAPE_REMEDIES[finding.kind]}. "
+        "The ledger only shrinks, so this is not a row to add"
+    )
+
+
+class FacadeShapeCheck(ProductCheck):
+    """Read what the facade accepts and returns, not only what it imports.
+
+    tach and import-linter work on the import graph, so a facade that imports its model module to
+    build contracts and one that returns the model from a public function look identical to them.
+    A model or a QuerySet on the boundary gives the caller managers, save()/delete(), and FK
+    descriptors that query on attribute access, so the caller reaches the whole database through a
+    function the doctrine says returns data. A DRF or a Django HTTP type means the facade knows the
+    transport, which belongs in presentation/.
+
+    Runs in both lint modes. A lenient product with a facade folder is exactly where the drawer
+    forms: the folder is public by location while nothing holds its shape.
+
+    The findings are ratcheted as the `facade-*` kinds of the model-crossing ledger, next to the
+    other couplings the import graph cannot see. Only the unrecorded direction blocks here: a row
+    whose finding is gone is caught by the repo-invariant test, which compares the whole file
+    against a fresh scan.
+    """
+
+    label = "facade shape"
+
+    def should_run(self, ctx: CheckContext) -> bool:
+        return super().should_run(ctx) and (ctx.backend_dir / "facade").is_dir()
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        findings = facade_shape_findings(ctx.backend_dir, ctx.name)
+        recorded = recorded_facade_shape_rows(ctx.name)
+        unrecorded = [f for f in findings if facade_shape_use(f).as_baseline_line() not in recorded]
+
+        result = CheckResult(file=f"products/{ctx.name}/backend/facade")
+        result.issues.extend(_facade_shape_issue(f) for f in unrecorded)
+
+        if result.issues:
+            result.lines = [f"✗ {len(result.issues)} issue(s)"] + [f"  → {i}" for i in result.issues]
+        elif shape_rows := {row for row in recorded if " facade-wiring " not in row}:
+            result.warnings.append(f"facade shape debt: {len(shape_rows)} row(s) in {_CROSSING_LEDGER}")
+            result.lines = [f"⚠ facade shape debt: {len(shape_rows)} rows"]
+        else:
+            result.lines = ["✓ ok"]
+        return result
+
+
+_APPROVED_INTERFACES = ", ".join(
+    [qualified.rsplit(".", 1)[1] for qualified in sorted(APPROVED_WIRING_BASES)]
+    + [f"@{qualified.split('.', 1)[1]}" for qualified in sorted(APPROVED_WIRING_DECORATORS)]
+)
+
+
+def _wiring_issue(finding: UnapprovedWiringClass) -> str:
+    """The lint line for one class: where it crosses, why it fails, and the moves that clear it."""
+    reason = (
+        "whose bases or members the lint cannot read statically"
+        if finding.verdict is WiringVerdict.UNRESOLVED
+        else f"which implements no approved interface ({_APPROVED_INTERFACES})"
+    )
+    return (
+        f"facade/{finding.facade_module} hands out {finding.class_name} from {finding.source_path}, {reason}. "
+        "A wiring folder alone does not make a class wiring. Return contracts from a facade function, "
+        "register a plain function, or put the class behind an approved interface "
+        "(products/architecture.md § Wiring couplings). The ledger only shrinks, so this is not a row to add"
+    )
+
+
+class WiringInterfaceCheck(ProductCheck):
+    """Hold the approved-interface rule of § Wiring couplings for classes from wiring locations.
+
+    The class re-export check accepts a wiring location by its path. This check reads the class: it
+    must carry an approved decorator or reach an approved base. Only an Isolated product is held to
+    it, so every product clears it on the way to Isolated. Below that rung the finding is
+    information. An Isolated product's findings that existed when the check was introduced are
+    `facade-wiring` rows in the crossings ledger, and an unrecorded finding blocks.
+    """
+
+    label = "wiring interfaces"
+
+    def should_run(self, ctx: CheckContext) -> bool:
+        return super().should_run(ctx) and (ctx.backend_dir / "facade").is_dir()
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        status = ctx.isolation_status()
+        findings = status.unapproved_wiring
+        result = CheckResult(file=f"products/{ctx.name}/backend/facade")
+        if not findings:
+            result.lines = ["✓ ok"]
+            return result
+        if status.rung is not IsolationRung.ISOLATED:
+            names = ", ".join(sorted({f.class_name for f in findings}))
+            result.lines = [f"ℹ {len(findings)} class(es) from wiring locations without an approved interface"]
+            if ctx.detailed:
+                result.lines.append(f"  → information below the Isolated rung, clear before isolating: {names}")
+            return result
+        recorded = recorded_facade_shape_rows(ctx.name)
+        unrecorded = [f for f in findings if facade_wiring_use(ctx.name, f).as_baseline_line() not in recorded]
+        result.issues.extend(_wiring_issue(f) for f in unrecorded)
+        if result.issues:
+            result.lines = [f"✗ {len(result.issues)} issue(s)"] + [f"  → {i}" for i in result.issues]
+        else:
+            result.warnings.append(f"wiring debt: {len(findings)} grandfathered row(s) in {_CROSSING_LEDGER}")
+            result.lines = [f"⚠ wiring debt: {len(findings)} grandfathered rows"]
+        return result
+
+
+class ProductYamlCheck(ProductCheck):
+    """Validates product.yaml exists, parses, and has correct field types."""
+
+    label = "product.yaml"
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        from .product_yaml import parse_product_yaml
+
+        yaml_path = ctx.product_dir / "product.yaml"
+
+        if not yaml_path.exists():
+            return CheckResult(
+                lines=["✗ missing"],
+                issues=["Missing product.yaml — every product needs name and owners"],
+                file=f"products/{ctx.name}",
+            )
+
+        result = CheckResult(file=f"products/{ctx.name}/product.yaml")
+
+        data, parse_err = parse_product_yaml(yaml_path)
+        if parse_err:
+            result.issues.append(f"product.yaml {parse_err}")
+            result.lines = [f"✗ {result.issues[0]}"]
+            return result
+
+        name = data.get("name")
+        if not name or not isinstance(name, str):
+            result.issues.append("product.yaml missing 'name' field (must be a non-empty string)")
+
+        owners = data.get("owners")
+        if not owners:
+            result.issues.append("product.yaml missing 'owners' field — who owns this product?")
+        elif not isinstance(owners, list) or not all(isinstance(o, str) for o in owners):
+            result.issues.append("product.yaml 'owners' must be a list of strings")
+
+        # The owners resolver ignores a value that is not a boolean, so a typo here would silently leave the paths
+        # not sensitive.
+        if "sensitive" in data and not isinstance(data["sensitive"], bool):
+            result.issues.append("product.yaml 'sensitive' must be true or false")
+
+        if result.issues:
+            result.lines = [f"✗ {len(result.issues)} issue(s)"] + [f"  → {i}" for i in result.issues]
+        else:
+            result.lines = ["✓ ok"]
+        return result
+
+
+class ProductYamlOwnersCheck(ProductCheck):
+    """Validates product.yaml owner slugs against GitHub team slugs in the PostHog org.
+
+    Not part of the default CHECKS list — pays a GitHub API call per run, so it's
+    only invoked via the dedicated ``product:lint:owners`` subcommand. CI gates
+    that subcommand on a ``products/*/product.yaml`` paths filter, so the API
+    call only fires when an ownership change is actually proposed.
+
+    Validates "team exists in the org", not "team has access to this repo" — the
+    repo-collaborator endpoint needs a permission the assign-reviewers GH App
+    lacks. The "exists but lacks repo access" gap is covered by the script's
+    422 fallback (drops bad teams, keeps valid ones).
+    """
+
+    label = "product.yaml owners"
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        from .gh import get_team_slugs
+        from .product_yaml import parse_product_yaml
+
+        yaml_path = ctx.product_dir / "product.yaml"
+        if not yaml_path.exists():
+            return CheckResult(skip=True)
+
+        data, parse_err = parse_product_yaml(yaml_path)
+        if parse_err:
+            return CheckResult(skip=True)
+
+        owners = data.get("owners")
+        if not owners or not isinstance(owners, list):
+            return CheckResult(skip=True)
+
+        gh_teams, fetch_err = get_team_slugs()
+        if gh_teams is None:
+            return CheckResult(
+                lines=[f"✗ {fetch_err}"],
+                issues=[fetch_err],
+                file=f"products/{ctx.name}/product.yaml",
+            )
+
+        result = CheckResult(file=f"products/{ctx.name}/product.yaml")
+
+        for owner in owners:
+            if not isinstance(owner, str):
+                continue
+            # `@username` entries are individual reviewers, not teams — validating
+            # them needs a different endpoint, and the assign-reviewers script
+            # already routes them separately. Skip here.
+            if owner.startswith("@"):
+                continue
+            if owner == "team-CHANGEME":
+                result.issues.append(
+                    "owner is still the 'team-CHANGEME' scaffold placeholder — pick a real owning team"
+                )
+                continue
+            if owner not in gh_teams:
+                result.issues.append(
+                    f"owner '{owner}' is not a GitHub team in the PostHog org. "
+                    f"See https://github.com/orgs/PostHog/teams"
+                )
+
+        if result.issues:
+            result.lines = [f"✗ {len(result.issues)} issue(s)"] + [f"  → {i}" for i in result.issues]
+        else:
+            result.lines = ["✓ ok"]
+        return result
+
+
+class OrphanedTestFilesCheck(ProductCheck):
+    """Flag pytest test files that no CI runner will pick up.
+
+    Walks the product directory for `test_*.py` / `*_test.py` and checks each
+    is reachable from either:
+      - the pytest paths listed in `backend:test`, or
+      - a known external runner via `_EXTERNAL_RUNNER_PREFIXES` (e.g. `dags/`
+        directories are picked up by ci-dagster.yml, regardless of the
+        product's package.json).
+
+    Without this check, moving a test file to (say) `products/foo/scripts/test/`
+    or forgetting to add it to `backend:test` silently strands the tests —
+    they collect cleanly when run by hand but never run in CI.
+    """
+
+    label = "test file coverage"
+
+    # Directories whose test files are run by workflows other than the product
+    # matrix. Keep in sync with the workflows under `.github/workflows/` that
+    # invoke pytest against product paths.
+    _EXTERNAL_RUNNER_PREFIXES = (
+        "dags/",  # ci-dagster.yml: pytest posthog/dags products/**/dags
+    )
+    # Exempt paths tested outside `backend:test`, including the Temporal tests in
+    # .depot/workflows/ci-backend.yml.
+    _PRODUCT_SPECIFIC_EXEMPTIONS = {
+        # .depot/workflows/ci-backend.yml "Run Temporal tests" step pytest paths:
+        "batch_exports": ("backend/tests/temporal/",),
+        "tasks": ("backend/temporal/",),
+        # backend/temporal/ is the Temporal segment above. sources/ holds the vendor plugins, which
+        # the "Warehouse sources checks and tests" job in ci-python.yml runs.
+        "warehouse_sources": ("backend/temporal/", "sources/"),
+        "signals": ("backend/emission/",),
+        # Covered by the "Run pr-approval-agent (stamphog) tests" step in ci-python.yml. The review
+        # engine is a flat script bundle with bare sibling imports, so it runs as its own pytest
+        # invocation rather than inside the product's Django suite.
+        "stamphog": ("packages/pr-approval-agent/",),
+    }
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        # Find every test file under the product.
+        test_files = sorted(
+            p.relative_to(ctx.product_dir).as_posix()
+            for pattern in ("test_*.py", "*_test.py")
+            for p in ctx.product_dir.rglob(pattern)
+            if "__pycache__" not in p.parts
+        )
+        if not test_files:
+            return CheckResult(skip=True)
+
+        # Extract the pytest paths from backend:test, if present.
+        package_json = ctx.product_dir / "package.json"
+        scripts = {}
+        if package_json.exists():
+            try:
+                scripts = json.loads(package_json.read_text()).get("scripts", {})
+            except json.JSONDecodeError:
+                pass  # PackageJsonScriptsCheck reports the invalid JSON
+        test_script = scripts.get("backend:test", "")
+        base_script = test_script.split("||")[0].strip() if test_script else ""
+        if base_script.startswith("pytest"):
+            pytest_paths = _parse_pytest_paths(base_script)
+        else:
+            pytest_paths = []
+
+        def _covered_by(rel: str, path: str) -> bool:
+            # pytest path can be a file ("backend/test_max_tools.py") or a
+            # directory ("backend/" or "scripts/test"). Treat as a prefix
+            # match against the trailing slash to avoid "backend/" eating
+            # "backend_tools/foo.py".
+            if rel == path:
+                return True
+            return rel.startswith(path.rstrip("/") + "/")
+
+        result = CheckResult()
+        per_product = self._PRODUCT_SPECIFIC_EXEMPTIONS.get(ctx.name, ())
+        orphans = []
+        for rel in test_files:
+            if any(_covered_by(rel, p) for p in self._EXTERNAL_RUNNER_PREFIXES):
+                continue
+            if any(_covered_by(rel, p) for p in per_product):
+                continue
+            if any(_covered_by(rel, p) for p in pytest_paths):
+                continue
+            orphans.append(rel)
+
+        if orphans:
+            result.lines.append(
+                f"✗ {len(orphans)} test file(s) not reachable from backend:test or any known external runner"
+            )
+            for o in orphans:
+                result.lines.append(f"  → {o}")
+            result.issues.extend(
+                f"Test file {o} is not covered by backend:test pytest paths or a known "
+                "external runner (e.g. ci-dagster.yml for dags/). It will never run in CI"
+                for o in orphans
+            )
+            result.file = f"products/{ctx.name}/package.json"
+        else:
+            result.lines.append("✓ ok")
+        return result
+
+
+class WatchedChannelsCheck(ProductCheck):
+    """Hold the modules that outside suites run without an import edge in the contract-check inputs.
+
+    watched_channels.py finds them: receivers on a sender the product does not own, modules that
+    outside tests or core settings name by dotted path, modules core loads by name, backend/apps.py
+    and what it imports, and registrations into another boundary's hook. Only a product with
+    'backend:contract-check' skips the suite, so no other product runs this check.
+    """
+
+    label = "watched channels"
+
+    def should_run(self, ctx: CheckContext) -> bool:
+        return super().should_run(ctx) and ctx.isolation_status().has_contract_check_script
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        channels = ctx.isolation_status().channel_modules
+        unwatched = unwatched_modules(ctx.product_dir, {c.path for c in channels})
+        result = CheckResult(file=f"products/{ctx.name}/turbo.json")
+        result.issues = [
+            unwatched_channel_issue(path, [c for c in channels if c.path == path]) for path in sorted(unwatched)
+        ]
+        if result.issues:
+            result.lines = [f"✗ {len(result.issues)} issue(s)"] + [f"  → {i}" for i in result.issues]
+        else:
+            result.lines = ["✓ ok"]
+        return result
+
+
+# A string shaped like a Django system check ID: dotted words, then a level letter and three digits.
+_SYSTEM_CHECK_ID_RE = re.compile(r"^[A-Za-z_][\w.]*\.[A-Z]\d{3}$")
+# Each module that registers system checks, mapped to its register function.
+_REGISTER_FUNCTIONS = {"django.core.checks": "register", "posthog.checks": "register_check"}
+
+
+def _register_bindings(tree: ast.Module) -> tuple[set[str], dict[str, str]]:
+    """Local names bound to a register function, and local module names mapped to their register function."""
+    register_names: set[str] = set()
+    module_names: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if _REGISTER_FUNCTIONS.get(node.module) == alias.name:
+                    register_names.add(bound)
+                elif (module := f"{node.module}.{alias.name}") in _REGISTER_FUNCTIONS:
+                    module_names[bound] = _REGISTER_FUNCTIONS[module]
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _REGISTER_FUNCTIONS:
+                    module_names[alias.asname or alias.name] = _REGISTER_FUNCTIONS[alias.name]
+    return register_names, module_names
+
+
+def _registers_system_check(tree: ast.Module) -> bool:
+    """Whether the module registers a Django system check, through Django or posthog.checks."""
+    register_names, module_names = _register_bindings(tree)
+
+    def _is_register(func: ast.expr) -> bool:
+        if isinstance(func, ast.Name):
+            return func.id in register_names
+        return isinstance(func, ast.Attribute) and module_names.get(ast.unparse(func.value)) == func.attr
+
+    return any(
+        (isinstance(node, ast.Call) and _is_register(node.func))
+        or (
+            isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and any(_is_register(decorator) for decorator in node.decorator_list)
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def _system_check_ids(tree: ast.Module) -> list[str]:
+    return sorted(
+        {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and _SYSTEM_CHECK_ID_RE.match(node.value)
+        }
+    )
+
+
+def _is_type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def _runtime_imports(statements: list[ast.stmt]) -> Iterator[ast.Import | ast.ImportFrom]:
+    """Imports that run when the statements run: not in a nested def or class, or a type-checking-only branch."""
+    for stmt in statements:
+        if isinstance(stmt, ast.Import | ast.ImportFrom):
+            yield stmt
+        elif isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            continue
+        elif isinstance(stmt, ast.If) and _is_type_checking(stmt.test):
+            yield from _runtime_imports(stmt.orelse)
+        elif (
+            isinstance(stmt, ast.If)
+            and isinstance(stmt.test, ast.UnaryOp)
+            and isinstance(stmt.test.op, ast.Not)
+            and _is_type_checking(stmt.test.operand)
+        ):
+            yield from _runtime_imports(stmt.body)
+        else:
+            for nested in ("body", "orelse", "finalbody"):
+                yield from _runtime_imports(getattr(stmt, nested, []))
+            for handler in getattr(stmt, "handlers", []):
+                yield from _runtime_imports(handler.body)
+
+
+def _imports_checks_module(node: ast.Import | ast.ImportFrom, backend: str) -> bool:
+    if isinstance(node, ast.Import):
+        return any(alias.name == f"{backend}.checks" for alias in node.names)
+    names = {alias.name for alias in node.names}
+    if node.level == 0:
+        return node.module == f"{backend}.checks" or (node.module == backend and "checks" in names)
+    return node.level == 1 and (node.module == "checks" or (node.module is None and "checks" in names))
+
+
+def _ready_imports_checks(apps_path: Path, product: str) -> bool:
+    """Whether an AppConfig.ready() in apps.py imports the product's backend/checks.py when it runs."""
+    tree = ast_parse_safe(apps_path) if apps_path.exists() else None
+    if tree is None:
+        return False
+    backend = f"products.{product}.backend"
+    return any(
+        _imports_checks_module(node, backend)
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef)
+        for ready in class_node.body
+        if isinstance(ready, ast.FunctionDef) and ready.name == "ready"
+        for node in _runtime_imports(ready.body)
+    )
+
+
+class SystemChecksCheck(ProductCheck):
+    """A product's Django system checks live in backend/checks.py, which apps.py ready() imports.
+
+    Django only runs a check whose module has been imported, so a check anywhere else, or a
+    checks.py that ready() never imports, is silently never run. IDs follow the scheme in
+    posthog/checks.py, with the product name as the area.
+    """
+
+    label = "system checks"
+
+    @staticmethod
+    def _misplaced_registrations(backend_dir: Path) -> list[str]:
+        problems: list[str] = []
+        for path in sorted(backend_dir.rglob("*.py")):
+            rel = path.relative_to(backend_dir)
+            if rel == Path("checks.py") or {"__pycache__", "test", "tests"}.intersection(rel.parts):
+                continue
+            if path.name.startswith("test_") or path.name.endswith("_test.py"):
+                continue
+            tree = ast_parse_safe(path)
+            if tree is not None and _registers_system_check(tree):
+                problems.append(
+                    f"backend/{rel.as_posix()} registers a Django system check: move it to backend/checks.py"
+                )
+        return problems
+
+    @staticmethod
+    def _checks_module_problems(ctx: CheckContext) -> list[str]:
+        tree = ast_parse_safe(ctx.backend_dir / "checks.py")
+        prefix = f"posthog.{ctx.name}."
+        problems = [
+            f"backend/checks.py uses check ID {check_id!r}, which must start with {prefix!r}"
+            for check_id in (_system_check_ids(tree) if tree is not None else [])
+            if not check_id.startswith(prefix)
+        ]
+        if not _ready_imports_checks(ctx.backend_dir / "apps.py", ctx.name):
+            problems.append(
+                "backend/checks.py is never imported by apps.py ready(), so Django never registers its checks"
+            )
+        return problems
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        if not ctx.backend_dir.exists():
+            return CheckResult(skip=True)
+
+        problems = self._misplaced_registrations(ctx.backend_dir)
+        if (ctx.backend_dir / "checks.py").exists():
+            problems.extend(self._checks_module_problems(ctx))
+
+        if problems:
+            return CheckResult(
+                lines=[f"✗ {len(problems)} problem(s)"] + [f"  → {p}" for p in problems],
+                issues=problems,
+            )
+        return CheckResult(lines=["✓ ok"])
+
+
+CHECKS: list[ProductCheck] = [
+    ProductYamlCheck(),
+    RequiredRootFilesCheck(),
+    BackendPackageMarkerCheck(),
+    ImportSurfaceCheck(),
+    PackageJsonScriptsCheck(),
+    MisplacedFilesCheck(),
+    FileFolderConflictsCheck(),
+    TachCheck(),
+    IsolationChainCheck(),
+    FacadeShapeCheck(),
+    WiringInterfaceCheck(),
+    WatchedChannelsCheck(),
+    OrphanedTestFilesCheck(),
+    SystemChecksCheck(),
+]

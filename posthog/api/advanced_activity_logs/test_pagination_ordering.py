@@ -1,0 +1,217 @@
+from datetime import timedelta
+from urllib.parse import parse_qs, quote, urlparse
+from uuid import UUID
+
+import time_machine
+from posthog.test.base import APIBaseTest
+from unittest.mock import patch
+
+from django.db.models import Q
+from django.utils import timezone
+
+from parameterized import parameterized
+from rest_framework.request import Request
+from rest_framework.test import APIRequestFactory
+
+from posthog.api.advanced_activity_logs.viewset import activity_log_ordering
+from posthog.models import Team
+from posthog.models.activity_logging.activity_log import ActivityLog
+
+
+@time_machine.travel("2024-01-01T12:00:00Z", tick=False)
+class TestActivityLogCursorOrdering(APIBaseTest):
+    def _create_logs(self, count: int, same_timestamp: bool = False) -> None:
+        stamp = timezone.now()
+        for index in range(count):
+            ActivityLog.objects.create(
+                team_id=self.team.id,
+                organization_id=self.organization.id,
+                scope="FeatureFlag",
+                activity="updated",
+                item_id=str(index),
+                created_at=stamp if same_timestamp else stamp + timedelta(minutes=index),
+            )
+
+    def test_cursor_page_size_is_honored(self):
+        self._create_logs(12)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/advanced_activity_logs/?page_size=5")
+
+        assert response.status_code == 200, response.json()
+        assert len(response.json()["results"]) == 5
+        assert response.json()["next"] is not None
+
+    def test_page_size_above_the_maximum_is_rejected(self):
+        response = self.client.get(f"/api/projects/{self.team.id}/advanced_activity_logs/?page_size=99999")
+
+        assert response.status_code == 400
+        assert response.json()["attr"] == "page_size"
+
+    def test_follow_keeps_the_cursor_usable_and_picks_up_new_entries(self):
+        self._create_logs(3)
+        base = f"/api/projects/{self.team.id}/advanced_activity_logs/?ordering=created_at&page_size=10&follow=true"
+
+        exhausted = self.client.get(base).json()
+        assert len(exhausted["results"]) == 3
+        tail = exhausted["next"]
+        assert tail is not None, "following stream must hand back a resumable cursor"
+
+        # Re-polling the tail returns nothing but keeps a usable cursor, as a poller expects.
+        idle = self.client.get(tail).json()
+        assert idle["results"] == []
+        assert idle["next"] is not None
+
+        last_seen = ActivityLog.objects.filter(team_id=self.team.id).order_by("-created_at").first()
+        assert last_seen is not None
+        ActivityLog.objects.create(
+            id=UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            team_id=self.team.id,
+            organization_id=self.organization.id,
+            scope="FeatureFlag",
+            activity="updated",
+            item_id="same-timestamp",
+            created_at=last_seen.created_at,
+        )
+        ActivityLog.objects.create(
+            team_id=self.team.id,
+            organization_id=self.organization.id,
+            scope="FeatureFlag",
+            activity="updated",
+            item_id="brand-new",
+            created_at=timezone.now() + timedelta(hours=1),
+        )
+
+        assert [row["item_id"] for row in self.client.get(tail).json()["results"]] == ["same-timestamp", "brand-new"]
+
+    @parameterized.expand(
+        [
+            ("descending_default", ""),
+            ("ascending_default", "&ordering=created_at"),
+            ("descending_even_when_following", "&follow=true"),
+        ]
+    )
+    def test_streams_that_should_terminate_end_with_a_null_next(self, _name: str, extra: str):
+        self._create_logs(3)
+
+        body = self.client.get(f"/api/projects/{self.team.id}/advanced_activity_logs/?page_size=10{extra}").json()
+
+        assert len(body["results"]) == 3
+        assert body["next"] is None
+
+    def test_ordering_always_carries_a_unique_tiebreak(self):
+        factory = APIRequestFactory()
+
+        assert activity_log_ordering(Request(factory.get("/"))) == ("-created_at", "-id")
+        assert activity_log_ordering(Request(factory.get("/?ordering=created_at"))) == ("created_at", "id")
+
+    def test_ascending_ordering_is_opt_in_and_descending_is_the_default(self):
+        self._create_logs(3)
+
+        base = f"/api/projects/{self.team.id}/advanced_activity_logs/"
+
+        ascending = self.client.get(f"{base}?ordering=created_at")
+        assert ascending.status_code == 200, ascending.json()
+        assert [row["item_id"] for row in ascending.json()["results"]] == ["0", "1", "2"]
+
+        default = self.client.get(base)
+        assert [row["item_id"] for row in default.json()["results"]] == ["2", "1", "0"]
+
+    def test_cursor_from_one_ordering_is_rejected_under_another(self):
+        self._create_logs(3)
+        base = f"/api/projects/{self.team.id}/advanced_activity_logs/?page_size=2"
+        next_link = self.client.get(base).json()["next"]
+        cursor = parse_qs(urlparse(next_link).query)["cursor"][0]
+
+        response = self.client.get(f"{base}&ordering=created_at&cursor={quote(cursor)}")
+
+        assert response.status_code == 404
+
+    def test_unknown_ordering_value_is_rejected(self):
+        response = self.client.get(f"/api/projects/{self.team.id}/advanced_activity_logs/?ordering=scope")
+
+        assert response.status_code == 400
+        assert response.json()["attr"] == "ordering"
+
+    def test_ascending_cursor_walk_covers_every_row(self):
+        self._create_logs(25, same_timestamp=True)
+
+        seen: list[str] = []
+        url = f"/api/projects/{self.team.id}/advanced_activity_logs/?ordering=created_at&page_size=10"
+        while url:
+            response = self.client.get(url)
+            assert response.status_code == 200, response.json()
+            body = response.json()
+            seen.extend(row["item_id"] for row in body["results"])
+            url = body["next"]
+
+        assert sorted(seen) == sorted(str(index) for index in range(25))
+
+    def test_tied_timestamps_paginate_without_loss_or_repeats(self):
+        self._create_logs(25, same_timestamp=True)
+
+        seen: list[str] = []
+        url = f"/api/projects/{self.team.id}/advanced_activity_logs/?page_size=10"
+        while url:
+            response = self.client.get(url)
+            assert response.status_code == 200, response.json()
+            body = response.json()
+            seen.extend(row["item_id"] for row in body["results"])
+            url = body["next"]
+
+        assert sorted(seen) == sorted(str(index) for index in range(25))
+
+    @parameterized.expand(
+        [
+            ("cursor_descending", "?page_size=3"),
+            ("cursor_ascending", "?page_size=3&ordering=created_at"),
+            ("numbered_descending", "?page=1&page_size=3"),
+            ("numbered_ascending", "?page=1&page_size=3&ordering=created_at"),
+        ]
+    )
+    @patch("posthog.api.advanced_activity_logs.viewset.POSITION_CHUNK_SIZE", 2)
+    def test_org_level_logs_page_in_order_without_loss_or_repeats(self, _name: str, query: str):
+        self.team.receive_org_level_activity_logs = True
+        self.team.save()
+        other_team = Team.objects.create(organization=self.organization)
+        stamp = timezone.now()
+        for index in range(11):
+            ActivityLog.objects.create(
+                team_id=None if index % 2 else self.team.id,
+                organization_id=self.organization.id,
+                scope="FeatureFlag",
+                activity="updated",
+                item_id=str(index),
+                created_at=stamp + timedelta(minutes=index // 2),
+            )
+        ActivityLog.objects.create(
+            team_id=other_team.id,
+            organization_id=self.organization.id,
+            scope="FeatureFlag",
+            activity="updated",
+            item_id="other-team",
+            created_at=stamp,
+        )
+
+        ordering = activity_log_ordering(Request(APIRequestFactory().get(f"/{query}")))
+        expected = list(
+            ActivityLog.objects.filter(
+                Q(team_id=self.team.id) | Q(team_id__isnull=True, organization_id=self.organization.id)
+            )
+            .order_by(*ordering)
+            .values_list("item_id", flat=True)
+        )
+
+        seen: list[str] = []
+        url: str | None = f"/api/projects/{self.team.id}/advanced_activity_logs/{query}"
+        while url:
+            response = self.client.get(url)
+            assert response.status_code == 200, response.json()
+            body = response.json()
+            if "count" in body:
+                assert body["count"] == len(expected)
+            seen.extend(row["item_id"] for row in body["results"])
+            url = body["next"]
+
+        assert {str(index) for index in range(11)} <= set(expected)
+        assert "other-team" not in expected
+        assert seen == expected

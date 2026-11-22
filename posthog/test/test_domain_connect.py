@@ -1,0 +1,275 @@
+import re
+import json
+import base64
+from pathlib import Path
+from urllib.parse import unquote
+
+from posthog.test.base import BaseTest
+from unittest.mock import MagicMock, patch
+
+from django.test import SimpleTestCase
+
+import dns.resolver
+from cryptography.hazmat.primitives import hashes as crypto_hashes
+from cryptography.hazmat.primitives.asymmetric import (
+    padding as asym_padding,
+    rsa,
+)
+from parameterized import parameterized
+
+from posthog import domain_connect
+from posthog.domain_connect import (
+    DOMAIN_CONNECT_PROVIDERS,
+    build_sync_apply_url,
+    extract_root_domain_and_host,
+    generate_apply_url,
+    get_available_providers,
+    get_service_id_for_region,
+    resolve_proxy_context,
+    sign_query_string,
+)
+
+TEMPLATE_DIR = (
+    Path(__file__).resolve().parents[2] / "frontend" / "src" / "lib" / "components" / "DomainConnect" / "templates"
+)
+
+
+def _load_template(filename: str) -> dict:
+    return json.loads((TEMPLATE_DIR / filename).read_text())
+
+
+def _extract_template_variables(template: dict) -> set[str]:
+    """Extract all %variable% placeholders from a template's records."""
+    variables: set[str] = set()
+    pattern = re.compile(r"%(\w+)%")
+    for record in template.get("records", []):
+        for value in record.values():
+            if isinstance(value, str):
+                variables.update(pattern.findall(value))
+    return variables
+
+
+class TestExtractRootDomainAndHost(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("simple subdomain", "ph.example.com", ("example.com", "ph")),
+            ("bare domain", "example.com", ("example.com", "")),
+            ("deep subdomain", "a.b.c.example.com", ("example.com", "a.b.c")),
+            ("co.uk domain", "ph.example.co.uk", ("example.co.uk", "ph")),
+            ("deep co.uk", "track.sub.example.co.uk", ("example.co.uk", "track.sub")),
+            ("bare co.uk", "example.co.uk", ("example.co.uk", "")),
+            ("com.au domain", "app.example.com.au", ("example.com.au", "app")),
+            ("trailing dot", "ph.example.com.", ("example.com", "ph")),
+            ("single label", "localhost", ("localhost", "")),
+        ]
+    )
+    def test_extraction(self, name: str, full_domain: str, expected: tuple[str, str]) -> None:
+        domain_parts = extract_root_domain_and_host(full_domain)
+        self.assertEqual(domain_parts.root_domain, expected[0], f"Failed root domain for {name}: {full_domain}")
+        self.assertEqual(domain_parts.host, expected[1], f"Failed host for {name}: {full_domain}")
+
+
+class TestGetServiceIdForRegion(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("US deployment", "US", "email-verification-us"),
+            ("EU deployment", "EU", "email-verification-eu"),
+            ("eu lowercase", "eu", "email-verification-eu"),
+            ("None deployment", None, "email-verification-us"),
+            ("DEV deployment", "DEV", "email-verification-us"),
+        ]
+    )
+    def test_region_mapping(self, _name: str, deployment: str | None, expected: str) -> None:
+        with self.settings(CLOUD_DEPLOYMENT=deployment):
+            self.assertEqual(get_service_id_for_region("email-verification"), expected)
+
+
+class TestBuildSyncApplyUrl(SimpleTestCase):
+    def test_basic_url(self) -> None:
+        url = build_sync_apply_url(
+            url_sync_ux="https://dns.provider.example/sync",
+            provider_id="posthog.com",
+            service_id="reverse-proxy-us",
+            domain="example.com",
+            variables={"target": "abc123.proxy.posthog.com"},
+            host="ph",
+        )
+
+        self.assertIn("/v2/domainTemplates/providers/posthog.com/services/reverse-proxy-us/apply?", url)
+        self.assertIn("domain=example.com", url)
+        self.assertIn("host=ph", url)
+        self.assertIn("target=abc123.proxy.posthog.com", url)
+
+    def test_url_without_host(self) -> None:
+        url = build_sync_apply_url(
+            url_sync_ux="https://dns.provider.example/sync",
+            provider_id="posthog.com",
+            service_id="email-verification-us",
+            domain="example.com",
+            variables={"verifyToken": "abc123"},
+        )
+
+        self.assertNotIn("host=", url)
+        self.assertIn("domain=example.com", url)
+        self.assertIn("verifyToken=abc123", url)
+
+    def test_url_with_redirect(self) -> None:
+        url = build_sync_apply_url(
+            url_sync_ux="https://dns.provider.example/sync",
+            provider_id="posthog.com",
+            service_id="reverse-proxy-us",
+            domain="example.com",
+            variables={"target": "abc.proxy.posthog.com"},
+            host="ph",
+            redirect_uri="https://us.posthog.com/settings?domain_connect=proxy",
+        )
+
+        self.assertIn("redirect_uri=", url)
+
+    def test_url_with_signing(self) -> None:
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+        url = build_sync_apply_url(
+            url_sync_ux="https://dns.provider.example/sync",
+            provider_id="posthog.com",
+            service_id="reverse-proxy-us",
+            domain="example.com",
+            variables={"target": "abc.proxy.posthog.com"},
+            host="ph",
+            private_key=private_key,
+            key_id="_dcpubkeyv1",
+            group_ids=("dkim", "spf"),
+        )
+
+        signed_query, signature_params = url.split("?", 1)[1].split("&sig=", 1)
+        self.assertIn("groupId=dkim%2Cspf", signed_query)
+        self.assertIn("key=_dcpubkeyv1", signature_params)
+        signature = unquote(signature_params.split("&key=", 1)[0])
+        private_key.public_key().verify(
+            base64.b64decode(signature),
+            signed_query.encode("utf-8"),
+            asym_padding.PKCS1v15(),
+            crypto_hashes.SHA256(),
+        )
+
+    def test_url_without_signing_key_has_no_sig(self) -> None:
+        url = build_sync_apply_url(
+            url_sync_ux="https://dns.provider.example/sync",
+            provider_id="posthog.com",
+            service_id="reverse-proxy-us",
+            domain="example.com",
+            variables={"target": "abc.proxy.posthog.com"},
+            host="ph",
+        )
+
+        self.assertNotIn("sig=", url)
+        self.assertNotIn("key=", url)
+
+
+class TestSignQueryString(SimpleTestCase):
+    def test_sign_and_verify(self) -> None:
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public_key = private_key.public_key()
+
+        query = "domain=example.com&host=ph&target=abc.proxy.posthog.com"
+        signature_b64 = sign_query_string(query, private_key)
+
+        signature_bytes = base64.b64decode(signature_b64)
+        # Should not raise
+        public_key.verify(
+            signature_bytes,
+            query.encode("utf-8"),
+            asym_padding.PKCS1v15(),
+            crypto_hashes.SHA256(),
+        )
+
+
+class TestGetAvailableProviders(SimpleTestCase):
+    def test_returns_all_providers(self) -> None:
+        with patch.dict(
+            DOMAIN_CONNECT_PROVIDERS,
+            {"api.cloudflare.com/client/v4/dns/domainconnect": "Cloudflare", "dnstemplate.godaddy.com": "GoDaddy"},
+            clear=True,
+        ):
+            providers = get_available_providers()
+
+        self.assertEqual(len(providers), 2)
+        names = {p["name"] for p in providers}
+        self.assertIn("Cloudflare", names)
+        self.assertIn("GoDaddy", names)
+
+    def test_empty_when_no_providers(self) -> None:
+        with patch.dict(DOMAIN_CONNECT_PROVIDERS, {}, clear=True):
+            providers = get_available_providers()
+
+        self.assertEqual(providers, [])
+
+
+class TestGenerateApplyUrl(SimpleTestCase):
+    def test_rejects_unknown_provider_endpoint(self) -> None:
+        with self.assertRaises(ValueError, msg="Unsupported provider endpoint"):
+            generate_apply_url(
+                domain="example.com",
+                service_id="reverse-proxy-us",
+                variables={"target": "abc.proxy.posthog.com"},
+                provider_endpoint="evil.internal.service",
+            )
+
+
+class TestTemplateResolverAlignment(BaseTest):
+    """Ensure backend resolvers produce variables that exactly match the template placeholders."""
+
+    @parameterized.expand(
+        [
+            ("posthog.com.reverse-proxy-us.json", "US"),
+            ("posthog.com.reverse-proxy-eu.json", "EU"),
+        ]
+    )
+    @patch("posthog.models.ProxyRecord")
+    def test_proxy_resolver_variables_match_template(
+        self, template_file: str, region: str, mock_proxy_cls: MagicMock
+    ) -> None:
+        template = _load_template(template_file)
+        expected_vars = _extract_template_variables(template)
+
+        mock_record = MagicMock()
+        mock_record.domain = "ph.example.com"
+        mock_record.target_cname = "abc.proxy.posthog.com"
+        mock_proxy_cls.objects.get.return_value = mock_record
+
+        with self.settings(CLOUD_DEPLOYMENT=region):
+            resolved = resolve_proxy_context("test-id", "test-org")
+
+        self.assertEqual(set(resolved.variables.keys()), expected_vars)
+        self.assertEqual(resolved.service_id, template["serviceId"])
+        self.assertEqual(resolved.root_domain, "example.com")
+        self.assertEqual(resolved.host, "ph")
+        if template.get("hostRequired"):
+            self.assertTrue(resolved.host, "hostRequired template but resolver returned empty host")
+
+
+class TestOutOfBandDomainsAreNotLookedUp(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("discovery", "_lookup_domain_connect_endpoint", None),
+            ("dmarc_absence", "_dmarc_absence_confirmed", False),
+        ]
+    )
+    def test_a_listed_domain_is_refused(self, _name: str, function_name: str, expected: object) -> None:
+        function = getattr(domain_connect, function_name)
+        with (
+            patch.object(domain_connect, "is_cloud", return_value=True),
+            patch.object(domain_connect.dns.resolver, "resolve") as resolve,
+        ):
+            self.assertEqual(function("abc.oast.live"), expected)
+
+        resolve.assert_not_called()
+
+    def test_off_cloud_the_lookup_still_runs(self) -> None:
+        with (
+            patch.object(domain_connect, "is_cloud", return_value=False),
+            patch.object(domain_connect.dns.resolver, "resolve", side_effect=dns.resolver.NXDOMAIN) as resolve,
+        ):
+            self.assertIsNone(domain_connect._lookup_domain_connect_endpoint("abc.oast.live"))
+
+        resolve.assert_called_once()

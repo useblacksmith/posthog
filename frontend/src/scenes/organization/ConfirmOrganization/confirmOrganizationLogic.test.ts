@@ -1,0 +1,161 @@
+import { router } from 'kea-router'
+import { expectLogic } from 'kea-test-utils'
+
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+
+import { confirmOrganizationLogic } from './confirmOrganizationLogic'
+
+const ORGANIZATION_NAME_ERROR =
+    "Please enter an organization name. You can use your own name if you don't belong to one."
+
+describe('confirmOrganizationLogic', () => {
+    let logic: ReturnType<typeof confirmOrganizationLogic.build>
+
+    beforeEach(() => {
+        initKeaTests()
+        logic = confirmOrganizationLogic()
+        logic.mount()
+    })
+
+    describe('query params', () => {
+        it.each([
+            ['Spike', 'Spikes Inc'],
+            ['3130', '2600'],
+        ])('prefills the form from the URL with the name %p', async (firstName, organizationName) => {
+            // A raw URL, not a params object: kea-router passes object values through untouched, so
+            // only a real query string parses a name of only digits into a number, which used to crash
+            router.actions.push(
+                `/organization/confirm-creation?email=spike@spike.com&first_name=${encodeURIComponent(firstName)}&organization_name=${encodeURIComponent(organizationName)}`
+            )
+
+            await expectLogic(logic)
+                .toDispatchActions(['setEmail', 'setConfirmOrganizationValues'])
+                .toMatchValues({
+                    confirmOrganization: expect.objectContaining({
+                        first_name: firstName,
+                        organization_name: organizationName,
+                    }),
+                    email: 'spike@spike.com',
+                })
+
+            expect(logic.values.confirmOrganizationValidationErrors.first_name).toBeUndefined()
+            expect(logic.values.confirmOrganizationValidationErrors.organization_name).toBeUndefined()
+        })
+
+        it('keeps user input when a later location change re-fires the handler', async () => {
+            router.actions.push('/organization/confirm-creation', { email: 'spike@spike.com' })
+
+            logic.actions.setConfirmOrganizationValue('organization_name', 'Spikes Inc')
+
+            // The docs side panel and similar links change the URL without the prefill params.
+            router.actions.push('/organization/confirm-creation', { panel: 'docs' })
+
+            await expectLogic(logic).toMatchValues({
+                confirmOrganization: expect.objectContaining({ organization_name: 'Spikes Inc' }),
+            })
+        })
+    })
+
+    describe('form', () => {
+        describe('signup continuation', () => {
+            const originalLocation = window.location
+
+            beforeEach(() => {
+                Object.defineProperty(window, 'location', {
+                    configurable: true,
+                    value: {
+                        ...originalLocation,
+                        search: '?next=%2Finsights',
+                        href: `${originalLocation.origin}/organization/confirm-creation`,
+                    },
+                })
+            })
+
+            afterEach(() => {
+                Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
+            })
+
+            it.each([
+                ['/complete/oidc/', '/complete/oidc/'],
+                [undefined, '/insights'],
+                ['https://example.net/complete/oidc/', '/insights'],
+            ])('follows the safe continuation %p before the next destination', async (continueUrl, expected) => {
+                useMocks({ post: { '/api/social_signup/': () => [201, { continue_url: continueUrl }] } })
+                logic.actions.setConfirmOrganizationValues({
+                    first_name: 'Example',
+                    organization_name: 'Example organization',
+                    role_at_organization: 'engineering',
+                })
+                await expectLogic(logic, () => logic.actions.submitConfirmOrganization()).toDispatchActions([
+                    'submitConfirmOrganizationSuccess',
+                ])
+                expect(window.location.href).toEqual(expected)
+            })
+        })
+
+        it('requires a name, an organization name and a role', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.submitConfirmOrganization()
+            }).toMatchValues({
+                confirmOrganizationValidationErrors: {
+                    first_name: 'Please enter your name',
+                    organization_name: ORGANIZATION_NAME_ERROR,
+                    role_at_organization: 'Please select your role to continue',
+                },
+            })
+        })
+
+        it.each([
+            ['   ', ORGANIZATION_NAME_ERROR],
+            ['  Spikes Inc  ', undefined],
+        ])('validates the organization name %p on its trimmed value', (organizationName, expectedError) => {
+            logic.actions.setConfirmOrganizationValue('organization_name', organizationName)
+
+            expect(logic.values.confirmOrganizationValidationErrors.organization_name).toEqual(expectedError)
+        })
+
+        it('shows the organization name error on touch, before any submit', () => {
+            expect(logic.values.confirmOrganizationErrors).toEqual({})
+
+            logic.actions.touchConfirmOrganizationField('organization_name')
+            expect(logic.values.confirmOrganizationErrors).toEqual({ organization_name: ORGANIZATION_NAME_ERROR })
+
+            logic.actions.setConfirmOrganizationValue('organization_name', 'Spikes Inc')
+            expect(logic.values.confirmOrganizationErrors).toEqual({})
+        })
+
+        it('puts an API error on the field it names, and lets the next attempt through', async () => {
+            useMocks({
+                post: {
+                    '/api/social_signup/': () => [
+                        400,
+                        {
+                            type: 'validation_error',
+                            code: 'invalid_input',
+                            detail: 'This name is not allowed.',
+                            attr: 'organization_name',
+                        },
+                    ],
+                },
+            })
+            logic.actions.setConfirmOrganizationValues({
+                first_name: 'Spike',
+                organization_name: 'Spikes Inc',
+                role_at_organization: 'engineering',
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfirmOrganization()
+            }).toFinishAllListeners()
+
+            expect(logic.values.confirmOrganizationErrors).toEqual({ organization_name: 'This name is not allowed.' })
+
+            // A manual error only clears when its own field is touched, so without preSubmit clearing
+            // it the person could never retry
+            await expectLogic(logic, () => {
+                logic.actions.submitConfirmOrganization()
+            }).toDispatchActions(['submitConfirmOrganizationRequest'])
+        })
+    })
+})

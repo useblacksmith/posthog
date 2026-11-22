@@ -1,0 +1,38 @@
+{
+    "name": "@posthog/products-posthog-ai",
+    "scripts": {
+        "backend:test": "pytest -c ../../pytest.ini --rootdir ../.. backend/ scripts/ eval_harness/test/ -v --tb=short"
+    },
+    "dependencies": {
+        "@posthog/quill-primitives": "workspace:*",
+        "@posthog/react": "catalog:",
+        "@tanstack/react-virtual": "*",
+        "eventsource-parser": "*",
+        "kea-subscriptions": "catalog:",
+        "marked": "*",
+        "monaco-editor": "^0.55.1",
+        "posthog-js": "catalog:",
+        "react-intersection-observer": "^9.16.0",
+        "tailwind-merge": "*"
+    },
+    "devDependencies": {
+        "@testing-library/react": "*",
+        "kea-test-utils": "catalog:",
+        "msw": "*"
+    },
+    "peerDependencies": {
+        "@posthog/icons": "catalog:",
+        "@storybook/react": "catalog:",
+        "@testing-library/dom": "*",
+        "@types/react": "*",
+        "@types/react-dom": "*",
+        "clsx": "*",
+        "kea": "catalog:",
+        "kea-disposables": "catalog:",
+        "kea-forms": "catalog:",
+        "kea-loaders": "catalog:",
+        "kea-router": "catalog:",
+        "react": "*",
+        "react-dom": "*"
+    }
+}

@@ -1,0 +1,271 @@
+from datetime import timedelta
+from pathlib import Path
+from typing import Any, Optional
+
+from posthog.test.base import APIBaseTest, ClickhouseTestMixin, _create_event, _create_person
+from unittest.mock import patch
+
+from django.test import override_settings
+from django.utils import timezone
+
+from posthog.clickhouse.client.execute import sync_execute
+from posthog.clickhouse.preaggregation.experiment_exposures_sql import (
+    SHARDED_EXPERIMENT_EXPOSURES_TABLE,
+    TRUNCATE_EXPERIMENT_EXPOSURES_TABLE_SQL,
+)
+from posthog.clickhouse.preaggregation.experiment_metric_events_sql import (
+    SHARDED_EXPERIMENT_METRIC_EVENTS_TABLE,
+    TRUNCATE_EXPERIMENT_METRIC_EVENTS_TABLE_SQL,
+)
+from posthog.models.team.extensions import get_or_create_team_extension
+
+from products.analytics_platform.backend.models.preaggregation_job import PreaggregationJob
+from products.data_tools.backend.models.join import DataWarehouseJoin
+from products.experiments.backend.hogql_queries.metric_events_precompute import MetricEventsPrecompute
+from products.experiments.backend.hogql_queries.precompute_policy import MIN_PRECOMPUTATION_DURATION_SECONDS
+from products.experiments.backend.models.experiment import Experiment
+from products.experiments.backend.models.team_experiments_config import TeamExperimentsConfig
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+from products.warehouse_sources.backend.facade.testing import create_data_warehouse_table_from_csv
+
+TEST_BUCKET = "test_storage_bucket-posthog.hogql.experiments.queryrunner"
+
+
+# One precomputed case per metric path, kept so the query over the preaggregated tables stays
+# snapshotted. Nothing else snapshots that read path.
+SNAPSHOT_PRECOMPUTED_CASES = frozenset(
+    {
+        "test_property_sum_metric_1_precomputed",  # mean
+        "test_query_runner_funnel_metric_1_precomputed",  # funnel
+        "test_basic_retention_calculation_1_precomputed",  # retention
+        "test_basic_ratio_metric_1_precomputed",  # ratio
+        "test_query_runner_with_unique_users_metric_1_precomputed",  # unique users
+        "test_exposure_query_returns_correct_timeseries_1_precomputed",  # exposures runner
+    }
+)
+
+
+@override_settings(IN_UNIT_TESTING=True)
+class ExperimentQueryRunnerBaseTest(ClickhouseTestMixin, APIBaseTest):
+    def teardown_method(self, method) -> None:
+        # Clean up preaggregation data to prevent leaks between tests
+        self._clean_preaggregation_data()
+
+        if getattr(self, "clean_up_data_warehouse_usage_data", None):
+            self.clean_up_data_warehouse_usage_data()
+        if getattr(self, "clean_up_data_warehouse_subscriptions_data", None):
+            self.clean_up_data_warehouse_subscriptions_data()
+        if getattr(self, "clean_up_data_warehouse_customers_data", None):
+            self.clean_up_data_warehouse_customers_data()
+
+    def _clean_preaggregation_data(self):
+        """Clean precomputation data from ClickHouse and PostgreSQL"""
+        sync_execute(TRUNCATE_EXPERIMENT_EXPOSURES_TABLE_SQL())
+        sync_execute(TRUNCATE_EXPERIMENT_METRIC_EVENTS_TABLE_SQL())
+        PreaggregationJob.objects.all().delete()
+
+    def assertQueryMatchesSnapshot(
+        self, query: str, params: Optional[dict[str, Any]] = None, replace_all_numbers: bool = False
+    ) -> None:
+        # Every precomputed case of a ("direct", False) / ("precomputed", True) pair reads the same
+        # preaggregated tables, so one case per metric path carries that SQL and the rest repeat it
+        # with different filters. Both cases always run; only the repeats lose their snapshot.
+        if self._testMethodName.endswith("precomputed") and self._testMethodName not in SNAPSHOT_PRECOMPUTED_CASES:
+            return
+        super().assertQueryMatchesSnapshot(query, params=params, replace_all_numbers=replace_all_numbers)
+
+    def _setup_precomputation_test(self, use_precomputation: bool):
+        """Initialize test for precomputation path (cleanup existing data)"""
+        if use_precomputation:
+            self._clean_preaggregation_data()
+            # Disable TTL merges so ClickHouse 26.3 doesn't immediately drop
+            # rows whose expires_at is in the past (due to the frozen clock).
+            for table_name in (
+                SHARDED_EXPERIMENT_EXPOSURES_TABLE(),
+                SHARDED_EXPERIMENT_METRIC_EVENTS_TABLE(),
+            ):
+                sync_execute(f"SYSTEM STOP TTL MERGES {table_name}")
+                self.addCleanup(sync_execute, f"SYSTEM START TTL MERGES {table_name}")
+
+    def _enable_precomputation(self):
+        config = get_or_create_team_extension(self.team, TeamExperimentsConfig)
+        config.experiment_precomputation_enabled = True
+        config.save()
+        # Ratio and CUPED metric-events precomputation each have an additional default-off
+        # kill-switch flag; force them on so tests still exercise the precomputed metric-events path.
+        if not getattr(self, "_metric_events_precompute_flags_patched", False):
+            for flag_method in ("ratio_flag_enabled", "cuped_flag_enabled"):
+                patcher = patch.object(MetricEventsPrecompute, flag_method, return_value=True)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+            self._metric_events_precompute_flags_patched = True
+
+    def _disable_precomputation(self):
+        config = get_or_create_team_extension(self.team, TeamExperimentsConfig)
+        config.experiment_precomputation_enabled = False
+        config.save()
+
+    def _save_experiment_with_precomputation(self, experiment, use_precomputation: bool):
+        """Save experiment with precomputation enabled if needed.
+
+        Production gates precomputation behind a minimum experiment runtime
+        (see MIN_PRECOMPUTATION_DURATION_SECONDS). Tests in this suite often
+        rely on the default `start_date=now` from create_experiment, which
+        would silently fall back to the direct path. Backdate start_date so
+        the experiment passes the gate and the precomputed path is exercised.
+        """
+        if use_precomputation:
+            self._enable_precomputation()
+            if experiment.start_date is not None:
+                now = timezone.now()
+                elapsed = (now - experiment.start_date).total_seconds()
+                if elapsed < MIN_PRECOMPUTATION_DURATION_SECONDS:
+                    # Backdate to exactly the threshold (gate is >=) so the
+                    # daily window stays in the same UTC day as the original
+                    # start_date and the SQL filter shifts by the minimum.
+                    experiment.start_date = now - timedelta(seconds=MIN_PRECOMPUTATION_DURATION_SECONDS)
+        experiment.save()
+
+    def create_feature_flag(self, key="test-experiment"):
+        return FeatureFlag.objects.create(
+            name=f"Test experiment flag: {key}",
+            key=key,
+            team=self.team,
+            filters={
+                "groups": [{"properties": [], "rollout_percentage": None}],
+                "multivariate": {
+                    "variants": [
+                        {
+                            "key": "control",
+                            "name": "Control",
+                            "rollout_percentage": 50,
+                        },
+                        {
+                            "key": "test",
+                            "name": "Test",
+                            "rollout_percentage": 50,
+                        },
+                    ]
+                },
+            },
+            created_by=self.user,
+        )
+
+    def create_experiment(
+        self,
+        name="test-experiment",
+        feature_flag=None,
+        start_date=None,
+        end_date=None,
+    ):
+        if feature_flag is None:
+            feature_flag = self.create_feature_flag(name)
+        if start_date is None:
+            start_date = timezone.now()
+        else:
+            start_date = timezone.make_aware(start_date)  # Make naive datetime timezone-aware
+        if end_date is None:
+            end_date = timezone.now() + timedelta(days=14)
+        elif end_date is not None:
+            end_date = timezone.make_aware(end_date)  # Make naive datetime timezone-aware
+        return Experiment.objects.create(
+            name=name,
+            team=self.team,
+            feature_flag=feature_flag,
+            start_date=start_date,
+            end_date=end_date,
+            exposure_criteria=None,
+        )
+
+    def create_data_warehouse_table_with_usage(self):
+        table, _, _, _, self.clean_up_data_warehouse_usage_data = create_data_warehouse_table_from_csv(
+            csv_path=Path(__file__).parent / "data" / "usage.csv",
+            table_name="usage",
+            table_columns={
+                "id": "String",
+                "ds": "Date",
+                "userid": "String",
+                "usage": "Float64",
+                "plan": "String",
+                "region": "String",
+            },
+            test_bucket=TEST_BUCKET,
+            team=self.team,
+        )
+
+        return table.name
+
+    def create_data_warehouse_table_with_subscriptions(self):
+        subscription_table_name = "stripe_subscriptions"
+        subscriptions_table, source, credential, _, self.clean_up_data_warehouse_subscriptions_data = (
+            create_data_warehouse_table_from_csv(
+                csv_path=Path(__file__).parent / "data" / "subscriptions.csv",
+                table_name=subscription_table_name,
+                table_columns={
+                    "subscription_id": "String",
+                    "subscription_created_at": "DateTime",
+                    "subscription_customer_id": "String",
+                    "subscription_amount": "Int64",
+                },
+                test_bucket=TEST_BUCKET,
+                team=self.team,
+            )
+        )
+
+        customer_table_name = "stripe_customers"
+        customers_table, _, _, _, self.clean_up_data_warehouse_customers_data = create_data_warehouse_table_from_csv(
+            csv_path=Path(__file__).parent / "data" / "customers.csv",
+            table_name=customer_table_name,
+            table_columns={
+                "customer_id": "String",
+                "customer_created_at": "DateTime",
+                "customer_name": "String",
+                "customer_email": "String",
+                "signup_count": "Int32",
+            },
+            test_bucket=TEST_BUCKET,
+            team=self.team,
+            source=source,
+            credential=credential,
+        )
+
+        DataWarehouseJoin.objects.create(
+            team=self.team,
+            source_table_name=subscriptions_table.name,
+            source_table_key="subscription_customer_id",
+            joining_table_name=customers_table.name,
+            joining_table_key="customer_id",
+            field_name="subscription_customer",
+        )
+
+        return subscriptions_table.name
+
+    def create_standard_test_events(self, feature_flag):
+        """
+        Creates a standard set of events that can be reused across multiple tests
+        """
+
+        feature_flag_property = f"$feature/{feature_flag.key}"
+
+        for variant, purchase_count in [("control", 6), ("test", 8)]:
+            for i in range(10):
+                _create_person(distinct_ids=[f"user_{variant}_{i}"], team_id=self.team.pk)
+                _create_event(
+                    team=self.team,
+                    event="$feature_flag_called",
+                    distinct_id=f"user_{variant}_{i}",
+                    timestamp="2020-01-02T12:00:00Z",
+                    properties={
+                        feature_flag_property: variant,
+                        "$feature_flag_response": variant,
+                        "$feature_flag": feature_flag.key,
+                    },
+                )
+                if i < purchase_count:
+                    _create_event(
+                        team=self.team,
+                        event="purchase",
+                        distinct_id=f"user_{variant}_{i}",
+                        timestamp="2020-01-02T12:01:00Z",
+                        properties={feature_flag_property: variant, "amount": 10 if i < 2 else ""},
+                    )

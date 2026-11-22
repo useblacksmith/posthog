@@ -1,0 +1,742 @@
+import uuid
+import asyncio
+from collections.abc import Callable
+from dataclasses import replace
+from typing import Any
+
+from posthog.test.base import BaseTest
+from unittest.mock import Mock, patch
+
+from django.test import SimpleTestCase
+
+from parameterized import parameterized
+from prometheus_client import REGISTRY
+
+from posthog.clickhouse.client.execute import KillSwitchLevel
+from posthog.clickhouse.client.limit import (
+    ConcurrencyLimitExceeded,
+    ConcurrencySlot,
+    QueueWait,
+    RateLimit,
+    get_api_team_rate_limiter,
+    get_app_telemetry_queries_rate_limiter,
+    get_materialized_endpoints_rate_limiter,
+)
+from posthog.clickhouse.query_tagging import (
+    Product,
+    QueryTags,
+    get_query_tag_value,
+    query_tags,
+    reset_query_tags,
+    tag_queries,
+)
+from posthog.constants import AvailableFeature
+
+
+class TestRateLimit(SimpleTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        team_bypass_patcher = patch("posthog.rate_limit.team_is_allowed_to_bypass_throttle", return_value=False)
+        team_bypass_patcher.start()
+        self.addCleanup(team_bypass_patcher.stop)
+        self.limit = RateLimit(
+            max_concurrency=1,
+            applicable=lambda *args, **kwargs: kwargs.get("is_api") if "is_api" in kwargs else args[0],
+            limit_name="api_per_team",
+            get_task_name=lambda *args, **kwargs: f"rate-limit-test-task:{kwargs.get('team_id') or args[1]}",
+            get_task_key=lambda *args, **kwargs: f"limit:rate-limit-test-task:{kwargs.get('team_id') or args[1]}",
+            get_task_id=lambda *args, **kwargs: f"{kwargs.get('task_id') or args[2]}",
+            ttl=10,
+        )
+        self.cancels: list[ConcurrencySlot | None] = []
+
+    def tearDown(self) -> None:
+        for slot in self.cancels:
+            if slot is not None:
+                self.limit.release(slot)
+
+    def test_rate_limit(self):
+        args: tuple = ()
+        kwargs: dict[str, Any] = {"is_api": True, "team_id": 7, "task_id": 17}
+
+        self.cancels.append(self.limit.use(*args, **kwargs))
+
+    def test_rate_limit_fail(self):
+        self.cancels.append(self.limit.use(is_api=True, team_id=8, task_id=17))
+        with self.assertRaises(ConcurrencyLimitExceeded):
+            self.cancels.append(self.limit.use(True, 8, 18))
+
+    @patch("posthog.rate_limit.team_is_allowed_to_bypass_throttle", return_value=True)
+    def test_team_bypass_uses_default(self, bypass: Mock) -> None:
+        self.cancels.append(self.limit.use(is_api=True, team_id=8, task_id=17))
+
+        assert self.limit.use(is_api=True, team_id=8, task_id=18) is None
+        bypass.assert_called_once_with(8)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    @patch("posthog.clickhouse.client.execute.get_kill_switch_level", return_value=KillSwitchLevel.FULL)
+    @patch("posthog.rate_limit.team_is_allowed_to_bypass_throttle", return_value=True)
+    def test_non_query_limit_can_disable_clickhouse_controls(self, bypass: Mock, kill_switch: Mock) -> None:
+        limit = RateLimit(
+            max_concurrency=2,
+            limit_name="non_query_limit",
+            get_task_name=lambda **_kwargs: "non-query-limit",
+            get_task_id=lambda **kwargs: kwargs["task_id"],
+            apply_clickhouse_kill_switch=False,
+            allow_team_bypass=False,
+        )
+        slots: list[ConcurrencySlot] = []
+        try:
+            first = limit.use(team_id=42, task_id="first")
+            second = limit.use(team_id=42, task_id="second")
+            assert first is not None
+            assert second is not None
+            slots.extend([first, second])
+            with self.assertRaises(ConcurrencyLimitExceeded):
+                limit.use(team_id=42, task_id="third")
+            bypass.assert_not_called()
+            kill_switch.assert_not_called()
+        finally:
+            for slot in slots:
+                limit.release(slot)
+
+    @parameterized.expand(
+        [
+            # Scene-only queries carry no explicit productKey; the block counter must still attribute
+            # them via the same fallback sync_execute applies later, not record "unknown".
+            ("scene_fallback", {"scene": "SQLEditor"}, "warehouse"),
+            # An explicit product wins over the scene fallback.
+            ("explicit_product_wins", {"scene": "SQLEditor", "product": Product.WEB_ANALYTICS}, "web_analytics"),
+            # Nothing to attribute falls back to "unknown".
+            ("no_tags", {}, "unknown"),
+        ]
+    )
+    def test_block_counter_attributes_product_via_fallback(self, _name, query_tags, expected_product):
+        reset_query_tags()
+        if query_tags:
+            tag_queries(**query_tags)
+        self.cancels.append(self.limit.use(is_api=True, team_id=9, task_id=1))
+        with patch("posthog.clickhouse.client.limit.CONCURRENT_QUERY_LIMIT_EXCEEDED_COUNTER") as mock_counter:
+            with self.assertRaises(ConcurrencyLimitExceeded):
+                self.limit.use(is_api=True, team_id=9, task_id=2)
+        labeled_products = {call.kwargs.get("product") for call in mock_counter.labels.call_args_list}
+        self.assertIn(expected_product, labeled_products)
+
+    def test_block_counter_buckets_unknown_product(self):
+        # A product value outside the known set (e.g. a client-forged tag that slipped past validation)
+        # must collapse to "unknown" so it can't mint an unbounded Prometheus series.
+        query_tags.set(QueryTags.model_construct(product="totally-made-up-product"))  # type: ignore[arg-type]
+        self.cancels.append(self.limit.use(is_api=True, team_id=9, task_id=1))
+        with patch("posthog.clickhouse.client.limit.CONCURRENT_QUERY_LIMIT_EXCEEDED_COUNTER") as mock_counter:
+            with self.assertRaises(ConcurrencyLimitExceeded):
+                self.limit.use(is_api=True, team_id=9, task_id=2)
+        labeled_products = {call.kwargs.get("product") for call in mock_counter.labels.call_args_list}
+        self.assertIn("unknown", labeled_products)
+        self.assertNotIn("totally-made-up-product", labeled_products)
+
+    def test_rate_limits_no_inference(self):
+        """
+        User limits do not interfere even with same task ids.
+        """
+        self.cancels.append(self.limit.use(is_api=True, team_id=9, task_id=17))
+        self.cancels.append(self.limit.use(is_api=True, team_id=10, task_id=17))
+        self.cancels.append(self.limit.use(is_api=True, team_id=11, task_id=17))
+
+    def test_ttl(self):
+        x = 0
+
+        def get_time_plus_100():
+            nonlocal x
+            x = x + 100
+            return x
+
+        self.limit.get_time = get_time_plus_100
+        self.cancels.append(self.limit.use(is_api=True, team_id=9, task_id=17))
+        self.cancels.append(self.limit.use(is_api=True, team_id=9, task_id=18))
+        self.cancels.append(self.limit.use(is_api=True, team_id=9, task_id=19))
+
+    def test_applicable(self):
+        @self.limit.wrap
+        def some_func(is_api: bool, team_id: int, task_id: int):
+            pass
+
+        some_func(is_api=True, team_id=9, task_id=17)
+        # none of the belows
+        some_func(is_api=False, team_id=9, task_id=19)
+        some_func(is_api=False, team_id=9, task_id=19)
+        some_func(is_api=False, team_id=9, task_id=19)
+
+    def test_context(self):
+        result = 0
+        with self.limit.run(is_api=True, team_id=9, task_id=17):
+            result += 1
+
+        with self.limit.run(is_api=True, team_id=9, task_id=17):
+            result += 2
+
+        assert result == 3
+
+    def test_context_fail(self):
+        result = 0
+        with self.limit.run(is_api=True, team_id=9, task_id=17):
+            result += 1
+            with self.assertRaises(ConcurrencyLimitExceeded):
+                with self.limit.run(is_api=True, team_id=9, task_id=18):
+                    result += 2
+                result += 4
+            result += 8
+
+        assert result == 9
+
+    def test_run_applicable(self):
+        result = 0
+        with self.limit.run(is_api=True, team_id=9, task_id=17):
+            result += 1
+            with self.limit.run(is_api=False, team_id=9, task_id=18):
+                result += 2
+            result += 4
+
+        assert result == 7
+
+    def test_custom_rate_limit_fail(self):
+        self.cancels.append(self.limit.use(is_api=True, team_id=8, task_id=17))
+        self.cancels.append(self.limit.use(is_api=True, team_id=8, task_id=18, limit=2))
+        with self.assertRaises(ConcurrencyLimitExceeded):
+            self.cancels.append(self.limit.use(True, 8, 19, limit=2))
+
+    def test_exception(self):
+        result = 0
+        with self.assertRaises(Exception):
+            result += 1
+            with self.limit.run(is_api=True, team_id=9, task_id=17):
+                result += 2
+                raise Exception()
+
+        with self.limit.run(is_api=True, team_id=9, task_id=17):
+            result += 8
+
+        assert result == 11
+
+    @parameterized.expand([(False, 1.0, 0.5), (True, 0.0, 0.5), (True, 0.0, 15.0), (True, 1.0, 15.0)])
+    def test_retry_mechanism_raises_exception(self, jitter: bool, fraction: float, timeout: float) -> None:
+        retry_limit = RateLimit(
+            max_concurrency=1,
+            applicable=lambda *args, **kwargs: True,
+            limit_name="test_retry_mechanism_raises_exception",
+            get_task_name=lambda *args, **kwargs: "test_retry_mechanism_raises_exception",
+            get_task_id=lambda *args, **kwargs: f"task-{kwargs.get('task_id', 1)}",
+            ttl=60,
+            retry=0.1,  # 100ms initial retry
+            retry_timeout=timeout,
+            retry_jitter=jitter,
+        )
+
+        time_helper = TimeHelper()
+        retry_limit.sleep = time_helper.sleep
+        retry_limit.get_time = time_helper.get_time
+
+        # First task should succeed immediately
+        with retry_limit.run(task_id=1):
+            pass
+
+        slot = retry_limit.use(task_id=2)
+        assert slot is not None
+        self.addCleanup(retry_limit.release, slot)
+        with patch(
+            "posthog.clickhouse.client.limit.random.uniform",
+            side_effect=lambda low, high: low + fraction * (high - low),
+        ):
+            with self.assertRaises(ConcurrencyLimitExceeded):
+                with retry_limit.run(task_id=3):
+                    pass
+
+        assert len(time_helper.sleep_times) >= 3
+        for previous, current in zip(time_helper.sleep_times[:-2], time_helper.sleep_times[1:-1]):
+            assert previous <= current
+        factor = (1 + fraction) / 2 if jitter else 1
+        self.assertAlmostEqual(time_helper.sleep_times[0], 0.1 * factor)
+        assert max(time_helper.sleep_times) <= 1.714 * factor
+        assert timeout - 0.01 < sum(time_helper.sleep_times) <= timeout
+
+    @parameterized.expand([(False,), (True,)])
+    def test_retry_mechanism_acquires_slot(self, jitter: bool) -> None:
+        retry_limit = RateLimit(
+            max_concurrency=1,
+            applicable=lambda *args, **kwargs: True,
+            limit_name="test_retry_mechanism_acquires_slot",
+            get_task_name=lambda *args, **kwargs: "test_retry_mechanism_acquires_slot",
+            get_task_id=lambda *args, **kwargs: f"task-{kwargs.get('task_id', 1)}",
+            ttl=10,
+            retry=0.1,  # 100ms initial retry
+            retry_timeout=0.5,  # 500ms total timeout
+            retry_jitter=jitter,
+        )
+
+        slot = retry_limit.use(task_id=1)  # consumes the slot
+        assert slot is not None
+
+        def on_sleep(duration):
+            if duration > 0.1:  # after second sleep, the slot is released
+                retry_limit.release(slot)
+
+        time_helper = TimeHelper(on_sleep)
+
+        retry_limit.sleep = time_helper.sleep
+        retry_limit.get_time = time_helper.get_time
+
+        with patch("posthog.clickhouse.client.limit.random.uniform", side_effect=lambda low, high: (low + high) / 2):
+            with retry_limit.run(task_id=2):
+                pass
+
+        self.assertAlmostEqual(time_helper.sleep_times[0], 0.075 if jitter else 0.1)
+        assert len(time_helper.sleep_times) == 2
+        for i in range(1, len(time_helper.sleep_times)):
+            assert time_helper.sleep_times[i] > time_helper.sleep_times[i - 1]  # Each retry should wait longer
+        total_sleep_time = sum(time_helper.sleep_times)
+
+        assert total_sleep_time <= 0.5  # Should not exceed retry_timeout
+
+    @parameterized.expand(
+        [
+            (get_api_team_rate_limiter, 0.1005),
+            (get_materialized_endpoints_rate_limiter, 0.134),
+            (get_app_telemetry_queries_rate_limiter, 0.075),
+        ]
+    )
+    def test_factory_retry_policy(self, factory: Callable[[], RateLimit], expected_wait: float) -> None:
+        time_helper = TimeHelper()
+        limiter = replace(factory(), get_time=time_helper.get_time, sleep=time_helper.sleep, allow_team_bypass=False)
+        limiter.redis_client = Mock()
+        limiter.redis_client.eval.side_effect = [0, 1]
+        with patch("posthog.clickhouse.client.limit.random.uniform", side_effect=lambda low, high: (low + high) / 2):
+            slot = limiter.use(task_id="waiting")
+        self.assertIsNotNone(slot)
+        self.assertAlmostEqual(sum(time_helper.sleep_times), expected_wait)
+
+    def _full_limiter(self) -> tuple[RateLimit, ConcurrencySlot, "TimeHelper"]:
+        name = f"queue-wait-test:{uuid.uuid4()}"
+        limiter = RateLimit(
+            max_concurrency=1,
+            applicable=lambda *args, **kwargs: True,
+            limit_name="queue_wait_test",
+            get_task_name=lambda *args, **kwargs: name,
+            get_task_id=lambda *args, **kwargs: f"task-{kwargs['task_id']}",
+            ttl=60,
+        )
+        time_helper = TimeHelper()
+        limiter.get_time = time_helper.get_time
+        limiter.sleep = time_helper.sleep
+        slot = limiter.use(task_id=1, team_id=5)
+        assert slot is not None
+        self.addCleanup(limiter.release, slot)
+        return limiter, slot, time_helper
+
+    def _queue_wait_count(self, result: str) -> float:
+        return (
+            REGISTRY.get_sample_value(
+                "posthog_clickhouse_query_concurrency_queue_wait_total",
+                {"limit_name": "queue_wait_test", "result": result},
+            )
+            or 0.0
+        )
+
+    def test_full_limiter_without_queue_wait_rejects_at_once(self) -> None:
+        limiter, _, time_helper = self._full_limiter()
+        waited_before = self._queue_wait_count("waited")
+
+        with self.assertRaises(ConcurrencyLimitExceeded):
+            limiter.use(task_id=2, team_id=5)
+
+        assert time_helper.sleep_times == []
+        assert self._queue_wait_count("waited") == waited_before
+
+    def test_queue_wait_admits_when_a_slot_frees(self) -> None:
+        limiter, slot, time_helper = self._full_limiter()
+
+        def free_slot_on_second_poll(_: float) -> None:
+            if len(time_helper.sleep_times) == 2:
+                limiter.release(slot)
+
+        time_helper.on_sleep = free_slot_on_second_poll
+        admitted_before = self._queue_wait_count("waited_then_admitted")
+        queue_wait = QueueWait()
+
+        reset_query_tags()
+        waiting_slot = limiter.use(task_id=2, team_id=5, queue_wait=queue_wait)
+        assert waiting_slot is not None
+        self.addCleanup(limiter.release, waiting_slot)
+
+        assert len(time_helper.sleep_times) == 2
+        assert get_query_tag_value("queue_wait_ms") == int(1000 * queue_wait.waited) > 0
+        assert self._queue_wait_count("waited_then_admitted") == admitted_before + 1
+        assert limiter.redis_client.zcard(f"{slot.running_tasks_key}:waiters:5") == 0
+
+    @parameterized.expand([("fresh_budget", 0.0), ("budget_partly_spent_on_another_limiter", 7.5)])
+    def test_queue_wait_rejects_once_the_budget_runs_out(self, _name: str, already_waited: float) -> None:
+        limiter, slot, time_helper = self._full_limiter()
+        rejected_before = self._queue_wait_count("waited_then_rejected")
+        queue_wait = QueueWait(waited=already_waited)
+
+        with self.assertRaises(ConcurrencyLimitExceeded):
+            limiter.use(task_id=2, team_id=5, queue_wait=queue_wait)
+
+        remaining = 10.0 - already_waited
+        assert remaining - 0.01 < sum(time_helper.sleep_times) <= remaining
+        assert 10.0 - 0.01 < queue_wait.waited < 10.0 + 0.01
+        assert self._queue_wait_count("waited_then_rejected") == rejected_before + 1
+        assert limiter.redis_client.zcard(f"{slot.running_tasks_key}:waiters:5") == 0
+
+    def test_queue_wait_rejects_at_once_when_the_team_has_too_many_waiters(self) -> None:
+        limiter, slot, time_helper = self._full_limiter()
+        waiters_key = f"{slot.running_tasks_key}:waiters:5"
+        limiter.redis_client.zadd(waiters_key, {"waiter-a": 1e12, "waiter-b": 1e12})
+        self.addCleanup(limiter.redis_client.delete, waiters_key)
+        capped_before = self._queue_wait_count("waiter_cap_rejected")
+
+        with self.assertRaises(ConcurrencyLimitExceeded):
+            limiter.use(task_id=2, team_id=5, queue_wait=QueueWait())
+
+        assert time_helper.sleep_times == []
+        assert self._queue_wait_count("waiter_cap_rejected") == capped_before + 1
+
+
+class TimeHelper:
+    def __init__(self, on_sleep: Callable[[float], None] = lambda _: None):
+        self.t = 1492.0
+        self.on_sleep = on_sleep
+        self.sleep_times: list[float] = []
+
+    def get_time(self):
+        self.t += 0.0001
+        return self.t
+
+    def sleep(self, duration: float):
+        self.sleep_times.append(duration)
+        self.on_sleep(duration)
+        self.t += duration
+
+
+class TestOrgConcurrencyLimit(BaseTest):
+    """Test the get_org_app_concurrency_limit helper function"""
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_no_org_limit_returns_none(self):
+        """Test that get_org_app_concurrency_limit returns None when no org limit is found"""
+        from posthog.clickhouse.client.limit import get_org_app_concurrency_limit
+
+        # Mock Redis to return None (cache miss)
+        with patch("posthog.clickhouse.client.limit.redis.get_client") as mock_redis:
+            mock_redis.return_value.get.return_value = None
+
+            # Call the helper method directly
+            result = get_org_app_concurrency_limit(self.organization.id)
+
+            # Should return None since no org-specific limit is configured
+            self.assertIsNone(result)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_org_limit_with_cache_miss_then_hit(self):
+        """Test that cache miss hits database, then subsequent calls use cache"""
+        from posthog.clickhouse.client.limit import get_org_app_concurrency_limit
+
+        # Set up organization with QUERY_CONCURRENCY feature
+        self.organization.available_product_features = [
+            {
+                "key": AvailableFeature.ORGANIZATION_APP_QUERY_CONCURRENCY_LIMIT,
+                "name": "Query Concurrency",
+                "limit": 50,
+            }
+        ]
+        self.organization.save()
+
+        # First call: cache miss, should hit database and cache the result
+        with patch("posthog.clickhouse.client.limit.redis.get_client") as mock_redis:
+            mock_redis.return_value.get.return_value = None
+            mock_redis.return_value.setex = Mock()
+
+            result = get_org_app_concurrency_limit(self.organization.id)
+
+            # Should return the org limit
+            self.assertEqual(result, 50)
+            # Verify that setex was called to cache the result
+            mock_redis.return_value.setex.assert_called_once_with(
+                f"org_app_concurrency_limit:{self.organization.id}", 3600, 50
+            )
+
+        # Second call: cache hit, should not hit database
+        with patch("posthog.clickhouse.client.limit.redis.get_client") as mock_redis2:
+            mock_redis2.return_value.get.return_value = b"50"
+
+            result2 = get_org_app_concurrency_limit(self.organization.id)
+
+            # Should return cached value
+            self.assertEqual(result2, 50)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_org_limit_with_invalid_limit_values(self):
+        """Test that invalid limit values return None"""
+        from posthog.clickhouse.client.limit import get_org_app_concurrency_limit
+
+        test_cases = [
+            {
+                "key": AvailableFeature.ORGANIZATION_APP_QUERY_CONCURRENCY_LIMIT,
+                "name": "Query Concurrency",
+                "limit": "not-a-number",
+            },
+            {
+                "key": AvailableFeature.ORGANIZATION_APP_QUERY_CONCURRENCY_LIMIT,
+                "name": "Query Concurrency",
+                "limit": None,
+            },
+            {
+                "key": AvailableFeature.ORGANIZATION_APP_QUERY_CONCURRENCY_LIMIT,
+                "name": "Query Concurrency",
+            },  # missing limit
+        ]
+
+        with patch("posthog.clickhouse.client.limit.redis.get_client") as mock_redis:
+            mock_redis.return_value.get.return_value = None
+
+            for feature_config in test_cases:
+                self.organization.available_product_features = [feature_config]
+                self.organization.save()
+
+                result = get_org_app_concurrency_limit(self.organization.id)
+                self.assertIsNone(result)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_org_limit_exception_handling(self):
+        """Test that exceptions are handled gracefully"""
+        from posthog.clickhouse.client.limit import get_org_app_concurrency_limit
+
+        # Test with non-existent org
+        with patch("posthog.clickhouse.client.limit.redis.get_client") as mock_redis:
+            mock_redis.return_value.get.return_value = None
+
+            result = get_org_app_concurrency_limit(uuid.uuid4())  # Non-existent org
+            self.assertIsNone(result)
+
+
+class TestMaterializedEndpointsRateLimiter(BaseTest):
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_applies_for_materialized_endpoints(self):
+        """Test that rate limiter is applicable when is_materialized_endpoint=True"""
+        from posthog.clickhouse.client.limit import get_materialized_endpoints_rate_limiter
+
+        rate_limiter = get_materialized_endpoints_rate_limiter()
+
+        is_applicable = rate_limiter.applicable(team_id=self.team.id, is_materialized_endpoint=True)
+        self.assertTrue(is_applicable)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_skips_for_non_materialized_endpoints(self):
+        """Test that rate limiter is not applicable when is_materialized_endpoint=False"""
+        from posthog.clickhouse.client.limit import get_materialized_endpoints_rate_limiter
+
+        rate_limiter = get_materialized_endpoints_rate_limiter()
+
+        is_applicable = rate_limiter.applicable(team_id=self.team.id, is_materialized_endpoint=False)
+        self.assertFalse(is_applicable)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_skips_when_is_materialized_endpoint_not_provided(self):
+        """Test that rate limiter is not applicable when is_materialized_endpoint is not provided"""
+        from posthog.clickhouse.client.limit import get_materialized_endpoints_rate_limiter
+
+        rate_limiter = get_materialized_endpoints_rate_limiter()
+
+        is_applicable = rate_limiter.applicable(team_id=self.team.id)
+        self.assertFalse(is_applicable)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_skips_without_team_id(self):
+        """Test that rate limiter is not applicable without team_id"""
+        from posthog.clickhouse.client.limit import get_materialized_endpoints_rate_limiter
+
+        rate_limiter = get_materialized_endpoints_rate_limiter()
+
+        is_applicable = rate_limiter.applicable(is_materialized_endpoint=True)
+        self.assertFalse(is_applicable)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_has_correct_max_concurrency(self):
+        """Test that rate limiter has max_concurrency of 10"""
+        from posthog.clickhouse.client.limit import get_materialized_endpoints_rate_limiter
+
+        rate_limiter = get_materialized_endpoints_rate_limiter()
+
+        self.assertEqual(rate_limiter.max_concurrency, 10)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_uses_team_based_task_key(self):
+        """Test that rate limiter creates team-based task keys"""
+        from posthog.clickhouse.client.limit import get_materialized_endpoints_rate_limiter
+
+        rate_limiter = get_materialized_endpoints_rate_limiter()
+
+        task_name = rate_limiter.get_task_name(team_id=123)
+        self.assertEqual(task_name, "materialized_endpoints:query:per-team:123")
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_enforces_concurrency_limit(self):
+        """Test that exceeding max_concurrency (10) raises ConcurrencyLimitExceeded"""
+        from posthog.clickhouse.client.limit import get_materialized_endpoints_rate_limiter
+
+        rate_limiter = get_materialized_endpoints_rate_limiter()
+        acquired_slots: list[ConcurrencySlot | None] = []
+
+        try:
+            # Acquire all 10 slots
+            for i in range(10):
+                slot = rate_limiter.use(team_id=self.team.id, task_id=f"test-slot-{i}", is_materialized_endpoint=True)
+                acquired_slots.append(slot)
+
+            # 11th request should fail. The production rate limiter has a 30s retry_timeout;
+            # we explicitly disable retries here so the test doesn't burn 30s waiting for a
+            # slot we know will never free up.
+            with patch.object(rate_limiter, "retry", None), self.assertRaises(ConcurrencyLimitExceeded):
+                rate_limiter.use(team_id=self.team.id, task_id="test-slot-overflow", is_materialized_endpoint=True)
+        finally:
+            # Clean up all acquired slots
+            for slot in acquired_slots:
+                if slot is not None:
+                    rate_limiter.release(slot)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_allows_after_release(self):
+        """Test that releasing a slot allows new requests"""
+        from posthog.clickhouse.client.limit import get_materialized_endpoints_rate_limiter
+
+        rate_limiter = get_materialized_endpoints_rate_limiter()
+        acquired_slots: list[ConcurrencySlot | None] = []
+
+        try:
+            # Fill all 10 slots
+            for i in range(10):
+                slot = rate_limiter.use(
+                    team_id=self.team.id, task_id=f"test-release-{i}", is_materialized_endpoint=True
+                )
+                acquired_slots.append(slot)
+
+            # Release one slot
+            released = acquired_slots.pop()
+            if released is not None:
+                rate_limiter.release(released)
+
+            # Now a new request should succeed
+            new_slot = rate_limiter.use(team_id=self.team.id, task_id="test-release-new", is_materialized_endpoint=True)
+            acquired_slots.append(new_slot)
+        finally:
+            # Clean up
+            for slot in acquired_slots:
+                if slot is not None:
+                    rate_limiter.release(slot)
+
+
+class TestAppOrgRateLimiter(BaseTest):
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_skips_for_temporal_activity(self):
+        """Experiment metric recalcs run their app queries inside Temporal activities,
+        which have their own concurrency controls — the per-org app limiter must not apply."""
+        from temporalio.testing import ActivityEnvironment
+
+        from posthog.clickhouse.client.limit import get_app_org_rate_limiter
+
+        async def check_rate_limiter_in_activity():
+            rate_limiter = get_app_org_rate_limiter()
+            return rate_limiter.applicable(org_id=str(self.organization.id), team_id=self.team.id)
+
+        env = ActivityEnvironment()
+        result = asyncio.run(env.run(check_rate_limiter_in_activity))
+
+        self.assertFalse(result, "Rate limiter should not apply in Temporal activity context")
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_applies_for_regular_requests(self):
+        from posthog.clickhouse.client.limit import get_app_org_rate_limiter
+
+        rate_limiter = get_app_org_rate_limiter()
+
+        with patch("posthog.clickhouse.client.limit.current_task", None):
+            with patch("temporalio.workflow.in_workflow", return_value=False):
+                is_applicable = rate_limiter.applicable(org_id=str(self.organization.id), team_id=self.team.id)
+                self.assertTrue(is_applicable)
+
+
+class TestDashboardQueriesRateLimiter(BaseTest):
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_skips_for_celery_tasks(self):
+        """Test that rate limiter is not applicable when running in Celery context"""
+        from celery import Task
+
+        from posthog.clickhouse.client.limit import get_app_dashboard_queries_rate_limiter
+
+        rate_limiter = get_app_dashboard_queries_rate_limiter()
+
+        mock_task = Mock(spec=Task)
+        with patch("posthog.clickhouse.client.limit.current_task", mock_task):
+            is_applicable = rate_limiter.applicable(
+                org_id=str(self.organization.id), dashboard_id=123, team_id=self.team.id
+            )
+            self.assertFalse(is_applicable)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_skips_for_temporal_workflows(self):
+        """Test that rate limiter is not applicable when running in Temporal workflow context"""
+        from posthog.clickhouse.client.limit import get_app_dashboard_queries_rate_limiter
+
+        rate_limiter = get_app_dashboard_queries_rate_limiter()
+
+        with patch("posthog.clickhouse.client.limit.current_task", None):
+            with patch("temporalio.workflow.in_workflow", return_value=True):
+                is_applicable = rate_limiter.applicable(
+                    org_id=str(self.organization.id), dashboard_id=123, team_id=self.team.id
+                )
+                self.assertFalse(is_applicable)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_skips_for_temporal_activity(self):
+        """Test that rate limiter is bypassed when running in Temporal activity context"""
+        from temporalio.testing import ActivityEnvironment
+
+        from posthog.clickhouse.client.limit import get_app_dashboard_queries_rate_limiter
+
+        async def check_rate_limiter_in_activity():
+            rate_limiter = get_app_dashboard_queries_rate_limiter()
+            is_applicable = rate_limiter.applicable(
+                org_id=str(self.organization.id), dashboard_id=123, team_id=self.team.id
+            )
+            return is_applicable
+
+        env = ActivityEnvironment()
+        result = asyncio.run(env.run(check_rate_limiter_in_activity))
+
+        self.assertFalse(result, "Rate limiter should not apply in Temporal activity context")
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_applies_for_regular_requests(self):
+        """Test that rate limiter is applicable for regular web requests"""
+        from posthog.clickhouse.client.limit import get_app_dashboard_queries_rate_limiter
+
+        rate_limiter = get_app_dashboard_queries_rate_limiter()
+
+        with patch("posthog.clickhouse.client.limit.current_task", None):
+            with patch("temporalio.workflow.in_workflow", return_value=False):
+                is_applicable = rate_limiter.applicable(
+                    org_id=str(self.organization.id), dashboard_id=123, team_id=self.team.id
+                )
+                self.assertTrue(is_applicable)
+
+    @patch("posthog.clickhouse.client.limit.TEST", False)
+    def test_rate_limiter_skips_for_api_requests(self):
+        """Test that rate limiter skips for API requests"""
+        from posthog.clickhouse.client.limit import get_app_dashboard_queries_rate_limiter
+
+        rate_limiter = get_app_dashboard_queries_rate_limiter()
+
+        with patch("posthog.clickhouse.client.limit.current_task", None):
+            with patch("temporalio.workflow.in_workflow", return_value=False):
+                is_applicable = rate_limiter.applicable(
+                    org_id=str(self.organization.id), dashboard_id=123, team_id=self.team.id, is_api=True
+                )
+                self.assertFalse(is_applicable)

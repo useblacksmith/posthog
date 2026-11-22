@@ -1,0 +1,1886 @@
+import { createParser } from 'eventsource-parser'
+import { z } from 'zod'
+
+import { MCP_CLIENT_IP_HEADERS, signedClientIpHeaders } from '@/lib/client-ip-signature'
+import { getUserAgent } from '@/lib/constants'
+import {
+    describeTransportCause,
+    ErrorCode,
+    ExperimentNotStartedError,
+    formatSafeRequestTarget,
+    hasTimeoutCause,
+    isTimeoutError,
+    parseRetryAfterSeconds,
+    PostHogApiError,
+    PostHogPermissionError,
+    PostHogRateLimitError,
+    PostHogTransportError,
+    PostHogValidationError,
+    ToolInputValidationError,
+} from '@/lib/errors'
+import { parseInsufficientScopeChallenge } from '@/lib/missing-scope'
+import { getSearchParamsFromRecord, sanitizeHeaders, sanitizeHeaderValue } from '@/lib/utils.js'
+import type {
+    ApiEventDefinition,
+    ApiOAuthIntrospection,
+    ApiPropertyDefinition,
+    ApiRedactedPersonalApiKey,
+    ApiUser,
+} from '@/schema/api'
+import type {
+    Experiment,
+    ExperimentExposureQuery,
+    ExperimentExposureQueryResponse,
+    ResolvedMetricEntry,
+} from '@/schema/experiments'
+import { buildMetricEntries, ExperimentExposureQuerySchema } from '@/schema/experiments'
+import { isShortId } from '@/tools/insights/utils'
+
+import type { Schemas } from './generated.js'
+
+// Outbound 429 retry policy. The API is the source of truth for rate limits
+// (per-scope, with per-team overrides), so we honor its Retry-After signal and
+// fall back to jittered exponential backoff when the header is missing or
+// invalid. The total wait budget bounds how long a throttled tool call can
+// hold the MCP client's request open across all retries combined.
+const RATE_LIMIT_MAX_RETRIES = 3
+const RATE_LIMIT_BASE_BACKOFF_MS = 2000
+const RATE_LIMIT_TOTAL_WAIT_BUDGET_MS = 30_000
+
+// Transport retry policy. A connection that fails or drops before a response
+// arrives is transient, and a safe method applied nothing upstream, so the
+// client repeats it instead of handing the agent a failure it can only fix by
+// sending the same call again. The budget stays small: a tool call holds the
+// MCP client's request open while it waits, and a host that is truly down
+// must surface fast.
+const TRANSPORT_MAX_RETRIES = 2
+const TRANSPORT_BASE_BACKOFF_MS = 250
+
+/** Methods that carry no upstream effect, so a repeat after a failed
+ *  connection cannot apply the same work twice. */
+const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD'])
+
+/** An aborted request is the caller's own timeout or cancellation, so a retry
+ *  would only wait for a deadline that has already passed. Everything else
+ *  thrown out of `fetch` or a body read is a transport fault. */
+function isAbortError(error: unknown): boolean {
+    return (error instanceof Error && error.name === 'AbortError') || isTimeoutError(error)
+}
+
+/** A caller's cancellation also ends a wait before a retry, so its deadline holds across retries. */
+function waitUnlessAborted(ms: number, signal: AbortSignal | null | undefined): Promise<void> {
+    return new Promise((resolve) => {
+        const done = (): void => {
+            clearTimeout(timer)
+            signal?.removeEventListener('abort', done)
+            resolve()
+        }
+        const timer = setTimeout(done, ms)
+        signal?.addEventListener('abort', done)
+    })
+}
+
+// Per-attempt deadline for a JSON API request. Without it, an upstream request that
+// never answers holds the tool call open until the MCP client gives up, and a batch
+// waits on its slowest call. A timeout returns an error that says whether a retry is
+// safe, so the agent does not have to guess if a write applied.
+const API_REQUEST_TIMEOUT_MS = 2 * 60 * 1000
+
+// Endpoints that run analytics queries or chains of model calls (manifest drafting) can
+// legitimately take minutes, so they keep a wide bound. It still ends a request that never answers.
+const LONG_RUNNING_API_REQUEST_TIMEOUT_MS = 10 * 60 * 1000
+const LONG_RUNNING_API_PATH =
+    /\/(query|run_insights|mcp_tools\/execute_sql|external_data_sources\/draft_custom_manifest)\/$|\/(max_tools|autoresearch)\//
+
+function apiRequestTimeoutMs(url: string): number {
+    return LONG_RUNNING_API_PATH.test(url.split('?')[0]!) ? LONG_RUNNING_API_REQUEST_TIMEOUT_MS : API_REQUEST_TIMEOUT_MS
+}
+
+// Default overall timeout for an SSE stream (wall-clock cap from connect to close).
+// Sized to comfortably cover the slowest known caller (session summarization, ~5 min
+// average) with headroom for cold-cache LLM calls.
+const SSE_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
+
+// Per-read inactivity timeout: if no chunk (not even a keepalive comment) arrives
+// within this window, the server is assumed dead. It must comfortably exceed
+// expected server keepalive intervals.
+const SSE_READ_TIMEOUT_MS = 30_000
+
+// Page size for the `query-*-actors` tools. The ceiling bounds how much of a caller's context
+// window one page can consume; everything past it is reachable by paging with `offset`.
+// Out-of-range values are clamped rather than rejected, because the schema codegen doesn't
+// propagate `@minimum`/`@maximum` on integer fields into the generated zod.
+const ACTORS_DEFAULT_LIMIT = 100
+const ACTORS_MAX_LIMIT = 1000
+
+function clampActorsLimit(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return ACTORS_DEFAULT_LIMIT
+    }
+    return Math.min(Math.max(Math.trunc(value), 1), ACTORS_MAX_LIMIT)
+}
+
+function clampActorsOffset(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return 0
+    }
+    return Math.max(Math.trunc(value), 0)
+}
+
+export interface GroupType {
+    group_type: string
+    group_type_index: number
+    name_singular: string | null
+    name_plural: string | null
+}
+
+// Global search types
+export const SearchableEntitySchema = z.enum([
+    'insight',
+    'dashboard',
+    'experiment',
+    'feature_flag',
+    'notebook',
+    'action',
+    'cohort',
+    'event_definition',
+    'survey',
+])
+export type SearchableEntity = z.infer<typeof SearchableEntitySchema>
+
+export interface SearchResult {
+    type: string
+    result_id: string
+    extra_fields: Record<string, unknown>
+    rank?: number
+}
+
+export interface SearchResponse {
+    results: SearchResult[]
+    counts?: Record<string, number | null>
+}
+
+export type Result<T, E = Error> = { success: true; data: T } | { success: false; error: E }
+
+export interface DataWarehouseSyncWarning {
+    type: 'warehouse_sync'
+    table_name: string
+    schema_name: string
+    source_type: string
+    status: string
+    message: string
+}
+
+export interface AccessControlFilterWarning {
+    type: 'access_control'
+    resources: string[]
+    message: string
+}
+
+export interface QueryEndpointResponse {
+    results: unknown
+    columns?: unknown
+    formatted_results?: string
+    // null (not just absent) when the query response carries no warnings — the backend
+    // serializes the field explicitly rather than omitting it. Carries both warehouse-sync
+    // warnings and object-level access control warnings.
+    warnings?: (DataWarehouseSyncWarning | AccessControlFilterWarning)[] | null
+    warehouse_suggestions?: Schemas.WarehouseSuggestionNote[] | null
+}
+
+export interface ApiConfig {
+    apiToken: string
+    baseUrl: string
+    /**
+     * Public-facing base URL used when building links the user clicks (e.g. `_posthogUrl`).
+     * Defaults to `baseUrl` when unset or empty. Distinct from `baseUrl` so deployments can route
+     * API traffic over a cluster-internal hostname while still rendering public links
+     * (e.g. https://us.posthog.com) in tool responses.
+     */
+    publicBaseUrl?: string | undefined
+    clientUserAgent?: string | undefined
+    mcpClientName?: string | undefined
+    mcpClientVersion?: string | undefined
+    mcpProtocolVersion?: string | undefined
+    mcpConsumer?: string | undefined
+    oauthClientName?: string | undefined
+    mcpSessionId?: string | undefined
+    mcpConversationId?: string | undefined
+    /**
+     * Sandbox-provisioned task id (from the inbound `x-posthog-task-id` MCP header). Forwarded
+     * to the PostHog API as `X-PostHog-Task-Id` on every call so writes can be attributed to
+     * the agent's task; the API validates it against the token's team.
+     */
+    taskId?: string | undefined
+    /** One tool call's stated intent, forwarded as `x-posthog-intent`. Set it through `withIntent`. */
+    intent?: string | undefined
+    /** Called only for a trusted PostHog API response marked as private. */
+    onPrivateResponse?: (() => void) | undefined
+    clientIp?: string | undefined
+    clientIpSigningKeys?: string[] | undefined
+}
+
+// Matches ACTIVITY_LOG_INTENT_MAX_LENGTH in posthog/models/activity_logging/utils.py.
+const MAX_INTENT_HEADER_LENGTH = 500
+
+// The intent rides along on every API call, so a bad value must cost the header, never the call.
+function intentHeaderValue(intent: unknown): string | undefined {
+    if (typeof intent !== 'string') {
+        return undefined
+    }
+    return sanitizeHeaderValue(intent)?.slice(0, MAX_INTENT_HEADER_LENGTH)
+}
+
+type Endpoint = Record<string, any>
+
+export class ApiClient {
+    public config: ApiConfig
+    public baseUrl: string
+    public publicBaseUrl: string
+
+    constructor(config: ApiConfig) {
+        this.config = config
+        this.baseUrl = config.baseUrl
+        // `||` (not `??`) so an empty string — e.g. the Workers vitest config sets
+        // env vars to '' — falls back to baseUrl instead of yielding relative links.
+        this.publicBaseUrl = config.publicBaseUrl || config.baseUrl
+    }
+
+    /**
+     * A copy of this client that carries one tool call's intent.
+     *
+     * The calls in a JSON-RPC batch run concurrently over one cached client, so writing the
+     * intent onto that client would let a later call overwrite an earlier call's intent.
+     * The copy keeps the prototype, so a `ForwardingApiClient` copy still forwards.
+     */
+    withIntent(intent: string): this {
+        const scoped = Object.create(Object.getPrototypeOf(this) as object) as this
+        Object.assign(scoped, this)
+        scoped.config = { ...this.config, intent }
+        return scoped
+    }
+
+    withAnalyticsSuppression(onPrivateResponse: () => void): this {
+        const scoped = Object.create(Object.getPrototypeOf(this) as object) as this
+        Object.assign(scoped, this)
+        scoped.config = { ...this.config, onPrivateResponse }
+        return scoped
+    }
+
+    getProjectBaseUrl(projectId: string): string {
+        if (projectId === '@current') {
+            return this.publicBaseUrl
+        }
+
+        return `${this.publicBaseUrl}/project/${projectId}`
+    }
+
+    // Every request, SSE stream and endpoint helper on this class funnels through here, which is what
+    // lets `ForwardingApiClient` re-route a whole client at one seam (see lib/connection-forwarding.ts).
+    protected async fetch(url: string, options?: RequestInit): Promise<Response> {
+        const authValues = [this.config.apiToken]
+        if (options?.headers) {
+            const entries =
+                options.headers instanceof Headers
+                    ? [...options.headers.entries()]
+                    : Array.isArray(options.headers)
+                      ? options.headers
+                      : Object.entries(options.headers)
+            authValues.push(
+                ...entries.filter(([name]) => name.toLowerCase() === 'authorization').map(([, value]) => value)
+            )
+        }
+        // Reject instead of sanitizing credentials: changing a token would authenticate a different value.
+        if (authValues.some((value) => /[\x00-\x1f\x7f-\x9f\u0100-\uffff]/.test(value))) {
+            throw new PostHogApiError({
+                status: 401,
+                statusText: 'Unauthorized',
+                body: '',
+                url,
+                method: options?.method ?? 'GET',
+                message: ErrorCode.INVALID_API_KEY,
+            })
+        }
+        const defaultHeaders: HeadersInit = {
+            Authorization: `Bearer ${this.config.apiToken}`,
+            // Every value below originates from the MCP client, so it is sanitized here at
+            // assembly rather than trusted to have been sanitized on the boundary it arrived
+            // on. `oauthClientName` in particular is read straight back from the token cache,
+            // which can still hold a name written before the ingest sanitizer covered it. A
+            // character above U+00FF makes the runtime throw converting headers to a
+            // ByteString, failing the API call itself — losing attribution detail is cheaper.
+            // The composed User-Agent stays out of the batch below: sanitizing it whole would
+            // truncate at the value cap and could slice off our own trailing token, so the
+            // client-supplied input is sanitized before composition instead. The other parts
+            // are code constants and an ASCII-only regex match, already header-safe.
+            'User-Agent': getUserAgent({ clientUserAgent: sanitizeHeaderValue(this.config.clientUserAgent) }),
+            ...sanitizeHeaders({
+                // Forward the originating client's User-Agent as a custom header so the
+                // PostHog API can attach it to analytics events for MCP source attribution.
+                'x-posthog-mcp-user-agent': this.config.clientUserAgent,
+                // Forward MCP clientInfo fields from the initialize request so the
+                // PostHog API can attach them to analytics events.
+                'x-posthog-mcp-client-name': this.config.mcpClientName,
+                'x-posthog-mcp-client-version': this.config.mcpClientVersion,
+                'x-posthog-mcp-protocol-version': this.config.mcpProtocolVersion,
+                'x-posthog-mcp-consumer': this.config.mcpConsumer,
+                'x-posthog-mcp-oauth-client-name': this.config.oauthClientName,
+                // Forward MCP session and conversation ids so backend logs and OTLP
+                // spans for downstream API hops can correlate with the same MCP context
+                // the events carry. This is attribute-based correlation only — we do
+                // not forward `traceparent` (the Worker emits no OTLP today), so the
+                // Django-rooted span is not a child of any Worker-side span.
+                'x-posthog-mcp-session-id': this.config.mcpSessionId,
+                'x-posthog-mcp-conversation-id': this.config.mcpConversationId,
+                // Forward the sandbox task id so API writes are attributed to the agent's task.
+                'X-PostHog-Task-Id': this.config.taskId,
+                // Forward the agent's stated intent so the activity log records why, not just who.
+                'x-posthog-intent': intentHeaderValue(this.config.intent),
+            }),
+            'X-PostHog-Client': 'mcp',
+            // Signed per call, so a long tool call cannot outlive the signature's time window.
+            ...(this.config.clientIp && this.config.clientIpSigningKeys
+                ? await signedClientIpHeaders(
+                      MCP_CLIENT_IP_HEADERS,
+                      this.config.clientIpSigningKeys,
+                      this.config.clientIp
+                  )
+                : {}),
+        }
+        if (options?.body) {
+            defaultHeaders['Content-Type'] = 'application/json'
+        }
+        let response: Response
+        try {
+            response = await fetch(url, {
+                ...options,
+                headers: {
+                    ...defaultHeaders,
+                    ...options?.headers,
+                },
+            })
+        } catch (cause) {
+            if (isAbortError(cause) && !isTimeoutError(cause)) {
+                throw new DOMException('The request was canceled.', 'AbortError')
+            }
+            throw new PostHogTransportError({
+                url,
+                method: options?.method ?? 'GET',
+                attempts: 1,
+                retryable: SAFE_HTTP_METHODS.has((options?.method ?? 'GET').toUpperCase()),
+                cause,
+            })
+        }
+        if (response.headers.get('X-PostHog-Suppress-Analytics') === 'true') {
+            this.config.onPrivateResponse?.()
+        }
+        return response
+    }
+
+    /**
+     * Generic HTTP request with auth.
+     * Used by generated tool handlers to avoid duplicating endpoint-specific methods.
+     */
+    async request<T = unknown>(opts: {
+        method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'
+        path: string
+        body?: Record<string, unknown>
+        query?: Record<string, unknown>
+        headers?: Record<string, string>
+        responseType?: 'json' | 'text'
+        /** Per-attempt deadline for a JSON response. Defaults to the path-based deadline. */
+        timeoutMs?: number
+        /** Cancels the request, including any wait before a retry. */
+        signal?: AbortSignal
+    }): Promise<T> {
+        const pathname = opts.path.split(/[?#]/, 1)[0]!
+        if (
+            !pathname.startsWith('/') ||
+            pathname.includes('//') ||
+            new URL(pathname, this.baseUrl).pathname !== pathname
+        ) {
+            throw new ToolInputValidationError(
+                'Invalid API path: a path parameter is empty, ".", or "..". Send a valid resource id and try again.'
+            )
+        }
+        const searchParams = new URLSearchParams()
+        if (opts.query) {
+            for (const [k, v] of Object.entries(opts.query)) {
+                if (v === undefined || v === null) {
+                    continue
+                }
+                if (Array.isArray(v) && v.length === 0) {
+                    continue
+                }
+                // JSON-stringify objects and arrays so backends that use json.loads() on query params work correctly
+                if (typeof v === 'object') {
+                    searchParams.append(k, JSON.stringify(v))
+                } else {
+                    searchParams.append(k, String(v))
+                }
+            }
+        }
+        const qs = searchParams.toString()
+        const url = `${this.baseUrl}${opts.path}${qs ? `?${qs}` : ''}`
+
+        const fetchOptions: RequestInit = {
+            method: opts.method,
+            ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
+            ...(opts.headers ? { headers: opts.headers } : {}),
+            ...(opts.signal ? { signal: opts.signal } : {}),
+        }
+
+        if (opts.responseType === 'text') {
+            const response = await this.fetch(url, fetchOptions)
+            if (!response.ok) {
+                const errorText = await response.text()
+                throw new PostHogApiError({
+                    status: response.status,
+                    statusText: response.statusText,
+                    body: errorText,
+                    url,
+                    method: opts.method,
+                    retryAfterSeconds:
+                        response.status === 503 ? parseRetryAfterSeconds(response.headers.get('Retry-After')) : null,
+                })
+            }
+            return (await response.text()) as T
+        }
+
+        const result = await this.fetchJson<T>(url, fetchOptions, { timeoutMs: opts.timeoutMs })
+
+        if (!result.success) {
+            // Re-throw the original error instance so callers can instanceof-check
+            // typed errors (e.g. PostHogPermissionError) that fetchJson throws.
+            throw result.error
+        }
+        return result.data as T
+    }
+
+    /**
+     * Open a Server-Sent Events (text/event-stream) connection and invoke `onEvent`
+     * for each parsed event. Resolves when the server closes the stream, throws on
+     * HTTP error, missing body, per-read inactivity, or overall stream timeout.
+     *
+     * Used by tools that consume long-running streaming endpoints (e.g. session
+     * summarization) where a synchronous request would exceed gateway timeouts.
+     */
+    async requestSSE<T = unknown>(opts: {
+        method: 'GET' | 'POST'
+        path: string
+        body?: Record<string, unknown>
+        onEvent: (event: string, data: T) => void
+        timeoutMs?: number
+    }): Promise<void> {
+        const url = `${this.baseUrl}${opts.path}`
+        const fetchOptions: RequestInit = {
+            method: opts.method,
+            ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
+            headers: {
+                Accept: 'text/event-stream',
+            },
+        }
+
+        const response = await this.fetch(url, fetchOptions)
+
+        if (!response.ok) {
+            const errorText = await response.text()
+            // Mirror fetchJson's typed-error mapping so a failed streaming call
+            // (e.g. a backend 4xx validation rejection) is classified as
+            // `validation`/`api_4xx` rather than collapsing into the generic
+            // `internal` bucket and minting a spurious error-tracking issue.
+            throw this.buildApiError(response, errorText, url, opts.method)
+        }
+
+        if (!response.body) {
+            throw new Error(`SSE response has no body: ${opts.method} ${formatSafeRequestTarget(url)}`)
+        }
+
+        const timeoutMs = opts.timeoutMs ?? SSE_DEFAULT_TIMEOUT_MS
+        const readTimeoutMs = SSE_READ_TIMEOUT_MS
+        const startTime = Date.now()
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+
+        const parser = createParser({
+            onEvent: ({ event, data }) => {
+                const eventType = event ?? 'message'
+                try {
+                    const parsed = JSON.parse(data) as T
+                    opts.onEvent(eventType, parsed)
+                } catch {
+                    // Non-JSON data, pass as-is
+                    opts.onEvent(eventType, data as T)
+                }
+            },
+        })
+
+        try {
+            while (true) {
+                if (Date.now() - startTime > timeoutMs) {
+                    throw new Error(`SSE stream timed out after ${timeoutMs}ms`)
+                }
+
+                let readTimeoutId: ReturnType<typeof setTimeout>
+                const readResult = await Promise.race([
+                    reader.read(),
+                    new Promise<never>((_, reject) => {
+                        readTimeoutId = setTimeout(
+                            () => reject(new Error(`SSE read timed out — no data received for ${readTimeoutMs}ms`)),
+                            readTimeoutMs
+                        )
+                    }),
+                ])
+                clearTimeout(readTimeoutId!)
+                const { done, value } = readResult
+                if (done) {
+                    break
+                }
+
+                parser.feed(decoder.decode(value, { stream: true }))
+            }
+        } finally {
+            await reader.cancel()
+            reader.releaseLock()
+        }
+    }
+
+    /**
+     * Maps a non-OK PostHog API response to the typed error that best describes
+     * it (invalid key, rate limit, permission, validation, or generic API
+     * error). Shared by fetchJson and the SSE path (requestSSE) so both surface
+     * the same recoverable-vs-genuine-failure signal to the tool-error
+     * classifier — a streaming failure should be classified by its HTTP status,
+     * not lumped into `internal`.
+     *
+     * The response body is read by the caller (SSE and JSON paths read it at
+     * different points) and passed in as `errorText`.
+     */
+    /**
+     * A 404 for a path that names an experiment, answered with DRF's generic detail, means the
+     * experiment itself is missing: `get_object()` fails the same way on the resource and on
+     * every lifecycle action under it. That gets the message naming the recovery path, typed as
+     * a 4xx so `handleToolError` treats it as agent-recoverable instead of capturing an exception
+     * per guessed id. A sub-resource that wrote its own detail (a missing recalculation run) is
+     * answering about itself and passes through untouched.
+     */
+    private buildExperimentNotFoundError(
+        response: Response,
+        errorText: string,
+        url: string,
+        method: string
+    ): PostHogApiError | undefined {
+        const experimentMatch = /\/experiments\/(\d+)(?:\/|$)/.exec(url.split('?')[0]!)
+        if (!experimentMatch) {
+            return undefined
+        }
+        let detail: unknown
+        try {
+            detail = JSON.parse(errorText)?.detail
+        } catch {
+            detail = undefined
+        }
+        if (detail !== undefined && detail !== 'Not found.') {
+            return undefined
+        }
+        const experimentId = experimentMatch[1]
+        console.error(`[API] Experiment ${experimentId} not found on ${method} ${formatSafeRequestTarget(url)}`)
+        return new PostHogApiError({
+            status: response.status,
+            statusText: response.statusText,
+            body: errorText,
+            url,
+            method,
+            message:
+                `Experiment ${experimentId} not found in this project. ` +
+                `If the id is correct, the experiment may belong to a different project — ` +
+                `call experiment-list to see experiments accessible with your current API key and project, or switch-project first.`,
+        })
+    }
+
+    /**
+     * PostHog also answers 401 when the token is valid but the account state is not, so the
+     * sentinel must retain the account-access hint without echoing arbitrary server details.
+     * The original body remains available to callers that need the account-state response.
+     */
+    private buildUnauthorizedError(
+        response: Response,
+        errorText: string,
+        url: string,
+        method: string
+    ): PostHogApiError {
+        return new PostHogApiError({
+            status: response.status,
+            statusText: response.statusText,
+            body: errorText,
+            url,
+            method,
+            message: errorText
+                ? `${ErrorCode.INVALID_API_KEY}: Verify your API key and account access.`
+                : ErrorCode.INVALID_API_KEY,
+        })
+    }
+
+    private buildApiError(response: Response, errorText: string, url: string, method: string): Error {
+        if (response.status === 404) {
+            const experimentNotFound = this.buildExperimentNotFoundError(response, errorText, url, method)
+            if (experimentNotFound) {
+                return experimentNotFound
+            }
+        }
+
+        if (response.status === 401) {
+            return this.buildUnauthorizedError(response, errorText, url, method)
+        }
+
+        if (response.status === 429) {
+            return new PostHogRateLimitError({
+                body: errorText,
+                url,
+                method,
+                retryAfterSeconds: parseRetryAfterSeconds(response.headers.get('Retry-After')),
+            })
+        }
+
+        let errorData: any
+        try {
+            errorData = JSON.parse(errorText)
+        } catch {
+            errorData = { detail: errorText }
+        }
+
+        if (response.status === 403 && errorData?.code === 'permission_denied') {
+            const scopeMatch = /required scope ['"]([a-z_]+:[a-z_]+)['"]/.exec(errorData.detail || '')
+            const missingScope = scopeMatch?.[1]
+            // Warn, not error: PostHogPermissionError is thrown and handled by callers,
+            // and a missing scope is a user-config issue rather than a service bug.
+            console.warn(
+                `[API] Permission denied on ${method} ${formatSafeRequestTarget(url)}: 403${missingScope ? ` (missing scope: ${missingScope})` : ''}`
+            )
+            return new PostHogPermissionError({
+                detail: errorData.detail || 'permission denied',
+                missingScope,
+                challengeScopes: parseInsufficientScopeChallenge(response.headers.get('WWW-Authenticate')),
+                url,
+                method,
+            })
+        }
+
+        if (errorData?.type === 'validation_error') {
+            const detail = errorData.detail || errorData.code || 'unknown'
+            console.error(`[API] Validation error on ${method} ${formatSafeRequestTarget(url)}: ${response.status}`)
+            return new PostHogValidationError({
+                detail,
+                attr: errorData.attr ?? undefined,
+                code: errorData.code ?? undefined,
+                extra: (errorData.extra ?? undefined) as Record<string, unknown> | undefined,
+                url,
+                method,
+            })
+        }
+
+        console.error(`[API] Request failed on ${method} ${formatSafeRequestTarget(url)}: ${response.status}`)
+        return new PostHogApiError({
+            status: response.status,
+            statusText: response.statusText,
+            body: errorText,
+            url,
+            method,
+            retryAfterSeconds:
+                response.status === 503 ? parseRetryAfterSeconds(response.headers.get('Retry-After')) : null,
+        })
+    }
+
+    /** Pass `idempotent` for a non-GET request that has no upstream effect, so
+     *  a transport fault retries it like a safe method. Pass `timeoutMs` to
+     *  override the per-attempt deadline. */
+    private async fetchJson<T>(
+        url: string,
+        options?: RequestInit,
+        { idempotent = false, timeoutMs: timeoutOverrideMs }: { idempotent?: boolean; timeoutMs?: number } = {}
+    ): Promise<Result<T>> {
+        const method = options?.method ?? 'GET'
+        const isSafeMethod = idempotent || SAFE_HTTP_METHODS.has(method.toUpperCase())
+        let waitBudgetMs = RATE_LIMIT_TOTAL_WAIT_BUDGET_MS
+        let rateLimitRetries = 0
+        let transportRetries = 0
+        const timeoutMs = timeoutOverrideMs ?? apiRequestTimeoutMs(url)
+
+        for (;;) {
+            if (options?.signal?.aborted) {
+                return {
+                    success: false,
+                    error: new PostHogTransportError({
+                        url,
+                        method,
+                        attempts: transportRetries + rateLimitRetries + 1,
+                        retryable: false,
+                        cause: options.signal.reason,
+                    }),
+                }
+            }
+            let response: Response
+            let bodyText: string
+            const deadline = new AbortController()
+            const timer = setTimeout(
+                () =>
+                    deadline.abort(
+                        new DOMException(`No response within ${Math.round(timeoutMs / 1000)} seconds`, 'TimeoutError')
+                    ),
+                timeoutMs
+            )
+            const signal = options?.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal
+            try {
+                response = await this.fetch(url, { ...options, signal })
+                // Read the body inside the same guard as the connection: a stream cut
+                // short throws here, and that failure is transport, not a bad response.
+                bodyText = await response.text()
+            } catch (error) {
+                if (error instanceof PostHogApiError) {
+                    return { success: false, error }
+                }
+                const canRetry =
+                    !signal.aborted &&
+                    !isAbortError(error) &&
+                    !hasTimeoutCause(error) &&
+                    isSafeMethod &&
+                    transportRetries < TRANSPORT_MAX_RETRIES
+                if (!canRetry) {
+                    console.error(
+                        `[API] Transport failure on ${method} ${formatSafeRequestTarget(url)}: ${describeTransportCause(error)}`
+                    )
+                    return {
+                        success: false,
+                        error: new PostHogTransportError({
+                            url,
+                            method,
+                            attempts: transportRetries + 1,
+                            retryable: isSafeMethod,
+                            cause: error,
+                        }),
+                    }
+                }
+                // Equal jitter so concurrent failures do not retry in lockstep.
+                const backoffMs = TRANSPORT_BASE_BACKOFF_MS * 2 ** transportRetries
+                const delayMs = backoffMs / 2 + Math.random() * (backoffMs / 2)
+                transportRetries++
+                console.warn(
+                    `[API] Transport failure on ${method} ${formatSafeRequestTarget(url)}: ${describeTransportCause(error)}. Retrying in ${Math.round(delayMs)}ms (attempt ${transportRetries}/${TRANSPORT_MAX_RETRIES})`
+                )
+                await waitUnlessAborted(delayMs, options?.signal)
+                continue
+            } finally {
+                clearTimeout(timer)
+            }
+
+            if (response.status === 429) {
+                const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get('Retry-After'))
+                const rateLimitFailure = (): Result<T> => ({
+                    success: false,
+                    error: new PostHogRateLimitError({
+                        body: bodyText,
+                        url,
+                        method,
+                        retryAfterSeconds,
+                    }),
+                })
+
+                if (rateLimitRetries === RATE_LIMIT_MAX_RETRIES) {
+                    console.error(
+                        `[API] Rate limit (429) retries exhausted on ${method} ${formatSafeRequestTarget(url)}`
+                    )
+                    return rateLimitFailure()
+                }
+
+                // DRF rejects throttled requests before the view executes,
+                // so retrying is safe for mutations too.
+                const backoffMs = RATE_LIMIT_BASE_BACKOFF_MS * 2 ** rateLimitRetries
+                const delayMs =
+                    retryAfterSeconds !== null
+                        ? retryAfterSeconds * 1000
+                        : // Equal jitter so concurrent 429s don't retry in lockstep.
+                          backoffMs / 2 + Math.random() * (backoffMs / 2)
+
+                if (delayMs > waitBudgetMs) {
+                    console.warn(
+                        `[API] Rate limited (429) on ${method} ${formatSafeRequestTarget(url)}. Requested wait of ${Math.round(delayMs / 1000)}s exceeds the remaining ${Math.round(waitBudgetMs / 1000)}s retry budget; not retrying.`
+                    )
+                    return rateLimitFailure()
+                }
+
+                waitBudgetMs -= delayMs
+                rateLimitRetries++
+                console.warn(
+                    `[API] Rate limited (429) on ${method} ${formatSafeRequestTarget(url)}. Retrying in ${Math.round(delayMs)}ms (attempt ${rateLimitRetries}/${RATE_LIMIT_MAX_RETRIES})`
+                )
+                await waitUnlessAborted(delayMs, options?.signal)
+                continue
+            }
+
+            if (!response.ok) {
+                return { success: false, error: this.buildApiError(response, bodyText, url, method) }
+            }
+
+            if (!bodyText) {
+                return { success: true, data: {} as T }
+            }
+
+            try {
+                const rawData = JSON.parse(bodyText)
+                return { success: true, data: rawData as T }
+            } catch {
+                return { success: true, data: bodyText as T }
+            }
+        }
+    }
+
+    organizations(): Endpoint {
+        return {
+            list: async (): Promise<Result<Schemas.OrganizationBasic[]>> => {
+                const result = await this.fetchJson<{ results: Schemas.OrganizationBasic[] }>(
+                    `${this.baseUrl}/api/organizations/`
+                )
+
+                if (result.success) {
+                    return { success: true, data: result.data.results }
+                }
+                return result
+            },
+
+            get: async ({ orgId }: { orgId: string }): Promise<Result<Schemas.Organization>> => {
+                return this.fetchJson<Schemas.Organization>(`${this.baseUrl}/api/organizations/${orgId}/`)
+            },
+
+            projects: ({ orgId }: { orgId: string }) => {
+                return {
+                    list: async (): Promise<Result<Schemas.ProjectBackwardCompat[]>> => {
+                        const result = await this.fetchJson<{ results: Schemas.ProjectBackwardCompat[] }>(
+                            `${this.baseUrl}/api/organizations/${orgId}/projects/`
+                        )
+
+                        if (result.success) {
+                            return { success: true, data: result.data.results }
+                        }
+                        return result
+                    },
+                }
+            },
+        }
+    }
+
+    apiKeys(): Endpoint {
+        return {
+            current: async ({ signal }: { signal?: AbortSignal } = {}): Promise<Result<ApiRedactedPersonalApiKey>> => {
+                return this.fetchJson<ApiRedactedPersonalApiKey>(
+                    `${this.baseUrl}/api/personal_api_keys/@current`,
+                    signal ? { signal } : undefined
+                )
+            },
+        }
+    }
+
+    oauth(): Endpoint {
+        return {
+            introspect: async ({ token }: { token: string }): Promise<Result<ApiOAuthIntrospection>> => {
+                // RFC 7662 introspection only reads the token state.
+                return this.fetchJson<ApiOAuthIntrospection>(
+                    `${this.baseUrl}/oauth/introspect`,
+                    {
+                        method: 'POST',
+                        body: JSON.stringify({ token }),
+                        headers: {
+                            'Content-Type': 'application/json',
+                            Authorization: `Bearer ${token}`,
+                        },
+                    },
+                    { idempotent: true }
+                )
+            },
+        }
+    }
+
+    projects(): Endpoint {
+        return {
+            get: async ({ projectId }: { projectId: string }): Promise<Result<Schemas.ProjectBackwardCompat>> => {
+                return this.fetchJson<Schemas.ProjectBackwardCompat>(`${this.baseUrl}/api/projects/${projectId}/`)
+            },
+
+            propertyDefinitions: async ({
+                projectId,
+                eventNames,
+                excludeCoreProperties,
+                filterByEventNames,
+                isFeatureFlag,
+                limit,
+                offset,
+                type,
+            }: {
+                projectId: string
+                eventNames?: string[] | undefined
+                excludeCoreProperties?: boolean
+                filterByEventNames?: boolean
+                isFeatureFlag?: boolean
+                limit?: number
+                offset?: number
+                type?: 'event' | 'person'
+            }): Promise<Result<ApiPropertyDefinition[]>> => {
+                try {
+                    const params = {
+                        event_names: eventNames?.length ? JSON.stringify(eventNames) : undefined,
+                        exclude_core_properties: excludeCoreProperties,
+                        filter_by_event_names: filterByEventNames,
+                        is_feature_flag: isFeatureFlag,
+                        limit: limit ?? 50,
+                        offset: offset ?? 0,
+                        type: type ?? 'event',
+                        exclude_hidden: true,
+                    }
+
+                    const searchParams = getSearchParamsFromRecord(params)
+
+                    const url = `${this.baseUrl}/api/projects/${projectId}/property_definitions/?${searchParams}`
+
+                    const response = await this.fetch(url)
+
+                    if (!response.ok) {
+                        throw this.buildApiError(response, await response.text(), url, 'GET')
+                    }
+
+                    const data = (await response.json()) as { results: ApiPropertyDefinition[] }
+
+                    const propertyDefinitionsWithoutHidden = data.results.filter((def) => !def.hidden)
+
+                    return { success: true, data: propertyDefinitionsWithoutHidden }
+                } catch (error) {
+                    return { success: false, error: error as Error }
+                }
+            },
+
+            eventDefinitions: async ({
+                projectId,
+                search,
+                limit,
+                offset,
+            }: {
+                projectId: string
+                search?: string | undefined
+                limit?: number
+                offset?: number
+            }): Promise<Result<ApiEventDefinition[]>> => {
+                try {
+                    const searchParams = getSearchParamsFromRecord({
+                        search,
+                        limit: limit ?? 50,
+                        offset: offset ?? 0,
+                    })
+
+                    const requestUrl = `${this.baseUrl}/api/projects/${projectId}/event_definitions/?${searchParams}`
+
+                    const response = await this.fetch(requestUrl)
+
+                    if (!response.ok) {
+                        throw this.buildApiError(response, await response.text(), requestUrl, 'GET')
+                    }
+
+                    const data = (await response.json()) as { results: ApiEventDefinition[] }
+
+                    return { success: true, data: data.results }
+                } catch (error) {
+                    return { success: false, error: error as Error }
+                }
+            },
+
+            createEventDefinition: async ({
+                projectId,
+                eventName,
+                data,
+            }: {
+                projectId: string
+                eventName: string
+                data?: {
+                    description?: string
+                    owner?: number | null
+                    tags?: string[]
+                    verified?: boolean
+                    hidden?: boolean
+                }
+            }): Promise<Result<ApiEventDefinition>> => {
+                const createUrl = `${this.baseUrl}/api/projects/${projectId}/event_definitions/`
+
+                return this.fetchJson<ApiEventDefinition>(createUrl, {
+                    method: 'POST',
+                    body: JSON.stringify({ name: eventName, ...data }),
+                })
+            },
+
+            getEventDefinition: async ({
+                projectId,
+                eventName,
+            }: {
+                projectId: string
+                eventName: string
+            }): Promise<Result<ApiEventDefinition>> => {
+                const searchParams = new URLSearchParams({ name: eventName })
+
+                return this.fetchJson<ApiEventDefinition>(
+                    `${this.baseUrl}/api/projects/${projectId}/event_definitions/by_name/?${searchParams}`
+                )
+            },
+
+            updateEventDefinition: async ({
+                projectId,
+                eventName,
+                data,
+            }: {
+                projectId: string
+                eventName: string
+                data: {
+                    description?: string
+                    owner?: number | null
+                    tags?: string[]
+                    verified?: boolean
+                    hidden?: boolean
+                }
+            }): Promise<Result<ApiEventDefinition>> => {
+                // Fetching the event definition by name to get its ID
+                const findResult: Result<ApiEventDefinition> = await this.projects().getEventDefinition({
+                    projectId,
+                    eventName,
+                })
+
+                if (!findResult.success) {
+                    if (findResult.error instanceof PostHogApiError && findResult.error.status === 404) {
+                        return {
+                            success: false,
+                            error: new Error(`Event definition not found: ${eventName}`),
+                        }
+                    }
+                    return findResult
+                }
+
+                // Updating the event definition by ID
+                const updateUrl = `${this.baseUrl}/api/projects/${projectId}/event_definitions/${findResult.data.id}/`
+
+                return this.fetchJson<ApiEventDefinition>(updateUrl, {
+                    method: 'PATCH',
+                    body: JSON.stringify(data),
+                })
+            },
+
+            updatePropertyDefinition: async ({
+                projectId,
+                propertyName,
+                type,
+                groupTypeIndex,
+                data,
+            }: {
+                projectId: string
+                propertyName: string
+                type?: 'event' | 'person' | 'group' | 'session'
+                groupTypeIndex?: number
+                data: {
+                    description?: string
+                    tags?: string[]
+                    property_type?: 'DateTime' | 'String' | 'Numeric' | 'Boolean' | 'Duration'
+                    verified?: boolean
+                    hidden?: boolean
+                }
+            }): Promise<Result<ApiPropertyDefinition>> => {
+                // Property definitions have no by-name lookup endpoint, so resolve the id via the
+                // list endpoint: `properties` does an exact-name match, and `type` disambiguates a
+                // name that exists across taxonomies (e.g. an event property and a person property).
+                const findParams = getSearchParamsFromRecord({
+                    properties: propertyName,
+                    type: type ?? 'event',
+                    group_type_index: groupTypeIndex,
+                })
+                const findUrl = `${this.baseUrl}/api/projects/${projectId}/property_definitions/?${findParams}`
+
+                const findResult = await this.fetchJson<{ results: ApiPropertyDefinition[] }>(findUrl)
+
+                if (!findResult.success) {
+                    return findResult
+                }
+
+                const propertyDef = findResult.data.results.find((def) => def.name === propertyName)
+
+                if (!propertyDef) {
+                    return {
+                        success: false,
+                        error: new Error(`Property definition not found: ${propertyName} (type: ${type ?? 'event'})`),
+                    }
+                }
+
+                const updateUrl = `${this.baseUrl}/api/projects/${projectId}/property_definitions/${propertyDef.id}/`
+
+                return this.fetchJson<ApiPropertyDefinition>(updateUrl, {
+                    method: 'PATCH',
+                    body: JSON.stringify(data),
+                })
+            },
+
+            updatePathCleaningFilters: async ({
+                projectId,
+                filters,
+            }: {
+                projectId: string
+                filters: Array<{ alias: string; regex: string; order: number }>
+            }): Promise<Result<Schemas.ProjectBackwardCompat>> => {
+                // path_cleaning_filters is a whole-list field on the project — the caller is
+                // responsible for having merged the desired rules into `filters` first.
+                return this.fetchJson<Schemas.ProjectBackwardCompat>(`${this.baseUrl}/api/projects/${projectId}/`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ path_cleaning_filters: filters }),
+                })
+            },
+        }
+    }
+
+    experiments({ projectId }: { projectId: string }): Endpoint {
+        return {
+            get: async ({ experimentId }: { experimentId: number }): Promise<Result<Experiment>> => {
+                return this.fetchJson<Experiment>(
+                    `${this.baseUrl}/api/projects/${projectId}/experiments/${experimentId}/`
+                )
+            },
+
+            getHealth: async ({
+                experimentId,
+                signal,
+            }: {
+                experimentId: number
+                signal?: AbortSignal
+            }): Promise<Result<Schemas.ExperimentHealth>> => {
+                return this.fetchJson<Schemas.ExperimentHealth>(
+                    `${this.baseUrl}/api/projects/${projectId}/experiments/${experimentId}/health/`,
+                    { signal }
+                )
+            },
+
+            getExposures: async ({
+                experimentId,
+                refresh = false,
+            }: {
+                experimentId: number
+                refresh: boolean
+            }): Promise<
+                Result<{
+                    exposures: ExperimentExposureQueryResponse
+                }>
+            > => {
+                /**
+                 * we have to get the experiment details first. There's no guarantee
+                 * that the user has queried for the experiment details before.
+                 */
+                const experimentDetails = await this.experiments({ projectId }).get({
+                    experimentId,
+                })
+                if (!experimentDetails.success) {
+                    return experimentDetails
+                }
+
+                const experiment = experimentDetails.data
+
+                /**
+                 * Validate that the experiment has started
+                 */
+                if (!experiment.start_date) {
+                    return {
+                        success: false,
+                        error: new ExperimentNotStartedError(
+                            `Experiment "${experiment.name}" has not started yet. Exposure data is only available for started experiments.`
+                        ),
+                    }
+                }
+
+                /**
+                 * create the exposure query
+                 */
+                const exposureQuery: ExperimentExposureQuery = {
+                    kind: 'ExperimentExposureQuery',
+                    experiment_id: experimentId,
+                    experiment_name: experiment.name,
+                    exposure_criteria: experiment.exposure_criteria,
+                    feature_flag: experiment.feature_flag ?? undefined,
+                    start_date: experiment.start_date,
+                    end_date: experiment.end_date,
+                    holdout: experiment.holdout,
+                }
+
+                // Validate against existing ExperimentExposureQuerySchema
+                const validated = ExperimentExposureQuerySchema.parse(exposureQuery)
+
+                // The API expects a QueryRequest object with the query wrapped
+                const queryRequest: any = {
+                    query: validated,
+                    ...(refresh ? { refresh: 'force_blocking' } : {}),
+                }
+
+                const result = await this.fetchJson<ExperimentExposureQueryResponse>(
+                    `${this.baseUrl}/api/environments/${projectId}/query/`,
+                    {
+                        method: 'POST',
+                        body: JSON.stringify(queryRequest),
+                    }
+                )
+
+                if (!result.success) {
+                    return result
+                }
+
+                return {
+                    success: true,
+                    data: {
+                        exposures: result.data,
+                    },
+                }
+            },
+
+            getMetricResults: async ({
+                experimentId,
+                refresh = false,
+            }: {
+                experimentId: number
+                refresh?: boolean
+            }): Promise<
+                Result<{
+                    experiment: Experiment
+                    primaryMetricEntries: ResolvedMetricEntry[]
+                    secondaryMetricEntries: ResolvedMetricEntry[]
+                    primaryMetricsResults: any[]
+                    secondaryMetricsResults: any[]
+                    exposures: ExperimentExposureQueryResponse
+                }>
+            > => {
+                /**
+                 * we have to get the experiment details first. There's no guarantee
+                 * that the user has queried for the experiment details before.
+                 */
+                const experimentDetails = await this.experiments({ projectId }).get({
+                    experimentId,
+                })
+
+                if (!experimentDetails.success) {
+                    return experimentDetails
+                }
+
+                const experiment = experimentDetails.data
+
+                /**
+                 * Validate that the experiment has started
+                 */
+                if (!experiment.start_date) {
+                    return {
+                        success: false,
+                        error: new Error(
+                            `Experiment "${experiment.name}" has not started yet. Results are only available for started experiments.`
+                        ),
+                    }
+                }
+
+                /**
+                 * let's get the experiment exposure details to get the full
+                 * picture of the resutls.
+                 */
+                const experimentExposure = await this.experiments({ projectId }).getExposures({
+                    experimentId,
+                    refresh,
+                })
+                if (!experimentExposure.success) {
+                    return experimentExposure
+                }
+
+                const { exposures } = experimentExposure.data
+
+                // Build the per-position metric entries. Each entry knows whether the metric
+                // was defined inline on the experiment or attached via a shared saved metric, so
+                // the result row can be self-describing to MCP callers.
+                const primaryMetricEntries = buildMetricEntries(experiment, 'primary')
+                const secondaryMetricEntries = buildMetricEntries(experiment, 'secondary')
+
+                // Execute queries for primary metrics
+                const primaryResults = await Promise.all(
+                    primaryMetricEntries.map(async ({ metric }) => {
+                        try {
+                            const queryBody = {
+                                kind: 'ExperimentQuery',
+                                metric,
+                                experiment_id: experimentId,
+                            }
+
+                            const queryRequest = {
+                                query: queryBody,
+                                ...(refresh ? { refresh: 'force_blocking' } : {}),
+                            }
+
+                            const result = await this.fetchJson<unknown>(
+                                `${this.baseUrl}/api/environments/${projectId}/query/`,
+                                {
+                                    method: 'POST',
+                                    body: JSON.stringify(queryRequest),
+                                }
+                            )
+
+                            return result.success ? result.data : null
+                        } catch {
+                            return null
+                        }
+                    })
+                )
+
+                // Execute queries for secondary metrics
+                const secondaryResults = await Promise.all(
+                    secondaryMetricEntries.map(async ({ metric }) => {
+                        try {
+                            const queryBody = {
+                                kind: 'ExperimentQuery',
+                                metric,
+                                experiment_id: experimentId,
+                            }
+
+                            const queryRequest = {
+                                query: queryBody,
+                                ...(refresh ? { refresh: 'force_blocking' } : {}),
+                            }
+
+                            const result = await this.fetchJson<unknown>(
+                                `${this.baseUrl}/api/environments/${projectId}/query/`,
+                                {
+                                    method: 'POST',
+                                    body: JSON.stringify(queryRequest),
+                                }
+                            )
+
+                            return result.success ? result.data : null
+                        } catch {
+                            return null
+                        }
+                    })
+                )
+
+                return {
+                    success: true,
+                    data: {
+                        experiment,
+                        primaryMetricEntries,
+                        secondaryMetricEntries,
+                        primaryMetricsResults: primaryResults,
+                        secondaryMetricsResults: secondaryResults,
+                        exposures,
+                    },
+                }
+            },
+        }
+    }
+
+    insights({ projectId }: { projectId: string }): Endpoint {
+        return {
+            get: async ({
+                insightId,
+                variables_override,
+                filters_override,
+            }: {
+                insightId: string | number
+                variables_override?: string
+                filters_override?: string
+            }): Promise<Result<Schemas.Insight>> => {
+                const params = new URLSearchParams()
+                if (variables_override) {
+                    params.set('variables_override', variables_override)
+                }
+                if (filters_override) {
+                    params.set('filters_override', filters_override)
+                }
+
+                const retrieveById = (): Promise<Result<Schemas.Insight>> => {
+                    const queryString = params.toString() ? `?${params}` : ''
+                    return this.fetchJson<Schemas.Insight>(
+                        `${this.baseUrl}/api/projects/${projectId}/insights/${insightId}/${queryString}`
+                    )
+                }
+
+                // A number is always a numeric id. Eight-digit ids also match the short_id syntax.
+                if (typeof insightId === 'number' || !isShortId(insightId)) {
+                    return retrieveById()
+                }
+
+                // The list endpoint accepts ?short_id=... and runs the same
+                // InsightSerializer.to_representation, which applies
+                // variables_override / filters_override from query_params. So
+                // short_id resolution + override application happen in one hop.
+                const listParams = new URLSearchParams(params)
+                listParams.set('short_id', insightId)
+                const result = await this.fetchJson<{ results: Schemas.Insight[] }>(
+                    `${this.baseUrl}/api/projects/${projectId}/insights/?${listParams}`
+                )
+
+                if (!result.success) {
+                    return result
+                }
+
+                const insight = result.data.results[0]
+                if (insight) {
+                    return { success: true, data: insight }
+                }
+
+                // Short ids are random alphanumerics, so an all-digit string can be either kind of id.
+                if (/^\d+$/.test(insightId)) {
+                    return retrieveById()
+                }
+
+                // A 404 keeps a wrong or stale short_id out of the internal error bucket and error tracking.
+                return {
+                    success: false,
+                    error: new PostHogApiError({
+                        status: 404,
+                        statusText: 'Not Found',
+                        body: '',
+                        url: `${this.baseUrl}/api/projects/${projectId}/insights/?short_id=${insightId}`,
+                        method: 'GET',
+                        message: `No insight found with short_id: ${insightId} in project ${projectId}. Use insights-list to find the insight. If the insight is in a different project, use switch-project.`,
+                    }),
+                }
+            },
+
+            saveExplanation: async ({
+                insightId,
+                data,
+            }: {
+                insightId: number
+                data: Record<string, unknown>
+            }): Promise<Result<Schemas.ChartExplanation>> => {
+                return this.fetchJson<Schemas.ChartExplanation>(
+                    `${this.baseUrl}/api/projects/${projectId}/insights/${insightId}/explanations/`,
+                    { method: 'POST', body: JSON.stringify({ data }) }
+                )
+            },
+
+            updateExplanation: async ({
+                insightId,
+                explanationId,
+                data,
+            }: {
+                insightId: number
+                explanationId: string
+                data: Record<string, unknown>
+            }): Promise<Result<Schemas.ChartExplanation>> => {
+                return this.fetchJson<Schemas.ChartExplanation>(
+                    `${this.baseUrl}/api/projects/${projectId}/insights/${insightId}/explanations/${encodeURIComponent(explanationId)}/`,
+                    { method: 'PUT', body: JSON.stringify({ data }) }
+                )
+            },
+
+            create: async ({ data }: { data: Record<string, any> }): Promise<Result<Schemas.Insight>> => {
+                return this.fetchJson<Schemas.Insight>(`${this.baseUrl}/api/projects/${projectId}/insights/`, {
+                    method: 'POST',
+                    body: JSON.stringify({ ...data, saved: true }),
+                })
+            },
+
+            update: async ({ insightId, data }: { insightId: number; data: any }): Promise<Result<Schemas.Insight>> => {
+                return this.fetchJson<Schemas.Insight>(
+                    `${this.baseUrl}/api/projects/${projectId}/insights/${insightId}/`,
+                    {
+                        method: 'PATCH',
+                        body: JSON.stringify(data),
+                    }
+                )
+            },
+
+            delete: async ({
+                insightId,
+            }: {
+                insightId: number
+            }): Promise<Result<{ success: boolean; message: string }>> => {
+                try {
+                    const url = `${this.baseUrl}/api/projects/${projectId}/insights/${insightId}/`
+                    const response = await this.fetch(url, {
+                        method: 'PATCH',
+                        body: JSON.stringify({ deleted: true }),
+                    })
+
+                    if (!response.ok) {
+                        throw this.buildApiError(response, await response.text(), url, 'PATCH')
+                    }
+
+                    return {
+                        success: true,
+                        data: {
+                            success: true,
+                            message: 'Insight deleted successfully',
+                        },
+                    }
+                } catch (error) {
+                    return { success: false, error: error as Error }
+                }
+            },
+
+            list: async ({ params }: { params?: Record<string, any> } = {}): Promise<
+                Result<Array<Schemas.Insight>>
+            > => {
+                try {
+                    const qs = new URLSearchParams()
+                    if (params?.limit !== undefined) {
+                        qs.set('limit', String(params.limit))
+                    }
+                    if (params?.offset !== undefined) {
+                        qs.set('offset', String(params.offset))
+                    }
+                    if (params?.search) {
+                        qs.set('search', params.search)
+                    }
+                    const qStr = qs.toString()
+                    const result = await this.fetchJson<{ results: Schemas.Insight[] }>(
+                        `${this.baseUrl}/api/projects/${projectId}/insights/${qStr ? `?${qStr}` : ''}`
+                    )
+                    if (!result.success) {
+                        throw result.error
+                    }
+                    return { success: true, data: result.data.results }
+                } catch (error) {
+                    return { success: false, error: error as Error }
+                }
+            },
+
+            query: async ({ query }: { query: Record<string, any> }): Promise<Result<QueryEndpointResponse>> => {
+                const url = `${this.baseUrl}/api/environments/${projectId}/query/`
+
+                return this.fetchJson<QueryEndpointResponse>(url, {
+                    method: 'POST',
+                    body: JSON.stringify({ query }),
+                })
+            },
+
+            validate: async ({
+                query,
+                language,
+                connectionId,
+            }: {
+                query: string
+                language: 'hogQL' | 'hogQLExpr' | 'hog' | 'hogTemplate'
+                connectionId?: string
+            }): Promise<
+                Result<{
+                    isValid: boolean
+                    query: string
+                    errors: Array<{ message: string; start?: number | null; end?: number | null; fix?: string | null }>
+                    warnings: Array<{
+                        message: string
+                        start?: number | null
+                        end?: number | null
+                        fix?: string | null
+                    }>
+                    notices: Array<{ message: string; start?: number | null; end?: number | null; fix?: string | null }>
+                    table_names: string[]
+                    ch_table_names?: string[] | null
+                }>
+            > => {
+                const url = `${this.baseUrl}/api/environments/${projectId}/query/`
+                const queryBody: Record<string, unknown> = { kind: 'HogQLMetadata', language, query }
+                if (connectionId) {
+                    queryBody.connectionId = connectionId
+                }
+                return this.fetchJson(url, {
+                    method: 'POST',
+                    body: JSON.stringify({ query: queryBody }),
+                })
+            },
+
+            sqlInsight: async ({ query }: { query: string }): Promise<Result<any[]>> => {
+                const requestBody = {
+                    query: query,
+                    insight_type: 'sql',
+                }
+
+                const result = await this.fetchJson<unknown[]>(
+                    `${this.baseUrl}/api/environments/${projectId}/max_tools/create_and_query_insight/`,
+                    {
+                        method: 'POST',
+                        body: JSON.stringify(requestBody),
+                    }
+                )
+
+                if (result.success) {
+                    // Ack messages don't add anything useful so let's just keep them out
+                    const filteredData = result.data.filter(
+                        (item: any) => !(item?.type === 'message' && item?.data?.type === 'ack')
+                    )
+
+                    return {
+                        success: true,
+                        data: filteredData,
+                    }
+                }
+
+                return result
+            },
+        }
+    }
+
+    query({ projectId }: { projectId: string }): Endpoint {
+        const queryUrl = `${this.baseUrl}/api/environments/${projectId}/query/`
+
+        // Bridge assistant-facing schema shape to the query API shape.
+        // The LLM emits `filterGroup` as a flat array; the API expects a nested PropertyGroupFilter.
+        const normalizeQuery = (query: Record<string, unknown>): Record<string, unknown> => {
+            const normalized = { ...query }
+            if (Array.isArray(normalized.filterGroup)) {
+                if (normalized.filterGroup.length > 0) {
+                    normalized.filterGroup = {
+                        type: 'AND',
+                        values: [{ type: 'AND', values: normalized.filterGroup }],
+                    }
+                } else {
+                    delete normalized.filterGroup
+                }
+            }
+            return normalized
+        }
+
+        const runActorsQuery = async (
+            query: Record<string, unknown>,
+            select: readonly string[],
+            orderBy: readonly string[] = []
+        ): Promise<{
+            query: Record<string, unknown>
+            results: { columns: string[]; results: any[][] }
+            hasMore: boolean
+            limit: number
+            offset: number
+        }> => {
+            // `limit`/`offset` are page controls on the outer ActorsQuery. The inner
+            // InsightActorsQuery rejects unknown keys, so they have to come off the source
+            // before it gets wrapped.
+            const { limit: requestedLimit, offset: requestedOffset, ...normalized } = normalizeQuery(query)
+            const limit = clampActorsLimit(requestedLimit)
+            const offset = clampActorsOffset(requestedOffset)
+            const includeRecordings = Boolean(normalized.includeRecordings)
+            const finalSelect = includeRecordings ? [...select, 'matched_recordings'] : [...select]
+
+            const wrappedQuery = {
+                kind: 'ActorsQuery',
+                source: normalized,
+                select: finalSelect,
+                // An explicit empty `orderBy` suppresses ActorsQueryRunner's default ordering and
+                // reaches ClickHouse with no ORDER BY, so row order is undefined and consecutive
+                // pages can repeat or skip actors. Omitting the key instead lets the runner order by
+                // the actor id column it selected. The per-tool orders already end in a unique
+                // tiebreak.
+                ...(orderBy.length > 0 ? { orderBy: [...orderBy] } : {}),
+                limit,
+                offset,
+            }
+
+            const response = await this.request<{
+                results: any[][]
+                hasMore?: boolean
+                limit?: number
+                offset?: number
+            }>({
+                method: 'POST',
+                path: `/api/environments/${projectId}/query/`,
+                body: { query: wrappedQuery },
+            })
+
+            const baseUrl = this.getProjectBaseUrl(projectId)
+
+            // `actor`/`person` → 3 columns, `matched_recordings` → recordings, everything else passes through.
+            // Retention projects `person`, which carries the same actor shape as `actor`.
+            const columns: string[] = []
+            for (const field of finalSelect) {
+                if (field === 'actor' || field === 'person') {
+                    columns.push('distinct_id', 'email', 'name')
+                } else if (field === 'matched_recordings') {
+                    columns.push('recordings')
+                } else {
+                    columns.push(field)
+                }
+            }
+
+            const results = (response.results ?? []).map((row) => {
+                const cells: any[] = []
+                for (let i = 0; i < finalSelect.length; i++) {
+                    const field = finalSelect[i]
+                    const cell = row[i]
+                    if (field === 'actor' || field === 'person') {
+                        const props = cell?.properties ?? {}
+                        cells.push(cell?.distinct_ids?.[0] ?? null, props.email, props.name)
+                    } else if (field === 'matched_recordings') {
+                        const links = (cell ?? [])
+                            .map((r: any) => r.session_id)
+                            .filter(Boolean)
+                            .map((sessionId: string) => `${baseUrl}/replay/${sessionId}`)
+                        cells.push(links)
+                    } else {
+                        cells.push(cell)
+                    }
+                }
+                return cells
+            })
+
+            return {
+                query: wrappedQuery,
+                results: { columns, results },
+                hasMore: response.hasMore ?? false,
+                limit: response.limit ?? limit,
+                offset: response.offset ?? offset,
+            }
+        }
+
+        return {
+            execute: async ({ queryBody }: { queryBody: any }): Promise<Result<{ results: any[] }>> => {
+                return this.fetchJson<{ results: unknown[] }>(queryUrl, {
+                    method: 'POST',
+                    body: JSON.stringify({ query: queryBody }),
+                })
+            },
+
+            runQuery: async ({
+                query,
+                signal,
+            }: {
+                query: Record<string, unknown>
+                signal?: AbortSignal
+            }): Promise<{
+                results: unknown
+                columns?: unknown[] | null
+                formatted_results?: string
+                warnings?: (DataWarehouseSyncWarning | AccessControlFilterWarning)[] | null
+                warehouse_suggestions?: Schemas.WarehouseSuggestionNote[] | null
+                has_next?: boolean
+                next_cursor?: string | null
+            }> => {
+                return this.request<{
+                    results: unknown
+                    columns?: unknown[] | null
+                    formatted_results?: string
+                    warnings?: (DataWarehouseSyncWarning | AccessControlFilterWarning)[] | null
+                    warehouse_suggestions?: Schemas.WarehouseSuggestionNote[] | null
+                    has_next?: boolean
+                    next_cursor?: string | null
+                }>({
+                    method: 'POST',
+                    path: `/api/environments/${projectId}/query/`,
+                    body: { query: normalizeQuery(query) },
+                    signal,
+                })
+            },
+
+            trendsActors: async ({ query }: { query: Record<string, unknown> }) =>
+                runActorsQuery(query, ['actor', 'event_count'], ['event_count DESC', 'actor_id DESC']),
+
+            lifecycleActors: async ({ query }: { query: Record<string, unknown> }) => runActorsQuery(query, ['actor']),
+
+            pathsActors: async ({ query }: { query: Record<string, unknown> }) =>
+                runActorsQuery(query, ['actor', 'event_count'], ['event_count DESC', 'actor_id DESC']),
+
+            retentionActors: async ({ query }: { query: Record<string, unknown> }) => {
+                // Columns are `person` + one per return interval: prefix = period (day/week/…), count =
+                // custom-bracket count + 1, else totalIntervals. Mirrors the frontend retentionToActorsQuery.
+                const filter = ((query.source as Record<string, unknown>)?.retentionFilter ?? {}) as Record<
+                    string,
+                    unknown
+                >
+                const period = typeof filter.period === 'string' ? filter.period.toLowerCase() : 'day'
+                const brackets = filter.retentionCustomBrackets as number[] | undefined
+                const count = brackets?.length ? brackets.length + 1 : (filter.totalIntervals as number) || 7
+                // The schema codegen doesn't propagate `@minimum`/`@maximum` on integer fields (only array
+                // `@maxItems`, which already bounds `retentionCustomBrackets`), so `totalIntervals` can't be
+                // capped in the generated zod — enforce it here instead. The limit matches the app's
+                // retention UI (period count capped at 31; totalIntervals adds the acquisition interval → 32).
+                // TODO: drop this guard once the schema generator supports integer min/max.
+                const MAX_RETENTION_INTERVALS = 32
+                if (count > MAX_RETENTION_INTERVALS) {
+                    throw new Error(
+                        `Retention query requests ${count} intervals; the maximum is ${MAX_RETENTION_INTERVALS}.`
+                    )
+                }
+
+                const select = ['person', ...Array.from({ length: count }, (_, i) => `${period}_${i}`)]
+                return runActorsQuery(query, select, ['length(appearances) DESC', 'actor_id'])
+            },
+
+            // Stickiness drills into one bar (`day` = active-interval count). The runner projects only
+            // `actor_id` with no `matching_events`, so there is no recordings column — same as lifecycle.
+            stickinessActors: async ({ query }: { query: Record<string, unknown> }) => runActorsQuery(query, ['actor']),
+
+            // Funnel actors project `actor` (+ `matched_recordings` when `includeRecordings`, handled
+            // by runActorsQuery). The query carries the step/trends-dropoff selectors on the inner
+            // FunnelsActorsQuery; there is no meaningful ranking, so the backend's own actor-id
+            // ordering applies.
+            funnelActors: async ({ query }: { query: Record<string, unknown> }) => runActorsQuery(query, ['actor']),
+        }
+    }
+
+    users(): Endpoint {
+        return {
+            me: async (): Promise<Result<ApiUser>> => {
+                const result = await this.fetchJson<ApiUser>(`${this.baseUrl}/api/users/@me/`)
+
+                if (!result.success) {
+                    return result
+                }
+
+                return {
+                    success: true,
+                    data: result.data,
+                }
+            },
+        }
+    }
+
+    /**
+     * Global search across PostHog entities
+     */
+    search({ projectId }: { projectId: string }): Endpoint {
+        return {
+            /**
+             * Search for entities by query string
+             * @param query - Search query (searches name/description fields)
+             * @param entities - Array of entity types to search (defaults to all if not specified)
+             */
+            query: async ({
+                query,
+                entities,
+            }: {
+                query: string
+                entities?: SearchableEntity[]
+            }): Promise<Result<SearchResponse>> => {
+                const searchParams = new URLSearchParams()
+
+                if (query) {
+                    searchParams.append('q', query)
+                }
+
+                if (entities && entities.length > 0) {
+                    for (const entity of entities) {
+                        searchParams.append('entities', entity)
+                    }
+                }
+
+                const url = `${this.baseUrl}/api/projects/${projectId}/search/${searchParams.toString() ? `?${searchParams}` : ''}`
+
+                return this.fetchJson<SearchResponse>(url)
+            },
+        }
+    }
+
+    async getGroupTypes(projectId: string): Promise<GroupType[]> {
+        const result = await this.fetchJson<GroupType[]>(`${this.baseUrl}/api/projects/${projectId}/groups_types/`)
+        if (!result.success) {
+            throw result.error
+        }
+        return result.data
+    }
+
+    /** Every third-party MCP tool the caller can reach, across all their gateway connections. */
+    async getGatewayTools(projectId: string): Promise<Schemas.AvailableToolsResponse> {
+        const result = await this.fetchJson<Schemas.AvailableToolsResponse>(
+            `${this.baseUrl}/api/projects/${projectId}/mcp_server_installations/available_tools/`
+        )
+        if (!result.success) {
+            throw result.error
+        }
+        return result.data
+    }
+}

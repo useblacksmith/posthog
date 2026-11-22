@@ -1,0 +1,117 @@
+import datetime as dt
+from functools import cached_property
+
+from posthog.schema import CachedLogsQueryResponse, LogsQuery
+
+from posthog.hogql import ast
+from posthog.hogql.constants import HogQLGlobalSettings
+from posthog.hogql.parser import parse_select
+from posthog.hogql.query import execute_hogql_query
+
+from posthog.clickhouse.client.connection import Workload
+from posthog.hogql_queries.query_runner import AnalyticsQueryRunner
+
+from products.logs.backend.logs_query_runner import (
+    LogsQueryResponse,
+    LogsQueryRunnerMixin,
+    fail_fast_aggregate_settings,
+)
+
+DEFAULT_TARGET_BUCKETS = 10
+MAX_TARGET_BUCKETS = 100
+
+
+def _utc_z(value: dt.datetime) -> str:
+    """Format a naive UTC datetime as a Z-suffixed ISO 8601 string."""
+    return value.replace(tzinfo=dt.UTC).isoformat().replace("+00:00", "Z")
+
+
+class CountRangesQueryRunner(AnalyticsQueryRunner[LogsQueryResponse], LogsQueryRunnerMixin):
+    """Returns adaptive-interval bucket counts for a filtered log stream.
+
+    Each bucket carries explicit `date_from` / `date_to` so an agent can copy the
+    range into a follow-up call without reasoning about interval width.
+    """
+
+    query: LogsQuery
+    cached_response: CachedLogsQueryResponse
+
+    def __init__(self, *args, target_buckets: int = DEFAULT_TARGET_BUCKETS, **kwargs):
+        # Set before super().__init__ so query_date_range (cached) sees the override
+        # the first time it's read.
+        self.BUCKET_TARGET = max(1, min(target_buckets, MAX_TARGET_BUCKETS))
+        super().__init__(*args, **kwargs)
+
+    def get_cache_payload(self) -> dict:
+        # A runner argument, not a query field, so the base payload cannot see it.
+        return {**super().get_cache_payload(), "target_buckets": self.BUCKET_TARGET}
+
+    @cached_property
+    def settings(self) -> HogQLGlobalSettings:
+        return fail_fast_aggregate_settings(max_bytes_to_read=1_000_000_000)
+
+    def _calculate(self) -> LogsQueryResponse:
+        response = execute_hogql_query(
+            query_type="LogsQuery",
+            query=self.to_query(),
+            modifiers=self.modifiers,
+            team=self.team,
+            workload=Workload.LOGS,
+            timings=self.timings,
+            limit_context=self.limit_context,
+            settings=self.settings,
+        )
+
+        ranges: list[dict] = []
+        for row in response.results:
+            # ClickHouse returns naive datetimes holding UTC values. Emit explicit UTC
+            # (Z-suffixed) ISO strings so a bucket's date_from/date_to can be fed straight
+            # back into query-logs without timezone drift.
+            bucket_start: dt.datetime = row[0]
+            bucket_end: dt.datetime = row[1]
+            count: int = row[2]
+            ranges.append(
+                {
+                    "date_from": _utc_z(bucket_start),
+                    "date_to": _utc_z(bucket_end),
+                    "count": count,
+                }
+            )
+
+        return LogsQueryResponse(
+            results={"ranges": ranges, "interval": self._interval_short()},
+        )
+
+    def _interval_short(self) -> str:
+        unit = self.query_date_range.interval_name
+        count = self.query_date_range.interval_count
+        if unit == "second":
+            return f"{count}s"
+        if unit != "minute":
+            raise ValueError(f"Unexpected interval unit from picker: {unit!r} (expected 'second' or 'minute')")
+        # Normalise minute counts up to hours/days when cleanly divisible.
+        if count and count % 1440 == 0:
+            return f"{count // 1440}d"
+        if count and count % 60 == 0:
+            return f"{count // 60}h"
+        return f"{count}m"
+
+    def to_query(self) -> ast.SelectQuery:
+        query = parse_select(
+            """
+                SELECT
+                    toStartOfInterval(timestamp, {one_interval_period}) AS bucket_start,
+                    bucket_start + {one_interval_period} AS bucket_end,
+                    count() AS event_count
+                FROM logs
+                WHERE {where}
+                GROUP BY bucket_start
+                ORDER BY bucket_start ASC
+            """,
+            placeholders={
+                **self.query_date_range.to_placeholders(),
+                "where": self.where_with_timestamp_bounds(),
+            },
+        )
+        assert isinstance(query, ast.SelectQuery)
+        return query

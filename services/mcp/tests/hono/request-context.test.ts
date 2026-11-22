@@ -1,0 +1,504 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+const { mockMe, mockApiClientCtor, mockCapture } = vi.hoisted(() => {
+    const mockMe = vi.fn()
+    const mockApiClientCtor = vi.fn().mockImplementation(function (config) {
+        return {
+            config,
+            users: () => ({ me: mockMe }),
+            apiKeys: () => ({
+                current: async () => ({
+                    success: true,
+                    data: { scopes: ['*'], scoped_teams: [], scoped_organizations: [] },
+                }),
+            }),
+        }
+    })
+    return { mockMe, mockApiClientCtor, mockCapture: vi.fn() }
+})
+
+vi.mock('@/api/client', () => ({
+    ApiClient: mockApiClientCtor,
+}))
+
+vi.mock('@/lib/posthog', () => ({
+    getPostHogClient: () => ({ capture: mockCapture }),
+}))
+
+import type { RedisLike } from '@/hono/cache/RedisCache'
+import { RequestContext } from '@/hono/request-context'
+import { AnalyticsEvent } from '@/lib/posthog/analytics'
+import type { RequestProperties } from '@/lib/request-properties'
+
+import { makeRedisRateLimitStubs } from './helpers/redis-rate-limit-stubs'
+
+function fakeRedis(): RedisLike {
+    const store = new Map<string, string>()
+    return {
+        get: async (key) => store.get(key) ?? null,
+        set: async (key, value) => {
+            store.set(key, String(value))
+            return 'OK'
+        },
+        del: async (...keys) => {
+            let n = 0
+            for (const k of keys) {
+                if (store.delete(k)) {
+                    n++
+                }
+            }
+            return n
+        },
+        scan: async () => ['0', [...store.keys()]],
+        ...makeRedisRateLimitStubs(),
+    }
+}
+
+function spyRedis(): RedisLike {
+    return {
+        get: vi.fn(async () => null),
+        set: vi.fn(async () => 'OK'),
+        del: vi.fn(async () => 0),
+        scan: vi.fn(async () => ['0', []] as [string, string[]]),
+        ...makeRedisRateLimitStubs(),
+    }
+}
+
+const env = {} as any
+
+function makeProps(overrides: Partial<RequestProperties> = {}): RequestProperties {
+    return {
+        userHash: 'test-user',
+        apiToken: 'phx_test',
+        sessionId: 'sess-1',
+        mcpClientName: 'test-client',
+        mcpClientVersion: '1.0',
+        mcpProtocolVersion: '2025-03-26',
+        transport: 'streamable-http',
+        requestStartTime: Date.now(),
+        ...overrides,
+    }
+}
+
+describe('RequestContext', () => {
+    it.each([
+        { impersonated: true, apiToken: 'phx_test', suppressed: true },
+        { impersonated: false, apiToken: 'phx_test', suppressed: false },
+        { impersonated: undefined, apiToken: 'phx_test', suppressed: false },
+        { impersonated: undefined, apiToken: 'pha_test', suppressed: false },
+    ])(
+        'passes trusted capture policy=$suppressed to captured events',
+        async ({ impersonated, apiToken, suppressed }) => {
+            mockCapture.mockClear()
+            const ctx = new RequestContext(fakeRedis(), env, makeProps({ apiToken }))
+            if (impersonated !== undefined) {
+                await ctx.tokenCache.set('apiKey', {
+                    scopes: [],
+                    scoped_teams: [],
+                    scoped_organizations: [],
+                    is_impersonated: impersonated,
+                    suppress_analytics: impersonated,
+                })
+            }
+
+            await ctx.trackEvent(
+                AnalyticsEvent.MCP_FEEDBACK_SUBMITTED,
+                { is_impersonated: !impersonated, suppress_analytics: !impersonated },
+                undefined,
+                undefined,
+                'user-123'
+            )
+
+            expect(mockCapture).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    event: AnalyticsEvent.MCP_FEEDBACK_SUBMITTED,
+                    properties: expect.objectContaining({
+                        is_impersonated: impersonated === true,
+                        suppress_analytics: suppressed,
+                    }),
+                })
+            )
+        }
+    )
+
+    describe('ApiClient construction', () => {
+        const originalEnv = { ...process.env }
+
+        afterEach(() => {
+            process.env = { ...originalEnv }
+            mockApiClientCtor.mockClear()
+            mockMe.mockClear()
+        })
+
+        it('passes POSTHOG_PUBLIC_URL as publicBaseUrl to the ApiClient', async () => {
+            process.env.POSTHOG_API_BASE_URL = 'http://posthog-web-django.posthog.svc.cluster.local:8000'
+            process.env.POSTHOG_PUBLIC_URL = 'https://us.posthog.com'
+
+            mockMe.mockResolvedValue({ success: true, data: { distinct_id: 'user-1' } })
+            const ctx = new RequestContext(fakeRedis(), env, makeProps())
+            await ctx.getDistinctId()
+
+            expect(mockApiClientCtor).toHaveBeenCalledTimes(1)
+            const config = mockApiClientCtor.mock.calls[0]![0]
+            expect(config.baseUrl).toBe('http://posthog-web-django.posthog.svc.cluster.local:8000')
+            expect(config.publicBaseUrl).toBe('https://us.posthog.com')
+        })
+
+        it('falls back to POSTHOG_API_BASE_URL when POSTHOG_PUBLIC_URL is not set', async () => {
+            process.env.POSTHOG_API_BASE_URL = 'https://us.posthog.com'
+            delete process.env.POSTHOG_PUBLIC_URL
+
+            mockMe.mockResolvedValue({ success: true, data: { distinct_id: 'user-1' } })
+            const ctx = new RequestContext(fakeRedis(), env, makeProps())
+            await ctx.getDistinctId()
+
+            const config = mockApiClientCtor.mock.calls[0]![0]
+            expect(config.baseUrl).toBe('https://us.posthog.com')
+            expect(config.publicBaseUrl).toBe('https://us.posthog.com')
+        })
+
+        it.each([
+            { label: 'cached OAuth client name', cached: 'Claude', expected: 'Claude' },
+            { label: 'no cached OAuth client name', cached: undefined, expected: undefined },
+        ])('passes $label through as oauthClientName', async ({ cached, expected }) => {
+            const redis = fakeRedis()
+            if (cached) {
+                await redis.set('mcp:token:test-user:clientName', JSON.stringify(cached))
+            }
+            mockMe.mockResolvedValue({ success: true, data: { distinct_id: 'user-1' } })
+
+            const ctx = new RequestContext(redis, env, makeProps())
+            await ctx.getDistinctId()
+
+            expect(mockApiClientCtor.mock.calls[0]![0].oauthClientName).toBe(expected)
+        })
+
+        it('forwards the session client identity after the API client already exists', async () => {
+            mockMe.mockResolvedValue({ success: true, data: { distinct_id: 'user-1' } })
+            const ctx = new RequestContext(fakeRedis(), env, makeProps({ mcpClientName: undefined }))
+            await ctx.getContext()
+
+            ctx.setMcpContexts(
+                {
+                    authMethod: 'personal_api_key',
+                    mcpClientName: undefined,
+                },
+                {
+                    mcpClientName: 'external-claims-smoke-a',
+                    mcpClientVersion: '1.0',
+                    mcpProtocolVersion: '2025-03-26',
+                }
+            )
+
+            const api = mockApiClientCtor.mock.results[0]!.value
+            expect(api.config).toMatchObject({
+                mcpClientName: 'external-claims-smoke-a',
+                mcpClientVersion: '1.0',
+                mcpProtocolVersion: '2025-03-26',
+            })
+        })
+
+        it('uses the session client identity when API construction happens later', async () => {
+            mockMe.mockResolvedValue({ success: true, data: { distinct_id: 'user-1' } })
+            const ctx = new RequestContext(fakeRedis(), env, makeProps({ mcpClientName: undefined }))
+            ctx.setMcpContexts(
+                {
+                    authMethod: 'personal_api_key',
+                    mcpClientName: undefined,
+                },
+                {
+                    mcpClientName: 'external-claims-smoke-b',
+                    mcpClientVersion: '2.0',
+                    mcpProtocolVersion: '2025-03-26',
+                }
+            )
+
+            await ctx.getContext()
+
+            expect(mockApiClientCtor.mock.calls[0]![0]).toMatchObject({
+                mcpClientName: 'external-claims-smoke-b',
+                mcpClientVersion: '2.0',
+                mcpProtocolVersion: '2025-03-26',
+            })
+        })
+    })
+
+    // `agent-feedback` and the context-switch events capture through `trackEvent`, which
+    // reads these properties. `clientInfo` arrives on `initialize` only, so reading the
+    // request alone records no client for every call after the first.
+    describe('buildClientProperties', () => {
+        it('falls back to the session client identity mid-session', () => {
+            const ctx = new RequestContext(fakeRedis(), env, makeProps({ mcpClientName: undefined }))
+            ctx.setMcpContexts(
+                { authMethod: 'personal_api_key', mcpClientName: undefined },
+                {
+                    mcpClientName: 'claude-code',
+                    mcpClientVersion: '1.0',
+                    mcpProtocolVersion: '2025-03-26',
+                    mcpConsumer: 'plugin',
+                    mcpVendorClient: 'ClaudeCode',
+                }
+            )
+
+            expect(ctx.buildClientProperties()).toMatchObject({
+                $mcp_client_name: 'claude-code',
+                $mcp_client_version: '1.0',
+                $mcp_protocol_version: '2025-03-26',
+                $mcp_consumer: 'plugin',
+                $mcp_vendor_client: 'ClaudeCode',
+            })
+        })
+
+        it('keeps the live request identity when the call carries one', () => {
+            const ctx = new RequestContext(fakeRedis(), env, makeProps({ mcpClientName: 'cursor' }))
+            ctx.setMcpContexts(
+                { authMethod: 'personal_api_key', mcpClientName: 'cursor' },
+                { mcpClientName: 'claude-code' }
+            )
+
+            expect(ctx.buildClientProperties()).toMatchObject({ $mcp_client_name: 'cursor' })
+        })
+    })
+
+    describe('getDistinctId', () => {
+        it('deduplicates concurrent calls into a single API request', async () => {
+            mockMe.mockResolvedValue({ success: true, data: { distinct_id: 'user-123' } })
+            const ctx = new RequestContext(fakeRedis(), env, makeProps())
+
+            const [a, b, c] = await Promise.all([ctx.getDistinctId(), ctx.getDistinctId(), ctx.getDistinctId()])
+
+            expect(a).toBe('user-123')
+            expect(b).toBe('user-123')
+            expect(c).toBe('user-123')
+            expect(mockMe).toHaveBeenCalledTimes(1)
+        })
+
+        it('returns cached distinctId without calling API', async () => {
+            const redis = fakeRedis()
+            await redis.set('mcp:token:test-user:distinctId', JSON.stringify('cached-id'))
+            mockMe.mockClear()
+
+            const ctx = new RequestContext(redis, env, makeProps())
+            const result = await ctx.getDistinctId()
+
+            expect(result).toBe('cached-id')
+            expect(mockMe).not.toHaveBeenCalled()
+        })
+
+        it('caches the resolved distinctId for subsequent calls', async () => {
+            mockMe.mockResolvedValueOnce({ success: true, data: { distinct_id: 'fresh-id' } })
+            const redis = fakeRedis()
+            const ctx = new RequestContext(redis, env, makeProps())
+
+            await ctx.getDistinctId()
+            const cached = await redis.get('mcp:token:test-user:distinctId')
+            expect(JSON.parse(cached!)).toBe('fresh-id')
+        })
+
+        it('throws when API returns an error', async () => {
+            mockMe.mockResolvedValue({ success: false, error: { message: 'Unauthorized' } })
+            const ctx = new RequestContext(fakeRedis(), env, makeProps())
+
+            await expect(ctx.getDistinctId()).rejects.toThrow('Failed to get user')
+        })
+    })
+
+    describe('getSessionUuid', () => {
+        it('returns undefined when sessionId is undefined', async () => {
+            const ctx = new RequestContext(fakeRedis(), env, makeProps())
+            expect(await ctx.getSessionUuid(undefined)).toBeUndefined()
+        })
+
+        it('returns a stable UUID for the same sessionId', async () => {
+            const ctx = new RequestContext(fakeRedis(), env, makeProps())
+            const first = await ctx.getSessionUuid('sess-abc')
+            const second = await ctx.getSessionUuid('sess-abc')
+
+            expect(first).toBe(second)
+            expect(first).toMatch(/^[0-9a-f-]{36}$/)
+        })
+
+        it('returns different UUIDs for different sessionIds', async () => {
+            const ctx = new RequestContext(fakeRedis(), env, makeProps())
+            const a = await ctx.getSessionUuid('sess-1')
+            const b = await ctx.getSessionUuid('sess-2')
+
+            expect(a).not.toBe(b)
+        })
+    })
+
+    describe('getSessionUuid memoization', () => {
+        it('serves one lookup per key and retries after a failure', async () => {
+            const ctx = new RequestContext(fakeRedis(), env, makeProps())
+            const spy = vi.spyOn(ctx.sessionManager, 'getSessionUuid')
+
+            const first = await ctx.getSessionUuid('sess-memo')
+            const second = await ctx.getSessionUuid('sess-memo')
+            expect(second).toBe(first)
+            expect(spy).toHaveBeenCalledTimes(1)
+
+            // A cached rejection would outlive the blip that caused it, and three tool-error
+            // paths await this outside a try.
+            spy.mockRejectedValueOnce(new Error('redis down'))
+            await expect(ctx.getSessionUuid('sess-retry')).rejects.toThrow('redis down')
+            spy.mockRestore()
+            await expect(ctx.getSessionUuid('sess-retry')).resolves.toMatch(/^[0-9a-f-]{36}$/)
+        })
+    })
+
+    describe('getEffectiveSessionUuid', () => {
+        it.each([
+            { mcpConversationId: undefined, sessionId: 'sess-1', mcpSessionId: 'mcp-1', expectedKey: 'sess-1' },
+            { mcpConversationId: undefined, sessionId: undefined, mcpSessionId: 'mcp-1', expectedKey: 'mcp-1' },
+            { mcpConversationId: undefined, sessionId: undefined, mcpSessionId: undefined, expectedKey: undefined },
+            { mcpConversationId: 'conv-1', sessionId: 'sess-1', mcpSessionId: 'mcp-1', expectedKey: 'conv-1' },
+            // MCP 2026-07-28 sends neither of the other two, so without the handle these events
+            // ship with no `$session_id`.
+            { mcpConversationId: 'conv-1', sessionId: undefined, mcpSessionId: undefined, expectedKey: 'conv-1' },
+        ])(
+            'conversationId=$mcpConversationId sessionId=$sessionId mcpSessionId=$mcpSessionId → resolves via expectedKey=$expectedKey',
+            async ({ mcpConversationId, sessionId, mcpSessionId, expectedKey }) => {
+                const ctx = new RequestContext(fakeRedis(), env, makeProps())
+                const effective = await ctx.getEffectiveSessionUuid({
+                    mcpConversationId,
+                    sessionId,
+                    mcpSessionId,
+                } as any)
+
+                expect(effective).toBe(expectedKey ? await ctx.getSessionUuid(expectedKey) : undefined)
+                if (expectedKey) {
+                    expect(effective).toMatch(/^[0-9a-f-]{36}$/)
+                }
+            }
+        )
+    })
+
+    describe('buildClientProperties', () => {
+        it('includes all request properties', () => {
+            const ctx = new RequestContext(
+                fakeRedis(),
+                env,
+                makeProps({
+                    mcpClientName: 'claude-code',
+                    mcpClientVersion: '2.0',
+                    mcpProtocolVersion: '2025-03-26',
+                    mcpConsumer: 'posthog-code',
+                    transport: 'streamable-http',
+                })
+            )
+
+            const result = ctx.buildClientProperties()
+            expect(result).toMatchObject({
+                $ai_product: 'mcp',
+                $mcp_source: 'posthog_mcp_analytics',
+                $mcp_server_name: 'PostHog',
+                $mcp_server_version: '1.0.0',
+                $mcp_client_name: 'claude-code',
+                $mcp_client_version: '2.0',
+                $mcp_protocol_version: '2025-03-26',
+                $mcp_consumer: 'posthog-code',
+                $mcp_transport: 'streamable-http',
+                mcp_runtime: 'hono',
+            })
+        })
+
+        it('adds stable session properties without replacing request properties', () => {
+            const ctx = new RequestContext(
+                fakeRedis(),
+                env,
+                makeProps({
+                    mcpClientName: 'Claude Desktop',
+                    mcpClientVersion: '2.0',
+                    mcpProtocolVersion: '2025-03-26',
+                    mcpConsumer: 'request-consumer',
+                    mcpVendorClient: 'ClaudeAI',
+                    transport: 'streamable-http',
+                })
+            )
+            ctx.setMcpContexts(
+                {
+                    authMethod: 'personal_api_key',
+                    sessionId: 'sess-1',
+                    mcpClientName: 'Claude Desktop',
+                    mcpClientVersion: '2.0',
+                    mcpProtocolVersion: '2025-03-26',
+                    mcpConsumer: 'request-consumer',
+                    mcpVendorClient: 'ClaudeAI',
+                    transport: 'streamable-http',
+                    mode: 'cli',
+                },
+                {
+                    mcpClientName: 'claude-code',
+                    mcpClientVersion: '1.0',
+                    mcpProtocolVersion: '2025-03-26',
+                    mcpConsumer: 'session-consumer',
+                    mcpVendorClient: 'ClaudeCode',
+                }
+            )
+
+            const result = ctx.buildClientProperties()
+            expect(result).toMatchObject({
+                $mcp_client_name: 'Claude Desktop',
+                $mcp_client_version: '2.0',
+                $mcp_consumer: 'request-consumer',
+                $mcp_vendor_client: 'ClaudeAI',
+                mcp_session_client_name: 'claude-code',
+                mcp_session_client_version: '1.0',
+                mcp_session_consumer: 'session-consumer',
+                mcp_session_vendor_client: 'ClaudeCode',
+            })
+        })
+
+        it('omits undefined properties', () => {
+            const ctx = new RequestContext(
+                fakeRedis(),
+                env,
+                makeProps({
+                    mcpClientName: undefined,
+                    mcpClientVersion: undefined,
+                    mcpProtocolVersion: undefined,
+                    mcpConsumer: undefined,
+                    transport: undefined,
+                })
+            )
+
+            const result = ctx.buildClientProperties()
+            expect(result).toMatchObject({
+                $ai_product: 'mcp',
+                $mcp_source: 'posthog_mcp_analytics',
+                $mcp_server_name: 'PostHog',
+                $mcp_server_version: '1.0.0',
+                mcp_runtime: 'hono',
+            })
+            expect(result.$mcp_client_name).toBeUndefined()
+            expect(result.$mcp_consumer).toBeUndefined()
+            expect(result.$mcp_transport).toBeUndefined()
+        })
+    })
+
+    describe('cache', () => {
+        it('throws when userHash is missing', () => {
+            const ctx = new RequestContext(fakeRedis(), env, makeProps({ userHash: '' }))
+            expect(() => ctx.cache).toThrow('User hash is required')
+        })
+
+        it('returns the same cache instance on repeated access', () => {
+            const ctx = new RequestContext(fakeRedis(), env, makeProps())
+            expect(ctx.cache).toBe(ctx.cache)
+        })
+
+        it('keeps token cache entries on the default 7 day TTL', async () => {
+            const redis = spyRedis()
+            const ctx = new RequestContext(redis, env, makeProps())
+
+            await ctx.tokenCache.set('distinctId', 'user-123')
+
+            expect(redis.set).toHaveBeenCalledWith(
+                'mcp:token:test-user:distinctId',
+                JSON.stringify('user-123'),
+                'EX',
+                7 * 24 * 60 * 60
+            )
+        })
+    })
+})

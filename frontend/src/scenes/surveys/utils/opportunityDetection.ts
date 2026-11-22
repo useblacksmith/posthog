@@ -1,0 +1,166 @@
+import type { AttachedContextItem } from '~/layout/ai/attachedContext'
+import {
+    AnyEntityNode,
+    EventsNode,
+    FunnelsDataWarehouseNode,
+    FunnelsQuery,
+    GroupNode,
+    InsightVizNode,
+    NodeKind,
+} from '~/queries/schema/schema-general'
+import { DashboardTile, FunnelVizType, InsightModel, SurveyEventsWithProperties } from '~/types'
+
+export interface FunnelContext {
+    insightName: string
+    conversionRate: number
+    steps: (AnyEntityNode<FunnelsDataWarehouseNode> | GroupNode)[]
+}
+
+interface FunnelStepResult {
+    count: number
+}
+
+export interface SurveyableFunnelInsight {
+    id?: number
+    short_id?: InsightModel['short_id']
+    name?: string
+    query: InsightVizNode<FunnelsQuery>
+    result: FunnelStepResult[]
+}
+
+export function surveyOpportunityContextItems(
+    insight: Pick<SurveyableFunnelInsight, 'id' | 'short_id'>,
+    funnelContext: FunnelContext | null
+): AttachedContextItem[] | null {
+    return funnelContext
+        ? [
+              {
+                  type: 'insight',
+                  key: insight.id,
+                  pageId: insight.short_id ?? null,
+                  label: funnelContext.insightName,
+              },
+              {
+                  type: 'survey_opportunity_funnel_context',
+                  value: JSON.stringify({
+                      conversionRate: funnelContext.conversionRate,
+                      steps: funnelContext.steps,
+                  }),
+                  label: 'Funnel conversion context',
+              },
+          ]
+        : null
+}
+
+/**
+ * Find the funnel with the best opportunity to create a survey, given a list
+ * of dashboard tiles.
+ *
+ * Returns the funnel with the lowest conversion rate (<50%) that:
+ * - Is a valid funnel insight
+ * - Has only event/action steps (survey targeting limitation)
+ * - Doesn't already have a linked survey
+ */
+export function getBestSurveyOpportunityFunnel(
+    tiles: DashboardTile[],
+    linkedInsightIds: Set<number> = new Set()
+): DashboardTile | null {
+    const candidates = tiles
+        .filter(
+            (tile) =>
+                isSurveyableFunnelInsight(tile.insight) && tile.insight?.id && !linkedInsightIds.has(tile.insight.id)
+        )
+        .map((tile) => ({
+            tile,
+            conversionRate: funnelConversionRate(tile.insight!.result as FunnelStepResult[]),
+        }))
+        .filter(({ conversionRate }) => conversionRate < 0.5)
+        .sort((a, b) => a.conversionRate - b.conversionRate)
+
+    return candidates[0]?.tile ?? null
+}
+
+/**
+ * Type guard to check if an insight has all required data for survey targeting.
+ * Returns true only if we have a valid funnel query with results.
+ */
+export function isSurveyableFunnelInsight(
+    insight: Partial<InsightModel> | undefined
+): insight is SurveyableFunnelInsight {
+    const query = insight?.query as InsightVizNode<FunnelsQuery> | undefined
+    const result = insight?.result
+    if (!query || !isValidFunnelQuery(query)) {
+        return false
+    }
+    // Only steps and flow funnels return one row per step.
+    const vizType = query.source.funnelsFilter?.funnelVizType ?? FunnelVizType.Steps
+
+    return (
+        query.source.series.every((node) => node.kind === NodeKind.EventsNode || node.kind === NodeKind.ActionsNode) &&
+        (vizType === FunnelVizType.Steps || vizType === FunnelVizType.Flow) &&
+        Array.isArray(result) &&
+        result.length >= 2 &&
+        // A breakdown funnel returns a list of steps for each breakdown value.
+        result.every((step) => !Array.isArray(step))
+    )
+}
+
+/**
+ * Get some useful "context" data from a funnel insight.
+ * Returns null if the insight doesn't have valid funnel data.
+ *
+ * @param insight funnel insight to extract context from
+ * @returns funnel "context" object, or null if invalid
+ */
+export function extractFunnelContext(insight: Partial<InsightModel> | undefined): FunnelContext | null {
+    if (!isSurveyableFunnelInsight(insight)) {
+        return null
+    }
+
+    return {
+        insightName: insight.name || 'Funnel',
+        conversionRate: funnelConversionRate(insight.result),
+        steps: insight.query.source.series,
+    }
+}
+
+/**
+ * Convert an event step (EventsNode) to the type expected by survey targeting conditions
+ *
+ * @param step step from funnel query source, e.g. `InsightVizNode<FunnelsQuery>.source.series[n]`
+ * @returns
+ */
+export function toSurveyEvent(step: EventsNode): SurveyEventsWithProperties {
+    const properties = (step as any).properties || []
+    return {
+        name: step.name || '',
+        propertyFilters: Object.fromEntries(
+            properties.map((p: any) => [
+                p.key,
+                {
+                    values: Array.isArray(p.value) ? p.value.map(String) : [],
+                    operator: p.operator,
+                },
+            ])
+        ),
+    }
+}
+
+export function isValidFunnelQuery(query: InsightVizNode | undefined): boolean {
+    return (
+        query?.kind === 'InsightVizNode' &&
+        query?.source?.kind === 'FunnelsQuery' &&
+        (query?.source?.series?.length ?? 0) >= 2
+    )
+}
+
+/**
+ * Get overall conversion rate from a given funnel insight result
+ * @param result validated funnel step results
+ * @returns conversion rate, expressed as a number 0-1
+ */
+function funnelConversionRate(result: FunnelStepResult[]): number {
+    const first = result[0]?.count || 1
+    const last = result[result.length - 1]?.count || 0
+    return last / first
+}

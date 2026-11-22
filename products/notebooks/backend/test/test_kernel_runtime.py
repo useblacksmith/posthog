@@ -1,0 +1,526 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Any
+
+from posthog.test.base import BaseTest
+from unittest.mock import MagicMock, patch
+
+from django.test import override_settings
+from django.utils import timezone
+
+from parameterized import parameterized
+
+from products.notebooks.backend.kernel_runtime import (
+    NOTEBOOK_KERNEL_MAX_RUNNING_PER_TEAM,
+    NOTEBOOK_KERNEL_STARTS_PER_USER_PER_HOUR,
+    NOTEBOOK_KERNEL_TTL_SECONDS,
+    KernelRuntimeService,
+    KernelSandboxLimitExceeded,
+    _KernelHandle,
+    _NotebookBridgeParser,
+    build_notebook_sandbox_config,
+)
+from products.notebooks.backend.models import KernelRuntime, Notebook
+
+
+class _DummyLock:
+    def __enter__(self) -> _DummyLock:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        return None
+
+
+@dataclass
+class _FakeExecutionResult:
+    stdout: str
+    stderr: str = ""
+    exit_code: int = 0
+
+
+class _FakeSandbox:
+    def __init__(self, result: _FakeExecutionResult, stream: _FakeSandboxStream | None = None) -> None:
+        self.result = result
+        self.stream = stream
+        self.command: str | None = None
+        self.timeout_seconds: int | None = None
+        self.written_files: dict[str, bytes] = {}
+
+    def execute(self, command: str, timeout_seconds: int | None = None) -> _FakeExecutionResult:
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        return self.result
+
+    def execute_stream(self, command: str, timeout_seconds: int | None = None) -> _FakeSandboxStream:
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        if self.stream is None:
+            raise RuntimeError("Fake sandbox stream not configured")
+        return self.stream
+
+    def write_file(self, path: str, content: bytes) -> _FakeExecutionResult:
+        self.written_files[path] = content
+        return self.result
+
+
+class _FakeSandboxStream:
+    def __init__(self, stdout_lines: list[str], result: _FakeExecutionResult) -> None:
+        self._stdout_lines = stdout_lines
+        self._result = result
+
+    def iter_stdout(self):
+        yield from self._stdout_lines
+
+    def wait(self) -> _FakeExecutionResult:
+        return self._result
+
+
+class _FakeSandboxClass:
+    sandbox: _FakeSandbox
+
+    @staticmethod
+    def get_by_id(sandbox_id: str) -> _FakeSandbox:
+        return _FakeSandboxClass.sandbox
+
+
+class TestKernelRuntimeService(BaseTest):
+    @parameterized.expand(
+        [
+            (
+                "cpu_memory_timeout",
+                {
+                    "kernel_cpu_cores": 2.5,
+                    "kernel_memory_gb": 8.0,
+                    "kernel_idle_timeout_seconds": 120,
+                },
+                {
+                    "cpu_cores": 2.5,
+                    "memory_gb": 8.0,
+                    "ttl_seconds": 120,
+                },
+            ),
+            (
+                "memory_only",
+                {"kernel_memory_gb": 12.0},
+                {"memory_gb": 12.0, "ttl_seconds": NOTEBOOK_KERNEL_TTL_SECONDS},
+            ),
+        ]
+    )
+    def test_build_notebook_sandbox_config(
+        self, _name: str, notebook_kwargs: dict[str, Any], expected: dict[str, Any]
+    ) -> None:
+        notebook = Notebook.objects.create(team=self.team, **notebook_kwargs)
+
+        sandbox_config = build_notebook_sandbox_config(notebook)
+
+        assert sandbox_config.template.value == "notebook_base"
+        assert sandbox_config.name == f"notebook-kernel-{notebook.short_id}"
+        assert sandbox_config.metadata == {"team_id": str(self.team.id), "product": "notebooks"}
+        for key, value in expected.items():
+            assert getattr(sandbox_config, key) == value
+
+    @parameterized.expand(
+        [
+            (
+                "non_dict_returns_none",
+                "not-a-dict",
+                None,
+            ),
+            (
+                "empty_dict_returns_none",
+                {},
+                None,
+            ),
+            (
+                "ok_with_type",
+                {
+                    "__type__answer": {"status": "ok", "data": {"text/plain": "'int'"}},
+                },
+                {"answer": {"status": "ok", "type": "int"}},
+            ),
+            (
+                "error_with_type_only",
+                {
+                    "__type__answer": {
+                        "status": "error",
+                        "ename": "NameError",
+                        "evalue": "missing",
+                        "traceback": ["traceback"],
+                    }
+                },
+                {
+                    "answer": {
+                        "status": "error",
+                        "ename": "NameError",
+                        "evalue": "missing",
+                        "traceback": ["traceback"],
+                    }
+                },
+            ),
+            (
+                "error_payload",
+                {
+                    "oops": {
+                        "status": "error",
+                        "ename": "NameError",
+                        "evalue": "missing",
+                        "traceback": ["traceback"],
+                    }
+                },
+                {
+                    "oops": {
+                        "status": "error",
+                        "ename": "NameError",
+                        "evalue": "missing",
+                        "traceback": ["traceback"],
+                    }
+                },
+            ),
+        ]
+    )
+    def test_parse_user_expressions(self, _name: str, payload: Any, expected: dict[str, Any] | None) -> None:
+        service = KernelRuntimeService()
+
+        assert service._parse_user_expressions(payload) == expected
+
+    @override_settings(SANDBOX_PROVIDER=KernelRuntime.Backend.MODAL, DEBUG=False, TEST=False)
+    def test_get_backend_requires_modal_credentials(self) -> None:
+        service = KernelRuntimeService()
+
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesMessage(RuntimeError, "Modal credentials are required to start notebook kernels"):
+                service._get_backend(require_credentials=True)
+
+    @parameterized.expand([("destroyed", False), ("destroy_failed", True)])
+    @patch("products.notebooks.backend.kernel_sandbox_usage.report_user_or_team_action")
+    def test_shutdown_reports_whether_the_sandbox_still_runs(
+        self, _name: str, destroy_fails: bool, mock_report: MagicMock
+    ) -> None:
+        notebook = Notebook.objects.create(team=self.team)
+        runtime = KernelRuntime.objects.create(
+            team=self.team,
+            notebook=notebook,
+            notebook_short_id=notebook.short_id,
+            user=self.user,
+            status=KernelRuntime.Status.RUNNING,
+            backend=KernelRuntime.Backend.MODAL,
+            sandbox_id="sb-notebook-kernel",
+            provisioned_cpu_cores=1,
+            provisioned_memory_gb=2,
+        )
+        KernelRuntime.objects.filter(pk=runtime.pk).update(ttl_expires_at=runtime.created_at + timedelta(hours=1))
+        sandbox = MagicMock()
+        if destroy_fails:
+            sandbox.destroy.side_effect = RuntimeError("provider unavailable")
+        sandbox_class = MagicMock()
+        sandbox_class.get_by_id.return_value = sandbox
+        service = KernelRuntimeService()
+
+        with (
+            patch.object(service, "_acquire_lock", return_value=_DummyLock()),
+            patch.object(service, "_get_sandbox_class", return_value=sandbox_class),
+        ):
+            assert service.shutdown_kernel(notebook, self.user)
+
+        mock_report.assert_called_once()
+        event, properties = mock_report.call_args[0]
+        assert event == "notebook kernel sandbox ended"
+        assert properties["ended_reason"] == KernelRuntime.Status.STOPPED
+        assert properties["sandbox_still_running"] is destroy_fails
+
+    @parameterized.expand(
+        [
+            ("user_hourly_starts", "same_user_ended", NOTEBOOK_KERNEL_STARTS_PER_USER_PER_HOUR, True),
+            ("team_running_sandboxes", "other_user_running", NOTEBOOK_KERNEL_MAX_RUNNING_PER_TEAM, True),
+            ("ended_sandboxes_of_other_users", "other_user_ended", NOTEBOOK_KERNEL_MAX_RUNNING_PER_TEAM, False),
+            ("under_both_limits", "same_user_ended", NOTEBOOK_KERNEL_STARTS_PER_USER_PER_HOUR - 1, False),
+        ]
+    )
+    def test_ensure_kernel_refuses_new_sandbox_over_limit(
+        self, _name: str, existing: str, count: int, refused: bool
+    ) -> None:
+        notebook = Notebook.objects.create(team=self.team)
+        other_user = self._create_user("other@example.com")
+        now = timezone.now()
+        for _ in range(count):
+            runtime = KernelRuntime.objects.create(
+                team=self.team,
+                notebook_short_id=notebook.short_id,
+                user=self.user if existing == "same_user_ended" else other_user,
+                status=KernelRuntime.Status.RUNNING,
+                backend=KernelRuntime.Backend.MODAL,
+            )
+            KernelRuntime.objects.filter(pk=runtime.pk).update(
+                ttl_expires_at=now + timedelta(minutes=30),
+                ended_at=None if existing == "other_user_running" else now,
+            )
+        sandbox_class = MagicMock()
+        sandbox_class.create.side_effect = RuntimeError("provider called")
+        service = KernelRuntimeService()
+
+        with (
+            patch.object(service, "_get_backend", return_value=KernelRuntime.Backend.MODAL),
+            patch.object(service, "_acquire_lock", return_value=_DummyLock()),
+            patch.object(service, "_get_sandbox_class", return_value=sandbox_class),
+        ):
+            with self.assertRaises(KernelSandboxLimitExceeded if refused else RuntimeError) as ctx:
+                service.ensure_kernel(notebook, self.user)
+
+        assert isinstance(ctx.exception, KernelSandboxLimitExceeded) is refused
+        assert sandbox_class.create.called is not refused
+
+    def test_execute_filters_invalid_variable_names(self) -> None:
+        service = KernelRuntimeService()
+        notebook = Notebook.objects.create(team=self.team)
+        runtime = KernelRuntime.objects.create(
+            team=self.team,
+            notebook=notebook,
+            notebook_short_id=notebook.short_id,
+            user=self.user,
+            status=KernelRuntime.Status.RUNNING,
+            backend=KernelRuntime.Backend.DOCKER,
+            connection_file="/tmp/connection.json",
+            sandbox_id="sandbox-1",
+        )
+        handle = _KernelHandle(
+            runtime=runtime,
+            lock_name="lock",
+            started_at=timezone.now(),
+            last_activity_at=timezone.now(),
+            backend=KernelRuntime.Backend.DOCKER,
+            sandbox_id=runtime.sandbox_id,
+        )
+
+        with (
+            patch.object(service, "_ensure_handle", return_value=handle),
+            patch.object(service, "_acquire_lock", return_value=_DummyLock()),
+            patch.object(service, "_is_handle_alive", return_value=True),
+            patch.object(service, "_execute_in_sandbox", return_value="ok") as mocked_execute,
+        ):
+            result = service.execute(
+                notebook,
+                self.user,
+                "code",
+                capture_variables=True,
+                variable_names=["valid", "not valid", "123", "_also_valid"],
+            )
+
+        assert result == "ok"  # type: ignore
+        assert mocked_execute.call_args.kwargs["variable_names"] == ["valid", "_also_valid"]  # type: ignore[unreachable]
+
+    def test_execute_in_sandbox_parses_output(self) -> None:
+        service = KernelRuntimeService(execution_timeout=5)
+        notebook = Notebook.objects.create(team=self.team)
+        runtime = KernelRuntime.objects.create(
+            team=self.team,
+            notebook=notebook,
+            notebook_short_id=notebook.short_id,
+            user=self.user,
+            status=KernelRuntime.Status.RUNNING,
+            backend=KernelRuntime.Backend.DOCKER,
+            connection_file="/tmp/connection.json",
+            sandbox_id="sandbox-1",
+        )
+        handle = _KernelHandle(
+            runtime=runtime,
+            lock_name="lock",
+            started_at=timezone.now(),
+            last_activity_at=timezone.now(),
+            backend=KernelRuntime.Backend.DOCKER,
+            sandbox_id=runtime.sandbox_id,
+        )
+        payload_out: dict[str, Any] = {
+            "status": "ok",
+            "stdout": "hello",
+            "stderr": "",
+            "result": {"text/plain": "42"},
+            "execution_count": 3,
+            "error_name": None,
+            "traceback": [],
+            "user_expressions": {
+                "__type__answer": {"status": "ok", "data": {"text/plain": "'int'"}},
+            },
+            "type": "result",
+        }
+        stream = _FakeSandboxStream(stdout_lines=[json.dumps(payload_out)], result=_FakeExecutionResult(stdout=""))
+        sandbox = _FakeSandbox(_FakeExecutionResult(stdout=""), stream=stream)
+        _FakeSandboxClass.sandbox = sandbox
+
+        with patch.object(service, "_get_sandbox_class", return_value=_FakeSandboxClass):
+            execution_result = service._execute_in_sandbox(
+                handle,
+                "print('hi')",
+                capture_variables=True,
+                variable_names=["answer"],
+                timeout=5,
+            )
+
+        assert execution_result.status == "ok"
+        assert execution_result.stdout == "hello"
+        assert execution_result.execution_count == 3
+        assert execution_result.variables == {"answer": {"status": "ok", "type": "int"}}
+        assert handle.execution_count == 3
+
+    def test_execute_in_sandbox_handles_notebook_bridge_messages(self) -> None:
+        service = KernelRuntimeService(execution_timeout=5)
+        notebook = Notebook.objects.create(team=self.team)
+        runtime = KernelRuntime.objects.create(
+            team=self.team,
+            notebook=notebook,
+            notebook_short_id=notebook.short_id,
+            user=self.user,
+            status=KernelRuntime.Status.RUNNING,
+            backend=KernelRuntime.Backend.DOCKER,
+            connection_file="/tmp/connection.json",
+            sandbox_id="sandbox-1",
+        )
+        handle = _KernelHandle(
+            runtime=runtime,
+            lock_name="lock",
+            started_at=timezone.now(),
+            last_activity_at=timezone.now(),
+            backend=KernelRuntime.Backend.DOCKER,
+            sandbox_id=runtime.sandbox_id,
+        )
+        marker = service._notebook_bridge_marker(handle)
+        bridge_payload = {"call": "hogql_execute", "query": "select 1", "response_path": "/tmp/resp.json"}
+        bridge_payload_json = json.dumps(bridge_payload)
+        bridge_message = f"{marker}{len(bridge_payload_json)} {bridge_payload_json}\n"
+        payload_out: dict[str, Any] = {
+            "type": "result",
+            "status": "ok",
+            "stdout": f"before\n{bridge_message}after",
+            "stderr": "",
+            "result": None,
+            "media": [],
+            "execution_count": 1,
+            "error_name": None,
+            "traceback": [],
+            "user_expressions": None,
+        }
+        stream = _FakeSandboxStream(
+            stdout_lines=[
+                json.dumps({"type": "stream", "name": "stdout", "text": bridge_message}),
+                json.dumps(payload_out),
+            ],
+            result=_FakeExecutionResult(stdout=""),
+        )
+        sandbox = _FakeSandbox(_FakeExecutionResult(stdout=""), stream=stream)
+        _FakeSandboxClass.sandbox = sandbox
+
+        with (
+            patch.object(service, "_get_sandbox_class", return_value=_FakeSandboxClass),
+            patch.object(service, "_handle_notebook_bridge_payload") as mock_payload,
+        ):
+            execution_result = service._execute_in_sandbox(
+                handle,
+                "print('hi')",
+                capture_variables=False,
+                variable_names=[],
+                timeout=5,
+            )
+
+        assert execution_result.stdout == "before\nafter"
+        mock_payload.assert_called_once_with(bridge_payload_json, handle)
+
+    def test_notebook_bridge_hogql_executes_as_runtime_user(self) -> None:
+        service = KernelRuntimeService(execution_timeout=5)
+        notebook = Notebook.objects.create(team=self.team)
+        runtime = KernelRuntime.objects.create(
+            team=self.team,
+            notebook=notebook,
+            notebook_short_id=notebook.short_id,
+            user=self.user,
+            status=KernelRuntime.Status.RUNNING,
+            backend=KernelRuntime.Backend.DOCKER,
+            connection_file="/tmp/connection.json",
+            sandbox_id="sandbox-1",
+        )
+        handle = _KernelHandle(
+            runtime=runtime,
+            lock_name="lock",
+            started_at=timezone.now(),
+            last_activity_at=timezone.now(),
+            backend=KernelRuntime.Backend.DOCKER,
+            sandbox_id=runtime.sandbox_id,
+        )
+        sandbox = _FakeSandbox(_FakeExecutionResult(stdout=""))
+        _FakeSandboxClass.sandbox = sandbox
+        payload = {"call": "hogql_execute", "query": "select * from warehouse_table", "response_path": "/tmp/resp.json"}
+
+        with (
+            patch.object(service, "_get_sandbox_class", return_value=_FakeSandboxClass),
+            patch("products.notebooks.backend.kernel_runtime.execute_hogql_query") as mock_execute,
+        ):
+            mock_execute.return_value.model_dump.return_value = {"results": [[1]], "columns": ["count"]}
+            service._handle_notebook_bridge_payload(json.dumps(payload), handle)
+
+        mock_execute.assert_called_once()
+        assert mock_execute.call_args.kwargs["user"] == self.user
+        header, body = sandbox.written_files["/tmp/resp.json"].split(b"\n", 1)
+        assert int(header) == len(body)
+
+    @parameterized.expand(
+        [
+            (
+                "no_marker_immediate",
+                "__NOTEBOOK_BRIDGE__",
+                ["hello12\n"],
+                ["hello12\n"],
+                [],
+            ),
+            (
+                "marker_not_at_line_start",
+                "__NOTEBOOK_BRIDGE__",
+                ['hello __NOTEBOOK_BRIDGE__41 {"call":"hogql_execute","query":"select"}\n'],
+                ['hello __NOTEBOOK_BRIDGE__41 {"call":"hogql_execute","query":"select"}\n'],
+                [],
+            ),
+            (
+                "payload_extraction",
+                "__NOTEBOOK_BRIDGE__",
+                [
+                    '__NOTEBOOK_BRIDGE__41 {"call":"hogql_execute","query":"select"}\nworld\n',
+                ],
+                ["world\n"],
+                ['{"call":"hogql_execute","query":"select"}'],
+            ),
+            (
+                "payload_split_across_chunks",
+                "__NOTEBOOK_BRIDGE__",
+                [
+                    '__NOTEBOOK_BRIDGE__41 {"call":"hogql_execute",',
+                    '"query":"select"}\nnext\n',
+                ],
+                ["", "next\n"],
+                ['{"call":"hogql_execute","query":"select"}'],
+            ),
+        ]
+    )
+    def test_notebook_bridge_parser_streaming(
+        self,
+        _name: str,
+        marker: str,
+        chunks: list[str],
+        expected_outputs: list[str],
+        expected_payloads: list[str],
+    ) -> None:
+        parser = _NotebookBridgeParser(marker=marker)
+        outputs: list[str] = []
+        payloads: list[str] = []
+        for chunk in chunks:
+            output, new_payloads = parser.feed(chunk)
+            outputs.append(output)
+            payloads.extend(new_payloads)
+
+        assert outputs == expected_outputs
+        assert payloads == expected_payloads
+        assert parser.buffer == ""

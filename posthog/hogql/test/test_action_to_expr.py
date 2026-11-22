@@ -1,0 +1,201 @@
+from typing import Any, Optional
+
+import pytest
+from posthog.test.base import BaseTest, _create_event
+
+from posthog.hogql import ast
+from posthog.hogql.errors import QueryError
+from posthog.hogql.parser import parse_expr, parse_select
+from posthog.hogql.property import action_to_expr, steps_to_expr
+from posthog.hogql.query import execute_hogql_query
+from posthog.hogql.visitor import clear_locations
+
+from posthog.models import Team
+
+from products.actions.backend.facade.contracts import ActionStep
+from products.actions.backend.facade.testing import create_action
+
+
+class TestActionToExpr(BaseTest):
+    maxDiff = None
+
+    def _parse_expr(self, expr: str, placeholders: Optional[dict[str, Any]] = None):
+        return clear_locations(parse_expr(expr, placeholders=placeholders))
+
+    def test_action_to_expr_autocapture_with_selector(self):
+        """Test autocapture action with CSS selector"""
+        _create_event(
+            event="$autocapture", team=self.team, distinct_id="some_id", elements_chain='a.active.nav-link:text="text"'
+        )
+        action = create_action(
+            team=self.team,
+            steps_json=[
+                {
+                    "event": "$autocapture",
+                    "selector": "a.nav-link.active",
+                }
+            ],
+        )
+        self.assertEqual(
+            clear_locations(action_to_expr(action)),
+            self._parse_expr(
+                "event = '$autocapture' and {regex1}",
+                {
+                    "regex1": ast.And(
+                        exprs=[
+                            self._parse_expr(
+                                "elements_chain =~ {regex}",
+                                {
+                                    "regex": ast.Constant(
+                                        value='(^|;)a(?:[^;"]|"(?:\\\\.|[^"\\\\])*")*?\\.active\\.(?:[^;"]|"(?:\\\\.|[^"\\\\])*")*?nav\\-link(?:[^;"]|"(?:\\\\.|[^"\\\\])*")*?($|;|:([^;^\\s]*(;|$|\\s)))'
+                                    )
+                                },
+                            ),
+                            self._parse_expr("arrayCount(x -> x IN ['a'], elements_chain_elements) > 0"),
+                        ]
+                    ),
+                },
+            ),
+        )
+        resp = execute_hogql_query(
+            parse_select("select count() from events where {prop}", {"prop": action_to_expr(action)}), self.team
+        )
+        self.assertEqual(resp.results[0][0], 1)
+
+    def test_action_to_expr_pageview_url_contains(self):
+        """Test pageview action with URL contains matching"""
+        action = create_action(
+            team=self.team,
+            steps_json=[
+                {
+                    "event": "$pageview",
+                    "url": "https://example.com",
+                    "url_matching": "contains",
+                }
+            ],
+        )
+        self.assertEqual(
+            clear_locations(action_to_expr(action)),
+            self._parse_expr("event = '$pageview' and properties.$current_url like '%https://example.com%'"),
+        )
+
+    def test_action_to_expr_multiple_steps_or(self):
+        """Test action with multiple steps creating OR expression"""
+        action = create_action(
+            team=self.team,
+            steps_json=[
+                {
+                    "event": "$pageview",
+                    "url": "https://example2.com",
+                    "url_matching": "regex",
+                },
+                {
+                    "event": "custom",
+                    "url": "https://example3.com",
+                    "url_matching": "exact",
+                },
+            ],
+        )
+        self.assertEqual(
+            clear_locations(action_to_expr(action)),
+            self._parse_expr(
+                "{s1} or {s2}",
+                {
+                    "s1": self._parse_expr("event = '$pageview' and properties.$current_url =~ 'https://example2.com'"),
+                    "s2": self._parse_expr("event = 'custom' and properties.$current_url = 'https://example3.com'"),
+                },
+            ),
+        )
+
+    def test_action_to_expr_null_event_resolves_to_true(self):
+        """Test action with null event step resolves to true"""
+        action = create_action(team=self.team, steps_json=[{"event": "$pageview"}, {"event": None}])
+        self.assertEqual(
+            clear_locations(action_to_expr(action)),
+            self._parse_expr("event = '$pageview' OR true"),
+        )
+
+    def test_action_to_expr_autocapture_href_regex(self):
+        """Test autocapture action with href regex matching"""
+        action = create_action(
+            team=self.team,
+            steps_json=[{"event": "$autocapture", "href": "https://example4.com", "href_matching": "regex"}],
+        )
+        self.assertEqual(
+            clear_locations(action_to_expr(action)),
+            self._parse_expr("event = '$autocapture' and elements_chain_href =~ 'https://example4.com'"),
+        )
+
+    def test_action_to_expr_autocapture_text_regex(self):
+        """Test autocapture action with text regex matching"""
+        action = create_action(
+            team=self.team,
+            steps_json=[{"event": "$autocapture", "text": "blabla", "text_matching": "regex"}],
+        )
+        self.assertEqual(
+            clear_locations(action_to_expr(action)),
+            self._parse_expr("event = '$autocapture' and arrayExists(x -> x =~ 'blabla', elements_chain_texts)"),
+        )
+
+    def test_action_to_expr_autocapture_text_contains(self):
+        """Test autocapture action with text contains matching"""
+        action = create_action(
+            team=self.team,
+            steps_json=[{"event": "$autocapture", "text": "blabla", "text_matching": "contains"}],
+        )
+        self.assertEqual(
+            clear_locations(action_to_expr(action)),
+            self._parse_expr("event = '$autocapture' and arrayExists(x -> x ilike '%blabla%', elements_chain_texts)"),
+        )
+
+    def test_action_to_expr_autocapture_text_exact(self):
+        """Test autocapture action with text exact matching"""
+        action = create_action(
+            team=self.team,
+            steps_json=[{"event": "$autocapture", "text": "blabla", "text_matching": "exact"}],
+        )
+        self.assertEqual(
+            clear_locations(action_to_expr(action)),
+            self._parse_expr("event = '$autocapture' and arrayExists(x -> x = 'blabla', elements_chain_texts)"),
+        )
+
+    def test_steps_to_expr_matches_action_to_expr(self):
+        action = create_action(
+            team=self.team,
+            steps_json=[
+                {"event": "$pageview", "url": "https://example.com", "url_matching": "contains"},
+                {"event": "custom_event"},
+            ],
+        )
+        steps = [
+            ActionStep(event="$pageview", url="https://example.com", url_matching="contains"),
+            ActionStep(event="custom_event"),
+        ]
+        self.assertEqual(
+            clear_locations(action_to_expr(action)),
+            clear_locations(steps_to_expr(steps, self.team)),
+        )
+
+    def test_steps_to_expr_empty_steps(self):
+        self.assertEqual(
+            clear_locations(steps_to_expr([], self.team)),
+            clear_locations(parse_expr("true")),
+        )
+
+
+class TestStepsToExprRegexValidation:
+    @pytest.mark.parametrize(
+        "step",
+        [
+            ActionStep(event="$pageview", url="/token-abc123/\\d+\\", url_matching="regex"),
+            ActionStep(event="$autocapture", href="/token-abc123/\\d+\\", href_matching="regex"),
+            ActionStep(event="$autocapture", text="/token-abc123/\\d+\\", text_matching="regex"),
+        ],
+        ids=["url", "href", "text"],
+    )
+    def test_invalid_step_regex_raises_query_error_without_logging_it(
+        self, step: ActionStep, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(QueryError, match="Invalid regular expression"):
+            steps_to_expr([step], team=Team())
+        assert "token-abc123" not in capfd.readouterr().err

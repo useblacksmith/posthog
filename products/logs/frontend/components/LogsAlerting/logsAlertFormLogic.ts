@@ -1,0 +1,569 @@
+import { MakeLogicType, actions, afterMount, connect, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import { forms } from 'kea-forms'
+import type { DeepPartial, DeepPartialMap, FieldName, ValidationErrorType } from 'kea-forms'
+import { loaders } from 'kea-loaders'
+import { router } from 'kea-router'
+import posthog from 'posthog-js'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import { ApiError } from 'lib/api'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { FeatureFlagsSet, featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { LogMessage } from '~/queries/schema/schema-general'
+import { FilterLogicalOperator, UniversalFiltersGroup } from '~/types'
+
+import { findQuietHoursIssues } from 'products/alerts/frontend/logic/scheduleRestrictionValidation'
+import type { ScheduleRestriction } from 'products/alerts/frontend/types'
+import { platformAlertDestinationsLogic } from 'products/alerts_platform/frontend/destinations/platformAlertDestinationsLogic'
+import { PlatformAlertCreateDestinationApi } from 'products/alerts_platform/frontend/generated/api.schemas'
+import {
+    logsAlertsCreate,
+    logsAlertsPartialUpdate,
+    logsAlertsSimulateCreate,
+} from 'products/logs/frontend/generated/api'
+import {
+    LogsAlertConfigurationApi,
+    LogsAlertSimulateResponseApi,
+    PatchedLogsAlertConfigurationApi,
+    LogsAlertConfigurationThresholdOperatorEnumApi,
+} from 'products/logs/frontend/generated/api.schemas'
+
+import { logsAlertDestinationsLogicProps } from './logsAlertDestinations'
+import {
+    DEFAULT_GROUPED_MAX_INSTANCES,
+    LogsAlertGroupBy,
+    canGroupAlert,
+    groupByOf,
+    groupingPayloadOf,
+    isRegroup,
+    maxInstancesError,
+    regroupConfirmationText,
+    SIMULATION_NEEDS_UNGROUPED,
+} from './logsAlertGrouping'
+import { logsAlertingLogic } from './logsAlertingLogic'
+import { buildAlertFilters, hasAnyFilter } from './logsAlertUtils'
+
+const EMPTY_FILTER_GROUP: UniversalFiltersGroup = {
+    type: FilterLogicalOperator.And,
+    values: [],
+}
+
+/** Thrown by the form submit to stop a save until the person confirms the regroup. */
+export class RegroupConfirmationRequired extends Error {}
+
+const DEFAULT_SEVERITY_LEVELS: LogMessage['severity_text'][] = ['trace', 'debug', 'info', 'warn', 'error', 'fatal']
+
+export interface LogsAlertFormType {
+    name: string
+    severityLevels: LogMessage['severity_text'][]
+    serviceNames: string[]
+    filterGroup: UniversalFiltersGroup
+    thresholdOperator: LogsAlertConfigurationThresholdOperatorEnumApi
+    thresholdCount: number
+    windowMinutes: number
+    evaluationPeriods: number
+    datapointsToAlarm: number
+    cooldownMinutes: number
+    scheduleRestriction: ScheduleRestriction | null
+    groupBy: LogsAlertGroupBy
+    maxInstances: number
+}
+
+export interface LogsAlertFormLogicProps {
+    alert: LogsAlertConfigurationApi | null
+    onCreateSuccess?: () => void
+    onSubmitSuccess?: () => void
+}
+
+function extractFilterGroup(alert: LogsAlertConfigurationApi | null): UniversalFiltersGroup {
+    const filters = (alert?.filters ?? {}) as Record<string, unknown>
+    const stored = filters.filterGroup as { type: string; values: unknown[] } | undefined
+    if (stored?.values) {
+        const innerGroup = stored.values[0] as UniversalFiltersGroup | undefined
+        if (innerGroup?.values) {
+            return innerGroup
+        }
+    }
+    return EMPTY_FILTER_GROUP
+}
+
+function saveErrorMessage(error: ApiError): string {
+    return error.detail ?? error.message ?? 'Failed to save alert'
+}
+
+export function buildFormDefaults(alert: LogsAlertConfigurationApi | null): LogsAlertFormType {
+    const filters = (alert?.filters ?? {}) as Record<string, unknown>
+    const groupBy = groupByOf(alert?.grouping)
+
+    return {
+        name: alert?.name ?? '',
+        severityLevels: alert
+            ? ((filters.severityLevels as LogMessage['severity_text'][]) ?? [])
+            : DEFAULT_SEVERITY_LEVELS,
+        serviceNames: (filters.serviceNames as string[]) ?? [],
+        filterGroup: extractFilterGroup(alert),
+        thresholdOperator: alert?.threshold_operator ?? LogsAlertConfigurationThresholdOperatorEnumApi.Above,
+        thresholdCount: alert?.threshold_count ?? 100,
+        windowMinutes: alert?.window_minutes ?? 10,
+        evaluationPeriods: alert?.evaluation_periods ?? 1,
+        datapointsToAlarm: alert?.datapoints_to_alarm ?? 1,
+        cooldownMinutes: alert?.cooldown_minutes ?? 0,
+        scheduleRestriction: alert?.schedule_restriction ?? null,
+        groupBy,
+        // An ungrouped alert stores the platform's ceiling, which is too many groups to notify on.
+        maxInstances:
+            groupBy === 'none'
+                ? DEFAULT_GROUPED_MAX_INSTANCES
+                : (alert?.grouping?.max_instances ?? DEFAULT_GROUPED_MAX_INSTANCES),
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface logsAlertFormLogicValues {
+    featureFlags: FeatureFlagsSet // featureFlagLogic
+    alerts: LogsAlertConfigurationApi[] // logsAlertingLogic
+    alertsLoaded: boolean // logsAlertingLogic
+    createdByFilter: string | null // logsAlertingLogic
+    pendingDestinations: PlatformAlertCreateDestinationApi[] // platformAlertDestinationsLogic
+    currentTeamId: number | null // teamLogic
+    alertForm: LogsAlertFormType
+    alertFormAllErrors: Record<string, any>
+    alertFormChanged: boolean
+    alertFormErrors: DeepPartialMap<LogsAlertFormType, ValidationErrorType>
+    alertFormHasErrors: boolean
+    alertFormManualErrors: Record<string, any>
+    alertFormTouched: boolean
+    alertFormTouches: Record<string, boolean>
+    alertFormValidationErrors: DeepPartialMap<LogsAlertFormType, ValidationErrorType>
+    canGroup: boolean
+    groupingFlagEnabled: boolean
+    isAlertFormSubmitting: boolean
+    isAlertFormValid: boolean
+    isEditing: boolean
+    isRegroupConfirmationOpen: boolean
+    isRegroupConfirmed: boolean
+    isSimulationPanelOpen: boolean
+    lockedGroupBy: LogsAlertGroupBy | null
+    needsRegroupConfirmation: boolean
+    regroupConfirmation: string
+    showAlertFormErrors: boolean
+    simulationDateFrom: string
+    simulationDisabledReason: string | undefined
+    simulationResult: LogsAlertSimulateResponseApi | null
+    simulationResultLoading: boolean
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface logsAlertFormLogicActions {
+    loadAlerts: (_?: any) => any // logsAlertingLogic
+    createPendingDestinations: (alertId: string) => {
+        alertId: string
+    } // platformAlertDestinationsLogic
+    clearSimulation: () => {
+        value: true
+    }
+    clearSimulationFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    clearSimulationSuccess: (
+        simulationResult: null,
+        payload?: {
+            value: true
+        }
+    ) => {
+        simulationResult: null
+        payload?: {
+            value: true
+        }
+    }
+    closeRegroupConfirmation: () => {
+        value: true
+    }
+    closeSimulationPanel: () => {
+        value: true
+    }
+    confirmRegroup: () => {
+        value: true
+    }
+    openRegroupConfirmation: () => {
+        value: true
+    }
+    openSimulationPanel: () => {
+        value: true
+    }
+    resetAlertForm: (values?: LogsAlertFormType) => {
+        values?: LogsAlertFormType
+    }
+    setAlertFormManualErrors: (errors: Record<string, any>) => {
+        errors: Record<string, any>
+    }
+    setAlertFormValue: (
+        key: FieldName,
+        value: any
+    ) => {
+        name: FieldName
+        value: any
+    }
+    setAlertFormValues: (values: DeepPartial<LogsAlertFormType>) => {
+        values: DeepPartial<LogsAlertFormType>
+    }
+    setGroupBy: (groupBy: LogsAlertGroupBy) => {
+        groupBy: LogsAlertGroupBy
+    }
+    setSimulationDateFrom: (dateFrom: string) => {
+        dateFrom: string
+    }
+    simulateAlert: () => {
+        value: true
+    }
+    simulateAlertFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    simulateAlertSuccess: (
+        simulationResult: LogsAlertSimulateResponseApi | null,
+        payload?: {
+            value: true
+        }
+    ) => {
+        simulationResult: LogsAlertSimulateResponseApi | null
+        payload?: {
+            value: true
+        }
+    }
+    submitAlertForm: () => {
+        value: boolean
+    }
+    submitAlertFormFailure: (
+        error: Error,
+        errors: Record<string, any>
+    ) => {
+        error: Error
+        errors: Record<string, any>
+    }
+    submitAlertFormRequest: (alertForm: LogsAlertFormType) => {
+        alertForm: LogsAlertFormType
+    }
+    submitAlertFormSuccess: (alertForm: LogsAlertFormType) => {
+        alertForm: LogsAlertFormType
+    }
+    touchAlertFormField: (key: string) => {
+        key: string
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface logsAlertFormLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        isEditing: (arg: any) => boolean
+        groupingFlagEnabled: (featureFlags: FeatureFlagsSet) => boolean
+        canGroup: (
+            arg: any,
+            alerts: LogsAlertConfigurationApi[],
+            alertsLoaded: boolean,
+            createdByFilter: string | null,
+            groupingFlagEnabled: boolean
+        ) => boolean
+        lockedGroupBy: (arg: any, groupingFlagEnabled: boolean) => LogsAlertGroupBy | null
+        regroupConfirmation: (arg: any) => string
+        needsRegroupConfirmation: (arg: any, canGroup: boolean, alertForm: LogsAlertFormType) => boolean
+        simulationDisabledReason: (canGroup: boolean, alertForm: LogsAlertFormType) => string | undefined
+    }
+}
+
+export type logsAlertFormLogicType = MakeLogicType<
+    logsAlertFormLogicValues,
+    logsAlertFormLogicActions,
+    LogsAlertFormLogicProps,
+    logsAlertFormLogicMeta
+>
+
+export const logsAlertFormLogic = kea<logsAlertFormLogicType>([
+    path(['products', 'logs', 'frontend', 'components', 'LogsAlerting', 'logsAlertFormLogic']),
+    props({} as LogsAlertFormLogicProps),
+    key(({ alert }) => alert?.id ?? 'new'),
+
+    connect(({ alert }: LogsAlertFormLogicProps) => ({
+        values: [
+            teamLogic,
+            ['currentTeamId'],
+            logsAlertingLogic,
+            ['alerts', 'alertsLoaded', 'createdByFilter'],
+            featureFlagLogic,
+            ['featureFlags'],
+            platformAlertDestinationsLogic(logsAlertDestinationsLogicProps(alert?.id)),
+            ['pendingDestinations'],
+        ],
+        actions: [
+            logsAlertingLogic,
+            ['loadAlerts'],
+            platformAlertDestinationsLogic(logsAlertDestinationsLogicProps(alert?.id)),
+            ['createPendingDestinations'],
+        ],
+    })),
+
+    actions({
+        simulateAlert: true,
+        clearSimulation: true,
+        setSimulationDateFrom: (dateFrom: string) => ({ dateFrom }),
+        openSimulationPanel: true,
+        closeSimulationPanel: true,
+        setGroupBy: (groupBy: LogsAlertGroupBy) => ({ groupBy }),
+        openRegroupConfirmation: true,
+        closeRegroupConfirmation: true,
+        confirmRegroup: true,
+    }),
+
+    reducers({
+        isSimulationPanelOpen: [
+            false,
+            {
+                openSimulationPanel: () => true,
+                closeSimulationPanel: () => false,
+            },
+        ],
+        simulationDateFrom: [
+            '-24h' as string,
+            {
+                setSimulationDateFrom: (_, { dateFrom }) => dateFrom,
+            },
+        ],
+        isRegroupConfirmationOpen: [
+            false,
+            {
+                openRegroupConfirmation: () => true,
+                closeRegroupConfirmation: () => false,
+                confirmRegroup: () => false,
+            },
+        ],
+    }),
+
+    loaders(({ values }) => ({
+        simulationResult: [
+            null as LogsAlertSimulateResponseApi | null,
+            {
+                simulateAlert: async (): Promise<LogsAlertSimulateResponseApi | null> => {
+                    const form = values.alertForm
+                    if (values.simulationDisabledReason) {
+                        return null
+                    }
+                    if (!hasAnyFilter(form.severityLevels, form.serviceNames, form.filterGroup)) {
+                        lemonToast.error('At least one filter is required to simulate')
+                        return null
+                    }
+                    const projectId = String(values.currentTeamId)
+                    return await logsAlertsSimulateCreate(projectId, {
+                        filters: buildAlertFilters(form.severityLevels, form.serviceNames, form.filterGroup),
+                        threshold_count: form.thresholdCount,
+                        threshold_operator: form.thresholdOperator,
+                        window_minutes: form.windowMinutes,
+                        evaluation_periods: form.evaluationPeriods,
+                        datapoints_to_alarm: form.datapointsToAlarm,
+                        cooldown_minutes: form.cooldownMinutes,
+                        date_from: values.simulationDateFrom,
+                    })
+                },
+                clearSimulation: () => null,
+            },
+        ],
+    })),
+
+    listeners(({ actions, values, props }) => ({
+        setAlertFormValue: () => {
+            actions.clearSimulation()
+        },
+        setGroupBy: ({ groupBy }) => {
+            const previous = values.alertForm.groupBy
+            if (groupBy === previous) {
+                return
+            }
+            actions.setAlertFormValue('groupBy', groupBy)
+            // pinned: analytics event name and properties, renaming breaks dashboards
+            posthog.capture('logs alert grouping changed', {
+                group_by: groupBy,
+                previous_group_by: previous,
+                is_editing: props.alert !== null,
+            })
+        },
+        confirmRegroup: () => {
+            // pinned: analytics event name and properties, renaming breaks dashboards
+            posthog.capture('logs alert regroup confirmed', {
+                group_by: values.alertForm.groupBy,
+                previous_group_by: groupByOf(props.alert?.grouping),
+            })
+            actions.submitAlertForm()
+        },
+        simulateAlertFailure: ({ error }) => {
+            lemonToast.error(`Simulation failed: ${error || 'Unknown error'}`)
+        },
+    })),
+
+    selectors({
+        isEditing: [() => [(_, props) => props.alert], (alert: LogsAlertConfigurationApi | null) => alert !== null],
+        groupingFlagEnabled: [
+            (s) => [s.featureFlags],
+            (featureFlags: FeatureFlagsSet): boolean => !!featureFlags[FEATURE_FLAGS.LOGS_ALERTS_GROUPING],
+        ],
+        canGroup: [
+            (s) => [(_, props) => props.alert, s.alerts, s.alertsLoaded, s.createdByFilter, s.groupingFlagEnabled],
+            (
+                alert: LogsAlertConfigurationApi | null,
+                alerts: LogsAlertConfigurationApi[],
+                alertsLoaded: boolean,
+                createdByFilter: string | null,
+                groupingFlagEnabled: boolean
+            ): boolean =>
+                canGroupAlert(
+                    alert,
+                    alertsLoaded ? { alerts, complete: createdByFilter === null } : null,
+                    groupingFlagEnabled
+                ),
+        ],
+        lockedGroupBy: [
+            (s) => [(_, props) => props.alert, s.groupingFlagEnabled],
+            (alert: LogsAlertConfigurationApi | null, groupingFlagEnabled: boolean): LogsAlertGroupBy | null =>
+                groupingFlagEnabled ? null : groupByOf(alert?.grouping),
+        ],
+        regroupConfirmation: [
+            () => [(_, props) => props.alert],
+            (alert: LogsAlertConfigurationApi | null): string => regroupConfirmationText(alert),
+        ],
+    }),
+
+    afterMount(({ actions, props }) => {
+        // Pass values explicitly to reset — kea caches logic instances by key,
+        // so defaults from a previous mount may be stale
+        actions.resetAlertForm(buildFormDefaults(props.alert))
+    }),
+
+    forms(({ props, actions, values }) => ({
+        alertForm: {
+            // Provides typed shape for kea-forms; afterMount resets with fresh values on every remount
+            defaults: buildFormDefaults(props.alert),
+            errors: ({ name, groupBy, maxInstances }) => ({
+                name: !name?.trim() ? 'Name is required' : undefined,
+                maxInstances: groupBy ? maxInstancesError(groupBy, maxInstances) : undefined,
+            }),
+            submit: async (form) => {
+                if (!form.name?.trim()) {
+                    form.name = 'Untitled alert'
+                }
+
+                if (form.scheduleRestriction?.blocked_windows) {
+                    const quietHoursIssue = findQuietHoursIssues(form.scheduleRestriction.blocked_windows)
+                    if (quietHoursIssue) {
+                        throw new Error(quietHoursIssue.message)
+                    }
+                }
+
+                if (!hasAnyFilter(form.severityLevels, form.serviceNames, form.filterGroup)) {
+                    lemonToast.error('At least one filter is required')
+                    throw new Error('At least one filter is required')
+                }
+                if (values.needsRegroupConfirmation && !values.isRegroupConfirmed) {
+                    actions.openRegroupConfirmation()
+                    throw new RegroupConfirmationRequired()
+                }
+
+                const projectId = String(values.currentTeamId)
+                // Left out when the alert cannot group, or keeps a grouping the form can't show, so the API keeps it.
+                const grouping = values.canGroup
+                    ? groupingPayloadOf(form.groupBy, form.maxInstances, props.alert?.grouping)
+                    : undefined
+                const payload = {
+                    ...(grouping ? { grouping } : {}),
+                    name: form.name.trim(),
+                    filters: buildAlertFilters(form.severityLevels, form.serviceNames, form.filterGroup),
+                    threshold_count: form.thresholdCount,
+                    threshold_operator: form.thresholdOperator,
+                    window_minutes: form.windowMinutes,
+                    evaluation_periods: form.evaluationPeriods,
+                    datapoints_to_alarm: form.datapointsToAlarm,
+                    cooldown_minutes: form.cooldownMinutes,
+                    schedule_restriction: form.scheduleRestriction,
+                }
+
+                let savedAlertId: string
+                try {
+                    if (props.alert) {
+                        const patch: PatchedLogsAlertConfigurationApi = { ...payload }
+                        await logsAlertsPartialUpdate(projectId, props.alert.id, patch)
+                        savedAlertId = props.alert.id
+                        lemonToast.success('Alert updated')
+                    } else {
+                        const created = await logsAlertsCreate(projectId, payload)
+                        savedAlertId = created.id
+                        lemonToast.success('Alert created')
+                    }
+                } catch (error: unknown) {
+                    lemonToast.error(saveErrorMessage(error as ApiError))
+                    throw error
+                }
+
+                let notificationsConfigured = true
+                try {
+                    if (values.pendingDestinations.length > 0) {
+                        const destinationsLogic = platformAlertDestinationsLogic(
+                            logsAlertDestinationsLogicProps(props.alert?.id)
+                        )
+                        await destinationsLogic.asyncActions.createPendingDestinations(savedAlertId)
+                        notificationsConfigured = destinationsLogic.values.pendingDestinations.length === 0
+                    }
+                } catch {
+                    notificationsConfigured = false
+                    if (props.alert) {
+                        lemonToast.error('Alert updated, but notifications could not be configured.')
+                    } else {
+                        lemonToast.error('Alert created, but notifications could not be configured.')
+                    }
+                }
+
+                actions.loadAlerts()
+                props.onSubmitSuccess?.()
+                if (!props.alert) {
+                    props.onCreateSuccess?.()
+                    if (!notificationsConfigured) {
+                        router.actions.push(urls.logsAlertDetail(savedAlertId, 'notifications'))
+                    }
+                }
+                return form
+            },
+        },
+    })),
+    // After `forms`, so the form value and submit actions it adds exist when these bind to them.
+    selectors({
+        needsRegroupConfirmation: [
+            (s) => [(_, props) => props.alert, s.canGroup, s.alertForm],
+            (alert: LogsAlertConfigurationApi | null, canGroup: boolean, alertForm: LogsAlertFormType): boolean =>
+                canGroup && isRegroup(alert, alertForm.groupBy),
+        ],
+        simulationDisabledReason: [
+            (s) => [s.canGroup, s.alertForm],
+            (canGroup: boolean, alertForm: LogsAlertFormType): string | undefined =>
+                canGroup && alertForm.groupBy !== 'none' ? SIMULATION_NEEDS_UNGROUPED : undefined,
+        ],
+    }),
+    reducers({
+        // Holds only for the save the person confirmed, so a failed save asks again.
+        isRegroupConfirmed: [
+            false,
+            {
+                confirmRegroup: () => true,
+                submitAlertFormSuccess: () => false,
+                submitAlertFormFailure: () => false,
+            },
+        ],
+    }),
+])

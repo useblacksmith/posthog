@@ -1,0 +1,6041 @@
+import {
+    MOCK_DEFAULT_BASIC_USER,
+    MOCK_DEFAULT_USER,
+    MOCK_DEFAULT_ORGANIZATION,
+    MOCK_DEFAULT_PROJECT,
+    MOCK_DEFAULT_TEAM,
+    MOCK_ORGANIZATION_ID,
+    MOCK_TEAM_ID,
+} from 'lib/api.mock'
+
+import { render } from '@testing-library/react'
+import { combineUrl, router } from 'kea-router'
+import { expectLogic, partial } from 'kea-test-utils'
+import posthog from 'posthog-js'
+import { toast } from 'react-toastify'
+
+import { lemonToast as sharedLemonToast } from '@posthog/lemon-ui'
+
+import api from 'lib/api'
+import { ApiError, NetworkError } from 'lib/api-error'
+import { activityLogLogic } from 'lib/components/ActivityLog/activityLogLogic'
+import { flagTriggerLogic } from 'lib/components/IngestionControls/triggers/FlagTrigger/flagTriggerLogic'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { featureFlagLogic as enabledFeaturesLogic } from 'lib/logic/featureFlagLogic'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { removeProjectIdIfPresent } from 'lib/utils/kea-router'
+import { organizationLogic } from 'scenes/organizationLogic'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { resumeKeaLoadersErrors, silenceKeaLoadersErrors } from '~/initKea'
+import { deleteFromTree, refreshTreeItem } from '~/layout/panel-layout/ProjectTree/projectTreeLogic'
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+import {
+    ActivityScope,
+    CohortPropertyFilter,
+    CohortType,
+    FeatureFlagGroupType,
+    FeatureFlagType,
+    FeatureFlagWithV1Config,
+    OrganizationFeatureFlag,
+    PersonPropertyFilter,
+    PropertyFilterType,
+    PropertyOperator,
+    RecurrenceInterval,
+    ScheduledChangeModels,
+    ScheduledChangeOperationType,
+    ScheduledChangeRequestState,
+    ScheduledChangeType,
+} from '~/types'
+import { FeatureFlagFilters } from '~/types'
+
+import { TemplateKey } from 'products/feature_flags/frontend/featureFlagTemplateConstants'
+import type {
+    CopyFlagsDependencyRequirementsResponseApi,
+    CopyFlagsResponseApi,
+} from 'products/feature_flags/frontend/generated/api.schemas'
+
+import * as defaultReleaseConditionsModule from './defaultReleaseConditionsLogic'
+import {
+    DefaultReleaseConditionsResponse,
+    defaultReleaseConditionsLogic,
+    resolveDefaultReleaseConditions,
+} from './defaultReleaseConditionsLogic'
+import { detectFeatureFlagChanges } from './featureFlagConfirmationLogic'
+import {
+    NEW_FLAG,
+    RollbackReasonSource,
+    convertIndexBasedPayloadsToVariantKeys,
+    dependencyActionLabel,
+    dependencyDisabledReason,
+    featureFlagLogic,
+    flagWentLive,
+    hasDirectFlagDependency,
+    hasMultipleVariantsActive,
+    hasStaticCohortDependency,
+    hasZeroRollout,
+    indexToVariantKeyFeatureFlagPayloads,
+    scheduleDateFromStoredISO,
+    scheduleDateToProjectTzISO,
+    slugifyFeatureFlagKey,
+    validateFeatureFlagKey,
+    validateFeatureFlagTags,
+    validateFeatureFlagVariantKey,
+    validateVariantRolloutSum,
+} from './featureFlagLogic'
+import { FeatureFlagsTab, featureFlagUrlFromList, featureFlagsLogic } from './featureFlagsLogic'
+
+jest.mock('posthog-js')
+
+function capturesOf(event: string): any[][] {
+    return (posthog.capture as jest.Mock).mock.calls.filter(([name]) => name === event)
+}
+
+function v1Filters(flag: FeatureFlagType): FeatureFlagFilters {
+    return flag.filters as FeatureFlagFilters
+}
+
+// A promise the test resolves by hand, so it can hold a request open while something else lands.
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve: () => void = () => {}
+    const promise = new Promise<void>((innerResolve) => {
+        resolve = innerResolve
+    })
+    return { promise, resolve }
+}
+
+// jest.config.ts sets clearMocks: true, so these mock.fn() call histories reset before every test.
+jest.mock('lib/lemon-ui/LemonToast/LemonToast', () => ({
+    lemonToast: {
+        success: jest.fn(),
+        error: jest.fn(),
+        warning: jest.fn(),
+        info: jest.fn(),
+        loading: jest.fn((_message, options) => options?.toastId),
+        dismiss: jest.fn(),
+    },
+}))
+
+jest.mock('~/layout/panel-layout/ProjectTree/projectTreeLogic', () => ({
+    ...jest.requireActual('~/layout/panel-layout/ProjectTree/projectTreeLogic'),
+    deleteFromTree: jest.fn(),
+    refreshTreeItem: jest.fn(),
+}))
+
+const MOCK_FEATURE_FLAG = {
+    ...NEW_FLAG,
+    id: 1,
+    key: 'test-flag',
+    name: 'test-name',
+}
+
+const MOCK_FEATURE_FLAG_STATUS = {
+    status: 'active',
+    reason: 'mock reason',
+    rollout: {
+        effectively_full_rollout: false,
+        has_targeting_conditions: false,
+        max_rollout_percentage: 50,
+        is_multivariate: false,
+    },
+}
+
+const MOCK_EXPERIMENT = {
+    id: 123,
+    name: 'Test Experiment',
+    feature_flag_key: 'test-flag',
+    start_date: '2023-01-01',
+}
+
+const MOCK_DEPENDENT_FLAGS = [
+    { id: 10, key: 'dependent-flag-1', name: 'Dependent Flag 1' },
+    { id: 11, key: 'dependent-flag-2', name: 'Dependent Flag 2' },
+]
+
+describe('payload conversion helpers', () => {
+    const variants = [
+        { key: 'control', rollout_percentage: 50 },
+        { key: 'test', rollout_percentage: 50 },
+    ]
+
+    it.each([
+        [
+            'keyed by variant index',
+            variants,
+            { 0: '{"color":"red"}', 1: '{"color":"blue"}' },
+            { control: '{"color":"red"}', test: '{"color":"blue"}' },
+        ],
+        [
+            'numeric-string variant keys (regression)',
+            [
+                { key: '2', rollout_percentage: 50 },
+                { key: '0', rollout_percentage: 50 },
+            ],
+            { 0: '{"for":"variant-2"}', 1: '{"for":"variant-0"}' },
+            { '2': '{"for":"variant-2"}', '0': '{"for":"variant-0"}' },
+        ],
+        [
+            'skips indices without a matching variant',
+            variants,
+            { 0: '{"color":"red"}', 5: '{"orphan":true}' },
+            { control: '{"color":"red"}' },
+        ],
+    ])('converts multivariate payloads %s', (_label, vars, payloads, expected) => {
+        expect(convertIndexBasedPayloadsToVariantKeys(vars, payloads)).toEqual(expected)
+    })
+
+    it('keeps boolean flag payload handling unchanged', () => {
+        expect(
+            indexToVariantKeyFeatureFlagPayloads({
+                filters: {
+                    groups: [{ properties: [], rollout_percentage: 100, variant: null }],
+                    multivariate: null,
+                    payloads: {
+                        true: '{"enabled":true}',
+                        false: '{"enabled":false}',
+                    },
+                },
+            } as unknown as FeatureFlagType)
+        ).toEqual({
+            filters: {
+                groups: [{ properties: [], rollout_percentage: 100, variant: null }],
+                multivariate: null,
+                payloads: {
+                    true: '{"enabled":true}',
+                },
+            },
+        })
+    })
+})
+
+describe('schedule timezone helpers', () => {
+    // Scenarios covered: project tz east and west of browser tz, and matching the browser.
+    it.each([
+        ['America/New_York', '2026-02-05T10:00:00', '2026-02-05T15:00:00.000Z'],
+        ['America/Los_Angeles', '2026-02-05T10:00:00', '2026-02-05T18:00:00.000Z'],
+        ['UTC', '2026-02-05T10:00:00', '2026-02-05T10:00:00.000Z'],
+        ['Asia/Tokyo', '2026-02-05T10:00:00', '2026-02-05T01:00:00.000Z'],
+    ])('scheduleDateToProjectTzISO interprets the wall clock in %s', (timezone, wallClock, expectedIso) => {
+        // Build a browser-local Dayjs regardless of the Jest host timezone.
+        const local = dayjs(wallClock)
+        expect(scheduleDateToProjectTzISO(local, timezone)).toBe(expectedIso)
+    })
+
+    it.each([
+        ['America/New_York', '2026-02-05T15:00:00.000Z', '2026-02-05 10:00'],
+        ['America/Los_Angeles', '2026-02-05T18:00:00.000Z', '2026-02-05 10:00'],
+        ['UTC', '2026-02-05T10:00:00.000Z', '2026-02-05 10:00'],
+        ['Asia/Tokyo', '2026-02-05T01:00:00.000Z', '2026-02-05 10:00'],
+    ])(
+        'scheduleDateFromStoredISO exposes the project-timezone wall clock as a local Dayjs in %s',
+        (timezone, stored, expectedWallClock) => {
+            const restored = scheduleDateFromStoredISO(stored, timezone)
+            expect(restored.format('YYYY-MM-DD HH:mm')).toBe(expectedWallClock)
+        }
+    )
+
+    it.each([['America/New_York'], ['America/Los_Angeles'], ['UTC'], ['Asia/Tokyo']])(
+        'round-trips the user-entered wall clock in %s',
+        (timezone) => {
+            const userPicked = dayjs('2026-02-05T10:30:00')
+            const iso = scheduleDateToProjectTzISO(userPicked, timezone)
+            const restored = scheduleDateFromStoredISO(iso, timezone)
+            expect(restored.format('YYYY-MM-DD HH:mm')).toBe('2026-02-05 10:30')
+        }
+    )
+
+    // end_date is persisted as end-of-day (HH:mm:ss.999) — verify sub-second precision survives the trip.
+    it.each([['America/New_York'], ['America/Los_Angeles'], ['UTC'], ['Asia/Tokyo']])(
+        'preserves millisecond precision through the round trip in %s',
+        (timezone) => {
+            const endOfDay = dayjs('2026-02-05T00:00:00').tz(timezone, true).endOf('day')
+            const iso = endOfDay.toISOString()
+            const restored = scheduleDateFromStoredISO(iso, timezone)
+            expect(restored.format('YYYY-MM-DD HH:mm:ss.SSS')).toBe('2026-02-05 23:59:59.999')
+        }
+    )
+})
+
+describe('featureFlagLogic', () => {
+    let logic: ReturnType<typeof featureFlagLogic.build>
+    const FLAG_URL = `/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`
+    // The shape drf-exceptions-hog returns. The `detail` is what the generic initKea toast renders,
+    // so an empty body would let a silence or "one notice" assertion pass without suppression.
+    const SERVER_ERROR_BODY = { type: 'server_error', code: 'error', detail: 'A server error occurred.' }
+
+    beforeEach(async () => {
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                    200,
+                    MOCK_FEATURE_FLAG,
+                ],
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/status`]: () => [
+                    200,
+                    MOCK_FEATURE_FLAG_STATUS,
+                ],
+            },
+        })
+
+        initKeaTests()
+        logic = featureFlagLogic({ id: 1 })
+        logic.mount()
+
+        await expectLogic(logic).toFinishAllListeners()
+    })
+
+    afterEach(() => {
+        logic.unmount()
+        jest.useRealTimers()
+    })
+
+    describe('breadcrumbs', () => {
+        it('hands list filter params carried on the flag URL back to the list crumb', async () => {
+            await expectLogic(logic, () => {
+                router.actions.push(urls.featureFlag(1), {
+                    list_search: 'checkout',
+                    list_created_by_id: '[42]',
+                    edit: 'true',
+                })
+            }).toFinishAllListeners()
+
+            const listCrumb = logic.values.breadcrumbs[0]
+            expect(listCrumb.path).toContain(`${urls.featureFlags()}?`)
+            expect(listCrumb.path).toContain('search=checkout')
+            expect(listCrumb.path).toContain('created_by_id=%5B42%5D')
+            expect(listCrumb.path).not.toContain('list_')
+            expect(listCrumb.path).not.toContain('edit=')
+        })
+
+        it('links the list crumb to the bare list URL when the flag URL carries no filters', async () => {
+            await expectLogic(logic, () => {
+                router.actions.push(urls.featureFlag(1))
+            }).toFinishAllListeners()
+
+            expect(logic.values.breadcrumbs[0].path).toBe(urls.featureFlags())
+        })
+    })
+
+    describe('carried list params on the flag page', () => {
+        it('shows history page 1 when the flag is opened from list page 3', async () => {
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/activity/`]:
+                        () => [200, { results: [], next: null }],
+                },
+            })
+            const activityLogic = activityLogLogic({ scope: ActivityScope.FEATURE_FLAG, id: MOCK_FEATURE_FLAG.id })
+            activityLogic.mount()
+
+            try {
+                await expectLogic(activityLogic, () => {
+                    router.actions.push(featureFlagUrlFromList(MOCK_FEATURE_FLAG.id, { page: 3 }, { tab: 'history' }))
+                }).toFinishAllListeners()
+
+                // The list's page rides as `list_page`, so the History tab's own pagination
+                // (which reads the bare `page` param) starts at page 1
+                expect(activityLogic.values.page).toBe(1)
+            } finally {
+                activityLogic.unmount()
+            }
+        })
+    })
+
+    describe('stale list-cache reconciliation on mount', () => {
+        it.each([
+            {
+                cohortChange: 'deleted',
+                listMarkers: {},
+                serverMarkers: { cohort_name: 'Frequent buyers', cohort_deleted: true },
+                expectedDeletedCohortFilters: [
+                    expect.objectContaining({ value: 5, cohort_name: 'Frequent buyers', cohort_deleted: true }),
+                ],
+            },
+            {
+                cohortChange: 'restored',
+                listMarkers: { cohort_name: 'Frequent buyers', cohort_deleted: true },
+                serverMarkers: { cohort_name: 'Frequent buyers' },
+                expectedDeletedCohortFilters: [],
+            },
+        ])(
+            'refreshes a cache-painted flag so active and cohort markers reflect the server after the cohort was $cohortChange',
+            async ({ listMarkers, serverMarkers, expectedDeletedCohortFilters }) => {
+                logic.unmount()
+
+                // The cohort changed after the list loaded, so the list copy and the server copy mark it differently.
+                const cohortCondition: CohortPropertyFilter = {
+                    key: 'id',
+                    type: PropertyFilterType.Cohort,
+                    value: 5,
+                    operator: PropertyOperator.In,
+                }
+                const withCohortCondition = (properties: CohortPropertyFilter[]): FeatureFlagFilters => ({
+                    ...MOCK_FEATURE_FLAG.filters,
+                    groups: [{ properties, rollout_percentage: 100, variant: null }],
+                })
+                useMocks({
+                    get: {
+                        '/api/projects/:projectId/feature_flags/': () => [
+                            200,
+                            {
+                                results: [
+                                    {
+                                        ...MOCK_FEATURE_FLAG,
+                                        active: false,
+                                        filters: withCohortCondition([{ ...cohortCondition, ...listMarkers }]),
+                                    },
+                                ],
+                                count: 1,
+                            },
+                        ],
+                        [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                            200,
+                            {
+                                ...MOCK_FEATURE_FLAG,
+                                active: true,
+                                filters: withCohortCondition([{ ...cohortCondition, ...serverMarkers }]),
+                            },
+                        ],
+                        [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/status`]:
+                            () => [200, MOCK_FEATURE_FLAG_STATUS],
+                    },
+                })
+
+                featureFlagsLogic.mount()
+                featureFlagsLogic.actions.loadFeatureFlags()
+                await expectLogic(featureFlagsLogic).toFinishAllListeners()
+                expect(featureFlagsLogic.values.featureFlags.results[0].active).toBe(false)
+
+                logic = featureFlagLogic({ id: 1 })
+                logic.mount()
+
+                await expectLogic(logic)
+                    .toDispatchActions(['setFeatureFlag', 'refreshFeatureFlag', 'refreshFeatureFlagSuccess'])
+                    .toFinishAllListeners()
+
+                expect(logic.values.featureFlag.active).toBe(true)
+                expect(logic.values.deletedCohortFilters).toEqual(expectedDeletedCohortFilters)
+                expect(logic.values.isFormDirty).toBe(false)
+                expect(featureFlagsLogic.values.featureFlags.results[0].active).toBe(true)
+                expect(lemonToast.info).not.toHaveBeenCalled()
+
+                featureFlagsLogic.unmount()
+            }
+        )
+
+        // The agent path surfaces its failures through this same loader, so its rethrow must not
+        // reach this one.
+        it('says nothing when the background refresh fails', async () => {
+            useMocks({ get: { [FLAG_URL]: () => [500, SERVER_ERROR_BODY] } })
+
+            // A payloadless refresh is the mount path; `afterMount` dispatches exactly this.
+            await expectLogic(logic, () => logic.actions.refreshFeatureFlag())
+                .toDispatchActions(['refreshFeatureFlagSuccess'])
+                .toNotHaveDispatchedActions(['refreshFeatureFlagFailure'])
+                .toFinishAllListeners()
+
+            expect(lemonToast.error).not.toHaveBeenCalled()
+            expect(lemonToast.info).not.toHaveBeenCalled()
+        })
+    })
+
+    describe('refresh after a PostHog AI change', () => {
+        function serverFlagMock(flag: Record<string, any>): Parameters<typeof useMocks>[0] {
+            return { get: { [FLAG_URL]: () => [200, { ...MOCK_FEATURE_FLAG, ...flag }] } }
+        }
+
+        // The agent reaches fields no manual mutation path folds, so folding only active/archived
+        // would leave the reader on the old name and rollout with nothing saying so.
+        it('shows the saved flag when the form is clean', async () => {
+            useMocks(serverFlagMock({ name: 'renamed by the agent', active: false }))
+
+            await expectLogic(logic, () => logic.actions.refreshFeatureFlagAfterAgentChange())
+                .toDispatchActions(['refreshFeatureFlag', 'loadFeatureFlagStatus', 'refreshFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(logic.values.featureFlag.name).toBe('renamed by the agent')
+            expect(logic.values.featureFlag.active).toBe(false)
+            // Re-baselined, so leaving the page must not warn about changes the reader never made.
+            expect(logic.values.isFormDirty).toBe(false)
+            expect(lemonToast.info).not.toHaveBeenCalled()
+        })
+
+        it('keeps unsaved edits, folds the state fields, and offers a reload', async () => {
+            logic.actions.setFeatureFlag({ ...logic.values.featureFlag, name: 'half-written local edit' })
+            expect(logic.values.isFormDirty).toBe(true)
+
+            useMocks(serverFlagMock({ name: 'renamed by the agent', active: false, version: 9 }))
+
+            await expectLogic(logic, () => logic.actions.refreshFeatureFlagAfterAgentChange())
+                .toDispatchActions(['refreshFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(logic.values.featureFlag.name).toBe('half-written local edit')
+            expect(logic.values.featureFlag.active).toBe(false)
+            expect(logic.values.isFormDirty).toBe(true)
+            // The next save has to submit a version behind the stored row. A folded-in server
+            // version disarms the stale-write check, and these edits then overwrite everything the
+            // agent wrote, with no error. A save submits the baseline, so the server checks that one.
+            expect(logic.values.featureFlag.version).toBe(0)
+            expect(logic.values.originalFeatureFlag?.version).toBe(0)
+            expect(lemonToast.info).toHaveBeenCalledTimes(1)
+
+            const [, options] = jest.mocked(lemonToast.info).mock.calls[0]
+            // Scoped to this flag. The default id hashes the message, which names no flag, so a
+            // notice still open for another flag would swallow this one as a duplicate and keep a
+            // button that reloads that other flag.
+            expect(options?.toastId).toBe('feature-flag-agent-change-1')
+
+            await expectLogic(logic, () => void options?.button?.action())
+                .toDispatchActions(['loadFeatureFlag', 'loadFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(logic.values.featureFlag.name).toBe('renamed by the agent')
+            expect(logic.values.isFormDirty).toBe(false)
+        })
+
+        // The Enabled switch writes to the same form field the refresh folds, so a rename must not
+        // revert a toggle the reader has not saved. The case above edits a field the fold skips,
+        // and asserts the opposite outcome, so it cannot carry this one.
+        it('keeps an unsaved Enabled toggle instead of folding the server value over it', async () => {
+            logic.actions.setFeatureFlag({ ...logic.values.featureFlag, active: false })
+            expect(logic.values.isFormDirty).toBe(true)
+
+            useMocks(serverFlagMock({ name: 'renamed by the agent', active: true }))
+
+            await expectLogic(logic, () => logic.actions.refreshFeatureFlagAfterAgentChange())
+                .toDispatchActions(['refreshFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(logic.values.featureFlag.active).toBe(false)
+            // The toggle is the only edit, so folding it would also leave the form reading clean
+            // while the notice says the edits were kept.
+            expect(logic.values.isFormDirty).toBe(true)
+            expect(lemonToast.info).toHaveBeenCalledTimes(1)
+        })
+
+        // The reaction fires per completed call, so a turn that changes this flag twice starts two
+        // refreshes. Needs its own setup: both requests have to be in flight at once, with the test
+        // choosing which one answers last.
+        it('discards a refresh response that a newer refresh superseded', async () => {
+            const firstResponse = deferred()
+            let requestCount = 0
+
+            useMocks({
+                get: {
+                    [FLAG_URL]: async () => {
+                        requestCount += 1
+                        if (requestCount === 1) {
+                            await firstResponse.promise
+                            return [200, { ...MOCK_FEATURE_FLAG, name: 'first agent change' }]
+                        }
+                        return [200, { ...MOCK_FEATURE_FLAG, name: 'second agent change' }]
+                    },
+                },
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.refreshFeatureFlagAfterAgentChange()
+                logic.actions.refreshFeatureFlagAfterAgentChange()
+            }).toDispatchActions(['refreshFeatureFlagSuccess'])
+
+            expect(logic.values.featureFlag.name).toBe('second agent change')
+
+            firstResponse.resolve()
+            await expectLogic(logic).toFinishAllListeners()
+
+            // The older response must not put the page or its baseline back.
+            expect(logic.values.featureFlag.name).toBe('second agent change')
+            expect(logic.values.originalFeatureFlag?.name).toBe('second agent change')
+        })
+
+        type MutationDuringRefresh = [string, (flag: FeatureFlagType) => void]
+
+        // These update only the fields they persisted. The inline tag and description saves and the
+        // cross-project toggle re-baseline without dispatching any loader success, so a guard keyed
+        // to those actions cannot see them.
+        const partialFoldsDuringRefresh: MutationDuringRefresh[] = [
+            ['a toggle', (flag) => logic.actions.updateFeatureFlagActiveSuccess(flag)],
+            [
+                'an inline field save',
+                (flag) => {
+                    logic.actions.setFeatureFlag(flag)
+                    logic.actions.setOriginalFeatureFlag(flag)
+                },
+            ],
+        ]
+        const fullReload: MutationDuringRefresh = [
+            'a full reload',
+            (flag) => logic.actions.loadFeatureFlagSuccess(flag),
+        ]
+        const fullSave: MutationDuringRefresh = ['a full save', (flag) => logic.actions.saveFeatureFlagSuccess(flag)]
+
+        // The case above holds a refresh against a second refresh, which `breakpoint()` covers on
+        // its own. A mutation landing mid-request needs a separate guard, so it needs its own case.
+        it.each([...partialFoldsDuringRefresh, fullReload])(
+            'discards a refresh response that %s superseded',
+            async (_label, mutate) => {
+                const response = deferred()
+                // The loader samples the mutation count before it calls the API, so mutating before the
+                // request is open would pass without exercising the guard.
+                const requestStarted = deferred()
+
+                useMocks({
+                    get: {
+                        [FLAG_URL]: async () => {
+                            requestStarted.resolve()
+                            await response.promise
+                            return [200, { ...MOCK_FEATURE_FLAG, name: 'agent change', active: true, version: 3 }]
+                        },
+                    },
+                })
+
+                logic.actions.refreshFeatureFlagAfterAgentChange()
+                await requestStarted.promise
+
+                mutate({ ...MOCK_FEATURE_FLAG, active: false, version: 7 } as FeatureFlagType)
+                expect(logic.values.featureFlag.active).toBe(false)
+
+                response.resolve()
+                await expectLogic(logic).toDispatchActions(['refreshFeatureFlagSuccess']).toFinishAllListeners()
+
+                expect(logic.values.featureFlag.active).toBe(false)
+                expect(logic.values.featureFlag.name).toBe('test-name')
+                expect(logic.values.featureFlag.version).toBe(7)
+            }
+        )
+
+        describe('when the request fails', () => {
+            beforeEach(silenceKeaLoadersErrors)
+            afterEach(resumeKeaLoadersErrors)
+
+            // A flag GET held open until `failAfter` lands `mutate`, then answered with a 500. The loader
+            // samples its counters before it calls the API, so mutating before the request is open would
+            // pass without exercising the guard.
+            function heldRefreshFailure(): {
+                mocks: Parameters<typeof useMocks>[0]
+                failAfter: (mutate: (flag: FeatureFlagType) => void) => Promise<void>
+            } {
+                const response = deferred()
+                const requestStarted = deferred()
+                return {
+                    mocks: {
+                        get: {
+                            [FLAG_URL]: async () => {
+                                requestStarted.resolve()
+                                await response.promise
+                                return [500, SERVER_ERROR_BODY]
+                            },
+                        },
+                    },
+                    failAfter: async (mutate) => {
+                        logic.actions.refreshFeatureFlagAfterAgentChange()
+                        await requestStarted.promise
+                        mutate({ ...MOCK_FEATURE_FLAG, active: false, version: 7 } as FeatureFlagType)
+                        response.resolve()
+                    },
+                }
+            }
+
+            // The failure notice never closes on its own, so a failure that lands after a whole-flag
+            // replacement would tell the reader a current page is stale until they act on it.
+            it.each([fullReload, fullSave])('says nothing when a refresh fails after %s', async (_label, mutate) => {
+                const held = heldRefreshFailure()
+                useMocks(held.mocks)
+                await held.failAfter(mutate)
+                await expectLogic(logic)
+                    .toDispatchActions(['refreshFeatureFlagSuccess'])
+                    .toNotHaveDispatchedActions(['refreshFeatureFlagFailure'])
+                    .toFinishAllListeners()
+
+                expect(lemonToast.error).not.toHaveBeenCalled()
+            })
+
+            // A partial fold leaves the page without the agent's other changes and carries the fresh
+            // `version` into the form, so the next save passes the stale-write check and overwrites
+            // them with no error. The notice is the only warning.
+            it.each(partialFoldsDuringRefresh)('still says the refresh failed after %s', async (_label, mutate) => {
+                const held = heldRefreshFailure()
+                useMocks(held.mocks)
+                await held.failAfter(mutate)
+                await expectLogic(logic).toDispatchActions(['refreshFeatureFlagFailure']).toFinishAllListeners()
+
+                expect(lemonToast.error).toHaveBeenCalledTimes(1)
+            })
+
+            // Silence here leaves the reader trusting a screen behind the server, then saving over it.
+            it('says the refresh failed and retries it from the notice', async () => {
+                useMocks({ get: { [FLAG_URL]: () => [500, SERVER_ERROR_BODY] } })
+
+                await expectLogic(logic, () => logic.actions.refreshFeatureFlagAfterAgentChange())
+                    .toDispatchActions(['refreshFeatureFlag', 'refreshFeatureFlagFailure'])
+                    .toFinishAllListeners()
+
+                // One notice, not two: initKea's ERROR_FILTER_ALLOW_LIST names this action.
+                expect(lemonToast.error).toHaveBeenCalledTimes(1)
+                const [message, options] = jest.mocked(lemonToast.error).mock.calls[0]
+                expect(message).toContain('could not load the new values')
+                expect(options?.toastId).toBe('feature-flag-agent-refresh-failed-1-1')
+                expect(options?.autoClose).toBe(false)
+                expect(options?.button?.label).toBe('Try again')
+
+                // A retry that fails again must not run the full loader, which would mark the flag
+                // missing and swap the page for Not Found.
+                await expectLogic(logic, () => void options?.button?.action())
+                    .toDispatchActions(['refreshFeatureFlag', 'refreshFeatureFlagFailure'])
+                    .toFinishAllListeners()
+
+                expect(logic.values.featureFlagMissing).toBe(false)
+                expect(lemonToast.error).toHaveBeenCalledTimes(2)
+                const [, retryOptions] = jest.mocked(lemonToast.error).mock.calls[1]
+                expect(retryOptions?.toastId).toBe('feature-flag-agent-refresh-failed-1-2')
+
+                useMocks(serverFlagMock({ name: 'renamed by the agent' }))
+
+                await expectLogic(logic, () => void retryOptions?.button?.action())
+                    .toDispatchActions(['refreshFeatureFlag', 'refreshFeatureFlagSuccess'])
+                    .toFinishAllListeners()
+
+                expect(logic.values.featureFlag.name).toBe('renamed by the agent')
+            })
+
+            // The notice never closes on its own. Each of these replaces the values it warns about, and
+            // after unmount its button would retry on a logic that is gone.
+            it.each<[string, () => Promise<void>]>([
+                [
+                    'a later refresh succeeds',
+                    async () => {
+                        useMocks(serverFlagMock({ name: 'renamed by the agent' }))
+                        await expectLogic(logic, () => logic.actions.refreshFeatureFlagAfterAgentChange())
+                            .toDispatchActions(['refreshFeatureFlagSuccess'])
+                            .toFinishAllListeners()
+                    },
+                ],
+                [
+                    'the flag fully reloads',
+                    async () => {
+                        await expectLogic(logic, () =>
+                            logic.actions.loadFeatureFlagSuccess(MOCK_FEATURE_FLAG)
+                        ).toFinishAllListeners()
+                    },
+                ],
+                [
+                    'the flag saves',
+                    async () => {
+                        await expectLogic(logic, () =>
+                            logic.actions.saveFeatureFlagSuccess(MOCK_FEATURE_FLAG)
+                        ).toFinishAllListeners()
+                    },
+                ],
+                ['the logic unmounts', async () => logic.unmount()],
+            ])('clears the failure notice when %s', async (_label, close) => {
+                const dismiss = jest.spyOn(toast, 'dismiss')
+                try {
+                    useMocks({ get: { [FLAG_URL]: () => [500, SERVER_ERROR_BODY] } })
+
+                    await expectLogic(logic, () => logic.actions.refreshFeatureFlagAfterAgentChange())
+                        .toDispatchActions(['refreshFeatureFlagFailure'])
+                        .toFinishAllListeners()
+
+                    const [, options] = jest.mocked(lemonToast.error).mock.calls[0]
+                    dismiss.mockClear()
+                    await close()
+
+                    expect(dismiss).toHaveBeenCalledWith(options?.toastId)
+                } finally {
+                    dismiss.mockRestore()
+                }
+            })
+
+            // A dirty-form refresh leaves its notice open until someone acts on it, so a later failure
+            // would otherwise stack a second permanent notice offering the same reload.
+            it('replaces the kept-edits notice when a later refresh fails', async () => {
+                const dismiss = jest.spyOn(toast, 'dismiss')
+                try {
+                    logic.actions.setFeatureFlag({ ...logic.values.featureFlag, name: 'half-written local edit' })
+                    expect(logic.values.isFormDirty).toBe(true)
+
+                    useMocks(serverFlagMock({ active: false }))
+                    await expectLogic(logic, () => logic.actions.refreshFeatureFlagAfterAgentChange())
+                        .toDispatchActions(['refreshFeatureFlagSuccess'])
+                        .toFinishAllListeners()
+                    expect(lemonToast.info).toHaveBeenCalledTimes(1)
+
+                    dismiss.mockClear()
+                    useMocks({ get: { [FLAG_URL]: () => [500, SERVER_ERROR_BODY] } })
+
+                    await expectLogic(logic, () => logic.actions.refreshFeatureFlagAfterAgentChange())
+                        .toDispatchActions(['refreshFeatureFlagFailure'])
+                        .toFinishAllListeners()
+
+                    expect(dismiss).toHaveBeenCalledWith('feature-flag-agent-change-1')
+                } finally {
+                    dismiss.mockRestore()
+                }
+            })
+
+            // Needs the two-in-flight setup for the same reason as the superseded-response case above:
+            // the notice is keyed to the flag and never closes on its own, so a late failure would tell
+            // the reader a current page is stale.
+            it('says nothing when a superseded refresh fails late', async () => {
+                const firstResponse = deferred()
+                let requestCount = 0
+
+                useMocks({
+                    get: {
+                        [FLAG_URL]: async () => {
+                            requestCount += 1
+                            if (requestCount === 1) {
+                                await firstResponse.promise
+                                return [500, SERVER_ERROR_BODY]
+                            }
+                            return [200, { ...MOCK_FEATURE_FLAG, name: 'second agent change' }]
+                        },
+                    },
+                })
+
+                await expectLogic(logic, () => {
+                    logic.actions.refreshFeatureFlagAfterAgentChange()
+                    logic.actions.refreshFeatureFlagAfterAgentChange()
+                }).toDispatchActions(['refreshFeatureFlagSuccess'])
+
+                firstResponse.resolve()
+                await expectLogic(logic).toFinishAllListeners()
+
+                expect(logic.values.featureFlag.name).toBe('second agent change')
+                expect(lemonToast.error).not.toHaveBeenCalled()
+            })
+        })
+    })
+
+    describe('load failure handling', () => {
+        const RELOAD_FAILED_MESSAGE = "We couldn't reload this feature flag. The page may not show its saved version."
+
+        async function remount(): Promise<void> {
+            logic.unmount()
+            logic = featureFlagLogic({ id: MOCK_FEATURE_FLAG.id })
+            logic.mount()
+            await expectLogic(logic).toFinishAllListeners()
+        }
+
+        // A server error carries a status, so initKea would toast it. A dropped connection carries
+        // none, so initKea never toasts it.
+        const LOAD_FAILURES: [string, () => () => void][] = [
+            [
+                'a server error',
+                () => {
+                    useMocks({ get: { [FLAG_URL]: () => [500, SERVER_ERROR_BODY] } })
+                    return () => {}
+                },
+            ],
+            [
+                'a dropped connection',
+                () => {
+                    const get = jest.spyOn(api, 'get').mockRejectedValue(new NetworkError('network'))
+                    return () => get.mockRestore()
+                },
+            ],
+        ]
+
+        let toastSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            silenceKeaLoadersErrors()
+            toastSpy = jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+        })
+
+        afterEach(() => {
+            toastSpy.mockRestore()
+            resumeKeaLoadersErrors()
+        })
+
+        it('reads a 404 as a missing flag', async () => {
+            useMocks({ get: { [FLAG_URL]: () => [404, { detail: 'Not found.' }] } })
+            await remount()
+
+            expect(logic.values.featureFlagMissing).toBe(true)
+            expect(logic.values.featureFlagLoadFailed).toBe(false)
+        })
+
+        it.each(LOAD_FAILURES)(
+            'offers the retry banner, and no toast, when the first load hits %s',
+            async (_desc, fail) => {
+                const restore = fail()
+                try {
+                    await remount()
+
+                    expect(logic.values.featureFlagMissing).toBe(false)
+                    expect(logic.values.featureFlagLoadFailed).toBe(true)
+                    expect(toastSpy).not.toHaveBeenCalled()
+                } finally {
+                    restore()
+                }
+            }
+        )
+
+        it.each(LOAD_FAILURES)('keeps a loaded flag and toasts a retry when a reload hits %s', async (_desc, fail) => {
+            const restore = fail()
+            try {
+                await expectLogic(logic, () => logic.actions.loadFeatureFlag()).toDispatchActions([
+                    'loadFeatureFlagFailure',
+                ])
+
+                expect(logic.values.featureFlagLoadFailed).toBe(false)
+                expect(logic.values.featureFlagMissing).toBe(false)
+                expect(logic.values.featureFlag.key).toBe(MOCK_FEATURE_FLAG.key)
+                // One call means initKea's generic toast stayed off and this is the only notice.
+                expect(toastSpy).toHaveBeenCalledTimes(1)
+                expect(toastSpy).toHaveBeenCalledWith(
+                    RELOAD_FAILED_MESSAGE,
+                    expect.objectContaining({ button: expect.objectContaining({ label: 'Try again' }) })
+                )
+            } finally {
+                restore()
+            }
+        })
+
+        it('offers the retry banner when the flag to duplicate fails to load', async () => {
+            useMocks({
+                get: { [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/42/`]: () => [500, SERVER_ERROR_BODY] },
+            })
+            router.actions.push(`${urls.featureFlag('new')}?sourceId=42`)
+            const duplicateLogic = featureFlagLogic({ id: 'new' })
+            try {
+                await expectLogic(duplicateLogic, () => {
+                    duplicateLogic.mount()
+                }).toDispatchActions(['loadFeatureFlagFailure'])
+
+                expect(duplicateLogic.values.featureFlagLoadFailed).toBe(true)
+            } finally {
+                duplicateLogic.unmount()
+            }
+        })
+
+        it('still toasts when a logic outside the flag scene fails to load a flag', async () => {
+            useMocks({ get: { [FLAG_URL]: () => [500, SERVER_ERROR_BODY] } })
+            const triggerLogic = flagTriggerLogic({
+                logicKey: 'test',
+                flag: { id: MOCK_FEATURE_FLAG.id, key: MOCK_FEATURE_FLAG.key, variant: null },
+                onChange: () => {},
+            })
+            try {
+                await expectLogic(triggerLogic, () => {
+                    triggerLogic.mount()
+                }).toDispatchActions(['loadFeatureFlagFailure'])
+
+                expect(toastSpy).toHaveBeenCalledWith(`Load feature flag failed: ${SERVER_ERROR_BODY.detail}`)
+            } finally {
+                triggerLogic.unmount()
+            }
+        })
+
+        it.each([
+            ['a server error', 500],
+            ['a missing flag', 404],
+        ])('clears %s when a retry loads the flag', async (_desc, status) => {
+            useMocks({ get: { [FLAG_URL]: () => [status, SERVER_ERROR_BODY] } })
+            await remount()
+            expect(logic.values.featureFlagMissing || logic.values.featureFlagLoadFailed).toBe(true)
+
+            useMocks({ get: { [FLAG_URL]: () => [200, MOCK_FEATURE_FLAG] } })
+            // Wait for the listeners, because the history already holds the success from the first mount.
+            await expectLogic(logic, () => logic.actions.loadFeatureFlag()).toFinishAllListeners()
+
+            expect(logic.values.featureFlagLoadFailed).toBe(false)
+            expect(logic.values.featureFlagMissing).toBe(false)
+        })
+
+        it('separates a missing flag from a failed load in what it captures', async () => {
+            const capture = jest.spyOn(posthog, 'capture').mockReturnValue(undefined as any)
+            try {
+                useMocks({ get: { [FLAG_URL]: () => [404, { detail: 'Not found.' }] } })
+                await remount()
+                expect(capture).toHaveBeenCalledWith('feature flag not found')
+
+                capture.mockClear()
+                useMocks({ get: { [FLAG_URL]: () => [500, { detail: 'boom' }] } })
+                await remount()
+                expect(capture).toHaveBeenCalledWith('feature flag load failed', { status: 500 })
+            } finally {
+                capture.mockRestore()
+            }
+        })
+
+        it('counts a failed load once per mount, however many retries fail', async () => {
+            const capture = jest.spyOn(posthog, 'capture').mockReturnValue(undefined as any)
+            try {
+                useMocks({ get: { [FLAG_URL]: () => [500, { detail: 'boom' }] } })
+                await remount()
+                await expectLogic(logic, () => logic.actions.loadFeatureFlag()).toDispatchActions([
+                    'loadFeatureFlagFailure',
+                ])
+
+                expect(capture.mock.calls.filter(([event]) => event === 'feature flag load failed')).toHaveLength(1)
+            } finally {
+                capture.mockRestore()
+            }
+        })
+    })
+
+    describe('live key conflict check', () => {
+        const flagListUrl = `/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/`
+        const flagList = (flags: { id: number; key: string }[]): [number, Record<string, any>] => [
+            200,
+            { results: flags.map((flag) => ({ ...MOCK_FEATURE_FLAG, ...flag })), count: flags.length },
+        ]
+
+        it.each([
+            [
+                'another flag uses the exact key',
+                'taken-key',
+                flagList([{ id: 42, key: 'taken-key' }]),
+                { existingFlagId: 42, existingFlagKey: 'taken-key', exact: true },
+            ],
+            [
+                'another flag uses the key with different case',
+                'taken-key',
+                flagList([{ id: 42, key: 'Taken-Key' }]),
+                { existingFlagId: 42, existingFlagKey: 'Taken-Key', exact: false },
+            ],
+            [
+                'a case-only match comes back before the exact match',
+                'taken-key',
+                flagList([
+                    { id: 43, key: 'Taken-Key' },
+                    { id: 42, key: 'taken-key' },
+                ]),
+                { existingFlagId: 42, existingFlagKey: 'taken-key', exact: true },
+            ],
+            [
+                'only the flag being edited matches',
+                'taken-key',
+                flagList([{ id: MOCK_FEATURE_FLAG.id, key: 'taken-key' }]),
+                null,
+            ],
+            ['no flag matches', 'free-key', flagList([]), null],
+            ['the lookup fails', 'taken-key', [500, {}] as [number, Record<string, any>], null],
+        ])('when %s', async (_desc, key, response, expectedConflict) => {
+            useMocks({ get: { [flagListUrl]: () => response } })
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue(['key'], key)
+            })
+                .toDispatchActions(['checkKeyConflictSuccess'])
+                .toFinishAllListeners()
+
+            expect(logic.values.currentKeyConflict).toEqual(expectedConflict && { key, ...expectedConflict })
+        })
+
+        it('hides a conflict once the key changes again', async () => {
+            useMocks({ get: { [flagListUrl]: () => flagList([{ id: 42, key: 'taken-key' }]) } })
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue(['key'], 'taken-key')
+            })
+                .toDispatchActions(['checkKeyConflictSuccess'])
+                .toFinishAllListeners()
+            expect(logic.values.currentKeyConflict?.exact).toBe(true)
+
+            logic.actions.setFeatureFlagValue(['key'], 'taken-key-2')
+            expect(logic.values.currentKeyConflict).toBeNull()
+            await expectLogic(logic).toFinishAllListeners()
+            expect(logic.values.currentKeyConflict).toBeNull()
+        })
+    })
+
+    describe('saveFeatureFlag error handling', () => {
+        it('shows the friendly permission toast on a save-time 403', async () => {
+            useMocks({
+                patch: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                        403,
+                        { type: 'authentication_error', code: 'permission_denied', detail: 'Nope' },
+                    ],
+                },
+            })
+            const toastSpy = jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+            try {
+                await expectLogic(logic, () => {
+                    logic.actions.saveFeatureFlag(logic.values.featureFlag)
+                }).toDispatchActions(['saveFeatureFlagFailure'])
+
+                expect(toastSpy).toHaveBeenCalledWith('Nope')
+            } finally {
+                toastSpy.mockRestore()
+            }
+        })
+
+        it('does not show the permission toast for other save errors', async () => {
+            useMocks({
+                patch: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                        500,
+                        { type: 'server_error', detail: 'boom' },
+                    ],
+                },
+            })
+            const toastSpy = jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+            try {
+                await expectLogic(logic, () => {
+                    logic.actions.saveFeatureFlag(logic.values.featureFlag)
+                }).toDispatchActions(['saveFeatureFlagFailure'])
+
+                // The permission-specific branch must not fire; the generic loaders toast owns this case.
+                expect(toastSpy).not.toHaveBeenCalledWith('Nope')
+            } finally {
+                toastSpy.mockRestore()
+            }
+        })
+
+        it('offers a retry that saves the form as it is when clicked', async () => {
+            silenceKeaLoadersErrors()
+            const update = jest.spyOn(api, 'update').mockRejectedValue(new NetworkError('network'))
+            const toastSpy = jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+            try {
+                await expectLogic(logic, () => logic.actions.editFeatureFlag(true)).toFinishAllListeners()
+                logic.actions.setFeatureFlag({ ...logic.values.featureFlag, name: 'edited' })
+                await expectLogic(logic, () => {
+                    logic.actions.submitFeatureFlag()
+                }).toDispatchActions(['saveFeatureFlagFailure'])
+
+                expect(toastSpy).toHaveBeenCalledWith(
+                    "We couldn't save this feature flag. Your changes are still here.",
+                    expect.objectContaining({ button: expect.objectContaining({ label: 'Try again' }) })
+                )
+                expect(logic.values.featureFlag.name).toBe('edited')
+
+                // An edit made after the failure must not be lost when the retry saves.
+                logic.actions.setFeatureFlag({ ...logic.values.featureFlag, name: 'edited again' })
+                update.mockResolvedValue({ ...MOCK_FEATURE_FLAG, name: 'edited again' })
+                await expectLogic(logic, () => {
+                    toastSpy.mock.calls[0][1]?.button?.action?.()
+                }).toDispatchActions(['saveFeatureFlagSuccess'])
+
+                expect(update).toHaveBeenLastCalledWith(
+                    expect.any(String),
+                    expect.objectContaining({ name: 'edited again' })
+                )
+            } finally {
+                update.mockRestore()
+                toastSpy.mockRestore()
+                resumeKeaLoadersErrors()
+            }
+        })
+
+        it('links the duplicate-key toast to the flag already using that key', async () => {
+            useMocks({
+                patch: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                        400,
+                        {
+                            type: 'validation_error',
+                            code: 'unique',
+                            attr: 'key',
+                            detail: 'There is already a feature flag with this key.',
+                        },
+                    ],
+                },
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/`]: () => [
+                        200,
+                        { results: [{ ...MOCK_FEATURE_FLAG, id: 42 }], count: 1 },
+                    ],
+                },
+            })
+            const toastSpy = jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+            const openSpy = jest.spyOn(window, 'open').mockImplementation(() => null)
+            try {
+                await expectLogic(logic, () => {
+                    logic.actions.saveFeatureFlag(logic.values.featureFlag)
+                })
+                    .toDispatchActions(['saveFeatureFlagFailure'])
+                    .toFinishAllListeners()
+
+                // One toast means the generic loaders toast stayed suppressed (initKea.ts) and this
+                // listener produced the only message; two would mean the suppression broke.
+                expect(toastSpy).toHaveBeenCalledTimes(1)
+                const [message, options] = toastSpy.mock.calls[0] as [
+                    string,
+                    { button?: { label: string; action: () => void } } | undefined,
+                ]
+                expect(message).toBe('Save feature flag failed: There is already a feature flag with this key.')
+                expect(options?.button?.label).toBe('View existing flag')
+
+                options?.button?.action()
+                expect(openSpy).toHaveBeenCalledWith(urls.featureFlag(42), '_blank')
+            } finally {
+                toastSpy.mockRestore()
+                openSpy.mockRestore()
+            }
+        })
+
+        it.each([
+            ['the list returns no matching flag', 200, { results: [], count: 0 }],
+            ['the lookup request fails', 500, { type: 'server_error', detail: 'boom' }],
+        ])('shows a plain duplicate-key toast when %s', async (_desc, listStatus, listBody) => {
+            useMocks({
+                patch: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                        400,
+                        {
+                            type: 'validation_error',
+                            code: 'unique',
+                            attr: 'key',
+                            detail: 'There is already a feature flag with this key.',
+                        },
+                    ],
+                },
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/`]: () => [listStatus, listBody],
+                },
+            })
+            const toastSpy = jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+            const openSpy = jest.spyOn(window, 'open').mockImplementation(() => null)
+            try {
+                await expectLogic(logic, () => {
+                    logic.actions.saveFeatureFlag(logic.values.featureFlag)
+                })
+                    .toDispatchActions(['saveFeatureFlagFailure'])
+                    .toFinishAllListeners()
+
+                expect(toastSpy).toHaveBeenCalledTimes(1)
+                expect(toastSpy).toHaveBeenCalledWith(
+                    'Save feature flag failed: There is already a feature flag with this key.'
+                )
+                expect(openSpy).not.toHaveBeenCalled()
+            } finally {
+                toastSpy.mockRestore()
+                openSpy.mockRestore()
+            }
+        })
+    })
+
+    describe('saveFeatureFlag navigation', () => {
+        it('keeps the canonical redirect when the feature flag page saves', async () => {
+            router.actions.push(urls.featureFlag(MOCK_FEATURE_FLAG.id))
+            const replaceSpy = jest.spyOn(router.actions, 'replace')
+
+            try {
+                await expectLogic(logic, () => {
+                    logic.actions.saveFeatureFlagSuccess(logic.values.featureFlag)
+                }).toFinishAllListeners()
+
+                expect(replaceSpy).toHaveBeenCalledWith(urls.featureFlag(MOCK_FEATURE_FLAG.id))
+            } finally {
+                replaceSpy.mockRestore()
+            }
+        })
+
+        it('keeps the carried list filter params when the flag page saves', async () => {
+            router.actions.push(urls.featureFlag(MOCK_FEATURE_FLAG.id), { list_search: 'checkout', edit: 'true' })
+            await expectLogic(logic).toFinishAllListeners()
+            const replaceSpy = jest.spyOn(router.actions, 'replace')
+
+            try {
+                await expectLogic(logic, () => {
+                    logic.actions.saveFeatureFlagSuccess(logic.values.featureFlag)
+                }).toFinishAllListeners()
+
+                expect(replaceSpy).toHaveBeenCalledWith(
+                    combineUrl(urls.featureFlag(MOCK_FEATURE_FLAG.id), { list_search: 'checkout' }).url
+                )
+            } finally {
+                replaceSpy.mockRestore()
+            }
+        })
+
+        it('keeps the current route when an embedded editor saves a feature flag', async () => {
+            const notebookUrl = urls.notebook('embedded-flag')
+            router.actions.push(notebookUrl)
+            const embeddedPathname = router.values.location.pathname
+
+            await expectLogic(logic, () => {
+                logic.actions.saveFeatureFlagSuccess(logic.values.featureFlag)
+            }).toFinishAllListeners()
+
+            expect(router.values.location.pathname).toBe(embeddedPathname)
+        })
+
+        const approvalRequired = (): ApiError =>
+            new ApiError(undefined, 409, undefined, {
+                code: 'approval_required',
+                status: 'approval_required',
+                detail: 'A change request has been created and is pending approval.',
+                change_request_id: 'cr-1',
+            })
+
+        const editOnFlagPage = async (name: string): Promise<void> => {
+            router.actions.push(urls.featureFlag(MOCK_FEATURE_FLAG.id), { edit: true })
+            await expectLogic(logic).toFinishAllListeners()
+            logic.actions.setFeatureFlag({ ...logic.values.featureFlag, name })
+        }
+
+        it('keeps the current route when an embedded editor save requires approval', async () => {
+            const notebookUrl = urls.notebook('embedded-flag')
+            router.actions.push(notebookUrl)
+            const embeddedPathname = router.values.location.pathname
+            jest.spyOn(sharedLemonToast, 'info').mockReturnValue('toast-id')
+
+            await expectLogic(logic, () => {
+                logic.actions.saveFeatureFlagFailure('Approval required', approvalRequired())
+            }).toFinishAllListeners()
+
+            expect(router.values.location.pathname).toBe(embeddedPathname)
+        })
+
+        it('shows the stored flag without a leave prompt when an edit needs approval', async () => {
+            await editOnFlagPage('Unapproved name')
+            jest.spyOn(api, 'update').mockRejectedValueOnce(approvalRequired())
+            const confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(false)
+            const approvalToast = jest.spyOn(sharedLemonToast, 'info').mockReturnValue('toast-id')
+
+            await expectLogic(logic, () => {
+                logic.actions.saveFeatureFlag(logic.values.featureFlag)
+            })
+                .toDispatchActions(['saveFeatureFlagFailure', 'loadFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(confirmSpy).not.toHaveBeenCalled()
+            expect(approvalToast).toHaveBeenCalledTimes(1)
+            expect(router.values.searchParams.edit).toBeUndefined()
+            expect(logic.values).toMatchObject({
+                isEditingFlag: false,
+                hasUnsavedChanges: false,
+                featureFlag: partial({ name: MOCK_FEATURE_FLAG.name }),
+            })
+        })
+
+        it('keeps the carried list filter params when a save needs approval', async () => {
+            router.actions.push(urls.featureFlag(MOCK_FEATURE_FLAG.id), { list_search: 'checkout', edit: true })
+            await expectLogic(logic).toFinishAllListeners()
+            logic.actions.setFeatureFlag({ ...logic.values.featureFlag, name: 'Unapproved name' })
+            jest.spyOn(api, 'update').mockRejectedValueOnce(approvalRequired())
+            jest.spyOn(sharedLemonToast, 'info').mockReturnValue('toast-id')
+
+            await expectLogic(logic, () => {
+                logic.actions.saveFeatureFlag(logic.values.featureFlag)
+            })
+                .toDispatchActions(['saveFeatureFlagFailure', 'loadFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            // The edit param falls away, but the list filters still ride for the breadcrumb
+            expect(router.values.searchParams.edit).toBeUndefined()
+            expect(router.values.searchParams.list_search).toBe('checkout')
+        })
+
+        it('opens the change request when creating a flag needs approval, and leaves the form clean', async () => {
+            router.actions.push(urls.featureFlag('new'))
+            const newLogic = featureFlagLogic({ id: 'new' })
+            newLogic.mount()
+
+            try {
+                await expectLogic(newLogic).toFinishAllListeners()
+                // A template loads a starting point that differs from the form defaults.
+                await expectLogic(newLogic, () => {
+                    newLogic.actions.loadFeatureFlagSuccess({
+                        ...newLogic.values.featureFlag,
+                        filters: {
+                            ...NEW_FLAG.filters,
+                            groups: [{ properties: [], rollout_percentage: 50, variant: null }],
+                        },
+                    })
+                }).toFinishAllListeners()
+                newLogic.actions.startNewFlagDisabled()
+                expect(newLogic.values).toMatchObject({ isFormDirty: false, featureFlag: partial({ active: false }) })
+                newLogic.actions.setFeatureFlag({ ...newLogic.values.featureFlag, key: 'gated-flag' })
+                jest.spyOn(api, 'create').mockRejectedValueOnce(approvalRequired())
+                const confirmSpy = jest.spyOn(window, 'confirm').mockReturnValue(false)
+                const approvalToast = jest.spyOn(sharedLemonToast, 'info').mockReturnValue('toast-id')
+
+                await expectLogic(newLogic, () => {
+                    newLogic.actions.saveFeatureFlag(newLogic.values.featureFlag)
+                })
+                    .toDispatchActions(['saveFeatureFlagFailure'])
+                    .toFinishAllListeners()
+
+                expect(approvalToast).toHaveBeenCalledTimes(1)
+                expect(removeProjectIdIfPresent(router.values.location.pathname)).toBe(urls.approval('cr-1'))
+
+                router.actions.push(urls.featureFlags())
+                expect(confirmSpy).not.toHaveBeenCalled()
+                expect(removeProjectIdIfPresent(router.values.location.pathname)).toBe(urls.featureFlags())
+            } finally {
+                newLogic.unmount()
+            }
+        })
+
+        it.each([
+            [
+                'a version conflict',
+                new ApiError(undefined, 409, undefined, {
+                    code: 'conflict',
+                    detail: 'The feature flag was updated by another user since you started editing it.',
+                }),
+                'The feature flag was updated by another user since you started editing it.',
+            ],
+            [
+                'a policy conflict',
+                new ApiError(undefined, 400, undefined, {
+                    code: 'policy_conflict',
+                    error: 'This change matches multiple approval policies',
+                }),
+                "Couldn't save the flag. These changes need approval under more than one policy, so save them one at a time.",
+            ],
+        ])('keeps the edit open and explains %s', async (_, error, message) => {
+            await editOnFlagPage('Edited name')
+            jest.spyOn(api, 'update').mockRejectedValueOnce(error)
+
+            await expectLogic(logic, () => {
+                logic.actions.saveFeatureFlag(logic.values.featureFlag)
+            })
+                .toDispatchActions(['saveFeatureFlagFailure'])
+                .toFinishAllListeners()
+
+            expect(lemonToast.error).toHaveBeenCalledWith(message)
+            expect(logic.values).toMatchObject({ isEditingFlag: true, featureFlag: partial({ name: 'Edited name' }) })
+        })
+    })
+
+    describe('send a broadcast to the people who have the flag', () => {
+        const COHORT = { id: 42, name: 'Users with feature flag test-flag enabled' }
+        const FILLING = { ...COHORT, is_calculating: true, errors_calculating: 0 }
+        const READY = { ...COHORT, is_calculating: false, errors_calculating: 0 }
+        const FAILED = { ...COHORT, is_calculating: false, errors_calculating: 1 }
+
+        const everyone = (rollout: number | null, active = true): any => ({
+            id: 1,
+            active,
+            filters: { groups: [{ properties: [], rollout_percentage: rollout }] },
+        })
+        const groupSet = { properties: [], rollout_percentage: 100, aggregation_group_type_index: 0 }
+
+        it.each([
+            { scenario: 'a raise to 100%', before: everyone(50), after: everyone(100), live: true },
+            {
+                scenario: 'enabling a flag already at 100%',
+                before: everyone(100, false),
+                after: everyone(100),
+                live: true,
+            },
+            {
+                scenario: 'a null rollout, which means everyone',
+                before: everyone(0),
+                after: everyone(null),
+                live: true,
+            },
+            { scenario: 'a second save at 100%', before: everyone(100), after: everyone(100), live: false },
+            {
+                scenario: 'the first save of a new flag at 100%',
+                before: { ...everyone(100), id: null },
+                after: everyone(100),
+                live: true,
+            },
+            {
+                scenario: 'a flag gated by early access enrollment',
+                before: everyone(0),
+                after: { ...everyone(100), filters: { ...everyone(100).filters, feature_enrollment: true } },
+                live: false,
+            },
+            {
+                scenario: 'a 100% set that aggregates by group in a person flag',
+                before: everyone(0),
+                after: { ...everyone(0), filters: { groups: [groupSet] } },
+                live: false,
+            },
+            {
+                scenario: 'a raise to 100% from a 100% set that aggregates by group',
+                before: { ...everyone(0), filters: { groups: [groupSet] } },
+                after: everyone(100),
+                live: true,
+            },
+            {
+                scenario: 'a 100% set that aggregates by group and stops evaluation early',
+                before: everyone(0),
+                after: { ...everyone(0), filters: { early_exit: true, groups: [groupSet] } },
+                live: false,
+            },
+            { scenario: 'a partial rollout', before: everyone(0), after: everyone(99), live: false },
+            {
+                scenario: '100% of a targeted group only',
+                before: everyone(0),
+                after: {
+                    active: true,
+                    filters: {
+                        groups: [
+                            {
+                                properties: [{ key: 'email', type: 'person', value: 'x', operator: 'icontains' }],
+                                rollout_percentage: 100,
+                            },
+                        ],
+                    },
+                },
+                live: false,
+            },
+            {
+                scenario: 'a 100% set behind a 0% set',
+                before: everyone(0),
+                after: {
+                    active: true,
+                    filters: {
+                        groups: [
+                            { properties: [], rollout_percentage: 0 },
+                            { properties: [], rollout_percentage: 100 },
+                        ],
+                    },
+                },
+                live: true,
+            },
+            {
+                scenario: 'a 100% set behind a 0% set that stops evaluation early',
+                before: everyone(0),
+                after: {
+                    active: true,
+                    filters: {
+                        early_exit: true,
+                        groups: [
+                            { properties: [], rollout_percentage: 0 },
+                            { properties: [], rollout_percentage: 100 },
+                        ],
+                    },
+                },
+                live: false,
+            },
+            {
+                scenario: 'a multivariate flag',
+                before: everyone(0),
+                after: { ...everyone(100), filters: { ...everyone(100).filters, multivariate: { variants: [] } } },
+                live: false,
+            },
+            {
+                scenario: 'a group-targeted flag',
+                before: everyone(0),
+                after: { ...everyone(100), filters: { ...everyone(100).filters, aggregation_group_type_index: 0 } },
+                live: false,
+            },
+        ])('offers the launch broadcast after $scenario: $live', ({ before, after, live }) => {
+            expect(flagWentLive(before, after)).toBe(live)
+        })
+
+        it.each([
+            {
+                scenario: 'opens the broadcast once the cohort fills on the third check',
+                polls: [FILLING, FILLING, READY],
+                expectedPolls: 3,
+                outcome: 'opened',
+            },
+            {
+                scenario: 'shows an error when the cohort fails to fill',
+                polls: [FAILED],
+                expectedPolls: 1,
+                outcome: 'error',
+            },
+            {
+                scenario: 'points to the cohort when it is still filling after the wait',
+                polls: [FILLING],
+                expectedPolls: 31,
+                outcome: 'still filling',
+            },
+            {
+                scenario: 'points to the cohort when a status check stalls past the wait',
+                polls: [FILLING],
+                expectedPolls: 2,
+                outcome: 'still filling',
+                stallAfter: 1,
+            },
+            {
+                scenario: 'offers the broadcast in a toast when the person left the flag page',
+                polls: [READY],
+                expectedPolls: 1,
+                outcome: 'offered',
+                startPath: urls.cohorts(),
+            },
+            {
+                scenario: 'offers the broadcast in a toast after leaving the flag page unmounts its logic',
+                polls: [FILLING, READY],
+                expectedPolls: 2,
+                outcome: 'offered',
+                startPath: urls.cohorts(),
+                unmountOnLeave: true,
+            },
+        ])('$scenario', async ({ polls, expectedPolls, outcome, startPath, unmountOnLeave, stallAfter }) => {
+            jest.useFakeTimers()
+            router.actions.push(urls.featureFlag(MOCK_FEATURE_FLAG.id))
+            let pollCount = 0
+            useMocks({
+                post: {
+                    '/api/projects/:projectId/feature_flags/:id/create_static_cohort_for_flag/': () => [
+                        201,
+                        { cohort: FILLING },
+                    ],
+                },
+                get: {
+                    '/api/projects/:projectId/cohorts/': () => [200, { count: 0, results: [] }],
+                    '/api/projects/:projectId/cohorts/42/': () => {
+                        const poll = pollCount++
+                        if (stallAfter !== undefined && poll >= stallAfter) {
+                            return new Promise(() => {})
+                        }
+                        return [200, polls[Math.min(poll, polls.length - 1)]]
+                    },
+                },
+            })
+
+            logic.actions.findOrCreateBroadcastCohort()
+            if (startPath) {
+                router.actions.push(startPath)
+            }
+            if (unmountOnLeave) {
+                await jest.advanceTimersByTimeAsync(500)
+                logic.unmount()
+            }
+            await jest.advanceTimersByTimeAsync(61_000)
+            if (unmountOnLeave) {
+                logic.mount()
+            }
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(pollCount).toBe(expectedPolls)
+            expect(capturesOf('message audience clicked')).toEqual([
+                ['message audience clicked', { source: 'feature_flag', destination: 'broadcast' }],
+            ])
+            expect(lemonToast.loading).toHaveBeenCalledTimes(1)
+            expect(lemonToast.dismiss).toHaveBeenCalledWith((lemonToast.loading as jest.Mock).mock.results[0].value)
+            const broadcastDetails = { name: 'test-flag announcement', source: 'feature_flag' }
+            if (outcome === 'opened') {
+                expect(router.values.location.pathname).toContain('/broadcasts/new')
+                expect(JSON.parse(router.values.searchParams.audience)).toEqual([
+                    expect.objectContaining({ type: 'cohort', value: 42 }),
+                ])
+                expect(router.values.searchParams).toMatchObject(broadcastDetails)
+                return
+            }
+            expect(router.values.location.pathname).toContain(startPath ?? urls.featureFlag(MOCK_FEATURE_FLAG.id))
+            if (outcome === 'error') {
+                expect(lemonToast.error).toHaveBeenCalledWith(
+                    "Couldn't find the people who have this flag. Try again in a few minutes."
+                )
+            } else if (outcome === 'still filling') {
+                const [message, { button }] = (lemonToast.info as jest.Mock).mock.calls[0]
+                expect(message).toContain('Still finding the people who have this flag')
+                button.action()
+                expect(router.values.location.pathname).toContain(urls.cohort(42))
+            } else {
+                const [, { button }] = (lemonToast.success as jest.Mock).mock.calls[0]
+                expect(button.label).toBe('Open broadcast')
+                button.action()
+                expect(router.values.location.pathname).toContain('/broadcasts/new')
+                expect(router.values.searchParams).toMatchObject(broadcastDetails)
+            }
+        })
+
+        it.each([
+            ['a dropped connection', {}, 1],
+            ['an HTTP error the shared loader toast already reports', { status: 500 }, 0],
+        ])('reports a failed broadcast lookup after %s', (_, errorObject, errorToasts) => {
+            logic.actions.findOrCreateBroadcastCohortFailure('failed', errorObject)
+
+            expect(lemonToast.error).toHaveBeenCalledTimes(errorToasts)
+        })
+
+        it.each([
+            {
+                scenario: 'targets groups',
+                flag: { filters: { ...MOCK_FEATURE_FLAG.filters, aggregation_group_type_index: 0 } },
+                message: 'This flag targets groups, not people, so there is no one to email.',
+            },
+            {
+                scenario: 'was archived after the page loaded',
+                flag: { archived: true, active: false },
+                message: 'This flag is archived, so no one has it. Unarchive and enable it first.',
+            },
+            {
+                scenario: 'was disabled after the page loaded',
+                flag: { active: false },
+                message: 'This flag is disabled, so no one has it. Enable it first.',
+            },
+        ])('makes no cohort when the saved flag $scenario', async ({ flag, message }) => {
+            const createStaticCohort = jest.fn(() => [201, { cohort: FILLING }])
+            useMocks({
+                post: {
+                    '/api/projects/:projectId/feature_flags/:id/create_static_cohort_for_flag/': createStaticCohort,
+                },
+                get: { [FLAG_URL]: () => [200, { ...MOCK_FEATURE_FLAG, ...flag }] },
+            })
+
+            logic.actions.findOrCreateBroadcastCohort()
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(lemonToast.error).toHaveBeenCalledWith(message)
+            expect(createStaticCohort).not.toHaveBeenCalled()
+            expect(router.values.location.pathname).not.toContain('/broadcasts/new')
+        })
+
+        const NOW = new Date('2026-10-07T12:00:00Z')
+        const minutesAgo = (minutes: number): string => new Date(NOW.getTime() - minutes * 60_000).toISOString()
+        const listedCohort = (
+            flagKey: string,
+            createdAt: string,
+            createdByUuid: string = MOCK_DEFAULT_BASIC_USER.uuid
+        ): Record<string, any> => ({
+            id: 7,
+            name: `Users with feature flag ${flagKey} enabled at 2026-10-07 11:50:00`,
+            created_by: { id: 1, uuid: createdByUuid },
+            is_static: true,
+            deleted: false,
+            errors_calculating: 0,
+            is_calculating: false,
+            created_at: createdAt,
+        })
+
+        it.each([
+            {
+                scenario: 'reuses a recent cohort for this flag',
+                listed: () => listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(10)),
+                usesCohortId: 7,
+            },
+            {
+                scenario: 'creates a cohort when the existing one is over an hour old',
+                listed: () => listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(61)),
+                usesCohortId: 42,
+            },
+            {
+                scenario: 'creates a cohort when the flag was saved after the recent one was made',
+                listed: () => listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(10)),
+                flagUpdatedAt: minutesAgo(5),
+                usesCohortId: 42,
+            },
+            {
+                scenario: 'creates a cohort when the flag changed on the server after this page loaded it',
+                listed: () => listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(10)),
+                serverUpdatedAt: minutesAgo(5),
+                usesCohortId: 42,
+            },
+            {
+                scenario: 'reuses a cohort still filling past the hour instead of starting a second scan',
+                listed: () => ({ ...listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(90)), is_calculating: true }),
+                usesCohortId: 7,
+            },
+            {
+                scenario: 'creates a cohort when the one still filling is past the fill limit',
+                listed: () => ({ ...listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(241)), is_calculating: true }),
+                usesCohortId: 42,
+            },
+            {
+                scenario: 'finds a reusable cohort past a first page of newer cohorts',
+                listed: () => listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(10)),
+                newerPage: true,
+                usesCohortId: 7,
+            },
+            {
+                scenario: 'creates a cohort when the recent one failed to fill',
+                listed: () => ({ ...listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(10)), errors_calculating: 1 }),
+                usesCohortId: 42,
+            },
+            {
+                scenario: 'creates a cohort when someone changed who is in the recent one',
+                listed: () => listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(10)),
+                edited: true,
+                usesCohortId: 42,
+            },
+            {
+                scenario: "creates a cohort when the recent one's history can't be read",
+                listed: () => listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(10)),
+                activityFails: true,
+                usesCohortId: 42,
+            },
+            {
+                scenario: 'creates a cohort when another user made the recent one',
+                listed: () => listedCohort(MOCK_FEATURE_FLAG.key, minutesAgo(10), 'another-user-uuid'),
+                usesCohortId: 42,
+            },
+            {
+                scenario: 'creates a cohort when the recent one belongs to a flag whose key extends this one',
+                listed: () => listedCohort(`${MOCK_FEATURE_FLAG.key}-2`, minutesAgo(10)),
+                usesCohortId: 42,
+            },
+        ])(
+            '$scenario',
+            async ({ listed, usesCohortId, flagUpdatedAt, serverUpdatedAt, newerPage, edited, activityFails }) => {
+                jest.useFakeTimers()
+                jest.setSystemTime(NOW)
+                router.actions.push(urls.featureFlag(MOCK_FEATURE_FLAG.id))
+                const createStaticCohort = jest.fn(() => [201, { cohort: FILLING }])
+                const existing = listed()
+                const listParams: URLSearchParams[] = []
+                let flagLoads = 0
+                useMocks({
+                    post: {
+                        '/api/projects/:projectId/feature_flags/:id/create_static_cohort_for_flag/': createStaticCohort,
+                    },
+                    get: {
+                        [FLAG_URL]: () => {
+                            const updatedAt = flagLoads++ === 0 ? flagUpdatedAt : (serverUpdatedAt ?? flagUpdatedAt)
+                            return [200, { ...MOCK_FEATURE_FLAG, updated_at: updatedAt ?? minutesAgo(120) }]
+                        },
+                        '/api/projects/:projectId/cohorts/': ({ request }) => {
+                            const params = new URL(request.url).searchParams
+                            listParams.push(params)
+                            if (newerPage && params.get('offset') === '0') {
+                                const others = Array.from({ length: 20 }, (_, index) => ({
+                                    ...listedCohort(`other-flag-${index}`, minutesAgo(5)),
+                                    id: 100 + index,
+                                }))
+                                return [200, { count: 21, next: 'more', results: others }]
+                            }
+                            return [200, { count: 1, results: [existing] }]
+                        },
+                        '/api/projects/:projectId/cohorts/7/activity/': () =>
+                            activityFails
+                                ? [402, { detail: 'This feature is part of the premium PostHog offering.' }]
+                                : [
+                                      200,
+                                      {
+                                          next: null,
+                                          previous: null,
+                                          results: edited ? [{ activity: 'persons_added_manually' }] : [],
+                                      },
+                                  ],
+                        '/api/projects/:projectId/cohorts/7/': () => [200, { ...existing, is_calculating: false }],
+                        '/api/projects/:projectId/cohorts/42/': () => [200, READY],
+                    },
+                })
+
+                logic.unmount()
+                logic = featureFlagLogic({ id: 1 })
+                logic.mount()
+                await jest.advanceTimersByTimeAsync(1_000)
+
+                logic.actions.findOrCreateBroadcastCohort()
+                await jest.advanceTimersByTimeAsync(5_000)
+                await expectLogic(logic).toFinishAllListeners()
+                expect(Object.fromEntries(listParams[0])).toEqual({
+                    type: 'static',
+                    created_by_id: String(MOCK_DEFAULT_USER.id),
+                    limit: '20',
+                    offset: '0',
+                })
+                expect(createStaticCohort).toHaveBeenCalledTimes(usesCohortId === 7 ? 0 : 1)
+                expect(JSON.parse(router.values.searchParams.audience)).toEqual([
+                    expect.objectContaining({ type: 'cohort', value: usesCohortId }),
+                ])
+            }
+        )
+    })
+
+    describe('setMultivariateEnabled functionality', () => {
+        it('adds default variants when enabling multivariate', async () => {
+            await expectLogic(logic).toMatchValues({
+                featureFlag: partial({
+                    filters: partial({
+                        groups: [
+                            partial({
+                                properties: [],
+                                variant: null,
+                            }),
+                        ],
+                    }),
+                }),
+                variants: [],
+            })
+            await expectLogic(logic, () => {
+                logic.actions.setMultivariateEnabled(true)
+            })
+                .toDispatchActions(['setMultivariateEnabled', 'setMultivariateOptions'])
+                .toMatchValues({
+                    variants: [
+                        {
+                            key: 'control',
+                            name: '',
+                            rollout_percentage: 50,
+                        },
+                        {
+                            key: 'test',
+                            name: '',
+                            rollout_percentage: 50,
+                        },
+                    ],
+                })
+        })
+
+        it('resets the variants and group variant keys when disabling multivariate', async () => {
+            const MOCK_MULTIVARIATE_FEATURE_FLAG: FeatureFlagWithV1Config = {
+                ...logic.values.featureFlag,
+                filters: {
+                    groups: [
+                        {
+                            variant: 'control1',
+                            properties: [
+                                {
+                                    key: '$browser',
+                                    type: PropertyFilterType.Person,
+                                    value: 'Chrome',
+                                    operator: PropertyOperator.Regex,
+                                },
+                            ],
+                            rollout_percentage: 100,
+                        },
+                    ],
+                    payloads: {
+                        control1: '{"key": "value"}',
+                    },
+                    multivariate: {
+                        variants: [
+                            {
+                                key: 'control1',
+                                name: 'Control 1',
+                                rollout_percentage: 30,
+                            },
+                            {
+                                key: 'control2',
+                                name: 'Control 2',
+                                rollout_percentage: 70,
+                            },
+                        ],
+                    },
+                },
+            }
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlag(MOCK_MULTIVARIATE_FEATURE_FLAG)
+            })
+                .toDispatchActions(['setFeatureFlag'])
+                .toMatchValues({
+                    featureFlag: MOCK_MULTIVARIATE_FEATURE_FLAG,
+                })
+
+            await expectLogic(logic, () => {
+                logic.actions.setMultivariateEnabled(false)
+            })
+                .toDispatchActions(['setMultivariateEnabled', 'setMultivariateOptions'])
+                .toMatchValues({
+                    featureFlag: partial({
+                        filters: partial({
+                            groups: [
+                                {
+                                    ...MOCK_MULTIVARIATE_FEATURE_FLAG.filters.groups[0],
+                                    variant: null,
+                                },
+                            ],
+                            payloads: {},
+                        }),
+                    }),
+                    variants: [],
+                })
+        })
+    })
+
+    describe('applyTemplate', () => {
+        const EXPECTED_VARIANTS = partial({
+            variants: [partial({ key: 'control' }), partial({ key: 'test' })],
+        })
+
+        const TEMPLATE_EXPECTATIONS: Array<{
+            id: TemplateKey
+            expectedMultivariate: unknown
+        }> = [
+            { id: 'simple', expectedMultivariate: null },
+            { id: 'targeted', expectedMultivariate: null },
+            { id: 'multivariate', expectedMultivariate: EXPECTED_VARIANTS },
+            { id: 'targeted-multivariate', expectedMultivariate: EXPECTED_VARIANTS },
+        ]
+
+        it.each(TEMPLATE_EXPECTATIONS)(
+            'clears encrypted-payload state when switching a remote configuration flag to $id',
+            async ({ id, expectedMultivariate }) => {
+                const MOCK_REMOTE_CONFIG_FLAG: FeatureFlagType = {
+                    ...logic.values.featureFlag,
+                    is_remote_configuration: true,
+                    has_encrypted_payloads: true,
+                    filters: {
+                        ...v1Filters(logic.values.featureFlag),
+                        payloads: { true: 'encrypted-ciphertext' },
+                    },
+                }
+
+                await expectLogic(logic, () => {
+                    logic.actions.setFeatureFlag(MOCK_REMOTE_CONFIG_FLAG)
+                }).toDispatchActions(['setFeatureFlag'])
+
+                await expectLogic(logic, () => {
+                    logic.actions.applyTemplate(id)
+                })
+                    .toDispatchActions(['applyTemplate', 'setFeatureFlag', 'resetEncryptedPayload'])
+                    .toMatchValues({
+                        featureFlag: partial({
+                            is_remote_configuration: false,
+                            has_encrypted_payloads: false,
+                            filters: partial({
+                                multivariate: expectedMultivariate,
+                                payloads: { true: '' },
+                            }),
+                        }),
+                    })
+
+                // The encrypted ciphertext must not survive under any payload key.
+                expect(Object.values(logic.values.featureFlag.filters.payloads ?? {})).not.toContain(
+                    'encrypted-ciphertext'
+                )
+            }
+        )
+
+        it('prepends org default groups ahead of template groups when default conditions are enabled', async () => {
+            const DEFAULT_GROUP = { properties: [], rollout_percentage: 10, variant: null }
+            // The shared singleton is warmed to a disabled value on mount, so seed its cache with
+            // enabled defaults before applyTemplate reads it.
+            defaultReleaseConditionsLogic.actions.loadDefaultReleaseConditionsSuccess({
+                enabled: true,
+                default_groups: [DEFAULT_GROUP],
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.applyTemplate('targeted')
+            }).toDispatchActions(['applyTemplate', 'setFeatureFlag'])
+
+            const groups = v1Filters(logic.values.featureFlag).groups
+            expect(groups[0]).toMatchObject(DEFAULT_GROUP)
+            expect(groups.length).toBeGreaterThan(1)
+        })
+
+        it('preserves variant payloads when applying a template to a non-encrypted flag', async () => {
+            const MOCK_NON_ENCRYPTED_FLAG: FeatureFlagType = {
+                ...logic.values.featureFlag,
+                is_remote_configuration: false,
+                has_encrypted_payloads: false,
+                filters: {
+                    ...v1Filters(logic.values.featureFlag),
+                    payloads: { control: '{"x":1}', test: '{"y":2}' },
+                },
+            }
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlag(MOCK_NON_ENCRYPTED_FLAG)
+            }).toDispatchActions(['setFeatureFlag'])
+
+            await expectLogic(logic, () => {
+                logic.actions.applyTemplate('multivariate')
+            })
+                .toDispatchActions(['applyTemplate', 'setFeatureFlag'])
+                .toMatchValues({
+                    featureFlag: partial({
+                        is_remote_configuration: false,
+                        has_encrypted_payloads: false,
+                        filters: partial({
+                            payloads: { control: '{"x":1}', test: '{"y":2}' },
+                        }),
+                    }),
+                })
+        })
+
+        it('does not access the store after unmounting mid-apply', async () => {
+            // applyTemplate awaits release conditions before reading values again. Unmounting during
+            // that await (navigating away, or the auto-apply from a ?template= param racing a fast
+            // unmount) must not touch a store path that no longer exists — that used to throw
+            // "Can not find path ... in the store" and surface as an unhandled rejection.
+            let resolveRelease: (value: DefaultReleaseConditionsResponse | null) => void = () => {}
+            const pendingRelease = new Promise<DefaultReleaseConditionsResponse | null>((resolve) => {
+                resolveRelease = resolve
+            })
+            const spy = jest
+                .spyOn(defaultReleaseConditionsModule, 'resolveDefaultReleaseConditions')
+                .mockReturnValue(pendingRelease)
+
+            const rejections: unknown[] = []
+            const onRejection = (error: unknown): void => {
+                rejections.push(error)
+            }
+            process.on('unhandledRejection', onRejection)
+
+            try {
+                // Listener parks on the pending release conditions, then we navigate away.
+                logic.actions.applyTemplate('targeted')
+                logic.unmount()
+
+                // Resuming after unmount must bail instead of reading values.featureFlag.
+                resolveRelease(null)
+                await pendingRelease
+                await new Promise((resolve) => setTimeout(resolve, 0))
+            } finally {
+                process.off('unhandledRejection', onRejection)
+                spy.mockRestore()
+            }
+
+            expect(rejections).toEqual([])
+        })
+    })
+
+    describe('setRemoteConfigEnabled', () => {
+        it('clears encrypted-payload state when toggling remote config off', async () => {
+            const MOCK_REMOTE_CONFIG_FLAG: FeatureFlagType = {
+                ...logic.values.featureFlag,
+                is_remote_configuration: true,
+                has_encrypted_payloads: true,
+                filters: {
+                    ...v1Filters(logic.values.featureFlag),
+                    payloads: { true: 'encrypted-ciphertext' },
+                },
+            }
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlag(MOCK_REMOTE_CONFIG_FLAG)
+            }).toDispatchActions(['setFeatureFlag'])
+
+            await expectLogic(logic, () => {
+                logic.actions.setRemoteConfigEnabled(false)
+            })
+                .toDispatchActions(['setRemoteConfigEnabled', 'resetEncryptedPayload'])
+                .toMatchValues({
+                    featureFlag: partial({
+                        is_remote_configuration: false,
+                        has_encrypted_payloads: false,
+                        filters: partial({
+                            payloads: { true: '' },
+                        }),
+                    }),
+                })
+
+            // The encrypted ciphertext must not survive under any payload key.
+            expect(Object.values(logic.values.featureFlag.filters.payloads ?? {})).not.toContain('encrypted-ciphertext')
+        })
+
+        it('does not reset encrypted payload state when toggling off a non-encrypted flag', async () => {
+            const MOCK_REMOTE_CONFIG_PLAIN_FLAG: FeatureFlagType = {
+                ...logic.values.featureFlag,
+                is_remote_configuration: true,
+                has_encrypted_payloads: false,
+                filters: {
+                    ...v1Filters(logic.values.featureFlag),
+                    payloads: { true: 'plain-payload' },
+                },
+            }
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlag(MOCK_REMOTE_CONFIG_PLAIN_FLAG)
+            }).toDispatchActions(['setFeatureFlag'])
+
+            await expectLogic(logic, () => {
+                logic.actions.setRemoteConfigEnabled(false)
+            })
+                .toDispatchActions(['setRemoteConfigEnabled'])
+                .toNotHaveDispatchedActions(['resetEncryptedPayload'])
+                .toMatchValues({
+                    featureFlag: partial({
+                        is_remote_configuration: false,
+                        has_encrypted_payloads: false,
+                        filters: partial({
+                            payloads: { true: 'plain-payload' },
+                        }),
+                    }),
+                })
+        })
+    })
+
+    describe('setFeatureFlagFilters', () => {
+        it.each([
+            ['an empty payload snapshot', {}],
+            ['a stale payload snapshot', { true: '{"enabled":false}' }],
+        ])('preserves boolean payloads when release conditions update from %s', async (_, incomingPayloads) => {
+            const payload = '{"enabled":true}'
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('filters', {
+                    ...v1Filters(logic.values.featureFlag),
+                    payloads: { true: payload },
+                })
+            }).toMatchValues({
+                featureFlag: partial({
+                    filters: partial({
+                        payloads: { true: payload },
+                    }),
+                }),
+            })
+
+            const updatedConditionFilters: FeatureFlagFilters = {
+                ...v1Filters(logic.values.featureFlag),
+                groups: [
+                    {
+                        properties: [
+                            {
+                                key: '$browser',
+                                value: 'Chrome',
+                                type: PropertyFilterType.Person,
+                                operator: PropertyOperator.Exact,
+                            },
+                        ],
+                        rollout_percentage: 42,
+                        variant: null,
+                    },
+                ],
+                payloads: incomingPayloads,
+            }
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagFilters(updatedConditionFilters, {})
+            }).toMatchValues({
+                featureFlag: partial({
+                    filters: partial({
+                        groups: updatedConditionFilters.groups,
+                        payloads: { true: payload },
+                    }),
+                }),
+            })
+        })
+    })
+
+    describe('change detection', () => {
+        it('detects active status changes', () => {
+            const originalFlag = { ...MOCK_FEATURE_FLAG, active: false }
+            const changedFlag = { ...originalFlag, active: true }
+
+            const changes = detectFeatureFlagChanges(originalFlag, changedFlag)
+            expect(changes).toContain('Enable the feature flag')
+        })
+
+        it('detects rollout percentage changes', () => {
+            const originalFlag = {
+                ...MOCK_FEATURE_FLAG,
+                filters: {
+                    groups: [{ properties: [], rollout_percentage: 100, variant: null }],
+                },
+            }
+            const changedFlag = {
+                ...originalFlag,
+                filters: {
+                    groups: [{ properties: [], rollout_percentage: 50, variant: null }],
+                },
+            }
+
+            const changes = detectFeatureFlagChanges(originalFlag, changedFlag)
+            expect(changes).toContain('Release condition rollout percentage changed')
+        })
+
+        it('does not throw and detects changes when a filter value is a bigint', () => {
+            // Property values can be bigint (PropertyFilterBaseValue); raw JSON.stringify throws on them.
+            const filtersWithBigIntId = (value: bigint): FeatureFlagFilters => ({
+                groups: [
+                    {
+                        properties: [
+                            { key: 'id', value, type: PropertyFilterType.Person, operator: PropertyOperator.Exact },
+                        ],
+                        rollout_percentage: 100,
+                        variant: null,
+                    },
+                ],
+            })
+            const originalFlag = { ...MOCK_FEATURE_FLAG, filters: filtersWithBigIntId(BigInt('9007199254740993')) }
+            const changedFlag = { ...MOCK_FEATURE_FLAG, filters: filtersWithBigIntId(BigInt('9007199254740994')) }
+
+            let changes: string[] = []
+            expect(() => {
+                changes = detectFeatureFlagChanges(originalFlag, changedFlag)
+            }).not.toThrow()
+            expect(changes).toContain('Release conditions changed')
+        })
+
+        it('returns no changes for new flags', () => {
+            const newFlag = { ...NEW_FLAG, key: 'new-flag', name: 'New Flag' }
+            const changes = detectFeatureFlagChanges(null, newFlag)
+            expect(changes.length).toBe(0)
+        })
+
+        it('returns no changes when nothing meaningful changed', () => {
+            const originalFlag = MOCK_FEATURE_FLAG
+            const changedFlag = { ...originalFlag, name: 'Different Name' } // Name change doesn't trigger confirmation
+
+            const changes = detectFeatureFlagChanges(originalFlag, changedFlag)
+            expect(changes.length).toBe(0)
+        })
+    })
+
+    describe('hasUnsavedChanges selector (drives beforeUnload dialog)', () => {
+        // The beforeUnload hook reads this selector to decide whether to warn on navigation.
+        // User form edits go through kea-forms' setFeatureFlagValue / setFeatureFlagValues,
+        // which update only `featureFlag`. `originalFeatureFlag` is the baseline from server load.
+
+        it('is false after the flag loads cleanly', async () => {
+            await expectLogic(logic).toMatchValues({ hasUnsavedChanges: false })
+        })
+
+        it('becomes true after the name is edited via the form', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('name', 'Edited name')
+            }).toMatchValues({ hasUnsavedChanges: true })
+        })
+
+        it('becomes true after the key is edited via the form', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('key', 'edited-key')
+            }).toMatchValues({ hasUnsavedChanges: true })
+        })
+
+        it('becomes true after filters change via the form', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('filters', {
+                    ...v1Filters(logic.values.featureFlag),
+                    groups: [{ properties: [], rollout_percentage: 42, variant: null }],
+                })
+            }).toMatchValues({ hasUnsavedChanges: true })
+        })
+
+        it('returns to false when the edited value is reverted to the loaded state', async () => {
+            const originalName = logic.values.featureFlag.name
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('name', 'temp-edit')
+            }).toMatchValues({ hasUnsavedChanges: true })
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('name', originalName)
+            }).toMatchValues({ hasUnsavedChanges: false })
+        })
+
+        it('keeps an in-progress release-condition edit dirty when a background setFeatureFlag reconciles', async () => {
+            // Regression: a mid-edit setFeatureFlag (inline tag save, active/archive sync, or the
+            // on-mount cache reconcile) used to re-baseline originalFeatureFlag to the already-edited
+            // working copy, flipping the guard to clean so navigation silently discarded the edit.
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('filters', {
+                    ...v1Filters(logic.values.featureFlag),
+                    groups: [
+                        ...v1Filters(logic.values.featureFlag).groups,
+                        { properties: [], rollout_percentage: 100, variant: null },
+                    ],
+                })
+            }).toMatchValues({ hasUnsavedChanges: true, isFormDirty: true })
+
+            // Reconcile with the current working copy, as a tag save / active sync does mid-edit.
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlag(logic.values.featureFlag)
+            }).toMatchValues({ hasUnsavedChanges: true, isFormDirty: true })
+        })
+
+        // These land while the page is interactive: the background refresh has its own loader key
+        // so it never shows the skeleton, and the toggles are one click away. Each persists only a
+        // couple of server-owned fields, so taking the whole server flag would drop an in-progress
+        // edit and re-baseline over it, leaving the guard clean and the edit gone without a prompt.
+        it.each([
+            ['refreshFeatureFlagSuccess', () => logic.actions.refreshFeatureFlagSuccess({ ...MOCK_FEATURE_FLAG })],
+            [
+                'updateFeatureFlagActiveSuccess',
+                () => logic.actions.updateFeatureFlagActiveSuccess({ ...MOCK_FEATURE_FLAG, active: false }),
+            ],
+            [
+                'updateFeatureFlagArchivedSuccess',
+                () => logic.actions.updateFeatureFlagArchivedSuccess({ ...MOCK_FEATURE_FLAG, archived: true }),
+            ],
+        ])('keeps an in-progress release-condition edit after %s reconciles', async (_label, reconcile) => {
+            const editedGroups = [
+                ...v1Filters(logic.values.featureFlag).groups,
+                { properties: [], rollout_percentage: 100, variant: null },
+            ]
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('filters', {
+                    ...v1Filters(logic.values.featureFlag),
+                    groups: editedGroups,
+                })
+            }).toMatchValues({ hasUnsavedChanges: true })
+
+            await expectLogic(logic, reconcile).toFinishAllListeners()
+
+            expect(v1Filters(logic.values.featureFlag).groups).toHaveLength(editedGroups.length)
+            expect(logic.values.hasUnsavedChanges).toBe(true)
+        })
+
+        it('tracks changes when the whole form is replaced via setFeatureFlagValues', async () => {
+            await expectLogic(logic, () => {
+                // Form `defaults` narrow `ensure_experience_continuity` to `boolean`, but
+                // FeatureFlagType allows `boolean | null`. The runtime accepts either —
+                // the cast bridges the form-vs-entity type gap that kea-typegen surfaces.
+                logic.actions.setFeatureFlagValues({
+                    ...logic.values.featureFlag,
+                    name: 'Bulk edit',
+                } as Parameters<typeof logic.actions.setFeatureFlagValues>[0])
+            }).toMatchValues({ hasUnsavedChanges: true })
+        })
+    })
+
+    describe('urlToAction preserves in-progress edits', () => {
+        // Regression for https://github.com/PostHog/posthog/issues/58656 — when the user
+        // dismisses the beforeUnload prompt, urlToAction must not silently reload the
+        // flag and wipe their in-progress edits. The guard must sit *above* the
+        // editFeatureFlag dispatch, because its listener also calls loadFeatureFlag()
+        // whenever editing === true.
+
+        it('preserves an in-progress edit on a PUSH navigation when the form is dirty', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('name', 'Edited but not saved')
+            }).toMatchValues({ hasUnsavedChanges: true, isFormDirty: true })
+
+            await expectLogic(logic, () => {
+                router.actions.push(urls.featureFlag(1))
+            })
+                .toFinishAllListeners()
+                .toNotHaveDispatchedActions(['editFeatureFlag'])
+
+            expect(logic.values.featureFlag.name).toBe('Edited but not saved')
+            expect(logic.values.hasUnsavedChanges).toBe(true)
+        })
+
+        it('preserves an in-progress edit on a PUSH to the same URL with ?edit=true', async () => {
+            // Realistic visibilitychange / re-push path: the user is already in edit mode,
+            // so the URL carries `?edit=true`. Without the early-return above editFeatureFlag,
+            // its listener (`if (editing) loadFeatureFlag()`) would still wipe the form.
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlagValue('name', 'Edited with edit=true in url')
+            }).toMatchValues({ hasUnsavedChanges: true, isFormDirty: true })
+
+            await expectLogic(logic, () => {
+                router.actions.push(`${urls.featureFlag(1)}?edit=true`)
+            })
+                .toFinishAllListeners()
+                .toNotHaveDispatchedActions(['editFeatureFlag'])
+
+            expect(logic.values.featureFlag.name).toBe('Edited with edit=true in url')
+            expect(logic.values.hasUnsavedChanges).toBe(true)
+        })
+
+        it.each([
+            ['sourceId=42', `${urls.featureFlag('new')}?sourceId=42`],
+            ['type=multivariate', `${urls.featureFlag('new')}?type=multivariate`],
+            ['template=experiment', `${urls.featureFlag('new')}?template=experiment`],
+            ['intent=remote-config', `${urls.featureFlag('new')}?intent=remote-config`],
+        ])('skips the new-flag template re-load on a dirty PUSH carrying %s', async (_label, targetUrl) => {
+            // Pin that the dirty guard also short-circuits the special new-flag
+            // re-load branches (sourceId / type / template / intent) inside `urlToAction`.
+            // Park the router at a non-matching path first so the `new`-keyed logic's
+            // afterMount doesn't see those query params at mount time and prefetch.
+            router.actions.push('/')
+            const newLogic = featureFlagLogic({ id: 'new' })
+            newLogic.mount()
+            await expectLogic(newLogic).toFinishAllListeners()
+
+            await expectLogic(newLogic, () => {
+                newLogic.actions.setFeatureFlagValue('name', 'Draft new flag')
+            }).toMatchValues({ isFormDirty: true })
+
+            await expectLogic(newLogic, () => {
+                router.actions.push(targetUrl)
+            })
+                .toFinishAllListeners()
+                .toNotHaveDispatchedActions(['editFeatureFlag'])
+
+            expect(newLogic.values.featureFlag.name).toBe('Draft new flag')
+            newLogic.unmount()
+        })
+
+        it('still reloads the flag on a PUSH navigation when the form is clean', async () => {
+            await expectLogic(logic).toMatchValues({ hasUnsavedChanges: false })
+
+            await expectLogic(logic, () => {
+                router.actions.push(urls.featureFlag(1))
+            }).toDispatchActions(['loadFeatureFlag'])
+        })
+    })
+
+    describe('active tab syncs with the URL', () => {
+        it.each([
+            ['?tab=usage', FeatureFlagsTab.USAGE],
+            ['?tab=schedule', FeatureFlagsTab.SCHEDULE],
+            // An unknown tab shouldn't strand the user on a blank page
+            ['?tab=not-a-tab', FeatureFlagsTab.OVERVIEW],
+            // The activity deep link belongs to the history tab
+            ['?activity=42', FeatureFlagsTab.HISTORY],
+        ])('opens %s on the %s tab', async (query, expectedTab) => {
+            await expectLogic(logic, () => {
+                router.actions.push(`${urls.featureFlag(1)}${query}`)
+            }).toMatchValues({ activeTab: expectedTab })
+        })
+
+        it('opens the history tab when the page loads with ?activity already in the URL', async () => {
+            logic.unmount()
+            router.actions.push(`${urls.featureFlag(1)}?activity=42`)
+
+            logic = featureFlagLogic({ id: 1 })
+            logic.mount()
+
+            await expectLogic(logic).toFinishAllListeners().toMatchValues({ activeTab: FeatureFlagsTab.HISTORY })
+        })
+
+        it('clamps a deep link to a tab the flag does not offer', async () => {
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/99/`]: () => [
+                        200,
+                        { ...MOCK_FEATURE_FLAG, id: 99, can_edit: false },
+                    ],
+                },
+            })
+            const readOnlyLogic = featureFlagLogic({ id: 99 })
+            readOnlyLogic.mount()
+
+            try {
+                await expectLogic(readOnlyLogic, () => {
+                    router.actions.push(`${urls.featureFlag(99)}?tab=permissions`)
+                })
+                    .toFinishAllListeners()
+                    // The request is kept in selectedTab, so the tab appears if can_edit flips
+                    .toMatchValues({
+                        selectedTab: FeatureFlagsTab.PERMISSIONS,
+                        activeTab: FeatureFlagsTab.OVERVIEW,
+                    })
+                // The URL keeps the requested tab too, so a reload re-requests it
+                expect(router.values.searchParams.tab).toEqual('permissions')
+            } finally {
+                readOnlyLogic.unmount()
+            }
+        })
+
+        it('defaults the schedule form against the loaded flag when deep-linking ?tab=schedule', async () => {
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/99/`]: () => [
+                        200,
+                        { ...MOCK_FEATURE_FLAG, id: 99, active: false },
+                    ],
+                },
+            })
+            router.actions.push(`${urls.featureFlag(99)}?tab=schedule`)
+            const inactiveFlagLogic = featureFlagLogic({ id: 99 })
+            inactiveFlagLogic.mount()
+
+            try {
+                await expectLogic(inactiveFlagLogic)
+                    .toFinishAllListeners()
+                    .toMatchValues({
+                        activeTab: FeatureFlagsTab.SCHEDULE,
+                        // The default is the opposite of the flag's real state, not the
+                        // NEW_FLAG placeholder the tab listener saw before the flag loaded
+                        schedulePayload: partial({ active: true }),
+                    })
+            } finally {
+                inactiveFlagLogic.unmount()
+            }
+        })
+
+        it('keeps an in-progress schedule edit through a later reload', async () => {
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/98/`]: () => [
+                        200,
+                        { ...MOCK_FEATURE_FLAG, id: 98, active: false },
+                    ],
+                },
+            })
+            router.actions.push(`${urls.featureFlag(98)}?tab=schedule`)
+            const inactiveFlagLogic = featureFlagLogic({ id: 98 })
+            inactiveFlagLogic.mount()
+
+            try {
+                await expectLogic(inactiveFlagLogic)
+                    .toFinishAllListeners()
+                    .toMatchValues({ schedulePayload: partial({ active: true }) })
+
+                // The user starts drafting a change before a second load (e.g. clicking Edit) lands
+                inactiveFlagLogic.actions.setSchedulePayload(NEW_FLAG.filters, false, {}, null, null)
+
+                await expectLogic(inactiveFlagLogic, () => {
+                    inactiveFlagLogic.actions.loadFeatureFlag()
+                })
+                    .toFinishAllListeners()
+                    .toMatchValues({ schedulePayload: partial({ active: false }) })
+            } finally {
+                inactiveFlagLogic.unmount()
+            }
+        })
+
+        it('does not fetch every flag in the project when deep-linking to the schedule tab of an unsaved flag', async () => {
+            router.actions.push(`${urls.featureFlag('new')}?tab=schedule`)
+            const newLogic = featureFlagLogic({ id: 'new' })
+            newLogic.mount()
+
+            try {
+                await expectLogic(newLogic)
+                    .toFinishAllListeners()
+                    .toMatchValues({ activeTab: FeatureFlagsTab.SCHEDULE })
+                    .toNotHaveDispatchedActions(['loadScheduledChanges'])
+            } finally {
+                newLogic.unmount()
+            }
+        })
+
+        it('falls back to overview instead of keeping the current tab when the URL names an unknown tab', async () => {
+            router.actions.push(`${urls.featureFlag(1)}?tab=usage`)
+            await expectLogic(logic).toMatchValues({ activeTab: FeatureFlagsTab.USAGE })
+
+            await expectLogic(logic, () => {
+                router.actions.push(`${urls.featureFlag(1)}?tab=not-a-tab`)
+            }).toMatchValues({ activeTab: FeatureFlagsTab.OVERVIEW })
+        })
+
+        it('writes the tab to the URL so it can be shared and survives a reload', async () => {
+            router.actions.push(urls.featureFlag(1))
+
+            await expectLogic(logic, () => {
+                logic.actions.setSelectedTab(FeatureFlagsTab.USAGE)
+            }).toFinishAllListeners()
+            expect(router.values.searchParams).toEqual(partial({ tab: 'usage' }))
+
+            // Overview is the default, so it stays out of the URL
+            await expectLogic(logic, () => {
+                logic.actions.setSelectedTab(FeatureFlagsTab.OVERVIEW)
+            }).toFinishAllListeners()
+            expect(router.values.searchParams.tab).toBeUndefined()
+        })
+
+        it('drops ?activity= from the URL when leaving the history tab', async () => {
+            router.actions.push(`${urls.featureFlag(1)}?activity=42`)
+            await expectLogic(logic).toMatchValues({ activeTab: FeatureFlagsTab.HISTORY })
+
+            await expectLogic(logic, () => {
+                logic.actions.setSelectedTab(FeatureFlagsTab.USAGE)
+            }).toFinishAllListeners()
+
+            expect(router.values.searchParams.activity).toBeUndefined()
+        })
+
+        it('leaves the URL alone when the flag scene is not the current page', async () => {
+            router.actions.push(urls.projectHomepage())
+
+            await expectLogic(logic, () => {
+                logic.actions.setSelectedTab(FeatureFlagsTab.USAGE)
+            }).toFinishAllListeners()
+
+            expect(router.values.searchParams.tab).toBeUndefined()
+        })
+    })
+
+    describe('default release conditions on new flags', () => {
+        const groupDefault: FeatureFlagGroupType = {
+            properties: [
+                {
+                    key: 'is_dev',
+                    type: PropertyFilterType.Group,
+                    value: ['true'],
+                    operator: PropertyOperator.Exact,
+                    group_type_index: 1,
+                },
+            ],
+            rollout_percentage: 100,
+            variant: null,
+            aggregation_group_type_index: 1,
+        }
+
+        async function mountNewFlag(defaultConditions: {
+            enabled: boolean
+            default_groups: FeatureFlagGroupType[]
+        }): Promise<ReturnType<typeof featureFlagLogic.build>> {
+            // Seed the shared singleton's cache before the new-flag loader reads it; useMocks lands
+            // too late since the logic is warmed to a disabled value on mount in beforeEach.
+            defaultReleaseConditionsLogic.actions.loadDefaultReleaseConditionsSuccess(defaultConditions)
+            // Park at a non-matching path so the `new`-keyed logic doesn't prefetch off stale params.
+            router.actions.push('/')
+            const newLogic = featureFlagLogic({ id: 'new' })
+            newLogic.mount()
+            await expectLogic(newLogic).toFinishAllListeners()
+            return newLogic
+        }
+
+        it('applies an enabled group-targeted default and mirrors the aggregation onto the new flag', async () => {
+            const newLogic = await mountNewFlag({ enabled: true, default_groups: [groupDefault] })
+
+            expect(v1Filters(newLogic.values.featureFlag).groups).toEqual([groupDefault])
+            expect(newLogic.values.featureFlag.filters.aggregation_group_type_index).toBe(1)
+            newLogic.unmount()
+        })
+
+        it('leaves a new flag on user targeting when the default config is disabled', async () => {
+            const newLogic = await mountNewFlag({ enabled: false, default_groups: [groupDefault] })
+
+            expect(v1Filters(newLogic.values.featureFlag).groups).toEqual([
+                { properties: [], rollout_percentage: 0, variant: null },
+            ])
+            expect(newLogic.values.featureFlag.filters.aggregation_group_type_index).toBeUndefined()
+            newLogic.unmount()
+        })
+    })
+
+    describe('experiment loading', () => {
+        it('loads experiment data when feature flag has an experiment linked', async () => {
+            const flagWithExperiment = {
+                ...MOCK_FEATURE_FLAG,
+                id: 2,
+                experiment_set: [MOCK_EXPERIMENT.id],
+                experiment_set_metadata: [{ id: MOCK_EXPERIMENT.id, name: MOCK_EXPERIMENT.name, is_running: true }],
+            }
+
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flagWithExperiment.id}/`]: () => [
+                        200,
+                        flagWithExperiment,
+                    ],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flagWithExperiment.id}/status`]: () => [
+                        200,
+                        MOCK_FEATURE_FLAG_STATUS,
+                    ],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/experiments/${MOCK_EXPERIMENT.id}/`]: () => [
+                        200,
+                        MOCK_EXPERIMENT,
+                    ],
+                },
+            })
+
+            const experimentLogic = featureFlagLogic({ id: 2 })
+            experimentLogic.mount()
+
+            // The loader awaits the experiment inline before returning the flag,
+            // so loadExperimentSuccess lands before loadFeatureFlagSuccess.
+            await expectLogic(experimentLogic)
+                .toDispatchActions(['loadFeatureFlag', 'loadExperimentSuccess', 'loadFeatureFlagSuccess'])
+                .toMatchValues({
+                    featureFlag: partial({
+                        id: flagWithExperiment.id,
+                        experiment_set: [MOCK_EXPERIMENT.id],
+                    }),
+                    experiment: MOCK_EXPERIMENT,
+                })
+
+            experimentLogic.unmount()
+        })
+
+        it('does not load experiment data when feature flag has no experiment', async () => {
+            const flagWithoutExperiment = {
+                ...MOCK_FEATURE_FLAG,
+                id: 3,
+                experiment_set: null,
+                experiment_set_metadata: null,
+            }
+
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flagWithoutExperiment.id}/`]: () => [
+                        200,
+                        flagWithoutExperiment,
+                    ],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flagWithoutExperiment.id}/status`]:
+                        () => [200, MOCK_FEATURE_FLAG_STATUS],
+                },
+            })
+
+            const noExperimentLogic = featureFlagLogic({ id: 3 })
+            noExperimentLogic.mount()
+
+            await expectLogic(noExperimentLogic, () => {
+                noExperimentLogic.actions.loadFeatureFlag()
+            })
+                .toDispatchActions(['loadFeatureFlagSuccess'])
+                .toNotHaveDispatchedActions(['loadExperimentSuccess'])
+                .toMatchValues({
+                    featureFlag: partial({
+                        id: flagWithoutExperiment.id,
+                        experiment_set: null,
+                    }),
+                    experiment: null,
+                })
+
+            noExperimentLogic.unmount()
+        })
+    })
+
+    describe('dependent flags confirmation', () => {
+        it('uses pre-loaded dependent flags when data is available', async () => {
+            const flag = { ...MOCK_FEATURE_FLAG, id: 6, active: true }
+
+            const testLogic = featureFlagLogic({ id: 6 })
+
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/`]: () => [200, flag],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/status`]: () => [
+                        200,
+                        MOCK_FEATURE_FLAG_STATUS,
+                    ],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/dependent_flags/`]: () => [
+                        200,
+                        MOCK_DEPENDENT_FLAGS,
+                    ],
+                },
+            })
+
+            testLogic.mount()
+
+            await expectLogic(testLogic, () => {
+                testLogic.actions.loadFeatureFlag()
+            }).toDispatchActions(['loadFeatureFlagSuccess', 'loadDependentFlagsSuccess'])
+
+            expect(testLogic.values.dependentFlags).toEqual(MOCK_DEPENDENT_FLAGS)
+            expect(testLogic.values.dependentFlagsLoading).toBe(false)
+
+            testLogic.unmount()
+        })
+    })
+
+    describe('dependent flags loading', () => {
+        it('loads dependent flags when feature flag loads successfully', async () => {
+            const flag = { ...MOCK_FEATURE_FLAG, id: 4 }
+
+            const testLogic = featureFlagLogic({ id: 4 })
+
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/`]: () => [200, flag],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/status`]: () => [
+                        200,
+                        MOCK_FEATURE_FLAG_STATUS,
+                    ],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/dependent_flags/`]: () => [
+                        200,
+                        MOCK_DEPENDENT_FLAGS,
+                    ],
+                },
+            })
+
+            testLogic.mount()
+
+            await expectLogic(testLogic, () => {
+                testLogic.actions.loadFeatureFlag()
+            })
+                .toDispatchActions(['loadFeatureFlagSuccess', 'loadDependentFlags', 'loadDependentFlagsSuccess'])
+                .toMatchValues({ dependentFlags: MOCK_DEPENDENT_FLAGS })
+
+            testLogic.unmount()
+        })
+
+        it('returns empty array when no dependent flags exist', async () => {
+            const flag = { ...MOCK_FEATURE_FLAG, id: 5 }
+
+            const testLogic = featureFlagLogic({ id: 5 })
+
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/`]: () => [200, flag],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/status`]: () => [
+                        200,
+                        MOCK_FEATURE_FLAG_STATUS,
+                    ],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/dependent_flags/`]: () => [
+                        200,
+                        [],
+                    ],
+                },
+            })
+
+            testLogic.mount()
+
+            await expectLogic(testLogic, () => {
+                testLogic.actions.loadFeatureFlag()
+            })
+                .toDispatchActions(['loadFeatureFlagSuccess', 'loadDependentFlags', 'loadDependentFlagsSuccess'])
+                .toMatchValues({ dependentFlags: [] })
+
+            testLogic.unmount()
+        })
+
+        it('handles API failure gracefully and returns empty array', async () => {
+            silenceKeaLoadersErrors()
+            const flag = { ...MOCK_FEATURE_FLAG, id: 14 }
+
+            const testLogic = featureFlagLogic({ id: 14 })
+
+            useMocks({
+                get: {
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/`]: () => [200, flag],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/status`]: () => [
+                        200,
+                        MOCK_FEATURE_FLAG_STATUS,
+                    ],
+                    [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${flag.id}/dependent_flags/`]: () => [
+                        500,
+                        { error: 'Internal server error' },
+                    ],
+                },
+            })
+
+            testLogic.mount()
+
+            await expectLogic(testLogic, () => {
+                testLogic.actions.loadFeatureFlag()
+            })
+                .toDispatchActions(['loadFeatureFlagSuccess', 'loadDependentFlags', 'loadDependentFlagsFailure'])
+                .toMatchValues({ dependentFlags: [], dependentFlagsLoading: false })
+
+            testLogic.unmount()
+            resumeKeaLoadersErrors()
+        })
+    })
+
+    describe('creating a flag in additional projects', () => {
+        const TARGET_A = MOCK_TEAM_ID + 1
+        const TARGET_B = MOCK_TEAM_ID + 2
+
+        let newLogic: ReturnType<typeof featureFlagLogic.build>
+        let copyRequests: Record<string, unknown>[]
+
+        function createAndCopyMocks(
+            copyResult: [number, CopyFlagsResponseApi | Record<string, unknown>]
+        ): Parameters<typeof useMocks>[0] {
+            return {
+                post: {
+                    '/api/projects/:team_id/feature_flags/': () => [201, MOCK_FEATURE_FLAG],
+                    '/api/organizations/:organization_id/feature_flags/copy_flags': async ({ request }) => {
+                        copyRequests.push((await request.json()) as Record<string, unknown>)
+                        return copyResult
+                    },
+                },
+            }
+        }
+
+        function copiedFlagInProject(teamId: number): CopyFlagsResponseApi['success'][number] {
+            return {
+                id: teamId,
+                key: MOCK_FEATURE_FLAG.key,
+                name: MOCK_FEATURE_FLAG.name,
+                active: true,
+                team_id: teamId,
+                updated_existing: false,
+            }
+        }
+
+        beforeEach(() => {
+            copyRequests = []
+            eventUsageLogic.mount()
+            newLogic = featureFlagLogic({ id: 'new' })
+            newLogic.mount()
+            // Named teams so the toasts resolve real project names instead of the "Project N" fallback
+            organizationLogic.actions.loadCurrentOrganizationSuccess({
+                ...MOCK_DEFAULT_ORGANIZATION,
+                teams: [
+                    MOCK_DEFAULT_TEAM,
+                    { ...MOCK_DEFAULT_TEAM, id: TARGET_A, name: 'Marketing' },
+                    { ...MOCK_DEFAULT_TEAM, id: TARGET_B, name: 'Docs' },
+                ],
+            })
+        })
+
+        afterEach(() => {
+            newLogic.unmount()
+            eventUsageLogic.unmount()
+        })
+
+        it('copies the created flag to each selected project and reports where it landed', async () => {
+            useMocks(
+                createAndCopyMocks([
+                    200,
+                    {
+                        success: [copiedFlagInProject(TARGET_A), copiedFlagInProject(TARGET_B)],
+                        failed: [],
+                    },
+                ])
+            )
+
+            await expectLogic(newLogic, () => {
+                newLogic.actions.setAlsoCreateInProjects([TARGET_A, TARGET_B])
+                newLogic.actions.saveFeatureFlag({ ...NEW_FLAG, key: MOCK_FEATURE_FLAG.key })
+            }).toDispatchActions(['saveFeatureFlagSuccess'])
+
+            // Asserted at the point saveFeatureFlagSuccess dispatched, without draining listeners
+            // first: the copy must complete inside the saveFeatureFlag loader, or featureFlagLoading
+            // drops mid-copy and a second submit can fire a second create.
+            expect(copyRequests).toHaveLength(1)
+            expect(copyRequests[0]).toEqual({
+                feature_flag_key: MOCK_FEATURE_FLAG.key,
+                from_project: MOCK_TEAM_ID,
+                target_project_ids: [TARGET_A, TARGET_B],
+            })
+            expect(lemonToast.success).toHaveBeenCalledWith(
+                expect.stringContaining('Flag also created in Marketing and Docs')
+            )
+            // The picker resets so the next new-flag form starts empty
+            expect(newLogic.values.alsoCreateInProjects).toEqual([])
+
+            await expectLogic(newLogic).toFinishAllListeners()
+        })
+
+        it('makes no copy call when no additional projects are selected', async () => {
+            useMocks(createAndCopyMocks([200, { success: [], failed: [] }]))
+
+            await expectLogic(newLogic, () => {
+                newLogic.actions.saveFeatureFlag({ ...NEW_FLAG, key: MOCK_FEATURE_FLAG.key })
+            })
+                .toDispatchActions(['saveFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(copyRequests).toHaveLength(0)
+        })
+
+        it('keeps the save successful and reports an error when the copy request itself fails', async () => {
+            useMocks(createAndCopyMocks([500, { type: 'server_error', detail: 'Copy failed' }]))
+
+            await expectLogic(newLogic, () => {
+                newLogic.actions.setAlsoCreateInProjects([TARGET_A, TARGET_B])
+                newLogic.actions.saveFeatureFlag({ ...NEW_FLAG, key: MOCK_FEATURE_FLAG.key })
+            })
+                .toDispatchActions(['saveFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(lemonToast.error).toHaveBeenCalledWith(
+                expect.stringContaining('Copy to Marketing and Docs failed: Copy failed')
+            )
+        })
+
+        it('reports an overwritten same-key flag separately from created ones', async () => {
+            useMocks(
+                createAndCopyMocks([
+                    200,
+                    {
+                        success: [
+                            { ...copiedFlagInProject(TARGET_A), updated_existing: true },
+                            copiedFlagInProject(TARGET_B),
+                        ],
+                        failed: [],
+                    },
+                ])
+            )
+
+            await expectLogic(newLogic, () => {
+                newLogic.actions.setAlsoCreateInProjects([TARGET_A, TARGET_B])
+                newLogic.actions.saveFeatureFlag({ ...NEW_FLAG, key: MOCK_FEATURE_FLAG.key })
+            })
+                .toDispatchActions(['saveFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(lemonToast.warning).toHaveBeenCalledWith(expect.stringContaining('Flag also created in Docs'))
+            expect(lemonToast.warning).toHaveBeenCalledWith(
+                expect.stringContaining('an existing flag with this key was overwritten in Marketing')
+            )
+            expect(capturesOf('feature flag created in additional projects')).toEqual([
+                [
+                    'feature flag created in additional projects',
+                    {
+                        target_count: 2,
+                        created_count: 1,
+                        overwritten_count: 1,
+                        pending_approval_count: 0,
+                        failed_count: 0,
+                    },
+                ],
+            ])
+        })
+
+        it('surfaces dependency warnings from an otherwise successful copy', async () => {
+            useMocks(
+                createAndCopyMocks([
+                    200,
+                    {
+                        success: [
+                            {
+                                ...copiedFlagInProject(TARGET_A),
+                                flag_dependency_warnings: ['Dependency "parent-flag" is missing in the target'],
+                            },
+                        ],
+                        failed: [],
+                    },
+                ])
+            )
+
+            await expectLogic(newLogic, () => {
+                newLogic.actions.setAlsoCreateInProjects([TARGET_A])
+                newLogic.actions.saveFeatureFlag({ ...NEW_FLAG, key: MOCK_FEATURE_FLAG.key })
+            })
+                .toDispatchActions(['saveFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(lemonToast.warning).toHaveBeenCalledWith(expect.stringContaining('parent-flag'))
+        })
+
+        it.each([
+            [
+                'a failed project',
+                { project_id: TARGET_B, error_message: 'No access to this project', approval_pending: false },
+                'copy to Docs failed: No access to this project',
+            ],
+            [
+                'an approval-pending project',
+                { project_id: TARGET_B, error_message: 'Approval required', approval_pending: true },
+                'copy to Docs needs approval (a change request was created)',
+            ],
+        ])('surfaces %s distinctly instead of swallowing it', async (_desc, failedEntry, expectedFragment) => {
+            useMocks(
+                createAndCopyMocks([
+                    200,
+                    {
+                        success: [copiedFlagInProject(TARGET_A)],
+                        failed: [failedEntry],
+                    },
+                ])
+            )
+
+            await expectLogic(newLogic, () => {
+                newLogic.actions.setAlsoCreateInProjects([TARGET_A, TARGET_B])
+                newLogic.actions.saveFeatureFlag({ ...NEW_FLAG, key: MOCK_FEATURE_FLAG.key })
+            })
+                .toDispatchActions(['saveFeatureFlagSuccess'])
+                .toFinishAllListeners()
+
+            expect(lemonToast.warning).toHaveBeenCalledWith(expect.stringContaining(expectedFragment))
+            expect(lemonToast.warning).toHaveBeenCalledWith(expect.stringContaining('Flag also created in Marketing'))
+        })
+    })
+
+    describe('copying flags', () => {
+        it('sends dependency copy options and resets them after success', async () => {
+            const targetProjectId = MOCK_DEFAULT_PROJECT.id + 1
+            let capturedCopyBody: Record<string, unknown> | null = null
+            let capturedRequirementsBody: Record<string, unknown> | null = null
+
+            useMocks({
+                get: {
+                    '/api/organizations/:organization_id/feature_flags/:feature_flag_key': () => [200, []],
+                },
+                post: {
+                    '/api/organizations/:organization_id/feature_flags/copy_flags/dependency_requirements': async ({
+                        request,
+                    }) => {
+                        capturedRequirementsBody = (await request.json()) as Record<string, unknown>
+                        return [
+                            200,
+                            {
+                                can_copy_dependencies: true,
+                                dependency_count: 1,
+                                copied_dependency_keys: ['parent-flag'],
+                                reused_dependency_keys: [],
+                                warnings: [],
+                                reason: '1 dependency flag can be copied.',
+                            },
+                        ]
+                    },
+                    '/api/organizations/:organization_id/feature_flags/copy_flags': async ({ request }) => {
+                        capturedCopyBody = (await request.json()) as Record<string, unknown>
+                        return [
+                            200,
+                            {
+                                success: [
+                                    {
+                                        id: MOCK_FEATURE_FLAG.id,
+                                        key: MOCK_FEATURE_FLAG.key,
+                                        name: MOCK_FEATURE_FLAG.name,
+                                        active: true,
+                                        team_id: targetProjectId,
+                                        copied_dependency_keys: ['parent-flag'],
+                                    },
+                                ],
+                                failed: [],
+                            },
+                        ]
+                    },
+                },
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlag({
+                    ...MOCK_FEATURE_FLAG,
+                    filters: {
+                        ...MOCK_FEATURE_FLAG.filters,
+                        groups: [
+                            {
+                                rollout_percentage: 100,
+                                properties: [
+                                    {
+                                        key: '123',
+                                        type: PropertyFilterType.Flag,
+                                        value: 'true',
+                                        operator: PropertyOperator.FlagEvaluatesTo,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                })
+                logic.actions.setCopyDestinationProject(targetProjectId)
+            }).toDispatchActions(['loadCopyDependencyRequirementsSuccess'])
+
+            expect(capturedRequirementsBody).toMatchObject({
+                feature_flag_key: MOCK_FEATURE_FLAG.key,
+                from_project: MOCK_DEFAULT_PROJECT.id,
+                target_project_ids: [targetProjectId],
+            })
+
+            logic.actions.setCopySchedule(true)
+            logic.actions.setDisableCopiedFlag(true)
+            logic.actions.setCopyDependencies(true)
+
+            await expectLogic(logic, () => {
+                logic.actions.copyFlag()
+            }).toDispatchActions(['copyFlagSuccess'])
+
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.copyDependencies).toBe(false)
+
+            expect(capturedCopyBody).toMatchObject({
+                feature_flag_key: MOCK_FEATURE_FLAG.key,
+                from_project: MOCK_DEFAULT_PROJECT.id,
+                target_project_ids: [targetProjectId],
+                copy_schedule: true,
+                disable_copied_flag: true,
+                copy_dependencies: true,
+            })
+        })
+
+        it('clears dependency requirements when the availability check fails', async () => {
+            const targetProjectId = MOCK_DEFAULT_PROJECT.id + 1
+            let requirementsCallCount = 0
+
+            useMocks({
+                post: {
+                    '/api/organizations/:organization_id/feature_flags/copy_flags/dependency_requirements': () => {
+                        requirementsCallCount += 1
+
+                        if (requirementsCallCount === 1) {
+                            return [
+                                200,
+                                {
+                                    can_copy_dependencies: true,
+                                    dependency_count: 1,
+                                    copied_dependency_keys: ['parent-flag'],
+                                    reused_dependency_keys: [],
+                                    warnings: [],
+                                    reason: '1 dependency flag can be copied.',
+                                },
+                            ]
+                        }
+
+                        return [500, { error: 'Unable to check dependency availability' }]
+                    },
+                },
+            })
+
+            logic.actions.setFeatureFlag({
+                ...MOCK_FEATURE_FLAG,
+                filters: {
+                    ...MOCK_FEATURE_FLAG.filters,
+                    groups: [
+                        {
+                            rollout_percentage: 100,
+                            properties: [
+                                {
+                                    key: '123',
+                                    type: PropertyFilterType.Flag,
+                                    value: 'true',
+                                    operator: PropertyOperator.FlagEvaluatesTo,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.setCopyDestinationProject(targetProjectId)
+            }).toDispatchActions(['loadCopyDependencyRequirementsSuccess'])
+            logic.actions.setCopyDependencies(true)
+
+            await expectLogic(logic, () => {
+                logic.actions.setCopyDestinationProject(targetProjectId + 1)
+            }).toDispatchActions(['loadCopyDependencyRequirementsFailure'])
+
+            expect(logic.values.copyDependencies).toBe(false)
+            expect(logic.values.copyDependencyRequirements?.can_copy_dependencies).toBe(false)
+            expect(logic.values.copyDependencyRequirements?.reason).toContain('Unable to check dependency availability')
+        })
+
+        it('refreshes dependency requirements and clears opt-in when the source flag changes', async () => {
+            const targetProjectId = MOCK_DEFAULT_PROJECT.id + 1
+            let requirementsCallCount = 0
+
+            const flagWithDependency = (dependencyId: string): FeatureFlagType => ({
+                ...MOCK_FEATURE_FLAG,
+                filters: {
+                    ...MOCK_FEATURE_FLAG.filters,
+                    groups: [
+                        {
+                            rollout_percentage: 100,
+                            properties: [
+                                {
+                                    key: dependencyId,
+                                    type: PropertyFilterType.Flag,
+                                    value: 'true',
+                                    operator: PropertyOperator.FlagEvaluatesTo,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+
+            useMocks({
+                get: {
+                    '/api/organizations/:organization_id/feature_flags/:feature_flag_key': () => [200, []],
+                },
+                post: {
+                    '/api/organizations/:organization_id/feature_flags/copy_flags/dependency_requirements': () => {
+                        requirementsCallCount += 1
+
+                        return [
+                            200,
+                            {
+                                can_copy_dependencies: true,
+                                dependency_count: 1,
+                                copied_dependency_keys: [`parent-flag-${requirementsCallCount}`],
+                                reused_dependency_keys: [],
+                                warnings: [],
+                                reason: '1 dependency flag can be copied.',
+                            },
+                        ]
+                    },
+                },
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlag(flagWithDependency('123'))
+                logic.actions.setCopyDestinationProject(targetProjectId)
+            }).toDispatchActions(['loadCopyDependencyRequirementsSuccess'])
+
+            logic.actions.setCopyDependencies(true)
+
+            await expectLogic(logic, () => {
+                logic.actions.setFeatureFlag(flagWithDependency('456'))
+            }).toDispatchActions(['loadCopyDependencyRequirementsSuccess'])
+
+            expect(requirementsCallCount).toBe(2)
+            expect(logic.values.copyDependencies).toBe(false)
+            expect(logic.values.copyDependencyRequirements?.copied_dependency_keys).toEqual(['parent-flag-2'])
+        })
+
+        it('ignores stale dependency requirements when the destination changes before the first request resolves', async () => {
+            jest.useFakeTimers()
+            const firstTargetProjectId = MOCK_DEFAULT_PROJECT.id + 1
+            const secondTargetProjectId = MOCK_DEFAULT_PROJECT.id + 2
+            type DependencyRequirementsMockResponse = [number, Record<string, unknown>]
+            const pendingRequests = new Map<number, (response: DependencyRequirementsMockResponse) => void>()
+            const waitForPendingRequest = async (projectId: number): Promise<void> => {
+                for (let attempt = 0; attempt < 10; attempt++) {
+                    if (pendingRequests.has(projectId)) {
+                        return
+                    }
+                    await Promise.resolve()
+                }
+                throw new Error(`Missing dependency requirements request for project ${projectId}`)
+            }
+
+            useMocks({
+                post: {
+                    '/api/organizations/:organization_id/feature_flags/copy_flags/dependency_requirements': async ({
+                        request,
+                    }) => {
+                        const body = (await request.json()) as { target_project_ids: number[] }
+                        const projectId = body.target_project_ids[0]
+
+                        return await new Promise<DependencyRequirementsMockResponse>((resolve) => {
+                            pendingRequests.set(projectId, resolve)
+                        })
+                    },
+                },
+            })
+
+            logic.actions.setFeatureFlag({
+                ...MOCK_FEATURE_FLAG,
+                filters: {
+                    ...MOCK_FEATURE_FLAG.filters,
+                    groups: [
+                        {
+                            rollout_percentage: 100,
+                            properties: [
+                                {
+                                    key: '123',
+                                    type: PropertyFilterType.Flag,
+                                    value: 'true',
+                                    operator: PropertyOperator.FlagEvaluatesTo,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+
+            logic.actions.setCopyDestinationProject(firstTargetProjectId)
+            await jest.advanceTimersByTimeAsync(300)
+            await waitForPendingRequest(firstTargetProjectId)
+
+            logic.actions.setCopyDestinationProject(secondTargetProjectId)
+            await jest.advanceTimersByTimeAsync(300)
+            await waitForPendingRequest(secondTargetProjectId)
+
+            pendingRequests.get(secondTargetProjectId)?.([
+                200,
+                {
+                    can_copy_dependencies: true,
+                    dependency_count: 1,
+                    copied_dependency_keys: ['second-parent-flag'],
+                    reused_dependency_keys: [],
+                    warnings: [],
+                    reason: '1 dependency flag can be copied.',
+                },
+            ])
+
+            await expectLogic(logic).toDispatchActions(['loadCopyDependencyRequirementsSuccess'])
+            expect(logic.values.copyDependencyRequirements?.copied_dependency_keys).toEqual(['second-parent-flag'])
+
+            pendingRequests.get(firstTargetProjectId)?.([
+                200,
+                {
+                    can_copy_dependencies: true,
+                    dependency_count: 1,
+                    copied_dependency_keys: ['first-parent-flag'],
+                    reused_dependency_keys: [],
+                    warnings: [],
+                    reason: '1 dependency flag can be copied.',
+                },
+            ])
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.copyDestinationProject).toBe(secondTargetProjectId)
+            expect(logic.values.copyDependencyRequirements?.copied_dependency_keys).toEqual(['second-parent-flag'])
+        })
+
+        it('ignores stale dependency requirement failures after the destination changes', async () => {
+            jest.useFakeTimers()
+            const firstTargetProjectId = MOCK_DEFAULT_PROJECT.id + 1
+            const secondTargetProjectId = MOCK_DEFAULT_PROJECT.id + 2
+            type DependencyRequirementsMockResponse = [number, Record<string, unknown>]
+            const pendingRequests = new Map<number, (response: DependencyRequirementsMockResponse) => void>()
+            const waitForPendingRequest = async (projectId: number): Promise<void> => {
+                for (let attempt = 0; attempt < 10; attempt++) {
+                    if (pendingRequests.has(projectId)) {
+                        return
+                    }
+                    await Promise.resolve()
+                }
+                throw new Error(`Missing dependency requirements request for project ${projectId}`)
+            }
+
+            useMocks({
+                post: {
+                    '/api/organizations/:organization_id/feature_flags/copy_flags/dependency_requirements': async ({
+                        request,
+                    }) => {
+                        const body = (await request.json()) as { target_project_ids: number[] }
+                        const projectId = body.target_project_ids[0]
+
+                        return await new Promise<DependencyRequirementsMockResponse>((resolve) => {
+                            pendingRequests.set(projectId, resolve)
+                        })
+                    },
+                },
+            })
+
+            logic.actions.setFeatureFlag({
+                ...MOCK_FEATURE_FLAG,
+                filters: {
+                    ...MOCK_FEATURE_FLAG.filters,
+                    groups: [
+                        {
+                            rollout_percentage: 100,
+                            properties: [
+                                {
+                                    key: '123',
+                                    type: PropertyFilterType.Flag,
+                                    value: 'true',
+                                    operator: PropertyOperator.FlagEvaluatesTo,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+
+            logic.actions.setCopyDestinationProject(firstTargetProjectId)
+            await jest.advanceTimersByTimeAsync(300)
+            await waitForPendingRequest(firstTargetProjectId)
+
+            logic.actions.setCopyDestinationProject(secondTargetProjectId)
+            await jest.advanceTimersByTimeAsync(300)
+            await waitForPendingRequest(secondTargetProjectId)
+
+            pendingRequests.get(secondTargetProjectId)?.([
+                200,
+                {
+                    can_copy_dependencies: true,
+                    dependency_count: 1,
+                    copied_dependency_keys: ['second-parent-flag'],
+                    reused_dependency_keys: [],
+                    warnings: [],
+                    reason: '1 dependency flag can be copied.',
+                },
+            ])
+
+            await expectLogic(logic).toDispatchActions(['loadCopyDependencyRequirementsSuccess'])
+            expect(logic.values.copyDependencyRequirements?.copied_dependency_keys).toEqual(['second-parent-flag'])
+
+            pendingRequests.get(firstTargetProjectId)?.([500, { error: 'Unable to check dependency availability' }])
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.copyDestinationProject).toBe(secondTargetProjectId)
+            expect(logic.values.copyDependencyRequirements?.copied_dependency_keys).toEqual(['second-parent-flag'])
+        })
+    })
+
+    describe('scheduled changes', () => {
+        const makeScheduledChange = (overrides: Partial<ScheduledChangeType>): ScheduledChangeType => ({
+            id: 1,
+            team_id: MOCK_DEFAULT_PROJECT.id,
+            record_id: MOCK_FEATURE_FLAG.id,
+            model_name: ScheduledChangeModels.FeatureFlag,
+            payload: { operation: ScheduledChangeOperationType.UpdateStatus, value: true },
+            scheduled_at: '2026-01-01T00:00:00Z',
+            executed_at: null,
+            failure_reason: null,
+            created_at: '2026-01-01T00:00:00Z',
+            created_by: MOCK_DEFAULT_BASIC_USER,
+            is_recurring: false,
+            recurrence_interval: null,
+            cron_expression: null,
+            last_executed_at: null,
+            end_date: null,
+            change_request: null,
+            ...overrides,
+        })
+
+        const schedulesUrl = `/api/projects/${MOCK_DEFAULT_PROJECT.id}/scheduled_changes`
+
+        it.each([
+            {
+                // Mirrors the issue: a recurring change created first must not float above sooner one-time changes.
+                desc: 'interleaves recurring and one-time changes by next firing time, soonest first',
+                results: [
+                    makeScheduledChange({ id: 1, scheduled_at: '2026-05-02T15:00:00Z', is_recurring: true }),
+                    makeScheduledChange({ id: 2, scheduled_at: '2026-05-01T14:00:00Z' }),
+                    makeScheduledChange({ id: 3, scheduled_at: '2026-07-04T14:58:00Z' }),
+                    makeScheduledChange({ id: 4, scheduled_at: '2026-06-13T18:59:00Z' }),
+                ],
+                expectedIds: [2, 1, 4, 3],
+            },
+            {
+                desc: 'breaks ties by id when scheduled_at is equal',
+                results: [
+                    makeScheduledChange({ id: 7, scheduled_at: '2026-05-01T00:00:00Z' }),
+                    makeScheduledChange({ id: 3, scheduled_at: '2026-05-01T00:00:00Z' }),
+                    makeScheduledChange({ id: 5, scheduled_at: '2026-05-01T00:00:00Z' }),
+                ],
+                expectedIds: [3, 5, 7],
+            },
+            {
+                desc: 'excludes executed changes',
+                results: [
+                    makeScheduledChange({ id: 1, scheduled_at: '2026-05-01T00:00:00Z' }),
+                    makeScheduledChange({
+                        id: 2,
+                        scheduled_at: '2026-04-01T00:00:00Z',
+                        executed_at: '2026-04-01T00:00:00Z',
+                    }),
+                ],
+                expectedIds: [1],
+            },
+        ])('$desc', async ({ results, expectedIds }) => {
+            useMocks({ get: { [schedulesUrl]: () => [200, { results }] } })
+            await expectLogic(logic, () => {
+                logic.actions.loadScheduledChanges()
+            }).toDispatchActions(['loadScheduledChangesSuccess'])
+
+            await expectLogic(logic).toMatchValues({
+                activeSchedules: expectedIds.map((id) => partial({ id })),
+            })
+        })
+
+        it('moves one-time schedules with a rejected or expired approval to history, keeps others active', async () => {
+            useMocks({
+                get: {
+                    [schedulesUrl]: () => [
+                        200,
+                        {
+                            results: [
+                                makeScheduledChange({
+                                    id: 1,
+                                    change_request: { id: 'cr-1', state: ScheduledChangeRequestState.Rejected },
+                                }),
+                                makeScheduledChange({
+                                    id: 2,
+                                    change_request: { id: 'cr-2', state: ScheduledChangeRequestState.Expired },
+                                }),
+                                makeScheduledChange({
+                                    id: 3,
+                                    change_request: { id: 'cr-3', state: ScheduledChangeRequestState.Pending },
+                                }),
+                                // A recurring schedule re-gates each occurrence, so a denied request is not terminal.
+                                makeScheduledChange({
+                                    id: 4,
+                                    is_recurring: true,
+                                    recurrence_interval: RecurrenceInterval.Daily,
+                                    change_request: { id: 'cr-4', state: ScheduledChangeRequestState.Expired },
+                                }),
+                                // An executed row pins how denied rows interleave with real history:
+                                // executed first, never-executed denied rows after.
+                                makeScheduledChange({
+                                    id: 5,
+                                    scheduled_at: '2025-12-01T00:00:00Z',
+                                    executed_at: '2025-12-01T00:00:00Z',
+                                }),
+                            ],
+                        },
+                    ],
+                },
+            })
+            await expectLogic(logic, () => {
+                logic.actions.loadScheduledChanges()
+            }).toDispatchActions(['loadScheduledChangesSuccess'])
+
+            await expectLogic(logic).toMatchValues({
+                activeSchedules: [partial({ id: 3 }), partial({ id: 4 })],
+                completedSchedules: [partial({ id: 5 }), partial({ id: 2 }), partial({ id: 1 })],
+            })
+        })
+
+        it.each([
+            {
+                name: 'gated create toasts pending approval',
+                change_request: { id: 'cr-toast', state: ScheduledChangeRequestState.Pending },
+                expectedMessage:
+                    'Change scheduled - pending approval. It will be skipped if not approved before the scheduled time.',
+            },
+            {
+                name: 'ungated create toasts plain success',
+                change_request: null,
+                expectedMessage: 'Change scheduled successfully',
+            },
+        ])('$name', async ({ change_request, expectedMessage }) => {
+            useMocks({ get: { [schedulesUrl]: () => [200, { results: [] }] } })
+            // The success listener reports to eventUsageLogic, but featureFlagLogic does not mount it via connect().
+            eventUsageLogic.mount()
+
+            await expectLogic(logic, () => {
+                logic.actions.createScheduledChangeSuccess(makeScheduledChange({ change_request }))
+            }).toFinishAllListeners()
+
+            expect(lemonToast.success).toHaveBeenCalledWith(expectedMessage)
+        })
+
+        it('orders completed changes most-recent first', async () => {
+            useMocks({
+                get: {
+                    [schedulesUrl]: () => [
+                        200,
+                        {
+                            results: [
+                                makeScheduledChange({
+                                    id: 1,
+                                    scheduled_at: '2026-05-01T00:00:00Z',
+                                    executed_at: '2026-05-01T00:00:00Z',
+                                }),
+                                makeScheduledChange({
+                                    id: 2,
+                                    scheduled_at: '2026-07-01T00:00:00Z',
+                                    executed_at: '2026-07-01T00:00:00Z',
+                                }),
+                                makeScheduledChange({
+                                    id: 3,
+                                    scheduled_at: '2026-06-01T00:00:00Z',
+                                    executed_at: '2026-06-01T00:00:00Z',
+                                }),
+                            ],
+                        },
+                    ],
+                },
+            })
+            await expectLogic(logic, () => {
+                logic.actions.loadScheduledChanges()
+            }).toDispatchActions(['loadScheduledChangesSuccess'])
+
+            await expectLogic(logic).toMatchValues({
+                completedSchedules: [partial({ id: 2 }), partial({ id: 3 }), partial({ id: 1 })],
+            })
+        })
+
+        it('orders completed changes by execution time, not scheduled time', async () => {
+            useMocks({
+                get: {
+                    [schedulesUrl]: () => [
+                        200,
+                        {
+                            results: [
+                                // Scheduled first but, after a delay, executed last.
+                                makeScheduledChange({
+                                    id: 1,
+                                    scheduled_at: '2026-05-01T00:00:00Z',
+                                    executed_at: '2026-05-03T00:00:00Z',
+                                }),
+                                makeScheduledChange({
+                                    id: 2,
+                                    scheduled_at: '2026-05-02T00:00:00Z',
+                                    executed_at: '2026-05-02T00:00:00Z',
+                                }),
+                            ],
+                        },
+                    ],
+                },
+            })
+            await expectLogic(logic, () => {
+                logic.actions.loadScheduledChanges()
+            }).toDispatchActions(['loadScheduledChangesSuccess'])
+
+            await expectLogic(logic).toMatchValues({
+                completedSchedules: [partial({ id: 1 }), partial({ id: 2 })],
+            })
+        })
+
+        it('collapses the form again after a create, so the plan stays in front', async () => {
+            useMocks({ get: { [schedulesUrl]: () => [200, { results: [makeScheduledChange({ id: 1 })] }] } })
+            // The success listener reports to eventUsageLogic, but featureFlagLogic does not mount it via connect().
+            eventUsageLogic.mount()
+            await expectLogic(logic, () => {
+                logic.actions.loadScheduledChanges()
+            }).toDispatchActions(['loadScheduledChangesSuccess'])
+
+            logic.actions.setScheduleFormExpanded(true)
+            expect(logic.values.scheduleFormState).toEqual('expanded')
+
+            await expectLogic(logic, () => {
+                logic.actions.createScheduledChangeSuccess(makeScheduledChange({ id: 2 }))
+            }).toFinishAllListeners()
+
+            expect(logic.values.scheduleFormState).toEqual('collapsed')
+        })
+
+        it('opens the form again when the last schedule goes, to match the empty state', async () => {
+            let results = [makeScheduledChange({ id: 1 })]
+            useMocks({ get: { [schedulesUrl]: () => [200, { results }] } })
+            await expectLogic(logic, () => {
+                logic.actions.loadScheduledChanges()
+            }).toDispatchActions(['loadScheduledChangesSuccess'])
+
+            logic.actions.setScheduleFormExpanded(false)
+            expect(logic.values.scheduleFormState).toEqual('collapsed')
+
+            results = []
+            await expectLogic(logic, () => {
+                logic.actions.loadScheduledChanges()
+            }).toDispatchActions(['loadScheduledChangesSuccess'])
+
+            expect(logic.values.scheduleFormState).toEqual('expanded')
+        })
+    })
+
+    describe('default release conditions', () => {
+        const conditionsUrl = `/api/environments/${MOCK_DEFAULT_PROJECT.id}/default_release_conditions/`
+
+        it('applies org default groups to a new flag when default conditions are enabled', async () => {
+            const DEFAULT_GROUP = { properties: [], rollout_percentage: 30, variant: null }
+            // Seed the shared singleton's cache with enabled defaults before the new-flag loader reads it
+            // (it's warmed to a disabled value on mount).
+            defaultReleaseConditionsLogic.actions.loadDefaultReleaseConditionsSuccess({
+                enabled: true,
+                default_groups: [DEFAULT_GROUP],
+            })
+
+            const newLogic = featureFlagLogic({ id: 'new' })
+            newLogic.mount()
+            await expectLogic(newLogic).toDispatchActions(['loadFeatureFlagSuccess'])
+
+            const groups = v1Filters(newLogic.values.featureFlag).groups
+            expect(groups[0]).toMatchObject(DEFAULT_GROUP)
+            expect(groups.length).toBe(1)
+
+            newLogic.unmount()
+        })
+
+        describe('resolveDefaultReleaseConditions', () => {
+            it('returns the cached value without fetching when one is already loaded', async () => {
+                const cached = {
+                    enabled: true,
+                    default_groups: [{ properties: [], rollout_percentage: 25, variant: null }],
+                }
+                // toBe asserts the same object reference, so a fetched copy would fail the assertion.
+                await expect(resolveDefaultReleaseConditions(cached, MOCK_DEFAULT_PROJECT.id)).resolves.toBe(cached)
+            })
+
+            it('fetches directly when the cache is empty', async () => {
+                const fetched = {
+                    enabled: true,
+                    default_groups: [{ properties: [], rollout_percentage: 10, variant: null }],
+                }
+                useMocks({ get: { [conditionsUrl]: () => [200, fetched] } })
+                await expect(resolveDefaultReleaseConditions(null, MOCK_DEFAULT_PROJECT.id)).resolves.toEqual(fetched)
+            })
+
+            it('returns null without fetching when no team is available', async () => {
+                await expect(resolveDefaultReleaseConditions(null, undefined)).resolves.toBeNull()
+            })
+
+            it('returns null when the fetch fails so new flag creation is not blocked', async () => {
+                // The graceful-failure path warns to the console by design.
+                const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {})
+                useMocks({ get: { [conditionsUrl]: () => [500, {}] } })
+                await expect(resolveDefaultReleaseConditions(null, MOCK_DEFAULT_PROJECT.id)).resolves.toBeNull()
+                warnSpy.mockRestore()
+            })
+        })
+    })
+
+    describe('toggleProjectFlagActive', () => {
+        const projectRow = (teamId: number, flagId: number): OrganizationFeatureFlag => ({
+            flag_id: flagId,
+            team_id: teamId,
+            filters: { groups: [] },
+            active: true,
+            created_by: null,
+            created_at: '',
+        })
+
+        beforeEach(() => {
+            useMocks({
+                patch: {
+                    '/api/projects/:team_id/feature_flags/:id/': async ({ request, params }) => {
+                        const body = (await request.json()) as { active: boolean }
+                        return [200, { id: Number(params.id), active: body.active }]
+                    },
+                },
+            })
+        })
+
+        it.each([false, true])(
+            'updates the toggled project row without touching the current flag (active → %s)',
+            async (active) => {
+                logic.actions.loadProjectsWithCurrentFlagSuccess([
+                    projectRow(MOCK_TEAM_ID, 1),
+                    { ...projectRow(555, 42), active: !active },
+                ])
+
+                logic.actions.toggleProjectFlagActive(555, 42, active)
+                expect(logic.values.projectFlagsToggling).toEqual({ '555:42': true })
+
+                await expectLogic(logic).toFinishAllListeners()
+                expect(logic.values.projectsWithCurrentFlag).toMatchObject([
+                    { team_id: MOCK_TEAM_ID, active: true },
+                    { team_id: 555, active },
+                ])
+                expect(logic.values.featureFlag.active).toBe(true)
+                expect(logic.values.projectFlagsToggling).toEqual({})
+            }
+        )
+
+        it('syncs featureFlag.active when the current project row is toggled', async () => {
+            logic.actions.loadProjectsWithCurrentFlagSuccess([projectRow(MOCK_TEAM_ID, 1)])
+
+            logic.actions.toggleProjectFlagActive(MOCK_TEAM_ID, 1, false)
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.projectsWithCurrentFlag).toMatchObject([{ team_id: MOCK_TEAM_ID, active: false }])
+            expect(logic.values.featureFlag.active).toBe(false)
+        })
+
+        it('clears the in-flight marker and keeps state when the update fails', async () => {
+            useMocks({
+                patch: {
+                    '/api/projects/:team_id/feature_flags/:id/': () => [403, { detail: 'No edit access' }],
+                },
+            })
+            logic.actions.loadProjectsWithCurrentFlagSuccess([projectRow(MOCK_TEAM_ID, 1), projectRow(555, 42)])
+
+            logic.actions.toggleProjectFlagActive(555, 42, false)
+            await expectLogic(logic).toDispatchActions(['projectFlagActiveUpdateFailed']).toFinishAllListeners()
+
+            expect(logic.values.projectsWithCurrentFlag).toMatchObject([
+                { team_id: MOCK_TEAM_ID, active: true },
+                { team_id: 555, active: true },
+            ])
+            expect(logic.values.featureFlag.active).toBe(true)
+            expect(logic.values.projectFlagsToggling).toEqual({})
+        })
+    })
+
+    describe('toggleFeatureFlagActive', () => {
+        it('opens one confirmation with matching disable copy', async () => {
+            const dialogOpenSpy = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+            logic.actions.setFeatureFlag({ ...MOCK_FEATURE_FLAG, active: true })
+
+            await expectLogic(logic, () => logic.actions.toggleFeatureFlagActive(false)).toFinishAllListeners()
+
+            expect(dialogOpenSpy).toHaveBeenCalledTimes(1)
+            const dialogProps = dialogOpenSpy.mock.calls[0][0]
+            expect(dialogProps.title).toBe('Disable this flag?')
+            expect(dialogProps.primaryButton?.children).toBe('Disable only')
+            dialogOpenSpy.mockRestore()
+        })
+
+        // onDisableAndArchive is optional at every hop between this listener and
+        // checkFeatureFlagConfirmation, so dropping it anywhere still compiles and would silently
+        // fall back to the plain status confirmation without the archive option.
+        it('offers disable and archive, archiving via the disable confirmation', async () => {
+            const dialogOpenSpy = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+            jest.spyOn(api, 'update').mockResolvedValueOnce({
+                ...MOCK_FEATURE_FLAG,
+                archived: true,
+                active: false,
+            })
+            logic.actions.setFeatureFlag({ ...MOCK_FEATURE_FLAG, active: true })
+
+            await expectLogic(logic, () => logic.actions.toggleFeatureFlagActive(false)).toFinishAllListeners()
+
+            const dialogProps = dialogOpenSpy.mock.calls[0][0]
+            expect(dialogProps.secondaryButton?.children).toBe('Disable and archive')
+
+            dialogProps.secondaryButton?.onClick?.(undefined as any)
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(capturesOf('feature flag archived')).toEqual([
+                ['feature flag archived', { via: 'disable-confirmation' }],
+            ])
+            dialogOpenSpy.mockRestore()
+        })
+    })
+
+    describe('release to everyone confirmation', () => {
+        const withRollout = (rollout_percentage: number): FeatureFlagType =>
+            ({
+                ...MOCK_FEATURE_FLAG,
+                filters: {
+                    ...MOCK_FEATURE_FLAG.filters,
+                    groups: [{ properties: [], rollout_percentage, variant: null }],
+                },
+            }) as FeatureFlagType
+
+        it('confirms a save that releases the flag to all users, even with team confirmation off', async () => {
+            const dialogOpenSpy = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+            logic.actions.setOriginalFeatureFlag(withRollout(50))
+            logic.actions.setFeatureFlag(withRollout(100))
+
+            await expectLogic(logic, () => logic.actions.submitFeatureFlagWithValidation(logic.values.featureFlag))
+                .toNotHaveDispatchedActions(['saveFeatureFlag'])
+                .toFinishAllListeners()
+
+            expect(dialogOpenSpy).toHaveBeenCalledTimes(1)
+            expect(dialogOpenSpy.mock.calls[0][0].primaryButton?.children).toBe('Release to all users')
+            expect(capturesOf('feature flag release to everyone confirmation shown')).toHaveLength(1)
+            dialogOpenSpy.mockRestore()
+        })
+
+        it('confirms turning on a disabled flag that is already at 100% of all users', async () => {
+            const dialogOpenSpy = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+            const disabledForEveryone = { ...withRollout(100), active: false }
+            logic.actions.setOriginalFeatureFlag(disabledForEveryone)
+            logic.actions.setFeatureFlag(disabledForEveryone)
+
+            await expectLogic(logic, () => logic.actions.toggleFeatureFlagActive(true)).toFinishAllListeners()
+
+            expect(dialogOpenSpy).toHaveBeenCalledTimes(1)
+            expect(dialogOpenSpy.mock.calls[0][0].primaryButton?.children).toBe('Release to all users')
+            expect(capturesOf('feature flag release to everyone confirmation shown')).toHaveLength(1)
+            dialogOpenSpy.mockRestore()
+        })
+
+        it('keeps the usual save confirmation for a partial rollout when the team requires confirmation', async () => {
+            teamLogic.actions.loadCurrentTeamSuccess({ ...MOCK_DEFAULT_TEAM, feature_flag_confirmation_enabled: true })
+            const dialogOpenSpy = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+            logic.actions.setOriginalFeatureFlag(withRollout(50))
+            logic.actions.setFeatureFlag(withRollout(60))
+
+            await expectLogic(logic, () => logic.actions.submitFeatureFlagWithValidation(logic.values.featureFlag))
+                .toNotHaveDispatchedActions(['saveFeatureFlag'])
+                .toFinishAllListeners()
+
+            const dialogProps = dialogOpenSpy.mock.calls[0][0]
+            expect(dialogProps.primaryButton?.children).toBe('Save changes')
+            dialogProps.onAfterClose?.()
+            expect(capturesOf('feature flag release to everyone confirmation shown')).toHaveLength(0)
+            expect(capturesOf('feature flag release to everyone confirmation canceled')).toHaveLength(0)
+            dialogOpenSpy.mockRestore()
+        })
+
+        it.each([
+            { scenario: 'dismissed with Escape, the close icon or the overlay', confirm: false, canceled: 1 },
+            { scenario: 'confirmed', confirm: true, canceled: 0 },
+        ])('counts a cancellation only when the warning is $scenario', async ({ confirm, canceled }) => {
+            const dialogOpenSpy = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+            const update = jest.spyOn(api, 'update').mockResolvedValue(withRollout(100))
+            logic.actions.setOriginalFeatureFlag(withRollout(50))
+            logic.actions.setFeatureFlag(withRollout(100))
+            await expectLogic(logic, () =>
+                logic.actions.submitFeatureFlagWithValidation(logic.values.featureFlag)
+            ).toFinishAllListeners()
+
+            const dialogProps = dialogOpenSpy.mock.calls[0][0]
+            if (confirm) {
+                dialogProps.primaryButton?.onClick?.(undefined as any)
+            }
+            dialogProps.onAfterClose?.()
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(capturesOf('feature flag release to everyone confirmation canceled')).toHaveLength(canceled)
+            expect(update).toHaveBeenCalledTimes(confirm ? 1 : 0)
+            dialogOpenSpy.mockRestore()
+            update.mockRestore()
+        })
+
+        it('saves a partial rollout change without asking', async () => {
+            const dialogOpenSpy = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+            jest.spyOn(api, 'update').mockResolvedValueOnce(withRollout(60))
+            logic.actions.setOriginalFeatureFlag(withRollout(50))
+            logic.actions.setFeatureFlag(withRollout(60))
+
+            await expectLogic(logic, () => logic.actions.submitFeatureFlagWithValidation(logic.values.featureFlag))
+                .toDispatchActions(['saveFeatureFlag'])
+                .toFinishAllListeners()
+
+            expect(dialogOpenSpy).not.toHaveBeenCalled()
+            dialogOpenSpy.mockRestore()
+        })
+    })
+
+    describe('rollback reason question', () => {
+        const rollbackReasonRequired = (): ApiError =>
+            new ApiError(undefined, 409, undefined, {
+                type: 'invalid_request',
+                code: 'rollback_reason_required',
+                detail: "This edit lowers the flag's exposure.",
+            })
+
+        // The save sends tags the form does not hold, as the sidebar tags save does, so a resend of the form fails.
+        const saveFrom: Record<RollbackReasonSource, (l: typeof logic) => void> = {
+            save: (l) => l.actions.saveFeatureFlag({ ...l.values.featureFlag, tags: ['from-the-sidebar'] }),
+            toggle: (l) => l.actions.updateFeatureFlagActive(false),
+        }
+        const sentBy: Record<RollbackReasonSource, Record<string, unknown>> = {
+            save: { tags: ['from-the-sidebar'] },
+            toggle: { active: false },
+        }
+
+        const withRollbackReasonFlag = (enabled: boolean): void => {
+            enabledFeaturesLogic.actions.setFeatureFlags([], { [FEATURE_FLAGS.FEATURE_FLAG_ROLLBACK_REASON]: enabled })
+        }
+
+        let openForm: jest.SpyInstance
+
+        beforeEach(() => {
+            silenceKeaLoadersErrors()
+            openForm = jest.spyOn(LemonDialog, 'openForm').mockImplementation(() => {})
+            logic.actions.setFeatureFlag({ ...MOCK_FEATURE_FLAG, active: true })
+        })
+
+        afterEach(() => {
+            resumeKeaLoadersErrors()
+            openForm.mockRestore()
+        })
+
+        it.each([
+            [
+                'save',
+                'an answer',
+                { reason: 'errors', note: 'Checkout broke' },
+                { rollback_reason: 'errors', rollback_reason_note: 'Checkout broke' },
+            ],
+            [
+                'toggle',
+                'an answer',
+                { reason: 'metrics', note: '' },
+                { rollback_reason: 'metrics', rollback_reason_note: null },
+            ],
+            ['save', 'a skip', 'skipped', {}],
+            ['toggle', 'a skip', 'skipped', {}],
+        ] as const)(
+            'a %s save that lowers exposure asks why, then saves with %s',
+            async (source, _label, choice, resentFields) => {
+                withRollbackReasonFlag(true)
+                const update = jest
+                    .spyOn(api, 'update')
+                    .mockRejectedValueOnce(rollbackReasonRequired())
+                    .mockResolvedValue({ ...MOCK_FEATURE_FLAG, active: source !== 'toggle' })
+
+                await expectLogic(logic, () => saveFrom[source](logic)).toFinishAllListeners()
+
+                expect(update).toHaveBeenCalledTimes(1)
+                expect(update.mock.calls[0][1]).toEqual(expect.objectContaining({ ask_rollback_reason: true }))
+                expect(capturesOf('feature flag rollback reason asked')).toEqual([
+                    ['feature flag rollback reason asked', { source }],
+                ])
+
+                const dialog = openForm.mock.calls[0][0]
+                if (choice === 'skipped') {
+                    dialog.tertiaryButton.onClick()
+                } else {
+                    dialog.onSubmit(choice)
+                }
+                dialog.onAfterClose()
+                await expectLogic(logic).toFinishAllListeners()
+
+                expect(update).toHaveBeenCalledTimes(2)
+                const resent = update.mock.calls[1][1] as Record<string, unknown>
+                expect(resent).not.toHaveProperty('ask_rollback_reason')
+                expect(resent).toEqual(expect.objectContaining({ ...sentBy[source], ...resentFields }))
+                expect(capturesOf('feature flag rollback reason skipped')).toEqual(
+                    choice === 'skipped' ? [['feature flag rollback reason skipped', { source }]] : []
+                )
+                expect(capturesOf('feature flag rollback reason canceled')).toEqual([])
+
+                // The answer belongs to that edit only, so the next save asks again.
+                await expectLogic(logic, () => saveFrom[source](logic)).toFinishAllListeners()
+                expect(update.mock.calls[2][1]).toEqual(expect.objectContaining({ ask_rollback_reason: true }))
+                expect(update.mock.calls[2][1]).not.toHaveProperty('rollback_reason')
+            }
+        )
+
+        it.each(['save', 'toggle'] as const)(
+            'a %s retried after the resend fails on the network keeps the answer',
+            async (source) => {
+                withRollbackReasonFlag(true)
+                const update = jest
+                    .spyOn(api, 'update')
+                    .mockRejectedValueOnce(rollbackReasonRequired())
+                    .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+                    .mockResolvedValue({ ...MOCK_FEATURE_FLAG, active: source !== 'toggle' })
+
+                await expectLogic(logic, () => saveFrom[source](logic)).toFinishAllListeners()
+                const dialog = openForm.mock.calls[0][0]
+                dialog.onSubmit({ reason: 'errors', note: '' })
+                dialog.onAfterClose()
+                await expectLogic(logic).toFinishAllListeners()
+
+                await expectLogic(logic, () => saveFrom[source](logic)).toFinishAllListeners()
+
+                expect(update).toHaveBeenCalledTimes(3)
+                expect(update.mock.calls[2][1]).toEqual(expect.objectContaining({ rollback_reason: 'errors' }))
+                expect(openForm).toHaveBeenCalledTimes(1)
+            }
+        )
+
+        it.each([
+            ['the edit is canceled', 'save', (l: typeof logic) => l.actions.editFeatureFlag(false), 'save'],
+            ['the flag is reloaded', 'save', (l: typeof logic) => l.actions.loadFeatureFlag(), 'save'],
+            ['the next edit comes from the other source', 'toggle', () => {}, 'save'],
+        ] as const)(
+            'an answer whose resend failed does not ride on the next edit when %s',
+            async (_label, answeredFrom, discard, nextFrom) => {
+                withRollbackReasonFlag(true)
+                const update = jest
+                    .spyOn(api, 'update')
+                    .mockRejectedValueOnce(rollbackReasonRequired())
+                    .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+                    .mockResolvedValue({ ...MOCK_FEATURE_FLAG, active: true })
+
+                await expectLogic(logic, () => saveFrom[answeredFrom](logic)).toFinishAllListeners()
+                const dialog = openForm.mock.calls[0][0]
+                dialog.onSubmit({ reason: 'errors', note: '' })
+                dialog.onAfterClose()
+                await expectLogic(logic).toFinishAllListeners()
+                await expectLogic(logic, () => discard(logic)).toFinishAllListeners()
+
+                await expectLogic(logic, () => saveFrom[nextFrom](logic)).toFinishAllListeners()
+
+                expect(update.mock.calls[2][1]).toEqual(expect.objectContaining({ ask_rollback_reason: true }))
+                expect(update.mock.calls[2][1]).not.toHaveProperty('rollback_reason')
+            }
+        )
+
+        it('saves nothing when the question is closed without an answer', async () => {
+            withRollbackReasonFlag(true)
+            const update = jest.spyOn(api, 'update').mockRejectedValueOnce(rollbackReasonRequired())
+            const toastSpy = jest.spyOn(lemonToast, 'error').mockReturnValue('toast-id')
+            try {
+                await expectLogic(logic, () => saveFrom.save(logic)).toFinishAllListeners()
+
+                openForm.mock.calls[0][0].onAfterClose()
+                await expectLogic(logic).toFinishAllListeners()
+
+                expect(update).toHaveBeenCalledTimes(1)
+                expect(capturesOf('feature flag rollback reason canceled')).toEqual([
+                    ['feature flag rollback reason canceled', { source: 'save' }],
+                ])
+                // The 409 must not read as a version conflict.
+                expect(toastSpy).not.toHaveBeenCalled()
+            } finally {
+                toastSpy.mockRestore()
+            }
+        })
+
+        it.each([
+            ['the feature flag is off', false, () => logic.actions.saveFeatureFlag(logic.values.featureFlag)],
+            ['the flag is turned on', true, () => logic.actions.updateFeatureFlagActive(true)],
+        ])('does not ask when %s', async (_label, enabled, save) => {
+            withRollbackReasonFlag(enabled)
+            const update = jest.spyOn(api, 'update').mockResolvedValueOnce({ ...MOCK_FEATURE_FLAG, active: true })
+
+            await expectLogic(logic, save).toFinishAllListeners()
+
+            expect(update.mock.calls[0][1]).not.toHaveProperty('ask_rollback_reason')
+        })
+    })
+
+    describe('saveSidebarTags', () => {
+        it('saves a v1 flag through the full save, evaluation contexts included', async () => {
+            const update = jest
+                .spyOn(api, 'update')
+                .mockImplementation(async (_url, payload) => ({ ...MOCK_FEATURE_FLAG, ...(payload as object) }))
+
+            logic.actions.saveSidebarTags(['beta'], ['web'])
+            await expectLogic(logic).toDispatchActions(['updateFlag', 'saveFeatureFlag']).toFinishAllListeners()
+
+            expect(update).toHaveBeenCalledWith(
+                expect.stringContaining(`/feature_flags/${MOCK_FEATURE_FLAG.id}`),
+                expect.objectContaining({ tags: ['beta'], evaluation_contexts: ['web'], filters: expect.anything() })
+            )
+        })
+    })
+
+    describe('stale status after a mutation', () => {
+        const STATUS_URL = `/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/status`
+
+        function statusMock(status: string, reason: string): Parameters<typeof useMocks>[0] {
+            return { get: { [STATUS_URL]: () => [200, { ...MOCK_FEATURE_FLAG_STATUS, status, reason }] } }
+        }
+
+        // The banner asks the reader to disable the flag or change its rollout. `flagStatus` is a
+        // server verdict about the saved flag, so without a refetch it keeps the boot-time answer
+        // and the banner advises an action the reader already took.
+        it.each([
+            [
+                'the flag is disabled',
+                () => logic.actions.updateFeatureFlagActiveSuccess({ ...MOCK_FEATURE_FLAG, active: false }),
+            ],
+            ['an edit is saved', () => logic.actions.saveFeatureFlagSuccess(MOCK_FEATURE_FLAG)],
+            ['PostHog AI changes the flag', () => logic.actions.refreshFeatureFlagAfterAgentChange()],
+        ])('clears the stale banner when %s', async (_name, mutate) => {
+            useMocks(statusMock('stale', 'Flag has not been called in 45 days'))
+            await expectLogic(logic, () => logic.actions.loadFeatureFlagStatus()).toFinishAllListeners()
+            expect(logic.values.showStaleFlagBanner).toBe(true)
+
+            useMocks(statusMock('active', 'Flag is disabled (not evaluated for staleness)'))
+            await expectLogic(logic, mutate).toFinishAllListeners()
+
+            expect(logic.values.showStaleFlagBanner).toBe(false)
+        })
+
+        it('hides the stale banner when a post-mutation status refresh fails', async () => {
+            // kea-loaders keeps the prior value on failure, so a refetch that 500s must not leave the
+            // banner rendering the earlier stale verdict. Silence the loader's logged rejection.
+            silenceKeaLoadersErrors()
+            try {
+                useMocks(statusMock('stale', 'Flag has not been called in 45 days'))
+                await expectLogic(logic, () => logic.actions.loadFeatureFlagStatus()).toFinishAllListeners()
+                expect(logic.values.showStaleFlagBanner).toBe(true)
+
+                useMocks({ get: { [STATUS_URL]: () => [500, {}] } })
+                await expectLogic(logic, () => logic.actions.loadFeatureFlagStatus()).toFinishAllListeners()
+
+                expect(logic.values.showStaleFlagBanner).toBe(false)
+            } finally {
+                resumeKeaLoadersErrors()
+            }
+        })
+
+        it('keeps the newest verdict when an earlier status request resolves last', async () => {
+            // Two overlapping requests to the same URL, with the older one resolving last. Without the
+            // loader's breakpoint, that late stale success would overwrite the newer verdict.
+            const resolvers: Array<(response: [number, Record<string, unknown>]) => void> = []
+            const waitForRequests = async (count: number): Promise<void> => {
+                for (let attempt = 0; attempt < 20 && resolvers.length < count; attempt++) {
+                    await Promise.resolve()
+                }
+                if (resolvers.length < count) {
+                    throw new Error(`Expected ${count} status requests, saw ${resolvers.length}`)
+                }
+            }
+            useMocks({ get: { [STATUS_URL]: async () => new Promise((resolve) => resolvers.push(resolve)) } })
+
+            logic.actions.loadFeatureFlagStatus() // older request
+            await waitForRequests(1)
+            logic.actions.loadFeatureFlagStatus() // newer request
+            await waitForRequests(2)
+
+            resolvers[1]([200, { ...MOCK_FEATURE_FLAG_STATUS, status: 'active', reason: 'Flag was called today' }])
+            await expectLogic(logic).toDispatchActions(['loadFeatureFlagStatusSuccess'])
+
+            resolvers[0]([
+                200,
+                { ...MOCK_FEATURE_FLAG_STATUS, status: 'stale', reason: 'Flag has not been called in 45 days' },
+            ])
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.flagStatus?.status).toBe('active')
+        })
+
+        it('clears the stale banner when the current flag is disabled from the Projects tab', async () => {
+            const patchMock = {
+                patch: {
+                    '/api/projects/:team_id/feature_flags/:id/': async ({ request, params }: any) => {
+                        const body = (await request.json()) as { active: boolean }
+                        return [200, { id: Number(params.id), active: body.active }]
+                    },
+                },
+            }
+            useMocks({ ...statusMock('stale', 'Flag has not been called in 45 days'), ...patchMock })
+            await expectLogic(logic, () => logic.actions.loadFeatureFlagStatus()).toFinishAllListeners()
+            expect(logic.values.showStaleFlagBanner).toBe(true)
+
+            useMocks({ ...statusMock('active', 'Flag is disabled (not evaluated for staleness)'), ...patchMock })
+            await expectLogic(logic, () =>
+                logic.actions.toggleProjectFlagActive(MOCK_TEAM_ID, MOCK_FEATURE_FLAG.id, false)
+            ).toFinishAllListeners()
+
+            expect(logic.values.showStaleFlagBanner).toBe(false)
+        })
+
+        it('shows the stale banner after a restored flag turns out stale', async () => {
+            // Restore un-deletes the flag, so the retained DELETED verdict is no longer right. Without
+            // a refetch the banner keeps that verdict and never surfaces the restored flag's staleness.
+            const updateSpy = jest.spyOn(api, 'update').mockResolvedValue({ ...MOCK_FEATURE_FLAG, deleted: false })
+            try {
+                useMocks({
+                    get: {
+                        [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                            200,
+                            MOCK_FEATURE_FLAG,
+                        ],
+                        [STATUS_URL]: () => [
+                            200,
+                            {
+                                ...MOCK_FEATURE_FLAG_STATUS,
+                                status: 'stale',
+                                reason: 'Flag has not been called in 45 days',
+                            },
+                        ],
+                    },
+                })
+                await expectLogic(logic, () =>
+                    logic.actions.restoreFeatureFlag(MOCK_FEATURE_FLAG)
+                ).toFinishAllListeners()
+
+                expect(logic.values.showStaleFlagBanner).toBe(true)
+            } finally {
+                updateSpy.mockRestore()
+            }
+        })
+
+        it('shows the stale banner after an unarchived flag turns out stale', async () => {
+            // While the flag is archived the endpoint answers ARCHIVED, so that verdict is what sits
+            // in flagStatus. Unarchiving clears the selector's archived guard, and only the refetch
+            // replaces the retained verdict. The archived direction is hidden by that guard either
+            // way, so it cannot cover this.
+            const updateSpy = jest.spyOn(api, 'update').mockResolvedValue({ ...MOCK_FEATURE_FLAG, archived: false })
+            try {
+                useMocks({
+                    get: {
+                        [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                            200,
+                            { ...MOCK_FEATURE_FLAG, archived: false },
+                        ],
+                        [STATUS_URL]: () => [
+                            200,
+                            {
+                                ...MOCK_FEATURE_FLAG_STATUS,
+                                status: 'stale',
+                                reason: 'Flag has not been called in 45 days',
+                            },
+                        ],
+                    },
+                })
+                await expectLogic(logic, () =>
+                    logic.actions.updateFeatureFlagArchived({ archived: false })
+                ).toFinishAllListeners()
+
+                expect(logic.values.showStaleFlagBanner).toBe(true)
+            } finally {
+                updateSpy.mockRestore()
+            }
+        })
+    })
+
+    describe('deleting and restoring', () => {
+        let updateSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            updateSpy = jest.spyOn(api, 'update')
+        })
+
+        afterEach(() => {
+            updateSpy.mockRestore()
+        })
+
+        it('deletes the flag without overwriting its description, and Undo keeps it in the list', async () => {
+            updateSpy.mockResolvedValue({ ...MOCK_FEATURE_FLAG, deleted: true })
+            // deleteWithUndo imports its toast from @posthog/lemon-ui, which the LemonToast mock above does not reach.
+            const toastSpy = jest.spyOn(sharedLemonToast, 'info').mockReturnValue('toast-id')
+            const successToastSpy = jest.spyOn(sharedLemonToast, 'success').mockReturnValue('toast-id')
+            try {
+                await expectLogic(logic, () => logic.actions.deleteFeatureFlag(MOCK_FEATURE_FLAG))
+                    .toDispatchActions(['deleteFlag'])
+                    .toFinishAllListeners()
+
+                // A `name` in the body overwrites the flag's description.
+                expect(updateSpy.mock.calls[0][1]).toEqual({ deleted: true })
+                const [message, options] = toastSpy.mock.calls[0]
+                expect(render(message as JSX.Element).container.textContent).toBe(
+                    `${MOCK_FEATURE_FLAG.key} has been deleted`
+                )
+
+                expect(options?.button?.label).toBe('Undo')
+                await expectLogic(logic, async () => {
+                    await options?.button?.action()
+                }).toNotHaveDispatchedActions(['deleteFlag'])
+            } finally {
+                toastSpy.mockRestore()
+                successToastSpy.mockRestore()
+            }
+        })
+
+        it('puts the restored flag back in the files tree', async () => {
+            updateSpy.mockResolvedValue({ ...MOCK_FEATURE_FLAG, deleted: false })
+
+            await expectLogic(logic, () => logic.actions.restoreFeatureFlag(MOCK_FEATURE_FLAG))
+                .toDispatchActions(['restoreFeatureFlag'])
+                .toMatchValues({ featureFlagRestoreLoading: true })
+                .toDispatchActions(['restoreFeatureFlagSuccess'])
+                .toMatchValues({ featureFlagRestoreLoading: false })
+                .toFinishAllListeners()
+
+            // Refreshing alone keeps a stale entry beside the new one, and deleting alone drops the flag.
+            expect(deleteFromTree).toHaveBeenCalledWith('feature_flag', String(MOCK_FEATURE_FLAG.id))
+            expect(refreshTreeItem).toHaveBeenCalledWith('feature_flag', String(MOCK_FEATURE_FLAG.id))
+            expect(jest.mocked(deleteFromTree).mock.invocationCallOrder[0]).toBeLessThan(
+                jest.mocked(refreshTreeItem).mock.invocationCallOrder[0]
+            )
+            expect(updateSpy.mock.calls[0][1]).toEqual({ deleted: false })
+            expect(lemonToast.success).toHaveBeenCalledWith(`${MOCK_FEATURE_FLAG.key} has been restored`)
+        })
+
+        it('stops loading and leaves the tree alone when the restore fails', async () => {
+            updateSpy.mockRejectedValue(new Error('nope'))
+
+            await expectLogic(logic, () => logic.actions.restoreFeatureFlag(MOCK_FEATURE_FLAG))
+                .toFinishAllListeners()
+                .toMatchValues({ featureFlagRestoreLoading: false })
+
+            expect(refreshTreeItem).not.toHaveBeenCalled()
+            expect(lemonToast.error).toHaveBeenCalled()
+        })
+    })
+
+    describe('updateFeatureFlagArchived archive telemetry', () => {
+        // One test here rejects the archive request on purpose; kea-loaders would log the failure
+        beforeEach(silenceKeaLoadersErrors)
+        afterEach(resumeKeaLoadersErrors)
+
+        beforeEach(() => {
+            ;(posthog.capture as jest.Mock).mockClear()
+        })
+
+        it('captures "feature flag archived" only after the archive succeeds', async () => {
+            jest.spyOn(api, 'update').mockResolvedValueOnce({ ...MOCK_FEATURE_FLAG, archived: true, active: false })
+
+            logic.actions.updateFeatureFlagArchived({ archived: true, via: 'archive-dialog' })
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(capturesOf('feature flag archived')).toEqual([['feature flag archived', { via: 'archive-dialog' }]])
+        })
+
+        it('does not capture "feature flag archived" when the archive request fails', async () => {
+            jest.spyOn(api, 'update').mockRejectedValueOnce({ status: 409, data: { detail: 'Conflict' } })
+
+            logic.actions.updateFeatureFlagArchived({ archived: true, via: 'archive-dialog' })
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(capturesOf('feature flag archived')).toHaveLength(0)
+        })
+    })
+
+    describe('copyFlagSuccess', () => {
+        const copyFlagsUrl = `/api/organizations/${MOCK_ORGANIZATION_ID}/feature_flags/copy_flags/`
+
+        beforeEach(() => {
+            useMocks({
+                get: {
+                    // Hit by the loadProjectsWithCurrentFlag() the listener always triggers afterward.
+                    [`/api/organizations/${MOCK_ORGANIZATION_ID}/feature_flags/${MOCK_FEATURE_FLAG.key}/`]: () => [
+                        200,
+                        [],
+                    ],
+                },
+            })
+            // The copy listener reports to eventUsageLogic, but featureFlagLogic does not mount it via connect().
+            // Mount it here so the listener does not throw when it calls reportFeatureFlagCopyFailure().
+            eventUsageLogic.mount()
+            logic.actions.setCopyDestinationProject(MOCK_TEAM_ID)
+        })
+
+        it('shows a pending-approval warning, not a raw error, when the target project gates the write', async () => {
+            useMocks({
+                post: {
+                    [copyFlagsUrl]: () => [
+                        200,
+                        {
+                            success: [],
+                            failed: [
+                                {
+                                    project_id: MOCK_TEAM_ID,
+                                    error_message: 'Approval required',
+                                    approval_pending: true,
+                                    change_request_id: 'cr-1',
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+
+            logic.actions.copyFlag()
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(lemonToast.warning).toHaveBeenCalledWith(
+                `A change request was created for ${MOCK_DEFAULT_TEAM.name}; the copy will apply once approved.`
+            )
+            expect(lemonToast.error).not.toHaveBeenCalled()
+        })
+
+        it('shows a plain error toast for a hard failure', async () => {
+            useMocks({
+                post: {
+                    [copyFlagsUrl]: () => [
+                        200,
+                        {
+                            success: [],
+                            failed: [{ project_id: MOCK_TEAM_ID, error_message: 'Project not found.' }],
+                        },
+                    ],
+                },
+            })
+
+            logic.actions.copyFlag()
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(lemonToast.error).toHaveBeenCalledWith('Error while copying feature flag: Project not found.')
+            expect(lemonToast.warning).not.toHaveBeenCalled()
+        })
+
+        it('serializes BigInt payload values in the error toast when a failure has no error_message', async () => {
+            // JSON transport can't carry a BigInt, so the HTTP mock layer can't produce this
+            // payload — dispatch the loader success action directly with the shape the
+            // stringifyWithBigInts fallback defends against.
+            logic.actions.copyFlagSuccess({
+                success: [],
+                failed: [{ project_id: MOCK_TEAM_ID, filter_value: BigInt(123) }],
+            } as unknown as CopyFlagsResponseApi)
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(lemonToast.error).toHaveBeenCalledWith(
+                `Error while copying feature flag: [{"project_id":${MOCK_TEAM_ID},"filter_value":"123"}]`
+            )
+            expect(lemonToast.warning).not.toHaveBeenCalled()
+        })
+    })
+})
+
+const createFilters = (overrides: Partial<FeatureFlagFilters> = {}): FeatureFlagFilters => ({
+    groups: [],
+    ...overrides,
+})
+
+describe('hasZeroRollout', () => {
+    it.each([
+        { filters: undefined, expected: false, desc: 'undefined filters' },
+        { filters: null, expected: false, desc: 'null filters' },
+        { filters: createFilters(), expected: false, desc: 'empty groups' },
+        {
+            filters: createFilters({ groups: [{ rollout_percentage: 0 }] }),
+            expected: true,
+            desc: 'single group at 0%',
+        },
+        {
+            filters: createFilters({ groups: [{ rollout_percentage: 0 }, { rollout_percentage: 0 }] }),
+            expected: true,
+            desc: 'all groups at 0%',
+        },
+        {
+            filters: createFilters({ groups: [{ rollout_percentage: 0 }, { rollout_percentage: 50 }] }),
+            expected: false,
+            desc: 'mixed groups',
+        },
+        {
+            filters: createFilters({ groups: [{ rollout_percentage: 100 }] }),
+            expected: false,
+            desc: 'single group at 100%',
+        },
+        {
+            filters: createFilters({ groups: [{ rollout_percentage: null }] }),
+            expected: false,
+            desc: 'null rollout_percentage (defaults to 100%)',
+        },
+        {
+            filters: createFilters({ groups: [{ rollout_percentage: undefined }] }),
+            expected: false,
+            desc: 'undefined rollout_percentage (defaults to 100%)',
+        },
+    ])('returns $expected when $desc', ({ filters, expected }) => {
+        expect(hasZeroRollout(filters)).toBe(expected)
+    })
+})
+
+describe('hasDirectFlagDependency', () => {
+    it.each([
+        {
+            filters: { groups: { properties: [] } },
+            expected: false,
+            desc: 'groups is not an array',
+        },
+        {
+            filters: { groups: [null] },
+            expected: false,
+            desc: 'group is null',
+        },
+        {
+            filters: { groups: [{ properties: { type: PropertyFilterType.Flag } }] },
+            expected: false,
+            desc: 'properties is not an array',
+        },
+        {
+            filters: { groups: [{ properties: [null] }] },
+            expected: false,
+            desc: 'property is null',
+        },
+        {
+            filters: createFilters({
+                groups: [
+                    {
+                        properties: [
+                            {
+                                key: '123',
+                                type: PropertyFilterType.Flag,
+                                value: 'true',
+                                operator: PropertyOperator.FlagEvaluatesTo,
+                            },
+                        ],
+                    },
+                ],
+            }),
+            expected: true,
+            desc: 'group has a flag property',
+        },
+    ])('returns $expected when $desc', ({ filters, expected }) => {
+        expect(hasDirectFlagDependency({ ...MOCK_FEATURE_FLAG, filters: filters as FeatureFlagFilters })).toBe(expected)
+    })
+})
+
+describe('dependency copy labels', () => {
+    const dependencyRequirements = (
+        overrides: Partial<CopyFlagsDependencyRequirementsResponseApi> = {}
+    ): CopyFlagsDependencyRequirementsResponseApi => ({
+        can_copy_dependencies: true,
+        dependency_count: 1,
+        copied_dependency_keys: ['parent-flag'],
+        reused_dependency_keys: [],
+        warnings: [],
+        reason: '1 dependency flag can be copied.',
+        ...overrides,
+    })
+
+    const actionLabelCases: {
+        desc: string
+        loading: boolean
+        req: CopyFlagsDependencyRequirementsResponseApi | null
+        expected: string
+    }[] = [
+        {
+            desc: 'requirements are loading',
+            loading: true,
+            req: dependencyRequirements({ can_copy_dependencies: false, reason: 'Dependency copying is disabled.' }),
+            expected: 'Copy dependencies: Checking',
+        },
+        {
+            desc: 'requirements are missing',
+            loading: false,
+            req: null,
+            expected: 'Copy dependencies: Checking',
+        },
+        {
+            desc: 'dependencies can be copied',
+            loading: false,
+            req: dependencyRequirements({ copied_dependency_keys: ['parent-flag', 'grandparent-flag'] }),
+            expected: 'Copy dependencies: 2 missing',
+        },
+        {
+            desc: 'dependency copying has warnings',
+            loading: false,
+            req: dependencyRequirements({
+                can_copy_dependencies: false,
+                copied_dependency_keys: [],
+                warnings: ['Dependency copying is unavailable.'],
+                reason: 'Dependency copying is unavailable.',
+            }),
+            expected: 'Copy dependencies: Unavailable',
+        },
+        {
+            desc: 'all dependencies already exist',
+            loading: false,
+            req: dependencyRequirements({
+                can_copy_dependencies: false,
+                copied_dependency_keys: [],
+                reused_dependency_keys: ['parent-flag'],
+                warnings: [],
+                reason: 'All dependencies already exist in the destination project.',
+            }),
+            expected: 'Copy dependencies: Already satisfied',
+        },
+    ]
+
+    const disabledReasonCases: {
+        desc: string
+        loading: boolean
+        req: CopyFlagsDependencyRequirementsResponseApi | null
+        expected: string | undefined
+    }[] = [
+        {
+            desc: 'requirements are loading',
+            loading: true,
+            req: dependencyRequirements({ can_copy_dependencies: false, reason: 'Dependency copying is disabled.' }),
+            expected: 'Checking dependency availability',
+        },
+        {
+            desc: 'requirements are missing',
+            loading: false,
+            req: null,
+            expected: 'Checking dependency availability',
+        },
+        {
+            desc: 'dependencies can be copied',
+            loading: false,
+            req: dependencyRequirements(),
+            expected: undefined,
+        },
+        {
+            desc: 'dependency copying is unavailable',
+            loading: false,
+            req: dependencyRequirements({
+                can_copy_dependencies: false,
+                reason: 'Dependency copying is unavailable.',
+            }),
+            expected: 'Dependency copying is unavailable.',
+        },
+    ]
+
+    it.each(actionLabelCases)('returns "$expected" as the action label when $desc', ({ loading, req, expected }) => {
+        expect(dependencyActionLabel(loading, req)).toBe(expected)
+    })
+
+    it.each(disabledReasonCases)(
+        'returns "$expected" as the disabled reason when $desc',
+        ({ loading, req, expected }) => {
+            expect(dependencyDisabledReason(loading, req)).toBe(expected)
+        }
+    )
+})
+
+describe('hasStaticCohortDependency', () => {
+    const cohorts = [
+        { id: 12, is_static: true },
+        { id: 13, is_static: false },
+    ] as CohortType[]
+
+    it.each([
+        {
+            filters: { groups: { properties: [] } },
+            expected: false,
+            desc: 'groups is not an array',
+        },
+        {
+            filters: { groups: [null] },
+            expected: false,
+            desc: 'group is null',
+        },
+        {
+            filters: { groups: [{ properties: { type: PropertyFilterType.Cohort, value: 12 } }] },
+            expected: false,
+            desc: 'properties is not an array',
+        },
+        {
+            filters: { groups: [{ properties: [null] }] },
+            expected: false,
+            desc: 'property is null',
+        },
+        {
+            filters: createFilters({
+                groups: [
+                    {
+                        properties: [
+                            {
+                                key: 'id',
+                                type: PropertyFilterType.Cohort,
+                                value: 13,
+                                operator: PropertyOperator.In,
+                            },
+                        ],
+                    },
+                ],
+            }),
+            expected: false,
+            desc: 'cohort is behavioral',
+        },
+        {
+            filters: createFilters({
+                groups: [
+                    {
+                        properties: [
+                            {
+                                key: 'id',
+                                type: PropertyFilterType.Cohort,
+                                value: 12,
+                                operator: PropertyOperator.In,
+                            },
+                        ],
+                    },
+                ],
+            }),
+            expected: true,
+            desc: 'cohort is static',
+        },
+    ])('returns $expected when $desc', ({ filters, expected }) => {
+        expect(
+            hasStaticCohortDependency({ ...MOCK_FEATURE_FLAG, filters: filters as FeatureFlagFilters }, cohorts)
+        ).toBe(expected)
+    })
+})
+
+describe('hasMultipleVariantsActive', () => {
+    it.each([
+        { filters: undefined, expected: false, desc: 'undefined filters' },
+        { filters: null, expected: false, desc: 'null filters' },
+        { filters: createFilters(), expected: false, desc: 'no multivariate config' },
+        {
+            filters: createFilters({ multivariate: { variants: [] } }),
+            expected: false,
+            desc: 'empty variants',
+        },
+        {
+            filters: createFilters({ multivariate: { variants: [{ key: 'control', rollout_percentage: 50 }] } }),
+            expected: false,
+            desc: 'single active variant',
+        },
+        {
+            filters: createFilters({
+                multivariate: {
+                    variants: [
+                        { key: 'control', rollout_percentage: 50 },
+                        { key: 'test', rollout_percentage: 50 },
+                    ],
+                },
+            }),
+            expected: true,
+            desc: 'two active variants',
+        },
+        {
+            filters: createFilters({
+                multivariate: {
+                    variants: [
+                        { key: 'control', rollout_percentage: 100 },
+                        { key: 'test', rollout_percentage: 0 },
+                    ],
+                },
+            }),
+            expected: false,
+            desc: 'two variants, but one shipped',
+        },
+        {
+            filters: createFilters({
+                multivariate: {
+                    variants: [
+                        { key: 'control', rollout_percentage: 0 },
+                        { key: 'test', rollout_percentage: 0 },
+                    ],
+                },
+            }),
+            expected: false,
+            desc: 'all variants at 0%',
+        },
+        {
+            filters: createFilters({
+                multivariate: {
+                    variants: [
+                        { key: 'control', rollout_percentage: 50 },
+                        { key: 'test', rollout_percentage: 0 },
+                        { key: 'test-2', rollout_percentage: 50 },
+                    ],
+                },
+            }),
+            expected: true,
+            desc: 'two of three variants active',
+        },
+    ])('returns $expected when $desc', ({ filters, expected }) => {
+        expect(hasMultipleVariantsActive(filters)).toBe(expected)
+    })
+})
+
+describe('slugifyFeatureFlagKey', () => {
+    it.each([
+        { input: 'my-flag', expected: 'my-flag', desc: 'valid kebab-case key passes through' },
+        { input: 'camelCase', expected: 'camelCase', desc: 'preserves case by default' },
+        { input: 'under_score', expected: 'under_score', desc: 'underscores pass through' },
+        { input: 'UPPER', expected: 'UPPER', desc: 'uppercase preserved' },
+        { input: 'foo bar', expected: 'foo-bar', desc: 'spaces become hyphens' },
+        { input: 'foo  bar', expected: 'foo-bar', desc: 'multiple spaces collapse to single hyphen' },
+        { input: 'foo.bar', expected: 'foobar', desc: 'dots are stripped' },
+        { input: 'foo,bar', expected: 'foobar', desc: 'commas are stripped' },
+        { input: 'foo?bar=baz', expected: 'foobarbaz', desc: 'query string chars are stripped' },
+        { input: 'foo/bar', expected: 'foobar', desc: 'slashes are stripped' },
+        { input: 'héllo', expected: 'hello', desc: 'accented characters are normalized' },
+        { input: '  leading', expected: 'leading', desc: 'leading whitespace is trimmed' },
+        { input: 'trailing ', expected: 'trailing-', desc: 'trailing whitespace kept (for typing)' },
+        { input: 'a--b', expected: 'a-b', desc: 'consecutive hyphens collapsed' },
+    ])('returns "$expected" when $desc', ({ input, expected }) => {
+        expect(slugifyFeatureFlagKey(input)).toBe(expected)
+    })
+
+    it.each([
+        { input: 'My Flag Name', expected: 'my-flag-name', desc: 'lowercases and converts spaces' },
+        { input: '  padded  ', expected: 'padded', desc: 'trims both ends' },
+        { input: 'UPPER CASE', expected: 'upper-case', desc: 'lowercases uppercase' },
+    ])('with fromTitleInput=true returns "$expected" when $desc', ({ input, expected }) => {
+        expect(slugifyFeatureFlagKey(input, { fromTitleInput: true })).toBe(expected)
+    })
+})
+
+describe('validateFeatureFlagKey', () => {
+    it.each([
+        { key: 'my-flag', desc: 'kebab-case' },
+        { key: 'camelCase', desc: 'camelCase' },
+        { key: 'under_score', desc: 'underscores' },
+        { key: '123', desc: 'numeric' },
+        { key: 'MIX-ed_123', desc: 'mixed valid chars' },
+        { key: 'a', desc: 'single character' },
+    ])('accepts valid key: $desc', ({ key }) => {
+        expect(validateFeatureFlagKey(key)).toBeUndefined()
+    })
+
+    it.each([
+        { key: 'foo bar', error: 'Only letters', desc: 'spaces' },
+        { key: 'foo.bar', error: 'Only letters', desc: 'dots' },
+        { key: 'foo,bar', error: 'Only letters', desc: 'commas' },
+        { key: 'foo?bar', error: 'Only letters', desc: 'question marks' },
+        { key: 'foo/bar', error: 'Only letters', desc: 'slashes' },
+        { key: 'foo\\bar', error: 'Only letters', desc: 'backslashes' },
+    ])('rejects key with $desc', ({ key, error }) => {
+        expect(validateFeatureFlagKey(key)).toContain(error)
+    })
+
+    it('rejects empty key', () => {
+        expect(validateFeatureFlagKey('')).toBe('Please set a key')
+    })
+
+    it('rejects key exceeding 400 characters', () => {
+        expect(validateFeatureFlagKey('a'.repeat(401))).toContain('400 characters')
+    })
+
+    it('accepts key at exactly 400 characters', () => {
+        expect(validateFeatureFlagKey('a'.repeat(400))).toBeUndefined()
+    })
+})
+
+describe('validateFeatureFlagVariantKey', () => {
+    it.each([
+        { key: 'control', desc: 'plain key' },
+        { key: 'provider/model-1.2', desc: 'slashes and dots (model-id style)' },
+        { key: '0.85', desc: 'dotted number' },
+        { key: 'a/b/c.d_e-f', desc: 'mixed dots, slashes, hyphens, underscores' },
+        { key: 'NULL', desc: 'uppercase NULL' },
+        { key: 'Null', desc: 'title-case Null' },
+        { key: 'null', savedKeys: ['control', 'null'], desc: 'null the saved flag already has' },
+    ])('accepts valid variant key: $desc', ({ key, savedKeys }) => {
+        expect(validateFeatureFlagVariantKey(key, savedKeys)).toBeUndefined()
+    })
+
+    it.each([
+        { key: 'foo bar', error: 'Only letters', desc: 'spaces' },
+        { key: 'foo,bar', error: 'Only letters', desc: 'commas' },
+        { key: 'foo?bar', error: 'Only letters', desc: 'question marks' },
+        { key: '', error: 'Please set a key', desc: 'empty key' },
+        { key: 'a'.repeat(401), error: '400 characters', desc: 'over 400 characters' },
+        { key: 'null', error: 'reserved', desc: 'null on a new flag' },
+        { key: 'null', savedKeys: ['control', 'test'], error: 'reserved', desc: 'null the saved flag lacks' },
+    ])('rejects variant key with $desc', ({ key, savedKeys, error }) => {
+        expect(validateFeatureFlagVariantKey(key, savedKeys)).toContain(error)
+    })
+})
+
+describe('validateVariantRolloutSum', () => {
+    // Float artifacts must not reach the user, and a rejected total must never read as 100.
+    it.each([
+        { percentages: [0.01, 64.04, 35], expected: '99.05' },
+        { percentages: [30.1, 30.1, 30.1], expected: '90.3' },
+        { percentages: [50, 49.99], expected: '99.99' },
+    ])('reports $expected without floating point noise', ({ percentages, expected }) => {
+        const variants = percentages.map((rollout_percentage, index) => ({
+            key: `variant-${index}`,
+            name: '',
+            rollout_percentage,
+        }))
+
+        expect(validateVariantRolloutSum(variants)).toBe(
+            `Percentage rollouts for variants must sum to 100 (currently ${expected}).`
+        )
+    })
+})
+
+describe('validateFeatureFlagTags', () => {
+    it.each([
+        { desc: 'the project does not require tags', tags: [], required: false, isNewFlag: true, hadTags: false },
+        { desc: 'a new flag carries a tag', tags: ['billing'], required: true, isNewFlag: true, hadTags: false },
+        // `hadTags` exists for this case: turning the setting on must not freeze the flags that
+        // predate it. Collapsing the check to a plain length test would block this save.
+        {
+            desc: 'a flag that predates the setting is edited while still untagged',
+            tags: [],
+            required: true,
+            isNewFlag: false,
+            hadTags: false,
+        },
+    ])('allows the save when $desc', ({ tags, required, isNewFlag, hadTags }) => {
+        expect(validateFeatureFlagTags(tags, { required, isNewFlag, hadTags })).toBeUndefined()
+    })
+
+    it.each([
+        {
+            desc: 'a new flag has no tags',
+            tags: [],
+            required: true,
+            isNewFlag: true,
+            hadTags: false,
+            error: 'Add at least one tag',
+        },
+        // A blank tag is not a tag: the server normalizes it away, so accepting it here would only
+        // buy a rejected save.
+        {
+            desc: 'a new flag has only a blank tag',
+            tags: ['   '],
+            required: true,
+            isNewFlag: true,
+            hadTags: false,
+            error: 'Add at least one tag',
+        },
+        {
+            desc: 'a tagged flag loses its last tag',
+            tags: [],
+            required: true,
+            isNewFlag: false,
+            hadTags: true,
+            error: 'Keep at least one tag',
+        },
+        {
+            desc: 'a tagged flag has its last tag replaced by a blank one',
+            tags: [''],
+            required: true,
+            isNewFlag: false,
+            hadTags: true,
+            error: 'Keep at least one tag',
+        },
+    ])('blocks the save when $desc', ({ tags, required, isNewFlag, hadTags, error }) => {
+        expect(validateFeatureFlagTags(tags, { required, isNewFlag, hadTags })).toContain(error)
+    })
+})
+
+describe('variant rollout sum validation', () => {
+    let logic: ReturnType<typeof featureFlagLogic.build>
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                    200,
+                    MOCK_FEATURE_FLAG,
+                ],
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/status`]: () => [
+                    200,
+                    MOCK_FEATURE_FLAG_STATUS,
+                ],
+            },
+        })
+        initKeaTests()
+        logic = featureFlagLogic({ id: 1 })
+        logic.mount()
+    })
+
+    afterEach(() => {
+        logic.unmount()
+    })
+
+    // Removing a variant leaves the rest short, and the API rejects that write.
+    it.each([
+        { desc: 'sums to 100', percentages: [50, 50], hasErrors: false },
+        { desc: 'falls short after a variant is removed', percentages: [50], hasErrors: true },
+        { desc: 'exceeds 100', percentages: [60, 60], hasErrors: true },
+        // Adds up to 100.00000000000001; the API tolerates the same drift.
+        { desc: 'sums to 100 with floating point drift', percentages: [0.01, 64.04, 35.95], hasErrors: false },
+        { desc: 'falls short by the smallest step the form allows', percentages: [50, 49.99], hasErrors: true },
+    ])('$desc: hasErrors=$hasErrors', ({ percentages, hasErrors }) => {
+        logic.actions.setFeatureFlag({
+            ...MOCK_FEATURE_FLAG,
+            filters: {
+                groups: [],
+                multivariate: {
+                    variants: percentages.map((rollout_percentage, index) => ({
+                        key: `variant-${index}`,
+                        name: '',
+                        rollout_percentage,
+                    })),
+                },
+                payloads: {},
+            },
+        })
+
+        expect(logic.values.featureFlagHasErrors).toBe(hasErrors)
+    })
+
+    // Valid keys are load-bearing: a bad key already opens the panel via the older key check, so
+    // only a sum-only failure proves the rollout error reaches submitFeatureFlagFailure.
+    it('opens the collapsed variant panels so the blocked save shows a reason', async () => {
+        logic.actions.setFeatureFlag({
+            ...MOCK_FEATURE_FLAG,
+            filters: {
+                groups: [],
+                multivariate: {
+                    variants: [
+                        { key: 'control', name: '', rollout_percentage: 50 },
+                        { key: 'test', name: '', rollout_percentage: 20 },
+                    ],
+                },
+                payloads: {},
+            },
+        })
+        logic.actions.setOpenVariants([])
+
+        await expectLogic(logic, () => {
+            logic.actions.submitFeatureFlag()
+        }).toFinishAllListeners()
+
+        expect(logic.values.openVariants).toEqual(expect.arrayContaining(['variant-0', 'variant-1']))
+    })
+
+    it('does not block a boolean flag, which carries no variants', () => {
+        logic.actions.setFeatureFlag({
+            ...MOCK_FEATURE_FLAG,
+            filters: { groups: [], multivariate: null, payloads: {} },
+        })
+
+        expect(logic.values.featureFlagHasErrors).toBe(false)
+    })
+})
+
+describe('required tags on a collapsed advanced panel', () => {
+    let logic: ReturnType<typeof featureFlagLogic.build>
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                    200,
+                    MOCK_FEATURE_FLAG,
+                ],
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/status`]: () => [
+                    200,
+                    MOCK_FEATURE_FLAG_STATUS,
+                ],
+            },
+        })
+        initKeaTests()
+        teamLogic.actions.loadCurrentTeamSuccess({
+            ...MOCK_DEFAULT_TEAM,
+            feature_flag_policy_config: { require_tags: true },
+        })
+        logic = featureFlagLogic({ id: 1 })
+        logic.mount()
+    })
+
+    afterEach(() => {
+        logic.unmount()
+    })
+
+    // The tag input sits inside the advanced panel, and a collapsed LemonCollapse unmounts its
+    // children, so without this the save is blocked with no field on screen to explain why.
+    it('opens the panel when a save is blocked for emptying the last tag', async () => {
+        logic.actions.setOriginalFeatureFlag({ ...MOCK_FEATURE_FLAG, tags: ['billing'] } as FeatureFlagType)
+        logic.actions.setFeatureFlag({ ...MOCK_FEATURE_FLAG, tags: [] } as FeatureFlagType)
+        expect(logic.values.advancedPanelOpen).toBe(false)
+
+        await expectLogic(logic, () => {
+            logic.actions.submitFeatureFlag()
+        }).toFinishAllListeners()
+
+        expect(logic.values.advancedPanelOpen).toBe(true)
+    })
+
+    // A flag that predates the setting stays editable, so an untagged one must not be held back.
+    it('leaves the panel closed when an untagged flag saves cleanly', async () => {
+        logic.actions.setOriginalFeatureFlag({ ...MOCK_FEATURE_FLAG, tags: [] } as FeatureFlagType)
+        logic.actions.setFeatureFlag({ ...MOCK_FEATURE_FLAG, tags: [] } as FeatureFlagType)
+
+        expect(logic.values.featureFlagHasErrors).toBe(false)
+        expect(logic.values.advancedPanelOpen).toBe(false)
+    })
+})
+
+describe('variant reordering', () => {
+    let logic: ReturnType<typeof featureFlagLogic.build>
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/`]: () => [
+                    200,
+                    MOCK_FEATURE_FLAG,
+                ],
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/${MOCK_FEATURE_FLAG.id}/status`]: () => [
+                    200,
+                    MOCK_FEATURE_FLAG_STATUS,
+                ],
+            },
+        })
+        initKeaTests()
+        logic = featureFlagLogic({ id: 1 })
+        logic.mount()
+
+        // Set up a multivariate flag with test variants
+        logic.actions.setFeatureFlag({
+            ...MOCK_FEATURE_FLAG,
+            filters: {
+                groups: [],
+                multivariate: {
+                    variants: [
+                        { key: 'control', name: 'Control', rollout_percentage: 33 },
+                        { key: 'test-a', name: 'Test A', rollout_percentage: 33 },
+                        { key: 'test-b', name: 'Test B', rollout_percentage: 34 },
+                    ],
+                },
+                payloads: { 0: { option: 'default' }, 1: { option: 'variant-a' }, 2: { option: 'variant-b' } },
+            },
+        })
+    })
+
+    afterEach(() => {
+        logic.unmount()
+    })
+
+    describe('moveVariantUp', () => {
+        it('moves variant up by one position', () => {
+            logic.actions.moveVariantUp(1) // Move 'test-a' up
+
+            const variants = logic.values.variants
+            expect(variants[0].key).toBe('test-a')
+            expect(variants[1].key).toBe('control')
+            expect(variants[2].key).toBe('test-b')
+        })
+
+        it('reorders payloads when moving variant up', () => {
+            logic.actions.moveVariantUp(1) // Move 'test-a' up
+
+            const payloads = logic.values.featureFlag.filters?.payloads
+            expect(payloads?.[0]).toEqual({ option: 'variant-a' }) // test-a payload now at index 0
+            expect(payloads?.[1]).toEqual({ option: 'default' }) // control payload now at index 1
+            expect(payloads?.[2]).toEqual({ option: 'variant-b' }) // test-b payload stays at index 2
+        })
+
+        it('does nothing when trying to move first variant up', () => {
+            const originalVariants = [...logic.values.variants]
+            logic.actions.moveVariantUp(0)
+
+            expect(logic.values.variants).toEqual(originalVariants)
+        })
+
+        it('handles negative indices gracefully', () => {
+            const originalVariants = [...logic.values.variants]
+            logic.actions.moveVariantUp(-1)
+
+            expect(logic.values.variants).toEqual(originalVariants)
+        })
+    })
+
+    describe('moveVariantDown', () => {
+        it('moves variant down by one position', () => {
+            logic.actions.moveVariantDown(0) // Move 'control' down
+
+            const variants = logic.values.variants
+            expect(variants[0].key).toBe('test-a')
+            expect(variants[1].key).toBe('control')
+            expect(variants[2].key).toBe('test-b')
+        })
+
+        it('reorders payloads when moving variant down', () => {
+            logic.actions.moveVariantDown(0) // Move 'control' down
+
+            const payloads = logic.values.featureFlag.filters?.payloads
+            expect(payloads?.[0]).toEqual({ option: 'variant-a' }) // test-a payload now at index 0
+            expect(payloads?.[1]).toEqual({ option: 'default' }) // control payload now at index 1
+            expect(payloads?.[2]).toEqual({ option: 'variant-b' }) // test-b payload stays at index 2
+        })
+
+        it('does nothing when trying to move last variant down', () => {
+            const originalVariants = [...logic.values.variants]
+            logic.actions.moveVariantDown(2) // Try to move last variant down
+
+            expect(logic.values.variants).toEqual(originalVariants)
+        })
+
+        it('handles out of bounds indices gracefully', () => {
+            const originalVariants = [...logic.values.variants]
+            logic.actions.moveVariantDown(10) // Out of bounds index
+
+            expect(logic.values.variants).toEqual(originalVariants)
+        })
+    })
+
+    describe('reorderVariants', () => {
+        it('moves variant from beginning to end', () => {
+            logic.actions.reorderVariants(0, 2) // Move 'control' from index 0 to 2
+
+            const variants = logic.values.variants
+            expect(variants[0].key).toBe('test-a')
+            expect(variants[1].key).toBe('test-b')
+            expect(variants[2].key).toBe('control')
+        })
+
+        it('moves variant from end to beginning', () => {
+            logic.actions.reorderVariants(2, 0) // Move 'test-b' from index 2 to 0
+
+            const variants = logic.values.variants
+            expect(variants[0].key).toBe('test-b')
+            expect(variants[1].key).toBe('control')
+            expect(variants[2].key).toBe('test-a')
+        })
+
+        it('moves variant forward by one position', () => {
+            logic.actions.reorderVariants(0, 1) // Move 'control' from index 0 to 1
+
+            const variants = logic.values.variants
+            expect(variants[0].key).toBe('test-a')
+            expect(variants[1].key).toBe('control')
+            expect(variants[2].key).toBe('test-b')
+        })
+
+        it('moves variant backward by one position', () => {
+            logic.actions.reorderVariants(1, 0) // Move 'test-a' from index 1 to 0
+
+            const variants = logic.values.variants
+            expect(variants[0].key).toBe('test-a')
+            expect(variants[1].key).toBe('control')
+            expect(variants[2].key).toBe('test-b')
+        })
+
+        it('correctly reorders payloads with complex reordering', () => {
+            logic.actions.reorderVariants(0, 2) // Move 'control' from index 0 to 2
+
+            const payloads = logic.values.featureFlag.filters?.payloads
+            expect(payloads?.[0]).toEqual({ option: 'variant-a' }) // test-a payload
+            expect(payloads?.[1]).toEqual({ option: 'variant-b' }) // test-b payload
+            expect(payloads?.[2]).toEqual({ option: 'default' }) // control payload
+        })
+
+        it('does nothing when fromIndex equals toIndex', () => {
+            const originalVariants = [...logic.values.variants]
+            const originalPayloads = { ...logic.values.featureFlag.filters?.payloads }
+
+            logic.actions.reorderVariants(1, 1)
+
+            expect(logic.values.variants).toEqual(originalVariants)
+            expect(logic.values.featureFlag.filters?.payloads).toEqual(originalPayloads)
+        })
+
+        it('handles invalid indices gracefully', () => {
+            const originalVariants = [...logic.values.variants]
+
+            logic.actions.reorderVariants(-1, 1) // Invalid fromIndex
+            expect(logic.values.variants).toEqual(originalVariants)
+
+            logic.actions.reorderVariants(1, -1) // Invalid toIndex
+            expect(logic.values.variants).toEqual(originalVariants)
+
+            logic.actions.reorderVariants(10, 1) // Out of bounds fromIndex
+            expect(logic.values.variants).toEqual(originalVariants)
+
+            logic.actions.reorderVariants(1, 10) // Out of bounds toIndex
+            expect(logic.values.variants).toEqual(originalVariants)
+        })
+
+        it('preserves all variant properties during reordering', () => {
+            logic.actions.reorderVariants(0, 2)
+
+            const variants = logic.values.variants
+            expect(variants[0]).toEqual({
+                key: 'test-a',
+                name: 'Test A',
+                rollout_percentage: 33,
+            })
+            expect(variants[1]).toEqual({
+                key: 'test-b',
+                name: 'Test B',
+                rollout_percentage: 34,
+            })
+            expect(variants[2]).toEqual({
+                key: 'control',
+                name: 'Control',
+                rollout_percentage: 33,
+            })
+        })
+    })
+
+    describe('payload synchronization edge cases', () => {
+        it('handles missing payloads gracefully', () => {
+            logic.actions.setFeatureFlag({
+                ...logic.values.featureFlag,
+                filters: {
+                    ...v1Filters(logic.values.featureFlag),
+                    payloads: undefined,
+                },
+            })
+
+            expect(() => logic.actions.reorderVariants(0, 2)).not.toThrow()
+            expect(logic.values.variants[0].key).toBe('test-a')
+        })
+
+        it('handles sparse payloads correctly', () => {
+            logic.actions.setFeatureFlag({
+                ...logic.values.featureFlag,
+                filters: {
+                    ...v1Filters(logic.values.featureFlag),
+                    payloads: { 0: { option: 'default' }, 2: { option: 'variant-b' } }, // Missing index 1
+                },
+            })
+
+            logic.actions.reorderVariants(0, 2)
+
+            const payloads = logic.values.featureFlag.filters?.payloads
+            expect(payloads?.[0]).toBeUndefined() // test-a had no payload
+            expect(payloads?.[1]).toEqual({ option: 'variant-b' }) // test-b payload
+            expect(payloads?.[2]).toEqual({ option: 'default' }) // control payload
+        })
+    })
+})
+
+describe('a flag in config version 2', () => {
+    let logic: ReturnType<typeof featureFlagLogic.build>
+
+    beforeEach(silenceKeaLoadersErrors)
+    afterEach(resumeKeaLoadersErrors)
+
+    const V2_FLAG = {
+        ...NEW_FLAG,
+        id: 7,
+        key: 'checkout-rules-v2',
+        active: false,
+        version: 3,
+        filters: {
+            version: 2,
+            return_type: 'boolean',
+            default_value: false,
+            rules: [
+                {
+                    id: 'rule-1',
+                    rule_type: 'targeted_release',
+                    targeting: { properties: [] },
+                    value: true,
+                },
+            ],
+        },
+    }
+
+    beforeEach(async () => {
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/7/`]: () => [200, V2_FLAG],
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/7/status`]: () => [
+                    200,
+                    MOCK_FEATURE_FLAG_STATUS,
+                ],
+            },
+        })
+        initKeaTests()
+        logic = featureFlagLogic({ id: 7 })
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+    })
+
+    afterEach(() => {
+        logic.unmount()
+        jest.restoreAllMocks()
+    })
+
+    it('loads without error, keeps the document untouched and exposes the format', () => {
+        expect(logic.values.featureFlag.filters).toEqual(V2_FLAG.filters)
+        expect(logic.values.configFormat).toBe('v2')
+        expect(logic.values.hasUnsavedChanges).toBe(false)
+    })
+
+    it('offers no tab that rewrites or copies the document', () => {
+        for (const tab of [FeatureFlagsTab.PROJECTS, FeatureFlagsTab.SCHEDULE, FeatureFlagsTab.TESTING]) {
+            expect(logic.values.availableTabs).not.toContain(tab)
+        }
+        expect(logic.values.availableTabs).toEqual(
+            expect.arrayContaining([FeatureFlagsTab.OVERVIEW, FeatureFlagsTab.USAGE, FeatureFlagsTab.HISTORY])
+        )
+    })
+
+    it('refreshes the flag when its row version was stale instead of retrying', async () => {
+        // The conflicting write replaced the document, so the refresh must show it, not only its version.
+        const changedElsewhere = {
+            ...V2_FLAG,
+            name: 'Renamed elsewhere',
+            version: 4,
+            filters: { ...V2_FLAG.filters, default_value: true, rules: [] },
+        }
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/7/`]: () => [200, changedElsewhere],
+            },
+        })
+        const detail = 'This feature flag has changed since version 3'
+        const update = jest
+            .spyOn(api, 'update')
+            .mockRejectedValueOnce(new ApiError(undefined, 409, undefined, { detail }))
+        const approvalWarning = jest.spyOn(sharedLemonToast, 'warning').mockReturnValue('toast-id')
+
+        logic.actions.updateFeatureFlagActive(true)
+        await expectLogic(logic)
+            .toDispatchActions(['updateFeatureFlagActiveFailure', 'refreshFeatureFlag', 'refreshFeatureFlagSuccess'])
+            .toFinishAllListeners()
+
+        expect(update).toHaveBeenCalledTimes(1)
+        expect(lemonToast.error).toHaveBeenCalledWith(detail)
+        // The approval handler treats every 409 as a change request, so the stale branch must return before it.
+        expect(approvalWarning).not.toHaveBeenCalled()
+        expect(logic.values.featureFlag).toMatchObject({
+            name: 'Renamed elsewhere',
+            version: 4,
+            filters: changedElsewhere.filters,
+        })
+        expect(logic.values.hasUnsavedChanges).toBe(false)
+    })
+
+    it('carries the row version when toggling active and when archiving', async () => {
+        const update = jest.spyOn(api, 'update').mockImplementation(async (_url, payload: any) => ({
+            ...V2_FLAG,
+            ...payload,
+            version: payload.version + 1,
+        }))
+
+        logic.actions.updateFeatureFlagActive(true)
+        await expectLogic(logic).toDispatchActions(['updateFeatureFlagActiveSuccess'])
+        expect(update).toHaveBeenLastCalledWith(expect.stringContaining('/feature_flags/7'), {
+            active: true,
+            version: 3,
+        })
+
+        logic.actions.updateFeatureFlagArchived({ archived: true })
+        await expectLogic(logic).toDispatchActions(['updateFeatureFlagArchivedSuccess'])
+        expect(update).toHaveBeenLastCalledWith(expect.stringContaining('/feature_flags/7'), {
+            archived: true,
+            active: false,
+            version: 4,
+        })
+    })
+
+    it('offers early access creation only for a v1 document', () => {
+        expect(logic.values.canCreateEarlyAccessFeature).toBe(false)
+
+        logic.actions.setFeatureFlag({ ...V2_FLAG, filters: { groups: [] } })
+        expect(logic.values.canCreateEarlyAccessFeature).toBe(true)
+    })
+
+    it('offers only disable in the disable confirmation, sending the row version', async () => {
+        const dialogOpenSpy = jest.spyOn(LemonDialog, 'open').mockImplementation(() => {})
+        const update = jest
+            .spyOn(api, 'update')
+            .mockImplementation(async (_url, payload) => ({ ...V2_FLAG, ...(payload as object) }))
+        logic.actions.setFeatureFlag({ ...V2_FLAG, active: true })
+        logic.actions.setOriginalFeatureFlag({ ...V2_FLAG, active: true })
+
+        await expectLogic(logic, () => logic.actions.toggleFeatureFlagActive(false)).toFinishAllListeners()
+
+        const dialogProps = dialogOpenSpy.mock.calls[0][0]
+        expect(dialogProps.secondaryButton).toBeNull()
+        dialogProps.primaryButton?.onClick?.(undefined as any)
+        await expectLogic(logic).toFinishAllListeners()
+        expect(update).toHaveBeenCalledWith(expect.stringContaining('/feature_flags/7'), { active: false, version: 3 })
+    })
+
+    it('saves sidebar tags as a narrow versioned write, not the full save', async () => {
+        const update = jest
+            .spyOn(api, 'update')
+            .mockImplementation(async (_url, payload) => ({ ...V2_FLAG, ...(payload as object), version: 4 }))
+
+        logic.actions.saveSidebarTags(['checkout'], [])
+        await expectLogic(logic)
+            .toDispatchActions(['saveTagsInline'])
+            .toNotHaveDispatchedActions(['saveFeatureFlag'])
+            .toFinishAllListeners()
+
+        expect(update).toHaveBeenCalledTimes(1)
+        expect(update).toHaveBeenCalledWith(expect.stringContaining('/feature_flags/7'), {
+            tags: ['checkout'],
+            version: 3,
+        })
+    })
+
+    it.each([
+        ['tags', () => logic.actions.saveTagsInline(['checkout'])],
+        ['description', () => logic.actions.saveDescriptionInline('Checkout redesign')],
+    ])('takes the row version its inline %s save produced, so the next write is not stale', async (_, save) => {
+        const update = jest
+            .spyOn(api, 'update')
+            .mockImplementation(async (_url, payload) => ({ ...V2_FLAG, ...(payload as object), version: 4 }))
+
+        save()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(update).toHaveBeenCalledWith(
+            expect.stringContaining('/feature_flags/7'),
+            expect.objectContaining({ version: 3 })
+        )
+        expect(logic.values.rowVersionToken).toEqual({ version: 4 })
+        expect(logic.values.originalFeatureFlag?.version).toBe(4)
+    })
+
+    it.each([
+        ['tags', () => logic.actions.saveTagsInline(['checkout'])],
+        ['description', () => logic.actions.saveDescriptionInline('Checkout redesign')],
+    ])('reloads the flag when its inline %s save hits a stale row version', async (_, save) => {
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/7/`]: () => [200, { ...V2_FLAG, version: 5 }],
+            },
+        })
+        jest.spyOn(api, 'update').mockRejectedValue({ status: 409, detail: 'This feature flag has changed.' })
+
+        save()
+        await expectLogic(logic)
+            .toDispatchActions(['refreshFeatureFlag', 'refreshFeatureFlagSuccess'])
+            .toFinishAllListeners()
+
+        expect(logic.values.rowVersionToken).toEqual({ version: 5 })
+    })
+
+    it.each([
+        ['deleting', () => logic.actions.deleteFeatureFlag(V2_FLAG), { deleted: true, version: 3 }],
+        [
+            'restoring',
+            () => logic.actions.restoreFeatureFlag({ ...V2_FLAG, deleted: true }),
+            { deleted: false, version: 3 },
+        ],
+    ])('sends only deleted and the row version when %s', async (_, act, body) => {
+        const update = jest.spyOn(api, 'update').mockResolvedValue({ ...V2_FLAG, ...body, version: 4 })
+
+        await expectLogic(logic, act).toFinishAllListeners()
+
+        expect(update).toHaveBeenCalledWith(`api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/7`, body)
+    })
+
+    it('deletes with the row version an inline save returned after the delete dialog opened', async () => {
+        const update = jest
+            .spyOn(api, 'update')
+            .mockImplementation(async (_url, payload) => ({ ...V2_FLAG, ...(payload as object), version: 4 }))
+        // The dialog's confirm passes the flag it was opened with, at version 3.
+        const flagWhenDialogOpened = logic.values.featureFlag
+
+        logic.actions.saveTagsInline(['checkout'])
+        await expectLogic(logic).toFinishAllListeners()
+        await expectLogic(logic, () => logic.actions.deleteFeatureFlag(flagWhenDialogOpened)).toFinishAllListeners()
+
+        expect(update).toHaveBeenLastCalledWith(`api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/7`, {
+            deleted: true,
+            version: 4,
+        })
+    })
+
+    it('offers no undo after a delete, because the server refuses to restore this flag', async () => {
+        jest.spyOn(api, 'update').mockResolvedValue({ ...V2_FLAG, deleted: true, version: 4 })
+        // deleteWithUndo toasts through @posthog/lemon-ui, which the LemonToast module mock does not replace.
+        const info = jest.spyOn(sharedLemonToast, 'info')
+
+        await expectLogic(logic, () => logic.actions.deleteFeatureFlag(V2_FLAG)).toFinishAllListeners()
+
+        expect(info).toHaveBeenCalledTimes(1)
+        expect(info.mock.calls[0][1]?.button).toBeUndefined()
+    })
+
+    it('reloads the flag when a delete hits a stale row version', async () => {
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/7/`]: () => [200, { ...V2_FLAG, version: 5 }],
+            },
+        })
+        jest.spyOn(api, 'update').mockRejectedValue({ status: 409, detail: 'This feature flag has changed.' })
+        const genericError = jest.spyOn(sharedLemonToast, 'error')
+
+        logic.actions.deleteFeatureFlag(V2_FLAG)
+        await expectLogic(logic)
+            .toDispatchActions(['refreshFeatureFlag', 'refreshFeatureFlagSuccess'])
+            .toFinishAllListeners()
+
+        expect(logic.values.rowVersionToken).toEqual({ version: 5 })
+        expect(lemonToast.error).toHaveBeenCalledWith('This feature flag has changed.')
+        expect(genericError).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        ['tags', () => logic.actions.saveTagsInline(['checkout'])],
+        ['description', () => logic.actions.saveDescriptionInline('Checkout redesign')],
+    ])('keeps a v1 flag on its loaded row version after an inline %s save', async (_, save) => {
+        // A v1 full save sends the loaded version, and a stale one makes the server drop the fields this page did not change.
+        const V1_FLAG = { ...V2_FLAG, filters: { groups: [] } }
+        logic.actions.setFeatureFlag(V1_FLAG)
+        logic.actions.setOriginalFeatureFlag(V1_FLAG)
+        jest.spyOn(api, 'update').mockImplementation(async (_url, payload) => ({
+            ...V1_FLAG,
+            ...(payload as object),
+            version: 4,
+        }))
+
+        save()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.featureFlag.version).toBe(3)
+        expect(logic.values.originalFeatureFlag?.version).toBe(3)
+    })
+
+    const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+    it('sends a tag save made while another is in flight with the version that save returned', async () => {
+        const firstResponse = deferred()
+        const update = jest.spyOn(api, 'update').mockImplementation(async (_url, payload: any) => {
+            if (update.mock.calls.length === 1) {
+                await firstResponse.promise
+            }
+            return { ...V2_FLAG, ...payload, version: payload.version + 1 }
+        })
+
+        logic.actions.saveTagsInline(['checkout'])
+        await wait(300)
+        expect(update).toHaveBeenCalledTimes(1)
+        // The second save passes its debounce while the first request is still open.
+        logic.actions.saveTagsInline(['checkout', 'pricing'])
+        await wait(300)
+        firstResponse.resolve()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(update.mock.calls.map(([, payload]) => payload)).toEqual([
+            { tags: ['checkout'], version: 3 },
+            { tags: ['checkout', 'pricing'], version: 4 },
+        ])
+        expect(logic.values.featureFlag).toMatchObject({ tags: ['checkout', 'pricing'], version: 5 })
+        expect(lemonToast.error).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        [
+            'a description save',
+            'a tag save',
+            () => logic.actions.saveTagsInline(['checkout']),
+            () => logic.actions.saveDescriptionInline('Checkout redesign'),
+        ],
+        [
+            'a tag save',
+            'a description save',
+            () => logic.actions.saveDescriptionInline('Checkout redesign'),
+            () => logic.actions.saveTagsInline(['checkout']),
+        ],
+    ])('sends %s made while %s is in flight with the version that save returned', async (_, __, first, second) => {
+        const firstResponse = deferred()
+        const update = jest.spyOn(api, 'update').mockImplementation(async (_url, payload: any) => {
+            if (update.mock.calls.length === 1) {
+                await firstResponse.promise
+            }
+            return { ...V2_FLAG, ...payload, version: payload.version + 1 }
+        })
+
+        first()
+        await wait(300)
+        second()
+        await wait(300)
+        firstResponse.resolve()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(update.mock.calls.map(([, payload]) => (payload as any).version)).toEqual([3, 4])
+        // Each save's response leaves the other save's field alone.
+        expect(logic.values.featureFlag).toMatchObject({ name: 'Checkout redesign', tags: ['checkout'], version: 5 })
+        expect(lemonToast.error).not.toHaveBeenCalled()
+    })
+
+    it('keeps the first tag save when the save queued behind it is refused', async () => {
+        const detail = 'Keep at least one tag. This project requires feature flags to stay tagged.'
+        const firstResponse = deferred()
+        const update = jest.spyOn(api, 'update').mockImplementation(async (_url, payload: any) => {
+            if (update.mock.calls.length > 1) {
+                throw new ApiError(undefined, 400, undefined, { detail })
+            }
+            await firstResponse.promise
+            return { ...V2_FLAG, ...payload, version: payload.version + 1 }
+        })
+
+        logic.actions.saveTagsInline(['checkout'])
+        await wait(300)
+        logic.actions.saveTagsInline([])
+        await wait(300)
+        firstResponse.resolve()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(update.mock.calls.map(([, payload]) => payload)).toEqual([
+            { tags: ['checkout'], version: 3 },
+            { tags: [], version: 4 },
+        ])
+        expect(logic.values.featureFlag).toMatchObject({ tags: ['checkout'], version: 4 })
+        expect(logic.values.originalFeatureFlag).toMatchObject({ tags: ['checkout'], version: 4 })
+        expect(lemonToast.error).toHaveBeenCalledWith(detail)
+    })
+
+    it('starts a blank flag when a duplicate link names this flag', async () => {
+        defaultReleaseConditionsLogic.actions.loadDefaultReleaseConditionsSuccess({
+            enabled: false,
+            default_groups: [],
+        })
+        router.actions.push(`${urls.featureFlag('new')}?sourceId=7`)
+        const newLogic = featureFlagLogic({ id: 'new' })
+        newLogic.mount()
+        await expectLogic(newLogic).toFinishAllListeners()
+
+        expect(lemonToast.error).toHaveBeenCalledWith("This flag's configuration format can't be duplicated yet.")
+        expect(newLogic.values.configFormat).toBe('v1')
+        expect(newLogic.values.featureFlag.key).toBe('')
+        expect(router.values.searchParams.sourceId).toBeUndefined()
+        newLogic.unmount()
+    })
+
+    it('prefills one fully rolled out release condition from a properties link', async () => {
+        defaultReleaseConditionsLogic.actions.loadDefaultReleaseConditionsSuccess({
+            enabled: false,
+            default_groups: [],
+        })
+        const properties: PersonPropertyFilter[] = [
+            {
+                key: 'p_signed_up',
+                type: PropertyFilterType.Person,
+                operator: PropertyOperator.GreaterThanOrEqual,
+                value: 0.6,
+            },
+        ]
+        router.actions.push(urls.featureFlagNew({ properties }))
+        const newLogic = featureFlagLogic({ id: 'new' })
+        newLogic.mount()
+        await expectLogic(newLogic).toFinishAllListeners()
+
+        expect(newLogic.values.featureFlag.filters.groups).toEqual([
+            { properties, rollout_percentage: 100, variant: null },
+        ])
+        newLogic.unmount()
+    })
+
+    it.each([
+        [
+            'splits prefilled variants evenly',
+            urls.featureFlagNew({
+                key: 'checkout-layout',
+                type: 'multivariate',
+                variants: ['control', 'compact', 'wide'],
+            }),
+            'checkout-layout',
+            [
+                { key: 'control', name: '', rollout_percentage: 34 },
+                { key: 'compact', name: '', rollout_percentage: 33 },
+                { key: 'wide', name: '', rollout_percentage: 33 },
+            ],
+        ],
+        [
+            'trims and dedupes hand-written variants',
+            '/feature-flags/new?type=multivariate&variants=control,%20wide,control',
+            '',
+            [
+                { key: 'control', name: '', rollout_percentage: 50 },
+                { key: 'wide', name: '', rollout_percentage: 50 },
+            ],
+        ],
+        [
+            'keeps only as many variants as a flag allows',
+            urls.featureFlagNew({
+                key: 'checkout-layout',
+                type: 'multivariate',
+                variants: Array.from({ length: 25 }, (_, i) => `v${i}`),
+            }),
+            'checkout-layout',
+            Array.from({ length: 20 }, (_, i) => ({ key: `v${i}`, name: '', rollout_percentage: 5 })),
+        ],
+        [
+            'ignores a key and variants the router decodes into objects',
+            '/feature-flags/new?type=multivariate&key={"toString":null}&variants=[{"toString":null},"wide"]',
+            '',
+            [{ key: 'wide', name: '', rollout_percentage: 100 }],
+        ],
+        [
+            'keeps the default variants without a variants param',
+            urls.featureFlagNew({ key: 'checkout-layout', type: 'multivariate' }),
+            'checkout-layout',
+            [
+                { key: 'control', name: '', rollout_percentage: 50 },
+                { key: 'test', name: '', rollout_percentage: 50 },
+            ],
+        ],
+        [
+            'ignores variants on a boolean flag',
+            urls.featureFlagNew({ key: 'checkout-layout', variants: ['control', 'compact'] }),
+            'checkout-layout',
+            null,
+        ],
+        [
+            'drops a key and variants that fail validation',
+            urls.featureFlagNew({
+                key: "x' + (globalThis.injected = true) + '",
+                type: 'multivariate',
+                variants: ['control', "a'b"],
+            }),
+            '',
+            [{ key: 'control', name: '', rollout_percentage: 100 }],
+        ],
+    ])('prefills from the link and %s', async (_label, link, expectedKey, expectedVariants) => {
+        defaultReleaseConditionsLogic.actions.loadDefaultReleaseConditionsSuccess({
+            enabled: false,
+            default_groups: [],
+        })
+        router.actions.push(link)
+        const newLogic = featureFlagLogic({ id: 'new' })
+        newLogic.mount()
+        await expectLogic(newLogic).toFinishAllListeners()
+
+        expect(newLogic.values.featureFlag.key).toBe(expectedKey)
+        expect(newLogic.values.featureFlag.filters.multivariate?.variants ?? null).toEqual(expectedVariants)
+        newLogic.unmount()
+    })
+
+    it('warns on load when the prefilled key is already taken', async () => {
+        defaultReleaseConditionsLogic.actions.loadDefaultReleaseConditionsSuccess({
+            enabled: false,
+            default_groups: [],
+        })
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/`]: () => [
+                    200,
+                    { results: [{ ...NEW_FLAG, id: 42, key: 'taken-key' }], count: 1 },
+                ],
+            },
+        })
+        router.actions.push(urls.featureFlagNew({ key: 'taken-key' }))
+        const newLogic = featureFlagLogic({ id: 'new' })
+        newLogic.mount()
+        await expectLogic(newLogic).toDispatchActions(['checkKeyConflictSuccess']).toFinishAllListeners()
+
+        expect(newLogic.values.currentKeyConflict).toEqual({
+            key: 'taken-key',
+            existingFlagId: 42,
+            existingFlagKey: 'taken-key',
+            exact: true,
+        })
+        newLogic.unmount()
+    })
+})
+
+describe('the editor a flag opens in', () => {
+    const V1_FLAG = { ...NEW_FLAG, id: 8, key: 'v1-flag', version: 1 }
+    const V2_FLAG = {
+        ...NEW_FLAG,
+        id: 7,
+        key: 'rules-v2-flag',
+        version: 3,
+        filters: { version: 2, return_type: 'boolean', default_value: false, rules: [] },
+    }
+
+    beforeEach(() => {
+        silenceKeaLoadersErrors()
+        useMocks({
+            get: {
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/7/`]: () => [200, V2_FLAG],
+                [`/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/8/`]: () => [200, V1_FLAG],
+            },
+        })
+        initKeaTests()
+    })
+
+    afterEach(resumeKeaLoadersErrors)
+
+    async function editorKind(id: 7 | 8 | 'new', editorEnabled: boolean, search = ''): Promise<string | null> {
+        enabledFeaturesLogic.actions.setFeatureFlags([], {
+            [FEATURE_FLAGS.FEATURE_FLAG_RULES_V2_EDITOR]: editorEnabled,
+        })
+        router.actions.push(`${urls.featureFlag(id)}${search}`)
+        const logic = featureFlagLogic({ id })
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+        if (id !== 'new') {
+            logic.actions.editFeatureFlag(true)
+            await expectLogic(logic).toDispatchActions(['loadFeatureFlagSuccess']).toFinishAllListeners()
+        }
+        const kind = logic.values.editorKind
+        logic.unmount()
+        return kind
+    }
+
+    it.each([
+        ['a v1 flag', 'v1', 8, true, ''],
+        ['a v1 flag with the editor off', 'v1', 8, false, ''],
+        ['a v2 flag', 'rules_v2', 7, true, ''],
+        ['a v2 flag with the editor off', null, 7, false, ''],
+        ['a new flag', 'v1', 'new', true, ''],
+        ['a new rules v2 flag', 'rules_v2', 'new', true, '?format=rules_v2'],
+        ['a new rules v2 flag with the editor off', 'v1', 'new', false, '?format=rules_v2'],
+    ] as const)('%s opens the %s editor', async (_label, expected, id, editorEnabled, search) => {
+        expect(await editorKind(id, editorEnabled, search)).toBe(expected)
+    })
+
+    const V2_FLAG_URL = `/api/projects/${MOCK_DEFAULT_PROJECT.id}/feature_flags/7/`
+    const EXPERIMENT_RULE = {
+        id: 'rule-split',
+        rule_type: 'experiment',
+        targeting: { properties: [] },
+        paused: false,
+        variants: [
+            { key: 'control', weight: 50, value: false },
+            { key: 'test', weight: 50, value: true },
+        ],
+        rollout_percentage: 100,
+        on_rollout_miss: 'continue',
+        assignment_algorithm: 'sha1_60_v1',
+        assign_by: 'person',
+        seed: 'stored-seed',
+    }
+
+    it.each([
+        ['a string return type', { return_type: 'string', default_value: 'control' }],
+        [
+            'a number return type',
+            {
+                return_type: 'number',
+                default_value: 1,
+                rules: [
+                    {
+                        ...EXPERIMENT_RULE,
+                        variants: [
+                            { key: 'control', weight: 50, value: 1 },
+                            { key: 'test', weight: 50, value: 2 },
+                        ],
+                    },
+                ],
+            },
+        ],
+        ['an experiment rule', { rules: [EXPERIMENT_RULE] }],
+        [
+            'an experiment rule with a holdout',
+            { rules: [{ ...EXPERIMENT_RULE, holdout: { seed: 'holdout-seed', exclusion_percentage: 5 } }] },
+        ],
+    ])('a v2 flag with %s opens the rules v2 editor', async (_label, filters) => {
+        useMocks({ get: { [V2_FLAG_URL]: () => [200, { ...V2_FLAG, filters: { ...V2_FLAG.filters, ...filters } }] } })
+        expect(await editorKind(7, true)).toBe('rules_v2')
+    })
+
+    // The editor would drop, or rewrite on save, what it cannot represent.
+    it.each([
+        ['an unknown return type', { return_type: 'date', default_value: null }],
+        ['group assignment', { aggregation_group_type_index: 0 }],
+    ])('a v2 flag with %s opens no editor, even with the editor on', async (_label, filters) => {
+        useMocks({ get: { [V2_FLAG_URL]: () => [200, { ...V2_FLAG, filters: { ...V2_FLAG.filters, ...filters } }] } })
+        expect(await editorKind(7, true)).toBeNull()
+    })
+})

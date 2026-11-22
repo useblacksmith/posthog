@@ -1,0 +1,45 @@
+.Playlist {
+    .Playlist__main {
+        flex: 1;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+    }
+
+    &--wide {
+        .Playlist__main {
+            flex: 1;
+            height: 100%;
+        }
+    }
+}
+
+.Playlist__main--stacked .SessionRecordingPlayerWrapper--watch .SessionRecordingPlayerWrapper__player {
+    height: clamp(14rem, 34vh, 32rem);
+}
+
+.NotebookNode__box .Playlist__list {
+    border-right: 1px solid var(--color-border-primary);
+}
+
+.SessionRecordingPlaylistHeightWrapper {
+    flex: 1 1 auto;
+    height: calc(100vh - 12rem);
+    min-height: 25rem;
+}
+
+.SessionRecordingPreview {
+    border-left: 3px solid transparent;
+
+    &--active {
+        border-left-color: var(--color-accent);
+    }
+
+    &--compact.SessionRecordingPreview--active {
+        background-color: var(--color-accent-highlight-secondary);
+    }
+
+    &:hover {
+        background-color: var(--color-accent-highlight-secondary);
+    }
+}

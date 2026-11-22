@@ -1,0 +1,583 @@
+"""
+Tests for Bayesian statistical methods.
+
+This module tests all Bayesian classes for correctness of calculations,
+validation, and edge case handling.
+"""
+
+import re
+from typing import Any
+
+import pytest
+from unittest import TestCase
+
+import numpy as np
+from parameterized import parameterized
+
+from products.experiments.stats.bayesian.method import BayesianConfig, BayesianMethod
+from products.experiments.stats.bayesian.priors import GaussianPrior
+from products.experiments.stats.bayesian.tests import BayesianGaussianTest, BayesianResult
+from products.experiments.stats.bayesian.utils import (
+    calculate_effect_size_and_variance,
+    calculate_posterior,
+    chance_to_win,
+    credible_interval,
+)
+from products.experiments.stats.frequentist.method import FrequentistMethod
+from products.experiments.stats.frequentist.utils import calculate_point_estimate, calculate_variance_pooled
+from products.experiments.stats.shared.enums import DifferenceType
+from products.experiments.stats.shared.statistics import (
+    ProportionStatistic,
+    RatioStatistic,
+    RelativeEffectBaseline,
+    SampleMeanStatistic,
+    StatisticError,
+)
+from products.experiments.stats.tests.test_statistics import (
+    DEGENERATE_QUANTILE_CASES,
+    QUANTILE_CONTROL,
+    QUANTILE_TREATMENT,
+)
+
+
+class TestGaussianPrior:
+    """Tests for GaussianPrior class."""
+
+    def test_validation_errors(self):
+        """Test prior validation."""
+        # Negative variance
+        with pytest.raises(ValueError):
+            GaussianPrior(variance=-1.0)
+
+        # Zero variance
+        with pytest.raises(ValueError):
+            GaussianPrior(variance=0.0)
+
+    def test_string_representation(self):
+        """Test string representation."""
+        # Non-informative prior
+        prior = GaussianPrior()
+        assert str(prior) == "Non-informative prior"
+
+        # Informative prior
+        prior = GaussianPrior(mean=0.05, variance=0.01, proper=True)
+        assert "N(μ=0.050, σ²=0.010)" in str(prior)
+
+
+class TestBayesianConfig(TestCase):
+    """Tests for BayesianConfig class."""
+
+    def test_default_config(self):
+        """Test default configuration."""
+        config = BayesianConfig()
+
+        assert config.ci_level == 0.95
+        assert config.inverse is False
+        assert config.difference_type == DifferenceType.RELATIVE
+        assert config.prior_mean == 0.0
+        assert config.prior_variance == 1.0
+        assert config.proper_prior is False
+
+    def test_create_prior(self):
+        """Test prior creation from config."""
+        config = BayesianConfig(prior_mean=0.05, prior_variance=0.01, proper_prior=True)
+
+        prior = config.create_prior()
+        assert prior.mean == 0.05
+        assert prior.variance == 0.01
+        assert prior.proper is True
+
+    def test_validation_errors(self):
+        """Test config validation."""
+        # Invalid ci_level
+        with pytest.raises(StatisticError):
+            BayesianConfig(ci_level=0.0)
+
+        with pytest.raises(StatisticError):
+            BayesianConfig(ci_level=1.0)
+
+        # Invalid prior variance
+        with pytest.raises(StatisticError):
+            BayesianConfig(prior_variance=0.0)
+
+
+class TestBayesianUtils(TestCase):
+    """Tests for Bayesian utility functions."""
+
+    def test_effect_size_calculation_absolute(self):
+        """Test absolute effect size calculation."""
+
+        # Sample mean statistics - use valid sum_squares
+        treatment = SampleMeanStatistic(n=100, sum=550, sum_squares=3050)  # mean=5.5
+        control = SampleMeanStatistic(n=100, sum=500, sum_squares=2550)  # mean=5.0
+
+        effect, variance = calculate_effect_size_and_variance(treatment, control, DifferenceType.ABSOLUTE)
+
+        assert abs(effect - 0.5) < 1e-10  # 5.5 - 5.0
+        # Calculate actual variances: (sum_squares - sum²/n) / (n-1)
+        treatment_var = (3050 - 550**2 / 100) / 99  # ≈ 0.7576
+        control_var = (2550 - 500**2 / 100) / 99  # ≈ 0.5051
+        expected_variance = treatment_var / 100 + control_var / 100
+        assert abs(variance - expected_variance) < 1e-6
+
+    def test_effect_size_calculation_relative(self):
+        """Test relative effect size calculation."""
+
+        # Proportion statistics
+        treatment = ProportionStatistic(n=1000, sum=110)  # proportion=0.11
+        control = ProportionStatistic(n=1000, sum=100)  # proportion=0.10
+
+        effect, variance = calculate_effect_size_and_variance(treatment, control, DifferenceType.RELATIVE)
+
+        expected_effect = (0.11 - 0.10) / 0.10  # 0.1 = 10% increase
+        assert abs(effect - expected_effect) < 1e-10
+        assert variance > 0  # Should have positive variance
+
+    def test_posterior_calculation(self):
+        """Test Bayesian posterior updating."""
+
+        # Non-informative prior
+        prior = GaussianPrior(proper=False)
+        effect_size = 0.1
+        effect_variance = 0.01
+
+        post_mean, post_var = calculate_posterior(effect_size, effect_variance, prior)
+
+        # With non-informative prior, posterior should equal likelihood
+        assert abs(post_mean - effect_size) < 1e-10
+        assert abs(post_var - effect_variance) < 1e-10
+
+        # Informative prior
+        prior = GaussianPrior(mean=0.05, variance=0.02, proper=True)
+        post_mean, post_var = calculate_posterior(effect_size, effect_variance, prior)
+
+        # Should be weighted average between prior and data
+        assert 0.05 < post_mean < 0.1  # Between prior mean and data
+        assert post_var < min(0.02, 0.01)  # Less than both prior and data variance
+
+    def test_chance_to_win(self):
+        """Test chance to win calculation."""
+
+        # Clearly positive effect
+        prob = chance_to_win(0.1, 0.01, inverse=False)
+        assert prob > 0.99  # Very high probability
+
+        # Clearly negative effect
+        prob = chance_to_win(-0.1, 0.01, inverse=False)
+        assert prob < 0.01  # Very low probability
+
+        # Test inverse logic (lower is better)
+        prob = chance_to_win(-0.1, 0.01, inverse=True)
+        assert prob > 0.99  # High probability for negative effect when inverse=True
+
+    def test_credible_interval(self):
+        """Test credible interval calculation."""
+
+        # 95% credible interval
+        lower, upper = credible_interval(0.1, 0.05, alpha=0.05)
+
+        assert lower < 0.1 < upper  # Mean should be in interval
+        assert upper - lower > 0.15  # Should be reasonably wide for this std dev
+
+        # 99% credible interval should be wider
+        lower_99, upper_99 = credible_interval(0.1, 0.05, alpha=0.01)
+        assert upper_99 - lower_99 > upper - lower
+
+
+class TestBayesianGaussianTest(TestCase):
+    """Tests for BayesianGaussianTest class."""
+
+    def test_basic_test_execution(self):
+        """Test basic Bayesian Gaussian test execution."""
+        test = BayesianGaussianTest(ci_level=0.95)
+
+        # Create test data
+        treatment = SampleMeanStatistic(n=100, sum=550, sum_squares=3050)
+        control = SampleMeanStatistic(n=100, sum=500, sum_squares=2550)
+        prior = GaussianPrior()
+
+        result = test.run_test(treatment, control, prior, DifferenceType.RELATIVE)
+
+        # Check result structure
+        assert isinstance(result, BayesianResult)
+        assert 0 <= result.chance_to_win <= 1
+        assert len(result.credible_interval) == 2
+        assert result.credible_interval[0] < result.credible_interval[1]
+        assert result.ci_level == 0.95
+        assert result.difference_type == "relative"
+
+    def test_proportion_test(self):
+        """Test with proportion statistics."""
+        test = BayesianGaussianTest()
+
+        # Conversion rate test: 11% vs 10%
+        treatment = ProportionStatistic(n=1000, sum=110)
+        control = ProportionStatistic(n=1000, sum=100)
+        prior = GaussianPrior()
+
+        result = test.run_test(treatment, control, prior, DifferenceType.RELATIVE)
+
+        assert result.effect_size > 0  # Treatment should be better
+        assert result.chance_to_win > 0.5  # Should favor treatment
+
+    def test_invalid_inputs(self):
+        """Test with invalid inputs."""
+        test = BayesianGaussianTest()
+
+        treatment = SampleMeanStatistic(n=100, sum=550, sum_squares=3050)
+        control = ProportionStatistic(n=100, sum=50)  # Different type!
+        prior = GaussianPrior()
+
+        # Should raise error for mismatched types
+        with pytest.raises(StatisticError):
+            test.run_test(treatment, control, prior)
+
+
+class TestBayesianMethod(TestCase):
+    """Tests for BayesianMethod class."""
+
+    def test_basic_method_usage(self):
+        """Test basic BayesianMethod usage."""
+        method = BayesianMethod()
+
+        treatment = SampleMeanStatistic(n=100, sum=550, sum_squares=3050)
+        control = SampleMeanStatistic(n=100, sum=500, sum_squares=2550)
+
+        result = method.run_test(treatment, control)
+
+        assert isinstance(result, BayesianResult)
+        assert result.effect_size > 0  # Treatment is better
+        assert result.chance_to_win > 0.5
+
+    def test_with_informative_prior(self):
+        """Test with informative prior."""
+        config = BayesianConfig(prior_mean=0.05, prior_variance=0.01, proper_prior=True)
+        method = BayesianMethod(config)
+
+        treatment = SampleMeanStatistic(n=100, sum=550, sum_squares=3050)
+        control = SampleMeanStatistic(n=100, sum=500, sum_squares=2550)
+
+        result = method.run_test(treatment, control)
+
+        # Prior should influence the result
+        assert result.proper_prior is True
+        assert result.prior_mean == 0.05
+        assert result.prior_variance == 0.01
+
+    def test_realistic_example(self):
+        """Test basic two-sided t-test with sample mean statistics."""
+        treatment = SampleMeanStatistic(sum=1922.7, sum_squares=94698.29, n=2461)
+        control = SampleMeanStatistic(sum=1196.87, sum_squares=37377.9767, n=2507)
+
+        config = BayesianConfig(ci_level=0.95, difference_type=DifferenceType.RELATIVE)
+        method = BayesianMethod(config)
+        result = method.run_test(treatment, control)
+
+        expected_dict: dict[str, Any] = {
+            "effect_size": 0.63646,
+            "credible_interval": [-0.0873, 1.36026],
+            "chance_to_win": 0.95759,
+            "error_message": None,
+        }
+
+        # Compare the key values
+        self.assertAlmostEqual(result.effect_size, expected_dict["effect_size"], places=4)
+        credible_interval_result = result.credible_interval
+        self.assertAlmostEqual(credible_interval_result[0], expected_dict["credible_interval"][0], places=4)
+        self.assertAlmostEqual(credible_interval_result[1], expected_dict["credible_interval"][1], places=4)
+        self.assertAlmostEqual(result.chance_to_win, expected_dict["chance_to_win"], places=4)
+
+    def test_two_sided_ttest_with_ratio_statistic(self):
+        """Test basic two-sided t-test with ratio statistics."""
+
+        treatment_n = 2034
+        treatment = RatioStatistic(
+            n=treatment_n,
+            m_statistic=SampleMeanStatistic(n=treatment_n, sum=99673.9364269569, sum_squares=11298745.182728939),
+            d_statistic=SampleMeanStatistic(n=treatment_n, sum=947, sum_squares=947),
+            m_d_sum_of_products=99673.9364269569,
+        )
+        control_n = 1966
+        control = RatioStatistic(
+            n=control_n,
+            m_statistic=SampleMeanStatistic(n=control_n, sum=94605.79858780127, sum_squares=10463129.505392816),
+            d_statistic=SampleMeanStatistic(n=control_n, sum=936, sum_squares=936),
+            m_d_sum_of_products=94605.79858780127,
+        )
+
+        config = BayesianConfig(ci_level=0.95, difference_type=DifferenceType.RELATIVE)
+        method = BayesianMethod(config)
+        result = method.run_test(treatment, control)
+
+        expected_dict: dict[str, Any] = {
+            "effect_size": 0.041333,
+            "credible_interval": [0.01378609, 0.0689],
+            "chance_to_win": 0.99836,
+            "error_message": None,
+        }
+
+        # Compare the key values
+        self.assertAlmostEqual(result.effect_size, expected_dict["effect_size"], places=4)
+        self.assertAlmostEqual(result.chance_to_win, expected_dict["chance_to_win"], places=4)
+        credible_interval_result = result.credible_interval
+        self.assertAlmostEqual(credible_interval_result[0], expected_dict["credible_interval"][0], places=4)
+        self.assertAlmostEqual(credible_interval_result[1], expected_dict["credible_interval"][1], places=4)
+
+    @parameterized.expand(
+        [
+            (
+                "absolute",
+                DifferenceType.ABSOLUTE,
+                1.415000000000001,
+                (0.08583772923349264, 2.744162270766509),
+                0.9815350910332983,
+            ),
+            (
+                "relative",
+                DifferenceType.RELATIVE,
+                0.12982842462611258,
+                (0.0031120207966113256, 0.2565448284556138),
+                0.9776835938774414,
+            ),
+        ]
+    )
+    def test_gaussian_test_with_quantile_statistic(self, _name, difference_type, effect, interval, chance_to_win):
+        method = BayesianMethod(BayesianConfig(ci_level=0.95, difference_type=difference_type))
+        result = method.run_test(QUANTILE_TREATMENT, QUANTILE_CONTROL)
+
+        self.assertAlmostEqual(result.effect_size, effect, places=12)
+        self.assertAlmostEqual(result.credible_interval[0], interval[0], places=10)
+        self.assertAlmostEqual(result.credible_interval[1], interval[1], places=10)
+        self.assertAlmostEqual(result.chance_to_win, chance_to_win, places=10)
+
+    @parameterized.expand(DEGENERATE_QUANTILE_CASES)
+    def test_rejects_quantile_without_usable_variance(self, _name, treatment, control, error):
+        with self.assertRaisesRegex(StatisticError, re.escape(f"Treatment statistic validation failed: {error}")):
+            BayesianMethod().run_test(treatment, control)
+
+
+class TestConvenienceFunctions:
+    """Tests for convenience functions."""
+
+    def test_run_simple_bayesian_test(self):
+        """Test run_simple_bayesian_test function."""
+        treatment = ProportionStatistic(n=1000, sum=110)
+        control = ProportionStatistic(n=1000, sum=100)
+
+        config = BayesianConfig(
+            ci_level=0.95,
+            inverse=False,
+            difference_type=DifferenceType.RELATIVE,
+            prior_mean=0.05,
+            prior_variance=0.01,
+            proper_prior=True,
+        )
+        method = BayesianMethod(config)
+
+        result = method.run_test(treatment, control)
+
+        assert isinstance(result, BayesianResult)
+        assert result.chance_to_win > 0.5  # Treatment should be favored
+
+
+class TestEdgeCases:
+    """Tests for edge cases and error conditions."""
+
+    def test_zero_control_mean_relative(self):
+        """Test relative difference with zero control mean."""
+        method = BayesianMethod()
+
+        treatment = SampleMeanStatistic(n=100, sum=100, sum_squares=100)  # mean=1
+        control = SampleMeanStatistic(n=100, sum=0, sum_squares=0)  # mean=0
+
+        # Should raise error for relative difference
+        with pytest.raises(StatisticError):
+            method.run_test(treatment, control)
+
+    def test_very_small_variances(self):
+        """Test with very small variances."""
+        method = BayesianMethod()
+
+        # Almost identical groups (very small variance)
+        # Use valid sum_squares: must be >= sum²/n
+        treatment = SampleMeanStatistic(n=1000, sum=10000, sum_squares=100001)  # mean=10, tiny variance
+        control = SampleMeanStatistic(n=1000, sum=9999, sum_squares=99990.001)  # mean≈10, tiny variance
+
+        result = method.run_test(treatment, control)
+
+        # Should still work, just with tight intervals
+        assert isinstance(result, BayesianResult)
+        assert result.posterior_variance > 0
+
+    def test_extreme_sample_sizes(self):
+        """Test with extreme sample sizes."""
+        method = BayesianMethod()
+
+        # Very small sample sizes
+        treatment = SampleMeanStatistic(n=2, sum=3, sum_squares=5)
+        control = SampleMeanStatistic(n=2, sum=2, sum_squares=2)
+
+        result = method.run_test(treatment, control)
+
+        # Should have high uncertainty
+        assert result.posterior_variance > 0
+        assert 0.1 < result.chance_to_win < 0.9  # Should be uncertain
+
+    def test_mismatched_statistic_types(self):
+        """Test with mismatched statistic types."""
+        method = BayesianMethod()
+
+        treatment = SampleMeanStatistic(n=100, sum=550, sum_squares=3050)
+        control = ProportionStatistic(n=100, sum=50)
+
+        with pytest.raises(StatisticError):
+            method.run_test(treatment, control)
+
+
+def _sample_mean_stat(n: int, mean: float, variance: float) -> SampleMeanStatistic:
+    total = n * mean
+    return SampleMeanStatistic(n=n, sum=total, sum_squares=(n - 1) * variance + total**2 / n)
+
+
+class TestRelativeEffectSignedBaseline(TestCase):
+    @parameterized.expand(
+        [
+            ("negative_baseline_metric_rises", -10.0, -5.0, 0.5),
+            ("negative_baseline_metric_falls", -8.0, -9.2, -0.15),
+            ("baseline_crosses_zero", -4.0, 2.0, 1.5),
+            ("positive_baseline_metric_rises", 8.0, 9.2, 0.15),
+        ]
+    )
+    def test_relative_effect_is_divided_by_baseline_magnitude(
+        self, _name: str, control_mean: float, treatment_mean: float, expected_relative: float
+    ) -> None:
+        treatment = _sample_mean_stat(n=2000, mean=treatment_mean, variance=36.0)
+        control = _sample_mean_stat(n=2500, mean=control_mean, variance=25.0)
+        expected_variance = 36.0 / 2000 / control_mean**2 + treatment_mean**2 * 25.0 / 2500 / control_mean**4
+
+        frequentist = FrequentistMethod().run_test(treatment, control)
+        bayesian = BayesianMethod().run_test(treatment, control)
+        _, bayesian_variance = calculate_effect_size_and_variance(treatment, control, DifferenceType.RELATIVE)
+
+        assert frequentist.point_estimate == pytest.approx(expected_relative)
+        assert bayesian.effect_size == pytest.approx(expected_relative)
+        assert calculate_variance_pooled(treatment, control, DifferenceType.RELATIVE) == pytest.approx(
+            expected_variance
+        )
+        assert bayesian_variance == pytest.approx(expected_variance)
+        assert (bayesian.chance_to_win > 0.5) == (expected_relative > 0)
+        assert (frequentist.confidence_interval[0] > 0) == (expected_relative > 0)
+
+    def test_negating_both_arms_flips_effects_and_keeps_variance(self) -> None:
+        treatment = _sample_mean_stat(n=1500, mean=-6.0, variance=16.0)
+        control = _sample_mean_stat(n=1500, mean=-7.5, variance=20.0)
+        negated_treatment = _sample_mean_stat(n=1500, mean=6.0, variance=16.0)
+        negated_control = _sample_mean_stat(n=1500, mean=7.5, variance=20.0)
+
+        for difference_type, expected in [(DifferenceType.ABSOLUTE, 1.5), (DifferenceType.RELATIVE, 1.5 / 7.5)]:
+            effect = calculate_point_estimate(treatment, control, difference_type)
+            negated_effect = calculate_point_estimate(negated_treatment, negated_control, difference_type)
+            bayesian_effect, bayesian_variance = calculate_effect_size_and_variance(treatment, control, difference_type)
+            negated_bayesian_effect, negated_bayesian_variance = calculate_effect_size_and_variance(
+                negated_treatment, negated_control, difference_type
+            )
+
+            assert effect == pytest.approx(expected)
+            assert negated_effect == pytest.approx(-expected)
+            assert bayesian_effect == pytest.approx(expected)
+            assert negated_bayesian_effect == pytest.approx(-expected)
+            assert calculate_variance_pooled(treatment, control, difference_type) == pytest.approx(
+                calculate_variance_pooled(negated_treatment, negated_control, difference_type)
+            )
+            assert bayesian_variance == pytest.approx(negated_bayesian_variance)
+
+    @parameterized.expand(
+        [
+            ("frequentist", 0.0, lambda t, c: FrequentistMethod().run_test(t, c)),
+            ("bayesian", 0.0, lambda t, c: BayesianMethod().run_test(t, c)),
+            (
+                "frequentist_cuped_baseline",
+                2.0,
+                lambda t, c: FrequentistMethod().run_test(
+                    t,
+                    c,
+                    relative_effect_baseline=RelativeEffectBaseline(mean=0.0, variance=0.0, difference_covariance=0.0),
+                ),
+            ),
+            (
+                "bayesian_cuped_baseline",
+                2.0,
+                lambda t, c: BayesianMethod().run_test(
+                    t,
+                    c,
+                    relative_effect_baseline=RelativeEffectBaseline(
+                        mean=1e-12, variance=0.0, difference_covariance=0.0
+                    ),
+                ),
+            ),
+        ]
+    )
+    def test_zero_baseline_is_rejected(self, _name: str, control_mean: float, run_test: Any) -> None:
+        treatment = _sample_mean_stat(n=500, mean=3.0, variance=4.0)
+        control = _sample_mean_stat(n=500, mean=control_mean, variance=4.0)
+
+        with pytest.raises(StatisticError, match="Baseline mean is zero"):
+            run_test(treatment, control)
+
+    @parameterized.expand(
+        [
+            ("frequentist", lambda t, c: FrequentistMethod().run_test(t, c)),
+            ("bayesian", lambda t, c: BayesianMethod().run_test(t, c)),
+        ]
+    )
+    def test_zero_treatment_without_spread_is_rejected(self, _name: str, run_test: Any) -> None:
+        treatment = _sample_mean_stat(n=100, mean=0.0, variance=0.0)
+        control = _sample_mean_stat(n=100, mean=2.5, variance=2.25)
+
+        with pytest.raises(StatisticError, match="variance must be positive"):
+            run_test(treatment, control)
+
+
+class TestNumericalStability:
+    """Tests for numerical stability and precision."""
+
+    def test_large_numbers(self):
+        """Test with large numbers."""
+        method = BayesianMethod()
+
+        # Large sums but reasonable means - ensure valid sum_squares
+        treatment = SampleMeanStatistic(n=1000000, sum=10500000, sum_squares=110250001)  # mean=10.5
+        control = SampleMeanStatistic(n=1000000, sum=10000000, sum_squares=100000001)  # mean=10
+
+        result = method.run_test(treatment, control)
+
+        assert np.isfinite(result.effect_size)
+        assert np.isfinite(result.posterior_variance)
+        assert 0 <= result.chance_to_win <= 1
+
+    def test_small_differences(self):
+        """Test with very small effect sizes."""
+        method = BayesianMethod()
+
+        # Very small difference - ensure valid sum_squares (must be >= sum²/n)
+        treatment = SampleMeanStatistic(n=10000, sum=10001, sum_squares=10002.0002)  # mean≈1.0001
+        control = SampleMeanStatistic(n=10000, sum=10000, sum_squares=10000.0001)  # mean=1.0000
+
+        result = method.run_test(treatment, control)
+
+        assert np.isfinite(result.effect_size)
+        assert result.effect_size > 0  # Should detect small positive effect
+
+    def test_precision_loss_protection(self):
+        """Test protection against precision loss."""
+        method = BayesianMethod()
+
+        # Case that passes normal approximation validation
+        treatment = ProportionStatistic(n=1000, sum=10)  # 1% proportion
+        control = ProportionStatistic(n=1000, sum=5)  # 0.5% proportion
+
+        result = method.run_test(treatment, control, difference_type=DifferenceType.ABSOLUTE)
+
+        # Should handle this gracefully
+        assert np.isfinite(result.effect_size)
+        assert result.posterior_variance > 0

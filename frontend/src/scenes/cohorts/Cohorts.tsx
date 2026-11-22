@@ -1,0 +1,337 @@
+import './Cohorts.scss'
+
+import { useActions, useValues } from 'kea'
+import { combineUrl, router } from 'kea-router'
+
+import { LemonBanner, LemonInput, LemonSelect } from '@posthog/lemon-ui'
+import { Button } from '@posthog/quill'
+
+import { MemberSelect } from 'lib/components/MemberSelect'
+import { Shortcut } from 'lib/components/Shortcuts/Shortcut'
+import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
+import ViewRecordingsPlaylistButton from 'lib/components/ViewRecordingButton/ViewRecordingsPlaylistButton'
+import { dayjs } from 'lib/dayjs'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { More } from 'lib/lemon-ui/LemonButton/More'
+import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
+import { LemonTable, LemonTableColumn, LemonTableColumns } from 'lib/lemon-ui/LemonTable'
+import { createdAtColumn, createdByColumn } from 'lib/lemon-ui/LemonTable/columnUtils'
+import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
+import { Spinner } from 'lib/lemon-ui/Spinner/Spinner'
+import { getAccessControlDisabledReason } from 'lib/utils/accessControlUtils'
+import { PeopleSceneHeader } from 'scenes/activity/PeopleSceneHeader'
+import { cohortsSceneLogic } from 'scenes/cohorts/cohortsSceneLogic'
+import { openDeleteCohortDialog } from 'scenes/cohorts/DeleteCohortDialog'
+import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { ProductKey } from '~/queries/schema/schema-general'
+import {
+    AccessControlLevel,
+    AccessControlResourceType,
+    CohortType,
+    FilterLogicalOperator,
+    PropertyFilterType,
+    PropertyOperator,
+} from '~/types'
+
+import { cohortsEmptyState } from 'products/cohorts/frontend/emptyState/cohortsEmptyState'
+import { CohortRealtimeTag } from 'products/cohorts/frontend/realtime/CohortRealtimeTag'
+import { RealtimeCohortsJoinBanner } from 'products/cohorts/frontend/realtime/RealtimeCohortsJoinBanner'
+import { RealtimeCohortsWaitlistBanner } from 'products/cohorts/frontend/realtime/RealtimeCohortsWaitlistBanner'
+import { useRealtimeCohortsServing } from 'products/cohorts/frontend/realtime/useRealtimeCohortsServing'
+
+export const scene: SceneExport = {
+    component: Cohorts,
+    logic: cohortsSceneLogic,
+    productKey: ProductKey.PRODUCT_ANALYTICS,
+    emptyState: cohortsEmptyState,
+}
+
+export function Cohorts(): JSX.Element {
+    const { cohorts, cohortsLoading, pagination, cohortFilters, cohortSorting, cohortsLoadError } =
+        useValues(cohortsSceneLogic)
+    const { deleteCohort, exportCohortPersons, setCohortFilters, setCohortSorting, loadCohorts } =
+        useActions(cohortsSceneLogic)
+    const { searchParams } = useValues(router)
+    const realtimeTargetingEnabled = useRealtimeCohortsServing()
+    const todayRailNav = useFeatureFlag('TODAY_RAIL_NAV')
+
+    // Creating an export requires editor access to the export resource.
+    const exportAccessControlDisabledReason = getAccessControlDisabledReason(
+        AccessControlResourceType.Export,
+        AccessControlLevel.Editor
+    )
+
+    const columns: LemonTableColumns<CohortType> = [
+        {
+            title: 'Name',
+            dataIndex: 'name',
+            width: '30%',
+            sorter: (a, b) => (a.name || '').localeCompare(b.name || ''),
+            render: function Render(name, { id, description, realtime }) {
+                return (
+                    <LemonTableLink
+                        to={combineUrl(urls.cohort(id), searchParams).url}
+                        // In the title rather than beside the link, so a row with a description
+                        // keeps the state on the name's line instead of wrapping under it.
+                        title={
+                            <>
+                                {name || 'Untitled'}
+                                <CohortRealtimeTag realtime={realtime} />
+                            </>
+                        }
+                        description={description}
+                    />
+                )
+            },
+        },
+        {
+            title: 'Users in cohort',
+            align: 'right',
+            render: function RenderCount(_: any, cohort: CohortType) {
+                return cohort.count?.toLocaleString()
+            },
+            dataIndex: 'count',
+            sorter: (a, b) => (a.count || 0) - (b.count || 0),
+        },
+        createdByColumn<CohortType>() as LemonTableColumn<CohortType, keyof CohortType | undefined>,
+        createdAtColumn<CohortType>() as LemonTableColumn<CohortType, keyof CohortType | undefined>,
+        {
+            title: 'Last calculated',
+            tooltip: realtimeTargetingEnabled
+                ? 'When PostHog last worked out who belongs to this cohort. That count is what insights, breakdowns and the people list use, and it is recalculated once a day and whenever the cohort is edited.'
+                : 'PostHog calculates what users belong to each cohort. This is then used when filtering on cohorts in the Trends page etc. Calculating happens every 24 hours, or whenever a cohort is updated',
+            render: function RenderCalculation(_: any, cohort: CohortType) {
+                if (cohort.is_static) {
+                    return <>N/A</>
+                }
+                return cohort.is_calculating ? (
+                    <span className="flex items-center">
+                        in progress <Spinner className="ml-2" />
+                    </span>
+                ) : (
+                    dayjs(cohort.last_calculation).fromNow()
+                )
+            },
+        },
+        {
+            width: 0,
+            render: function RenderActions(_, cohort) {
+                const cohortId = typeof cohort.id === 'number' ? cohort.id : null
+                return (
+                    <More
+                        overlay={
+                            <>
+                                <LemonButton to={urls.cohort(cohort.id)} fullWidth>
+                                    Edit
+                                </LemonButton>
+                                {cohortId && (
+                                    <ViewRecordingsPlaylistButton
+                                        filters={{
+                                            filter_group: {
+                                                type: FilterLogicalOperator.And,
+                                                values: [
+                                                    {
+                                                        type: FilterLogicalOperator.And,
+                                                        values: [
+                                                            {
+                                                                type: PropertyFilterType.Cohort,
+                                                                key: 'id',
+                                                                operator: PropertyOperator.In,
+                                                                value: cohortId,
+                                                            },
+                                                        ],
+                                                    },
+                                                ],
+                                            },
+                                        }}
+                                        fullWidth
+                                        label="View session recordings"
+                                        data-attr="cohort-view-recordings"
+                                    />
+                                )}
+                                <LemonButton
+                                    onClick={() =>
+                                        exportCohortPersons(cohort.id, [
+                                            'distinct_ids.0',
+                                            'id',
+                                            'name',
+                                            'properties.email',
+                                        ])
+                                    }
+                                    tooltip="Export specific columns for users belonging to this cohort in CSV format. Includes distinct id, internal id, email, and name"
+                                    disabledReason={exportAccessControlDisabledReason ?? undefined}
+                                    fullWidth
+                                >
+                                    Export important columns for users
+                                </LemonButton>
+                                <LemonButton
+                                    onClick={() => exportCohortPersons(cohort.id)}
+                                    tooltip="Export all users belonging to this cohort in CSV format."
+                                    disabledReason={exportAccessControlDisabledReason ?? undefined}
+                                    fullWidth
+                                >
+                                    Export all columns for users
+                                </LemonButton>
+                                <LemonDivider />
+                                <LemonButton
+                                    status="danger"
+                                    onClick={() => {
+                                        openDeleteCohortDialog({
+                                            cohortId: cohort.id,
+                                            cohortName: cohort.name,
+                                            onConfirm: () =>
+                                                deleteCohort({ id: cohort.id, name: cohort.name, deleted: true }),
+                                        })
+                                    }}
+                                    fullWidth
+                                >
+                                    Delete cohort
+                                </LemonButton>
+                            </>
+                        }
+                    />
+                )
+            },
+        },
+    ]
+
+    const filtersSection = (
+        <div className="flex justify-between gap-2 flex-wrap">
+            <Shortcut
+                name="SearchCohorts"
+                keybind={[keyBinds.filter]}
+                intent="Search cohorts"
+                interaction="click"
+                scope={Scene.Cohorts}
+            >
+                <LemonInput
+                    className="w-60"
+                    type="search"
+                    placeholder="Search for cohorts"
+                    onChange={(search) => {
+                        setCohortFilters({ search: search || undefined, page: 1 })
+                    }}
+                    value={cohortFilters.search}
+                />
+            </Shortcut>
+
+            <div className="flex items-center gap-2">
+                <span>
+                    <b>Type</b>
+                </span>
+                <LemonSelect
+                    dropdownMatchSelectWidth={false}
+                    size="small"
+                    onChange={(type) => {
+                        if (type) {
+                            if (type === 'all') {
+                                setCohortFilters({ type: undefined, page: 1 })
+                            } else {
+                                setCohortFilters({ type, page: 1 })
+                            }
+                        }
+                    }}
+                    options={[
+                        { label: 'All', value: 'all' },
+                        { label: 'Static', value: 'static' },
+                        { label: 'Dynamic', value: 'dynamic' },
+                    ]}
+                    value={cohortFilters.type ?? 'all'}
+                    data-attr="cohorts-filter-select-type"
+                />
+                <span className="ml-1">
+                    <b>Created by</b>
+                </span>
+                <MemberSelect
+                    defaultLabel="Any user"
+                    value={cohortFilters.created_by_id ?? null}
+                    onChange={(user) => {
+                        if (!user) {
+                            if (cohortFilters) {
+                                const { created_by_id, ...restFilters } = cohortFilters
+                                setCohortFilters({ ...restFilters, page: 1 }, true)
+                            }
+                        } else {
+                            setCohortFilters({ created_by_id: user.id, page: 1 })
+                        }
+                    }}
+                    data-attr="cohort-filters-select-created-by"
+                />
+            </div>
+        </div>
+    )
+
+    return (
+        <SceneContent>
+            <PeopleSceneHeader
+                activeKey="cohorts"
+                name={sceneConfigurations[Scene.Cohorts].name}
+                description={sceneConfigurations[Scene.Cohorts].description}
+                resourceType={{
+                    type: sceneConfigurations[Scene.Cohorts].iconType || 'default_icon_type',
+                }}
+                actions={
+                    <Shortcut
+                        name="NewCohort"
+                        keybind={[keyBinds.new]}
+                        intent="New cohort"
+                        interaction="click"
+                        scope={Scene.Cohorts}
+                    >
+                        {todayRailNav ? (
+                            <Button
+                                variant="primary"
+                                data-attr="new-cohort"
+                                onClick={() => router.actions.push(urls.cohort('new'))}
+                                tooltip="New cohort"
+                            >
+                                New cohort
+                            </Button>
+                        ) : (
+                            <LemonButton
+                                type="primary"
+                                size="small"
+                                data-attr="new-cohort"
+                                onClick={() => router.actions.push(urls.cohort('new'))}
+                                tooltip="New cohort"
+                            >
+                                New cohort
+                            </LemonButton>
+                        )}
+                    </Shortcut>
+                }
+            />
+
+            <RealtimeCohortsWaitlistBanner />
+            <RealtimeCohortsJoinBanner />
+
+            <div>{filtersSection}</div>
+            <LemonTable
+                columns={columns}
+                loading={cohortsLoading}
+                rowKey="id"
+                pagination={pagination}
+                dataSource={cohorts.results}
+                nouns={['cohort', 'cohorts']}
+                emptyState={
+                    cohortsLoadError ? (
+                        <LemonBanner type="error" action={{ children: 'Try again', onClick: () => loadCohorts() }}>
+                            There was an error loading cohorts: {cohortsLoadError}
+                        </LemonBanner>
+                    ) : undefined
+                }
+                data-attr="cohorts-table"
+                sorting={cohortSorting}
+                onSort={(sorting) => {
+                    setCohortSorting(sorting)
+                }}
+                useURLForSorting={false}
+            />
+        </SceneContent>
+    )
+}

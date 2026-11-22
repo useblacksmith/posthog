@@ -1,0 +1,322 @@
+from datetime import UTC, datetime
+
+from posthog.test.base import APIBaseTest
+from unittest.mock import patch
+
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
+
+from posthog.models.team.team import Team
+
+from products.data_modeling.backend.facade.models import DataModelingJob, DataModelingJobEngine, DataWarehouseSavedQuery
+from products.data_warehouse.backend.presentation.views.data_modeling_job import DataModelingJobPagination
+
+
+class TestDataModelingJob(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.other_team = Team.objects.create(organization=self.organization)
+        self.saved_query = DataWarehouseSavedQuery.objects.create(team=self.team, name="Test saved query")
+        self.other_team_saved_query = DataWarehouseSavedQuery.objects.create(
+            team=self.other_team, name="Other team saved query"
+        )
+
+        self.job1 = DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=self.saved_query,
+            status=DataModelingJob.Status.COMPLETED,
+            rows_materialized=100,
+            last_run_at=timezone.now(),
+        )
+
+        self.job2 = DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=self.saved_query,
+            status=DataModelingJob.Status.RUNNING,
+            rows_materialized=50,
+            last_run_at=timezone.now(),
+        )
+
+        self.job3 = DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=self.saved_query,
+            status=DataModelingJob.Status.FAILED,
+            rows_materialized=0,
+            error="Something went wrong",
+            last_run_at=timezone.now(),
+        )
+
+        # Another team's job
+        self.other_team_job = DataModelingJob.objects.create(
+            team=self.other_team,
+            saved_query=self.other_team_saved_query,
+            status=DataModelingJob.Status.COMPLETED,
+            rows_materialized=200,
+            last_run_at=timezone.now(),
+        )
+
+    def test_list_data_modeling_jobs(self):
+        response = self.client.get(f"/api/environments/{self.team.pk}/data_modeling_jobs/")
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertIn("results", data)
+        results = data["results"]
+        self.assertEqual(len(results), 3)
+
+        # Most recent should be first
+        job_ids = [job["id"] for job in results]
+        expected_ids = [str(job.id) for job in [self.job3, self.job2, self.job1]]
+        self.assertEqual(job_ids, expected_ids)
+
+        first_job = results[0]
+        self.assertEqual(first_job["status"], DataModelingJob.Status.FAILED)
+        self.assertEqual(first_job["saved_query_id"], str(self.saved_query.id))
+        self.assertEqual(first_job["saved_query_name"], "Test saved query")
+        self.assertFalse(first_job["saved_query_deleted"])
+        self.assertEqual(first_job["rows_materialized"], 0)
+        self.assertEqual(first_job["error"], "Something went wrong")
+        # The frontend derives failed-run duration and the log-search window from updated_at.
+        self.assertIsNotNone(first_job["updated_at"])
+
+    def test_retrieve_data_modeling_job(self):
+        response = self.client.get(f"/api/environments/{self.team.pk}/data_modeling_jobs/{self.job1.id}/")
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertEqual(data["id"], str(self.job1.id))
+        self.assertEqual(data["status"], DataModelingJob.Status.COMPLETED)
+        self.assertEqual(data["rows_materialized"], 100)
+        other_saved_query = DataWarehouseSavedQuery.objects.create(team=self.team, name="Another saved query")
+        other_job = DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=other_saved_query,
+            status=DataModelingJob.Status.COMPLETED,
+            rows_materialized=75,
+            last_run_at=timezone.now(),
+        )
+
+        response = self.client.get(
+            f"/api/environments/{self.team.pk}/data_modeling_jobs/?saved_query_id={self.saved_query.id}"
+        )
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertIn("results", data)
+        results = data["results"]
+        self.assertEqual(len(results), 3)
+        self.assertNotIn(str(other_job.id), [job["id"] for job in results])
+
+        response = self.client.get(
+            f"/api/environments/{self.team.pk}/data_modeling_jobs/?saved_query_id={other_saved_query.id}"
+        )
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertIn("results", data)
+        results = data["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], str(other_job.id))
+
+    def test_filters_by_status(self):
+        response = self.client.get(
+            f"/api/environments/{self.team.pk}/data_modeling_jobs/?status={DataModelingJob.Status.FAILED}"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([job["id"] for job in response.json()["results"]], [str(self.job3.id)])
+
+    def test_filters_by_saved_query_ids(self):
+        included_query = DataWarehouseSavedQuery.objects.create(team=self.team, name="Included query")
+        included_job = DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=included_query,
+            status=DataModelingJob.Status.COMPLETED,
+            last_run_at=timezone.now(),
+        )
+        excluded_query = DataWarehouseSavedQuery.objects.create(team=self.team, name="Excluded query")
+        excluded_job = DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=excluded_query,
+            status=DataModelingJob.Status.COMPLETED,
+            last_run_at=timezone.now(),
+        )
+
+        response = self.client.get(
+            f"/api/environments/{self.team.pk}/data_modeling_jobs/",
+            {"saved_query_ids": f"{self.saved_query.id},{included_query.id}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        job_ids = {job["id"] for job in response.json()["results"]}
+        self.assertEqual(job_ids, {str(self.job1.id), str(self.job2.id), str(self.job3.id), str(included_job.id)})
+        self.assertNotIn(str(excluded_job.id), job_ids)
+
+    def test_filters_by_finished_date_range(self):
+        DataModelingJob.objects.filter(id=self.job1.id).update(last_run_at=datetime(2026, 10, 10, tzinfo=UTC))
+        DataModelingJob.objects.filter(id=self.job2.id).update(last_run_at=datetime(2026, 10, 11, tzinfo=UTC))
+        DataModelingJob.objects.filter(id=self.job3.id).update(last_run_at=datetime(2026, 10, 12, tzinfo=UTC))
+
+        response = self.client.get(
+            f"/api/environments/{self.team.pk}/data_modeling_jobs/",
+            {"after": "2026-10-11T00:00:00Z", "before": "2026-10-12T00:00:00Z"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([job["id"] for job in response.json()["results"]], [str(self.job2.id)])
+
+    def test_excludes_managed_warehouse_jobs(self):
+        warehouse_job = DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=self.saved_query,
+            status=DataModelingJob.Status.COMPLETED,
+            engine=DataModelingJobEngine.MANAGED_WAREHOUSE,
+            last_run_at=timezone.now(),
+        )
+
+        response = self.client.get(f"/api/environments/{self.team.pk}/data_modeling_jobs/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(str(warehouse_job.id), [job["id"] for job in response.json()["results"]])
+
+    def test_all_engines_includes_managed_warehouse_jobs_with_usage(self):
+        warehouse_job = DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=self.saved_query,
+            status=DataModelingJob.Status.COMPLETED,
+            engine=DataModelingJobEngine.MANAGED_WAREHOUSE,
+            last_run_at=timezone.now(),
+            read_bytes=1024,
+            read_rows=20,
+            cpu_microseconds=300,
+            query_count=4,
+            usage_updated_at=timezone.now(),
+        )
+
+        response = self.client.get(f"/api/environments/{self.team.pk}/data_modeling_jobs/?all_engines=true")
+
+        self.assertEqual(response.status_code, 200)
+        jobs_by_id = {job["id"]: job for job in response.json()["results"]}
+        self.assertIn(str(warehouse_job.id), jobs_by_id)
+        self.assertNotIn(str(self.other_team_job.id), jobs_by_id)
+        self.assertEqual(jobs_by_id[str(warehouse_job.id)]["engine"], DataModelingJobEngine.MANAGED_WAREHOUSE)
+        self.assertEqual(jobs_by_id[str(warehouse_job.id)]["read_bytes"], 1024)
+        self.assertEqual(jobs_by_id[str(warehouse_job.id)]["read_rows"], 20)
+        self.assertEqual(jobs_by_id[str(warehouse_job.id)]["cpu_microseconds"], 300)
+        self.assertEqual(jobs_by_id[str(warehouse_job.id)]["query_count"], 4)
+        self.assertIsNotNone(jobs_by_id[str(warehouse_job.id)]["usage_updated_at"])
+
+        managed_only = self.client.get(
+            f"/api/environments/{self.team.pk}/data_modeling_jobs/?all_engines=true&engine=managed_warehouse"
+        )
+        self.assertEqual(managed_only.status_code, 200)
+        self.assertEqual([job["id"] for job in managed_only.json()["results"]], [str(warehouse_job.id)])
+
+    def test_job_keeps_name_for_an_endpoint_or_soft_deleted_model(self):
+        self.saved_query.deleted = True
+        self.saved_query.save(update_fields=["deleted"])
+
+        response = self.client.get(f"/api/environments/{self.team.pk}/data_modeling_jobs/{self.job1.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["saved_query_name"], "Test saved query")
+        self.assertTrue(response.json()["saved_query_deleted"])
+
+    def test_unrestricted_list_hides_runs_of_a_hard_deleted_model_without_reading_models(self):
+        DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=None,
+            status=DataModelingJob.Status.COMPLETED,
+            last_run_at=timezone.now(),
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(f"/api/environments/{self.team.pk}/data_modeling_jobs/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["count"], 3)
+        self.assertEqual(
+            {job["id"] for job in response.json()["results"]}, {str(self.job1.id), str(self.job2.id), str(self.job3.id)}
+        )
+        count_sql = next(q["sql"] for q in queries.captured_queries if "COUNT(*)" in q["sql"])
+        self.assertNotIn(DataWarehouseSavedQuery._meta.db_table, count_sql)
+
+    def test_pagination_honors_offset_and_returns_count(self):
+        paged_query = DataWarehouseSavedQuery.objects.create(team=self.team, name="Paged saved query")
+        for _ in range(12):
+            DataModelingJob.objects.create(
+                team=self.team,
+                saved_query=paged_query,
+                status=DataModelingJob.Status.COMPLETED,
+                last_run_at=timezone.now(),
+            )
+
+        base_url = f"/api/environments/{self.team.pk}/data_modeling_jobs/?saved_query_id={paged_query.id}"
+
+        first_page = self.client.get(f"{base_url}&limit=10&offset=0").json()
+        self.assertEqual(first_page["count"], 12)
+        self.assertFalse(first_page["count_is_capped"])
+        self.assertEqual(len(first_page["results"]), 10)
+
+        second_page = self.client.get(f"{base_url}&limit=10&offset=10").json()
+        self.assertEqual(second_page["count"], 12)
+        self.assertEqual(len(second_page["results"]), 2)
+
+        first_ids = {job["id"] for job in first_page["results"]}
+        second_ids = {job["id"] for job in second_page["results"]}
+        self.assertEqual(first_ids & second_ids, set())
+
+    def test_count_stops_at_the_cap_and_pages_continue_past_it(self):
+        paged_query = DataWarehouseSavedQuery.objects.create(team=self.team, name="Paged saved query")
+        for _ in range(12):
+            DataModelingJob.objects.create(
+                team=self.team,
+                saved_query=paged_query,
+                status=DataModelingJob.Status.COMPLETED,
+                last_run_at=timezone.now(),
+            )
+        base_url = f"/api/environments/{self.team.pk}/data_modeling_jobs/?saved_query_id={paged_query.id}"
+
+        with patch.object(DataModelingJobPagination, "count_cap", 5):
+            first_page = self.client.get(f"{base_url}&limit=10&offset=0").json()
+            page_past_the_cap = self.client.get(f"{base_url}&limit=10&offset=10").json()
+
+        self.assertEqual((first_page["count"], first_page["count_is_capped"]), (5, True))
+        self.assertEqual(len(first_page["results"]), 10)
+        self.assertIsNotNone(first_page["next"])
+        self.assertEqual(len(page_past_the_cap["results"]), 2)
+        self.assertIsNone(page_past_the_cap["next"])
+
+    def test_recent_reports_a_skip_over_the_older_success(self):
+        query = DataWarehouseSavedQuery.objects.create(team=self.team, name="Blocked saved query")
+        DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=query,
+            status=DataModelingJob.Status.COMPLETED,
+            workflow_id="materialize-view-abc",
+            last_run_at=timezone.now(),
+        )
+        skipped = DataModelingJob.objects.create(
+            team=self.team,
+            saved_query=query,
+            status=DataModelingJob.Status.SKIPPED,
+            error="Skipped because upstream view orders_daily is failing.",
+            workflow_id="execute-dag-abc:900-2026-08-07T10:17:00Z",
+            last_run_at=timezone.now(),
+        )
+
+        response = self.client.get(f"/api/environments/{self.team.pk}/data_modeling_jobs/recent/")
+        self.assertEqual(response.status_code, 200)
+
+        for_query = [job for job in response.json() if job["saved_query_id"] == str(query.id)]
+        self.assertEqual([job["id"] for job in for_query], [str(skipped.id)])
+
+    def test_cannot_access_other_teams_jobs(self):
+        response = self.client.get(f"/api/environments/{self.team.pk}/data_modeling_jobs/{self.other_team_job.id}/")
+        self.assertEqual(response.status_code, 404)
+
+        response = self.client.get(f"/api/environments/{self.team.pk}/data_modeling_jobs/")
+        self.assertEqual(response.status_code, 200)
+
+        job_ids = [job["id"] for job in response.json()["results"]]
+        self.assertNotIn(str(self.other_team_job.id), job_ids)

@@ -1,0 +1,130 @@
+"""Shared constants for the stamphog review workflow stack.
+
+The workflow, its activities, and the client that starts it all read from here so
+there is a single source of truth for the task-queue name, activity timeouts, and
+the sandbox paths the reviewer-invocation builder and this workflow must agree on.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+from temporalio.common import RetryPolicy
+
+STAMPHOG_TASK_QUEUE = "stamphog-task-queue"
+
+# Where the target repo is cloned inside the review sandbox. The review engine ships into
+# ENGINE_DIR, which sits under the checkout, so the engine's repo-root walk finds the checkout and
+# reads the injected trusted policy. The context JSON lands at CONTEXT_PATH. These paths stay here
+# so that logic.reviewer.build_reviewer_invocation and run_review_in_sandbox agree on them.
+STAMPHOG_SANDBOX_REPO_DIR = "/tmp/stamphog/target"
+STAMPHOG_SANDBOX_WORKSPACE_DIR = "/tmp/stamphog/workspace"
+STAMPHOG_SANDBOX_ENGINE_DIR = f"{STAMPHOG_SANDBOX_REPO_DIR}/tools/pr-approval-agent"
+
+# Reviewer bots whose 👀 reaction means "review in flight" — the hosted workflow waits these out
+# server-side before provisioning the sandbox (the sandbox holds no token to poll with). Mirrors the
+# engine's TRUSTED_REACTOR_BOTS (products/stamphog/packages/pr-approval-agent/github.py) and its wait timings
+# (review_pr.py); the server cannot import the hyphenated engine dir, so keep the two in sync.
+STAMPHOG_TRUSTED_REACTOR_BOTS = frozenset(
+    {
+        "chatgpt-codex-connector[bot]",
+        "copilot-pull-request-reviewer[bot]",
+        "greptile-apps[bot]",
+        "hex-security-app[bot]",
+        "veria-ai[bot]",
+    }
+)
+STAMPHOG_BOT_EYES_MAX_AGE_SECONDS = 45 * 60
+STAMPHOG_BOT_REVIEW_POLL_SECONDS = 30
+STAMPHOG_BOT_REVIEW_MAX_POLLS = 10  # ~300s budget at 30s per poll, matching the engine's wait budget
+# A WAIT on a policy `attestations` check polls GitHub for that check for up to an hour. A check that
+# reports later leaves the PR at WAIT until the next push.
+STAMPHOG_ATTESTATION_POLL_SECONDS = 120
+STAMPHOG_ATTESTATION_MAX_POLLS = 30
+
+# The owners-yaml resolver package, expected by the engine as a sibling of its own dir
+# (gates.py resolves `../owners` for the hogli-resolver ownership format). This stays a sibling of
+# the engine dir although the monorepo source moved to packages/owners-yaml, because downstream repos
+# vendor the engine with the resolver beside it and the engine resolves the two layouts by offset.
+STAMPHOG_SANDBOX_OWNERS_DIR = f"{STAMPHOG_SANDBOX_REPO_DIR}/tools/owners"
+STAMPHOG_SANDBOX_CONTEXT_PATH = f"{STAMPHOG_SANDBOX_REPO_DIR}/.stamphog_review_context.json"
+# Outside the checkout, so the archive never shows up in the tree the reviewer explores.
+STAMPHOG_SANDBOX_PAYLOAD_PATH = "/tmp/stamphog/review-payload.tar.gz"
+# Outside the checkout too. The reviewer command reads the per-run gateway token from it and removes it.
+STAMPHOG_SANDBOX_GATEWAY_TOKEN_PATH = "/tmp/stamphog/gateway-token"
+
+# Trusted review-norms prose the engine reads as its reviewer system guidance, and
+# the gate policy entrypoint. Both are fetched from the target repo's DEFAULT branch
+# (never PR head) and written over the checkout's copies before the engine runs, so
+# a PR can't rewrite the policy or norms it is judged against.
+STAMPHOG_REVIEW_GUIDANCE_PATH = ".stamphog/review-guidance.md"
+STAMPHOG_POLICY_ENTRYPOINT = ".stamphog/policy.yml"
+
+# Files pulled from the target repo's DEFAULT branch onto the run and injected into
+# the sandbox checkout (overwriting any PR-head copy) as the trusted policy surface.
+STAMPHOG_POLICY_PATHS: tuple[str, ...] = (STAMPHOG_POLICY_ENTRYPOINT, STAMPHOG_REVIEW_GUIDANCE_PATH)
+
+# Optional per-repo files: fetched from the DEFAULT branch and ALWAYS wiped from the PR
+# head, but injected only when the default branch has them — there is no server-shipped
+# default (an absent steering.md just leaves the reviewer prompt unchanged).
+STAMPHOG_STEERING_PATH = ".stamphog/steering.md"
+STAMPHOG_OPTIONAL_POLICY_PATHS: tuple[str, ...] = (STAMPHOG_STEERING_PATH,)
+
+# Per-activity start-to-close timeouts.
+FETCH_CONTEXT_TIMEOUT = timedelta(minutes=5)
+# Two engine pre-check runs and one short LLM call, each capped at 30 seconds, plus the token mint.
+PRE_GATES_TIMEOUT = timedelta(minutes=3)
+RUN_REVIEW_TIMEOUT = timedelta(minutes=30)
+# The provision and the PR head fetch, and later the checkout and the blob prefetch. Each runs beside
+# the context fetch, the pre-check or the bot wait, as its own activity, so the waits between them are
+# workflow awaits. Each budget is its step ceilings plus SANDBOX_PHASE_RESERVE_SECONDS.
+SANDBOX_START_TIMEOUT = timedelta(minutes=10)
+SANDBOX_CHECKOUT_TIMEOUT = timedelta(minutes=10)
+SANDBOX_DESTROY_TIMEOUT = timedelta(minutes=2)
+
+# Ceilings for the steps inside the review activity. They add up to more than RUN_REVIEW_TIMEOUT on
+# purpose: each one caps a step that should never take that long, while the shared deadline in
+# each sandbox activity caps what the steps can spend between them. Granting each step its own
+# independent budget was the bug — the clone alone could hold the activity for twice its ceiling.
+CLONE_STEP_TIMEOUT_SECONDS = 5 * 60
+PREFETCH_DIFF_BLOBS_TIMEOUT_SECONDS = 3 * 60
+REVIEWER_TIMEOUT_SECONDS = 25 * 60
+# Held back from the deadline so a step that runs to its limit still leaves room for the sandbox
+# teardown and the terminal save that follow it.
+SANDBOX_PHASE_RESERVE_SECONDS = 2 * 60
+POST_VERDICT_TIMEOUT = timedelta(minutes=5)
+MARK_FAILED_TIMEOUT = timedelta(minutes=1)
+
+# GitHub reads/writes and DB updates are safe to retry; the sticky comment and the
+# approval review are both idempotent (upsert / single pending review per head).
+ACTIVITY_RETRY_POLICY = RetryPolicy(
+    maximum_attempts=3,
+    initial_interval=timedelta(seconds=5),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=1),
+)
+
+
+class SandboxPhaseError(Exception):
+    """Marks the paid phase of the review activity: this attempt made a sandbox, or found the claim
+    of an earlier one. SANDBOX_RETRY_POLICY excludes this type, so no run pays for a review twice.
+    """
+
+
+# Two attempts. The free phase — context load, token mint, sandbox config — costs nothing and is
+# safe to repeat, so a refusal there must not burn the whole review. The paid phase is fenced twice:
+# it raises SandboxPhaseError, which this policy excludes, and it records a claim that stops a
+# second sandbox when Temporal retries a lost worker instead. Both fences are on every worker, so
+# the rolling-deploy hole that held this at one attempt is closed.
+SANDBOX_RETRY_POLICY = RetryPolicy(
+    maximum_attempts=2,
+    initial_interval=timedelta(seconds=10),
+    non_retryable_error_types=["SandboxPhaseError"],
+)
+
+# The Claude Code CLI's own switches for its telemetry, error reporting and auto-update traffic.
+NETWORK_RESTRICTED_AGENT_ENV = {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+}

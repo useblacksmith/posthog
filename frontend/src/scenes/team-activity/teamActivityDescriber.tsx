@@ -1,0 +1,942 @@
+import { describeMappedChanges } from 'lib/components/ActivityLog/activityDescriptions/describeMappedChanges'
+import { shortIdActivityLink } from 'lib/components/ActivityLog/activityDescriptions/shortIdActivityLink'
+import {
+    ActivityChange,
+    ActivityLogItem,
+    ActivityLogUserName,
+    ChangeMapping,
+    HumanizedChange,
+    activityLogSummary,
+    defaultDescriber,
+} from 'lib/components/ActivityLog/humanizeActivity'
+import { SentenceList } from 'lib/components/ActivityLog/SentenceList'
+import { PathCleanFilterItem } from 'lib/components/PathCleanFilters/PathCleanFilterItem'
+import { keyFromFilter } from 'lib/components/PathCleanFilters/PathCleanFilters'
+import PropertyFiltersDisplay from 'lib/components/PropertyFilters/components/PropertyFiltersDisplay'
+import { Link } from 'lib/lemon-ui/Link'
+import { CURRENCY_SYMBOL_TO_EMOJI_MAP, CURRENCY_SYMBOL_TO_NAME_MAP } from 'lib/utils/currency'
+import { isObject } from 'lib/utils/guards'
+import { capitalizeFirstLetter, pluralize } from 'lib/utils/strings'
+import { ExperimentsConfig } from 'scenes/settings/environment/experimentsConfigLogic'
+import { urls } from 'scenes/urls'
+
+import { CurrencyCode } from '~/queries/schema/schema-general'
+import { ActivityScope, GroupType, PathCleaningFilter, TeamSurveyConfigType, TeamType } from '~/types'
+
+import { ThemeName } from '../dataThemeLogic'
+import { coreEventsConfigurationDescriber } from './core_events_config/coreEventsConfigurationDescriber'
+import { customerAnalyticsConfigurationDescriber } from './customer_analytics_config/customerAnalyticsConfigurationDescriber'
+import { marketingAnalyticsConfigurationDescriber } from './marketing_analytics_config/marketingAnalyticsConfigurationDescriber'
+import { revenueAnalyticsConfigurationDescriber } from './revenue_analytics_config/revenueAnalyticsConfigurationDescriber'
+
+const isNumberOrNull = (x: unknown): x is number | null => {
+    if (typeof x === 'number') {
+        return !isNaN(x)
+    } else if (typeof x === 'string') {
+        return !isNaN(parseFloat(x))
+    }
+    return false
+}
+
+// Helper functions for common change description patterns
+function createBooleanToggleHandler(featureName: string, options: { verb?: [string, string] } = {}) {
+    return (change: ActivityChange): ChangeMapping | null => {
+        const { verb = ['enabled', 'disabled'] } = options
+
+        const [enabledVerb, disabledVerb] = verb
+        const verbText = change.after ? enabledVerb : disabledVerb
+
+        return {
+            description: [
+                <>
+                    {verbText} {featureName}
+                </>,
+            ],
+        }
+    }
+}
+
+function createSessionRecordingConfigHandler(configName: string) {
+    return (change: ActivityChange): ChangeMapping | null => {
+        if (change.before === null && change.after === null) {
+            return null
+        }
+        return {
+            description: [<>Changed session replay {configName}</>],
+        }
+    }
+}
+
+function createApiTokenHandler(tokenType: string, createdVerb: string, changedVerb: string) {
+    return (change: ActivityChange): ChangeMapping | null => {
+        if (change.after === undefined) {
+            return null
+        }
+
+        const prefix = change.action === 'created' ? createdVerb : changedVerb
+        return {
+            description: [
+                <>
+                    {prefix} the {tokenType}
+                </>,
+            ],
+        }
+    }
+}
+
+function createArrayChangeHandler(
+    fieldName: string,
+    options: { useEmphasis?: boolean; map?: (item: any) => string | null | undefined } = {}
+) {
+    return (change: ActivityChange): ChangeMapping | null => {
+        const { useEmphasis = true, map } = options
+
+        if (change.after === undefined) {
+            return null
+        }
+
+        const array = (change.after || []) as any[]
+        const displayArray = map ? array.map(map).filter(Boolean) : array
+        const fieldNameElement = useEmphasis ? <em>{fieldName}</em> : fieldName
+
+        return {
+            description: [
+                <>
+                    {change.action === 'created' ? 'set' : 'changed'} the {fieldNameElement} to{' '}
+                    <code>[{displayArray.join(', ')}]</code>
+                </>,
+            ],
+        }
+    }
+}
+
+function createSimpleValueHandler(fieldName: string, options: { useEmphasis?: boolean; requireValue?: boolean } = {}) {
+    return (change: ActivityChange): ChangeMapping | null => {
+        const { useEmphasis = false, requireValue = true } = options
+
+        if (requireValue && !change.after) {
+            return null
+        }
+
+        const valueElement = useEmphasis ? <em>{String(change.after)}</em> : change.after
+        return {
+            description: [
+                <>
+                    {change.action === 'created' ? 'set' : 'changed'} the {fieldName} to {valueElement}
+                </>,
+            ],
+        }
+    }
+}
+
+function createFixedVerbValueHandler(
+    verb: string,
+    fieldName: string,
+    options: { useEmphasis?: boolean; checkBothNull?: boolean } = {}
+) {
+    return (change: ActivityChange): ChangeMapping | null => {
+        const { useEmphasis = false, checkBothNull = false } = options
+
+        if (checkBothNull && change.before === null && change.after === null) {
+            return null
+        }
+
+        const valueElement = useEmphasis ? <em>{String(change.after)}</em> : change.after
+        return {
+            description: [
+                <>
+                    {verb} {fieldName} to {valueElement}
+                </>,
+            ],
+        }
+    }
+}
+
+function createExperimentsDefaultHandler(fieldName: string, format: (value: unknown) => string = String) {
+    return (change: ActivityChange): ChangeMapping | null => {
+        if (change.after === null || change.after === undefined) {
+            return { description: [<>cleared the {fieldName}</>] }
+        }
+        return {
+            description: [
+                <>
+                    changed the {fieldName} to <em>{format(change.after)}</em>
+                </>,
+            ],
+        }
+    }
+}
+
+const TEAM_PROPERTIES_MAPPING: Record<
+    | keyof TeamType
+    | keyof ExperimentsConfig
+    | 'heatmaps_screenshot_allowed_hostnames'
+    | 'conversations_signing_secret'
+    | 'conversations_signing_secret_previous'
+    | 'events_retention_months',
+    (change: ActivityChange) => ChangeMapping | null
+> = {
+    // API-related tokens
+    api_token: createApiTokenHandler('project token', 'set', 'reset'),
+    secret_api_token: createApiTokenHandler('Feature Flags secure API key', 'generated', 'rotated'),
+    conversations_signing_secret: createApiTokenHandler(
+        'Conversations identity verification secret',
+        'generated',
+        'rotated'
+    ),
+    conversations_signing_secret_previous: (change) => {
+        if (change.action !== 'deleted') {
+            return null
+        }
+        return {
+            description: [<>Expired the previous Conversations identity verification secret</>],
+        }
+    },
+    heatmaps_screenshot_secret: createApiTokenHandler('heatmap screenshot value', 'generated', 'rotated'),
+    heatmaps_screenshot_allowed_hostnames: createArrayChangeHandler('approved screenshot hostnames'),
+    secret_api_token_backup: (change) => {
+        if (change.after === undefined || change.action !== 'deleted') {
+            return null
+        }
+
+        return {
+            description: [<>Deleted the Feature Flags secure API key backup</>],
+        }
+    },
+
+    // Session replay config
+    session_recording_url_trigger_config: createSessionRecordingConfigHandler('URL triggers'),
+    session_recording_url_blocklist_config: createSessionRecordingConfigHandler('URL blocklist'),
+    session_recording_event_trigger_config: createSessionRecordingConfigHandler('event triggers'),
+    session_recording_trigger_match_type_config: createFixedVerbValueHandler(
+        'Changed',
+        'session replay trigger match type',
+        { checkBothNull: true }
+    ),
+    capture_console_log_opt_in: createBooleanToggleHandler('console log capture in session replay'),
+    capture_performance_opt_in: createBooleanToggleHandler('console network performance capture in session replay'),
+    capture_dead_clicks: createBooleanToggleHandler('dead clicks autocapture'),
+    session_recording_opt_in: createBooleanToggleHandler('session recording'),
+    session_recording_minimum_duration_milliseconds: (change) => {
+        const after = change.after
+        if (after === undefined || typeof after !== 'number') {
+            return null
+        }
+
+        let prefix = 'changed'
+        if (change.action === 'created') {
+            prefix = 'set'
+        }
+        return {
+            description: [
+                <>
+                    {prefix} the minimum session recording duration to {after / 1000} seconds
+                </>,
+            ],
+        }
+    },
+    recording_domains: (change) => {
+        const before: string[] | null = Array.isArray(change.before) ? (change.before.map(String) ?? null) : null
+        const after: string[] | null = Array.isArray(change.after) ? (change.after.map(String) ?? null) : null
+        if (after === null && before === null) {
+            return null
+        }
+
+        const descriptions = []
+
+        const adds: string[] = []
+        if (after) {
+            for (const domain of after) {
+                if ((!before || !before.includes(domain)) && domain.trim().length > 0) {
+                    adds.push(domain)
+                }
+            }
+        }
+        if (adds.length) {
+            descriptions.push(
+                <>
+                    added {adds.join(', ')} to session recording authorised{' '}
+                    {pluralize(adds.length, 'domain', 'domains', false)}
+                </>
+            )
+        }
+
+        const removes: string[] = []
+        if (before) {
+            for (const domain of before) {
+                if ((!after || !after.includes(domain)) && domain.trim().length > 0) {
+                    removes.push(domain)
+                }
+            }
+        }
+
+        if (removes.length) {
+            descriptions.push(
+                <>
+                    removed {removes.join(', ')} from session recording authorised{' '}
+                    {pluralize(removes.length, 'domain', 'domains', false)}
+                </>
+            )
+        }
+        return { description: descriptions }
+    },
+    session_recording_linked_flag: (change) => {
+        const key = (change.after as any)?.key ?? (change.before as any)?.key ?? String(change.after)
+        return {
+            description: [
+                <>
+                    {change?.after ? 'linked' : 'unlinked'} session recording to feature flag {key}
+                </>,
+            ],
+        }
+    },
+    session_recording_masking_config: (change) => {
+        const maskAllInputsBefore = isObject(change.before) ? change.before.maskAllInputs : !!change.before
+        const maskAllInputsAfter = isObject(change.after) ? change.after.maskAllInputs : !!change.after
+        const maskAllInputsChanged = maskAllInputsBefore !== maskAllInputsAfter
+
+        const blockSelectorBefore = isObject(change?.before) ? change?.before.blockSelector : undefined
+        const blockSelectorAfter = isObject(change?.after) ? change?.after.blockSelector : undefined
+        const blockSelectorChanged = blockSelectorBefore !== blockSelectorAfter
+
+        const maskTextSelectorBefore = isObject(change?.before) ? change?.before.maskTextSelector : !!change?.before
+        const maskTextSelectorAfter = isObject(change?.after) ? change?.after.maskTextSelector : !!change?.after
+        const maskTextSelectorChanged = maskTextSelectorBefore !== maskTextSelectorAfter
+
+        const descriptions = []
+        if (maskAllInputsChanged) {
+            descriptions.push(<>{maskAllInputsAfter ? 'enabled' : 'disabled'} masking all inputs in session replay</>)
+        }
+
+        if (maskTextSelectorChanged) {
+            descriptions.push(
+                <>
+                    {change?.action === 'created' ? 'set' : 'changed'} masking text selector to {maskTextSelectorAfter}{' '}
+                    in session replay
+                </>
+            )
+        }
+
+        if (blockSelectorChanged) {
+            descriptions.push(
+                <>
+                    {change?.action === 'created' ? 'set' : 'changed'} blocking selector to "{blockSelectorAfter}"
+                </>
+            )
+        }
+
+        return descriptions.length
+            ? {
+                  description: descriptions,
+              }
+            : null
+    },
+    session_recording_network_payload_capture_config: (change) => {
+        const payloadBefore = isObject(change.before) ? change.before.recordBody : !!change.before
+        const payloadAfter = isObject(change.after) ? change.after.recordBody : !!change.after
+        const payloadChanged = payloadBefore !== payloadAfter
+
+        const headersBefore = isObject(change.before) ? change.before.recordHeaders : !!change.before
+        const headersAfter = isObject(change.after) ? change.after.recordHeaders : !!change.after
+        const headersChanged = headersBefore !== headersAfter
+
+        const descriptions = []
+        if (payloadChanged) {
+            descriptions.push(<>{payloadAfter ? 'enabled' : 'disabled'} network body capture in session replay</>)
+        }
+
+        if (headersChanged) {
+            descriptions.push(<>{headersAfter ? 'enabled' : 'disabled'} network headers capture in session replay</>)
+        }
+
+        return descriptions.length
+            ? {
+                  description: descriptions,
+              }
+            : null
+    },
+    session_recording_sample_rate: (change) => {
+        // purposefully not double equal
+        const hasBefore = change.before != undefined
+        const hasAfter = change.after != undefined
+        if (!hasAfter && !hasBefore) {
+            return null
+        }
+        if (change.before === change.after) {
+            return null
+        }
+        if (!isNumberOrNull(change.after)) {
+            return null
+        }
+
+        // removing the sample rate is equivalent to 100%
+        const chosenSampleRate = change.after ?? 1
+
+        return {
+            description: [
+                <>
+                    {change.action === 'created' ? 'set' : 'changed'} the session recording sample rate to{' '}
+                    {(chosenSampleRate * 100).toFixed(0)}%
+                </>,
+            ],
+        }
+    },
+    session_replay_config: (change) => {
+        // TODO we'll eventually need a deeper mapping for this nested object
+        const after = change.after
+        const recordCanvasAfter =
+            after && typeof after === 'object' && !Array.isArray(after) ? after.record_canvas : null
+
+        if (recordCanvasAfter === null) {
+            return null
+        }
+        return { description: [<>{recordCanvasAfter ? 'enabled' : 'disabled'} canvas recording in session replay</>] }
+    },
+    session_recording_retention_period: createSimpleValueHandler('session replay data retention'),
+    session_recording_trigger_groups: createSessionRecordingConfigHandler('session recording trigger groups'),
+
+    // Survey config
+    surveys_opt_in: createBooleanToggleHandler('surveys'),
+    survey_config: (change) => {
+        const before = change.before as TeamSurveyConfigType
+        const after = change.after as TeamSurveyConfigType
+        const descriptions = []
+        const preamble = 'Survey Configuration : '
+        if (before === undefined) {
+            descriptions.push('Survey Configuration was enabled')
+        }
+
+        const propertyChangeDesc = (
+            name: string,
+            callback: (config: TeamSurveyConfigType) => string | undefined
+        ): void => {
+            if (callback(before) !== callback(after)) {
+                descriptions.push(`${preamble} ${name} was changed from "${callback(before)}" to "${callback(after)}"`)
+            }
+        }
+
+        if (before?.appearance?.whiteLabel !== after?.appearance?.whiteLabel) {
+            descriptions.push(
+                `${preamble} Survey white labeling was ${after?.appearance?.whiteLabel ? 'enabled' : 'disabled'}`
+            )
+        }
+
+        if (before?.appearance?.displayThankYouMessage !== after?.appearance?.displayThankYouMessage) {
+            descriptions.push(
+                `${preamble} displayThankYouMessage was ${
+                    after?.appearance?.displayThankYouMessage ? 'enabled' : 'disabled'
+                }`
+            )
+        }
+
+        if (before?.appearance?.displayIntroScreen !== after?.appearance?.displayIntroScreen) {
+            descriptions.push(
+                `${preamble} Survey intro screen was ${after?.appearance?.displayIntroScreen ? 'enabled' : 'disabled'}`
+            )
+        }
+
+        propertyChangeDesc('backgroundColor', (c) => c?.appearance?.backgroundColor)
+        propertyChangeDesc('submitButtonColor', (c) => c?.appearance?.submitButtonColor)
+        propertyChangeDesc('submitButtonTextColor', (c) => c?.appearance?.submitButtonTextColor)
+        propertyChangeDesc('ratingButtonColor', (c) => c?.appearance?.ratingButtonColor)
+        propertyChangeDesc('ratingButtonActiveColor', (c) => c?.appearance?.ratingButtonActiveColor)
+        propertyChangeDesc('borderColor', (c) => c?.appearance?.borderColor)
+        propertyChangeDesc('placeholder', (c) => c?.appearance?.placeholder)
+        propertyChangeDesc('thankYouMessageHeader', (c) => c?.appearance?.thankYouMessageHeader)
+        propertyChangeDesc('intro screen header', (c) => c?.appearance?.introScreenHeader)
+        propertyChangeDesc('position', (c) => c?.appearance?.position)
+
+        return { description: descriptions }
+    },
+
+    // Events retention
+    events_retention_months: (change) => ({
+        description: [
+            change.after === null ? (
+                <>removed the project's events retention window</>
+            ) : (
+                <>
+                    set the events retention window to <em>{String(change.after)} months</em>
+                </>
+            ),
+        ],
+    }),
+
+    // Logs
+    logs_settings: () => {
+        return { description: [<>updated logs settings</>] }
+    },
+
+    // Feature flag confirmation config
+    feature_flag_confirmation_enabled: createBooleanToggleHandler('feature flag confirmation'),
+    feature_flag_confirmation_message: createSimpleValueHandler('feature flag confirmation message'),
+    default_evaluation_contexts_enabled: createBooleanToggleHandler('default evaluation contexts'),
+
+    // Autocapture
+    autocapture_exceptions_errors_to_ignore: createArrayChangeHandler('autocapture exceptions errors to ignore'),
+    autocapture_exceptions_opt_in: createBooleanToggleHandler('exception autocapture'),
+    autocapture_web_vitals_opt_in: createBooleanToggleHandler('web vitals autocapture'),
+    autocapture_opt_out: createBooleanToggleHandler('autocapture', { verb: ['opted out of', 'opted in to'] }),
+    heatmaps_opt_in: createBooleanToggleHandler('heatmaps'),
+    autocapture_web_vitals_allowed_metrics: (change) => {
+        const after = change.after
+        const metricsList = Array.isArray(after) ? after.join(', ') : 'CLS, FCP, INP, and LCP'
+        return { description: [<>set allowed web vitals autocapture metrics to {metricsList}</>] }
+    },
+
+    // and.... many more random stuff
+    name: createSimpleValueHandler('team name', { requireValue: false }),
+    test_account_filters_default_checked: createBooleanToggleHandler(
+        '"internal & test account filters" for all insights'
+    ),
+    anonymize_ips: createBooleanToggleHandler('anonymizing IP addresses'),
+    timezone: createSimpleValueHandler('timezone', { useEmphasis: true }),
+    business_model: createSimpleValueHandler('business model'),
+    data_attributes: createArrayChangeHandler('data attributes'),
+    live_events_columns: createArrayChangeHandler('live events columns'),
+    app_urls: createArrayChangeHandler('app URLs'),
+    group_types: createArrayChangeHandler('group types', { map: (group: GroupType) => group.name_plural }),
+    person_display_name_properties: createArrayChangeHandler('person display name properties'),
+    person_on_events_querying_enabled: createBooleanToggleHandler('querying person on events'),
+    human_friendly_comparison_periods: createBooleanToggleHandler('human friendly comparison periods'),
+    receive_org_level_activity_logs: createBooleanToggleHandler('organization-level activity logs'),
+    require_evaluation_contexts: createBooleanToggleHandler('require evaluation context tags'),
+    feature_flag_policy_config: (change) => {
+        const before = isObject(change.before) ? change.before : {}
+        const after = isObject(change.after) ? change.after : {}
+        const descriptions: JSX.Element[] = []
+        if (!!before.require_tags !== !!after.require_tags) {
+            descriptions.push(
+                <>
+                    {after.require_tags ? 'enabled' : 'disabled'} <em>required tags on feature flags</em>
+                </>
+            )
+        }
+        const lists = [
+            ['blocked_hosts', 'blocked domains for feature flag requests'],
+            ['blocked_ips', 'blocked IP addresses for feature flag requests'],
+        ] as const
+        for (const [field, label] of lists) {
+            const beforeEntries = (before[field] ?? []) as string[]
+            const afterEntries = (after[field] ?? []) as string[]
+            const added = afterEntries.filter((entry) => !beforeEntries.includes(entry))
+            const removed = beforeEntries.filter((entry) => !afterEntries.includes(entry))
+            if (added.length) {
+                descriptions.push(
+                    <>
+                        added <code>{added.join(', ')}</code> to the <em>{label}</em>
+                    </>
+                )
+            }
+            if (removed.length) {
+                descriptions.push(
+                    <>
+                        removed <code>{removed.join(', ')}</code> from the <em>{label}</em>
+                    </>
+                )
+            }
+        }
+        return descriptions.length ? { description: descriptions } : null
+    },
+    test_account_filters: (change) => {
+        // change.after is an array of property filters
+        // change.before is an array o property filters
+        // so we can say what was removed and what was added
+        const afters = Array.isArray(change.after) ? change.after || [] : []
+        const befores = Array.isArray(change.before) ? change.before || [] : []
+
+        const addedFilters = afters.filter((filter) => !befores.some((before) => before.key === filter.key))
+        const removedFilters = befores.filter((filter) => !afters.some((after) => after.key === filter.key))
+
+        const listParts = []
+        if (addedFilters.length) {
+            listParts.push(
+                <>
+                    added <PropertyFiltersDisplay filters={addedFilters} />
+                </>
+            )
+        }
+        if (removedFilters.length) {
+            listParts.push(
+                <>
+                    removed <PropertyFiltersDisplay filters={removedFilters} />
+                </>
+            )
+        }
+        if (listParts.length === 0) {
+            return null
+        }
+
+        return {
+            description: [
+                <>Updated the "internal and test" account filters</>,
+                <SentenceList key={0} listParts={listParts} />,
+            ],
+        }
+    },
+    extra_settings: (change) => {
+        const after = change.after
+        if (typeof after !== 'object') {
+            return null
+        }
+        const descriptions = []
+        for (const key in after) {
+            if (key === 'poe_v2_enabled') {
+                descriptions.push(
+                    <>{after[key as keyof typeof after] ? 'enabled' : 'disabled'} Person on Events (v2)</>
+                )
+            }
+        }
+        return { description: descriptions }
+    },
+    modifiers: (change) => {
+        const after = change.after
+        if (typeof after !== 'object') {
+            return null
+        }
+        const descriptions = []
+        for (const key in after) {
+            descriptions.push(
+                <>
+                    set <em>{key}</em> to "{String(after[key as keyof typeof after])}"
+                </>
+            )
+        }
+        return { description: descriptions }
+    },
+    default_data_theme: (change) => {
+        return {
+            description: [
+                <>
+                    changed the default color theme{' '}
+                    {change.before && (
+                        <>
+                            from <ThemeName id={change.before as number} />{' '}
+                        </>
+                    )}
+                    to{' '}
+                    <em>
+                        <ThemeName id={change.after as number} />
+                    </em>
+                </>,
+            ],
+        }
+    },
+    base_currency: (change) => {
+        const before = change.before as CurrencyCode
+        const after = change.after as CurrencyCode
+
+        return {
+            description: [
+                <>
+                    changed the <em>base currency</em> from{' '}
+                    <strong>
+                        {CURRENCY_SYMBOL_TO_EMOJI_MAP[before]}&nbsp;{before}
+                    </strong>{' '}
+                    ({CURRENCY_SYMBOL_TO_NAME_MAP[before]}) to{' '}
+                    <strong>
+                        {CURRENCY_SYMBOL_TO_EMOJI_MAP[after]}&nbsp;{after}
+                    </strong>{' '}
+                    ({CURRENCY_SYMBOL_TO_NAME_MAP[after]})
+                </>,
+            ],
+        }
+    },
+    completed_snippet_onboarding: (change) => {
+        if (!change.after) {
+            return null
+        }
+
+        return {
+            description: [<>completed their onboarding</>],
+        }
+    },
+    week_start_day: (change) => {
+        if (change.after === undefined || change.after === null) {
+            return null
+        }
+
+        const dayOfWeekMapping = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+        return {
+            description: [
+                <>
+                    {change.action === 'created' ? 'set' : 'changed'} the week start day to{' '}
+                    <em>{dayOfWeekMapping[change.after as number]}</em>
+                </>,
+            ],
+        }
+    },
+    primary_dashboard: (change) => {
+        if (!change.after) {
+            return null
+        }
+
+        return {
+            description: [
+                <>
+                    {change.action === 'created' ? 'set' : 'changed'} the <em>primary dashboard</em> to{' '}
+                    <Link to={urls.dashboard(change.after as number)}>
+                        <em>{String(change.after)}</em>
+                    </Link>
+                </>,
+            ],
+        }
+    },
+    home_tab_dashboard: (change) => {
+        if (!change.after) {
+            return {
+                description: [
+                    <>
+                        reset the <em>Home tab dashboard</em> to the generic view
+                    </>,
+                ],
+            }
+        }
+
+        return {
+            description: [
+                <>
+                    {change.action === 'created' ? 'set' : 'changed'} the <em>Home tab dashboard</em> to{' '}
+                    <Link to={urls.dashboard(change.after as number)}>
+                        <em>{String(change.after)}</em>
+                    </Link>
+                </>,
+            ],
+        }
+    },
+    flags_persistence_default: (change) => {
+        return {
+            description: [
+                <>
+                    {change.after ? 'enabled' : 'disabled'}{' '}
+                    <Link
+                        to="https://posthog.com/docs/feature-flags/creating-feature-flags#persisting-feature-flags-across-authentication-steps"
+                        target="_blank"
+                    >
+                        flag persistence
+                    </Link>{' '}
+                    by default
+                </>,
+            ],
+        }
+    },
+    path_cleaning_filters: (change) => {
+        if (change.after === undefined) {
+            return null
+        }
+
+        return {
+            description: [
+                <>
+                    set the <em>path cleaning filters</em> to{' '}
+                    {(change.after as PathCleaningFilter[]).map((filter) => (
+                        <PathCleanFilterItem key={keyFromFilter(filter)} filter={filter} />
+                    ))}
+                </>,
+            ],
+        }
+    },
+    onboarding_tasks: (change) => {
+        const afterTasks = change.after ? Object.entries(change.after) : []
+        const changedTasks = afterTasks.filter(([key, value]) => {
+            const beforeValue = (change.before as { [key: string]: string })?.[key]
+            return beforeValue !== value
+        })
+
+        if (!changedTasks.length) {
+            return null
+        }
+
+        return {
+            description: [
+                <>
+                    {changedTasks.map(([key, value], index) => (
+                        <span key={key}>
+                            {index > 0 && <>, </>}
+                            {value === 'completed' ? 'completed' : 'uncompleted'} onboarding task <em>{key}</em>
+                        </span>
+                    ))}
+                </>,
+            ],
+        }
+    },
+    has_completed_onboarding_for: (change) => {
+        const beforeProducts: { [key: string]: boolean } = (change.before as { [key: string]: boolean }) || {}
+        const afterProducts: { [key: string]: boolean } = (change.after as { [key: string]: boolean }) || {}
+
+        const newlyCompletedProducts = Object.entries(afterProducts).filter(
+            ([product, completed]) => completed && !beforeProducts[product]
+        )
+
+        if (!newlyCompletedProducts.length) {
+            return null
+        }
+
+        return {
+            description: [
+                <>
+                    completed onboarding for{' '}
+                    {newlyCompletedProducts.map(([product], index) => (
+                        <span key={product}>
+                            {index > 0 && <>, </>}
+                            <strong>{product}</strong>
+                        </span>
+                    ))}
+                </>,
+            ],
+        }
+    },
+
+    // Complex configs that require a custom describer
+    customer_analytics_config: customerAnalyticsConfigurationDescriber,
+    marketing_analytics_config: marketingAnalyticsConfigurationDescriber,
+    revenue_analytics_config: revenueAnalyticsConfigurationDescriber,
+    core_events_config: coreEventsConfigurationDescriber,
+
+    // Experiments defaults, written by the experiments_config endpoint and logged under the Team scope
+    default_experiment_stats_method: createExperimentsDefaultHandler('default statistical method for experiments'),
+    default_experiment_confidence_level: createExperimentsDefaultHandler(
+        'default confidence level for experiments',
+        (value) => `${Math.round(Number(value) * 100)}%`
+    ),
+    default_minimum_detectable_effect: createExperimentsDefaultHandler(
+        'default minimum detectable effect for experiments',
+        (value) => `${value}%`
+    ),
+    default_only_count_matured_users: createBooleanToggleHandler(
+        'only counting matured users by default in experiments'
+    ),
+    default_cuped_enabled: createBooleanToggleHandler('CUPED by default for experiments'),
+    default_cuped_lookback_days: createExperimentsDefaultHandler('default CUPED lookback window', (value) =>
+        pluralize(Number(value), 'day')
+    ),
+    default_sequential_testing_enabled: createBooleanToggleHandler('sequential testing by default for experiments'),
+    default_sequential_tuning_parameter: createExperimentsDefaultHandler(
+        'default tuning parameter for sequential testing'
+    ),
+    experiment_recalculation_times: (change) => {
+        if (!Array.isArray(change.after)) {
+            return { description: [<>reset the experiment recalculation time to the default</>] }
+        }
+        // Stored as HH:00:00 strings; the seconds carry no information.
+        const times = change.after.map((time: string) => time.slice(0, 5)).join(', ')
+        return {
+            description: [
+                <>
+                    changed the experiment recalculation time to <em>{times} UTC</em>
+                </>,
+            ],
+        }
+    },
+    flag_cleanup_repository: createExperimentsDefaultHandler('default repository for experiment flag cleanup PRs'),
+
+    // Conversations
+    conversations_enabled: createBooleanToggleHandler('conversations'),
+    conversations_settings: () => {
+        return { description: [<>updated conversations settings</>] }
+    },
+
+    // should never come from the backend
+    created_at: () => null,
+    id: () => null,
+    updated_at: () => null,
+    uuid: () => null,
+    user_access_level: () => null,
+    live_events_token: () => null,
+    product_intents: () => null,
+    cookieless_server_hash_mode: () => null,
+
+    // don't make sense to be displayed
+    project_id: () => null,
+    organization: () => null,
+    ingested_event: () => null,
+    effective_membership_level: () => null,
+    default_modifiers: () => null,
+    is_demo: () => null,
+    has_group_types: () => null,
+    web_analytics_pre_aggregated_tables_enabled: () => null,
+    web_analytics_pre_aggregated_tables_version: () => null,
+    managed_viewsets: () => null,
+    flag_evaluations_mode: () => null,
+    flag_calls_only_in_flag_evaluations: () => null,
+    realtime_cohorts: () => null,
+    available_error_tracking_ai_features: () => null,
+    workflows_config: () => null,
+}
+
+function describeWorkflowEmailSuspension(logItem: ActivityLogItem): HumanizedChange {
+    const wasSuspended = logItem.activity === 'email_sending_suspended'
+    const reason = logItem.detail?.context?.reason as string | undefined
+    return {
+        summary: activityLogSummary(
+            logItem,
+            wasSuspended ? 'Suspended workflow email sending' : 'Re-enabled workflow email sending',
+            shortIdActivityLink(logItem, urls.notebook),
+            wasSuspended ? reason : undefined
+        ),
+        description: (
+            <>
+                <ActivityLogUserName logItem={logItem} /> {wasSuspended ? 'suspended' : 're-enabled'} workflow email
+                sending on {shortIdActivityLink(logItem, urls.notebook)}
+                {wasSuspended && reason ? <> (reason: {reason})</> : null}
+            </>
+        ),
+    }
+}
+
+function describeWorkflowEmailTierChange(logItem: ActivityLogItem): HumanizedChange {
+    const changes = logItem.detail?.changes || []
+    const tierChange = changes.find((change) => change.field === 'email_sending_tier')
+    const pinChange = changes.find((change) => change.field === 'email_sending_tier_pinned')
+    const contextReason = logItem.detail?.context?.reason as string | undefined
+    // A staff-set tier has no decision behind it, so the row says "set" and shows no reason.
+    const setByStaff = contextReason === 'staff_set'
+    const reason = setByStaff ? undefined : contextReason
+    const target = shortIdActivityLink(logItem, urls.notebook)
+    const pinVerb = pinChange ? (pinChange.after ? 'pinned' : 'unpinned') : null
+    const verb = tierChange ? (setByStaff ? 'set' : 'moved') : (pinVerb ?? 'changed')
+    const tierMove = tierChange ? ` from ${String(tierChange.before)} to ${String(tierChange.after)}` : ''
+    const pinSuffix = tierChange && pinVerb ? ` and ${pinVerb === 'pinned' ? 'pinned it there' : 'unpinned it'}` : ''
+    const action = `${verb} the workflow email sending tier`
+    return {
+        summary: activityLogSummary(logItem, `${capitalizeFirstLetter(action)}${tierMove}${pinSuffix}`, target, reason),
+        description: (
+            <>
+                <ActivityLogUserName logItem={logItem} /> {action} on {target}
+                {tierMove}
+                {pinSuffix}
+                {reason ? <> (reason: {reason})</> : null}
+            </>
+        ),
+    }
+}
+
+export function teamActivityDescriber(logItem: ActivityLogItem, asNotification?: boolean): HumanizedChange {
+    if (logItem.scope !== ActivityScope.TEAM) {
+        console.error('team describer received a non-Team activity')
+        return { description: null }
+    }
+
+    if (logItem.activity === 'email_sending_suspended' || logItem.activity === 'email_sending_unsuspended') {
+        return describeWorkflowEmailSuspension(logItem)
+    }
+
+    if (logItem.activity === 'email_sending_tier_changed') {
+        return describeWorkflowEmailTierChange(logItem)
+    }
+
+    if (logItem.activity == 'changed' || logItem.activity == 'updated') {
+        const changes = describeMappedChanges(
+            logItem,
+            TEAM_PROPERTIES_MAPPING,
+            shortIdActivityLink(logItem, urls.notebook),
+            <>on {shortIdActivityLink(logItem, urls.notebook)}</>
+        )
+        if (changes) {
+            return changes
+        }
+    }
+
+    return defaultDescriber(logItem, asNotification, shortIdActivityLink(logItem, urls.notebook))
+}

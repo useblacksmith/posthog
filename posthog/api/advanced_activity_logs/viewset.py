@@ -1,0 +1,977 @@
+import re
+import json
+import heapq
+import hashlib
+import logging
+import itertools
+import dataclasses
+from collections.abc import Iterator, Sequence
+from datetime import datetime
+from functools import cached_property
+from operator import attrgetter
+from typing import Any, Optional, cast, get_args
+from urllib.parse import urlencode
+
+from django.db.models import Q, QuerySet
+
+from drf_spectacular.utils import extend_schema
+from rest_framework import mixins, serializers, viewsets
+from rest_framework.decorators import action
+from rest_framework.permissions import BasePermission
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from posthog.api.fields import JSONStringFilterField, JSONTolerantListField, OptionalBooleanField
+from posthog.api.pagination import BoundedPageNumberPagination, StableCursorPagination
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.api.shared import UserBasicSerializer
+from posthog.constants import AvailableFeature
+from posthog.exceptions_capture import capture_exception
+from posthog.models import NotificationViewed
+from posthog.models.activity_logging.activity_log import (
+    ActivityLog,
+    ActivityScope,
+    apply_activity_visibility_restrictions,
+)
+from posthog.models.activity_logging.property_value_visibility import PropertyValueVisibility
+from posthog.models.activity_logging.retention import get_activity_log_lookback_restriction
+from posthog.models.activity_logging.utils import CREDENTIAL_TYPE_CHOICES
+from posthog.models.organization import Organization, OrganizationMembership
+from posthog.models.user import User
+from posthog.paging import CursorPageRequest
+from posthog.permissions import PremiumFeaturePermission
+from posthog.queryset_paging import select_cursor_rows
+from posthog.tasks import exporter
+
+from products.exports.backend.models.exported_asset import ExportedAsset
+from products.exports.backend.source_authentication import get_export_source_authentication
+
+from .field_discovery import AdvancedActivityLogFieldDiscovery
+from .filters import AdvancedActivityLogFilterManager, filters_match_change_values, validate_detail_filters
+from .ocsf import ActivityLogOCSFSerializer
+
+ACTIVITY_LOG_ORDERING_DESCENDING = "-created_at"
+ACTIVITY_LOG_ORDERING_ASCENDING = "created_at"
+ACTIVITY_LOG_ORDERING_CHOICES = [ACTIVITY_LOG_ORDERING_DESCENDING, ACTIVITY_LOG_ORDERING_ASCENDING]
+
+ACTIVITY_LOG_SCHEMA_OCSF = "ocsf"
+
+
+def activity_log_ordering(request: Request) -> tuple[str, str]:
+    """Ordering tuple for the list endpoints, with `id` appended so ties break deterministically.
+
+    Ascending exists so a polling client can persist a cursor and resume forward; descending can't
+    advance because new rows always land at position 0. Values follow DRF's `OrderingFilter`
+    grammar: a bare field name is ascending, a `-` prefix descending.
+    """
+    if request.query_params.get("ordering") == ACTIVITY_LOG_ORDERING_ASCENDING:
+        return ("created_at", "id")
+    return ("-created_at", "-id")
+
+
+def exclude_loop_activity(queryset: QuerySet[ActivityLog]) -> QuerySet[ActivityLog]:
+    # Legacy loop rows can hold another member's personal loop config, and the loops that decided
+    # who may see them are gone, so no one sees them.
+    return queryset.exclude(scope="Loop")
+
+
+def restrict_canvas_activity(queryset: QuerySet[ActivityLog], team_id: int, user) -> QuerySet[ActivityLog]:
+    """Keep Canvas metadata hidden by channel visibility or source policy out of the feed.
+
+    Restrict `Canvas`-scoped rows to canvases this user may access through `CanvasViewSet`.
+    Lazy import keeps the canvas product off this module's path.
+    """
+    from products.canvas.backend.facade import access as canvas_activity  # noqa: PLC0415
+
+    visible_ids = canvas_activity.visible_canvas_ids(team_id, getattr(user, "id", None))
+    return queryset.exclude(Q(scope="Canvas") & ~Q(item_id__in=visible_ids))
+
+
+def restrict_canvas_activity_for_org(queryset: QuerySet[ActivityLog], organization_id, user) -> QuerySet[ActivityLog]:
+    """Org-wide equivalent of `restrict_canvas_activity`. The org route has no single
+    `team_id`, so deny canvases hidden by channel visibility or source policy across the
+    org. Canvases are soft-deleted, so their visibility stays computable without a snapshot.
+    """
+    from products.canvas.backend.facade import access as canvas_activity  # noqa: PLC0415
+
+    hidden_ids = canvas_activity.hidden_canvas_ids_for_org(organization_id, getattr(user, "id", None))
+    if not hidden_ids:
+        return queryset
+    return queryset.exclude(Q(scope="Canvas") & Q(item_id__in=hidden_ids))
+
+
+def apply_organization_scoped_filter(
+    queryset: QuerySet[ActivityLog], include_org_scoped: bool, team_id: int, organization_id
+) -> QuerySet[ActivityLog]:
+    """
+    Filter activity log queryset by team/org.
+
+    When include_org_scoped is True, includes both:
+    - Records with team_id matching the given team
+    - Records with team_id=NULL and organization_id matching (org-scoped records)
+
+    When False, only filters by team_id.
+    """
+    if include_org_scoped:
+        return queryset.filter(Q(team_id=team_id) | Q(team_id__isnull=True, organization_id=organization_id))
+    else:
+        return queryset.filter(team_id=team_id)
+
+
+def merge_ordered_rows(row_lists: Sequence[list[ActivityLog]], ordering: Sequence[str]) -> list[ActivityLog]:
+    return list(
+        heapq.merge(
+            *row_lists,
+            key=attrgetter(*(term.lstrip("-") for term in ordering)),
+            reverse=ordering[0].startswith("-"),
+        )
+    )
+
+
+def select_merged_cursor_rows(querysets: Sequence[QuerySet[ActivityLog]], page: CursorPageRequest) -> list[ActivityLog]:
+    window = dataclasses.replace(page, offset=0, limit=page.offset + page.limit)
+    rows = merge_ordered_rows([select_cursor_rows(queryset, window) for queryset in querysets], page.ordering)
+    return rows[page.offset : page.offset + page.limit]
+
+
+POSITION_CHUNK_SIZE = 1000
+
+
+class MergedActivityLogQuerysets:
+    def __init__(self, querysets: Sequence[QuerySet[ActivityLog]], ordering: Sequence[str]) -> None:
+        self.querysets = querysets
+        self.ordering = ordering
+
+    def count(self) -> int:
+        return sum(queryset.count() for queryset in self.querysets)
+
+    def _iter_positions(self, queryset: QuerySet[ActivityLog]) -> Iterator[tuple[Any, ...]]:
+        positions = queryset.values_list(*(term.lstrip("-") for term in self.ordering))
+        after: tuple[str | None, ...] = ()
+        while True:
+            chunk = cast(
+                list[tuple[Any, ...]],
+                select_cursor_rows(
+                    positions,
+                    CursorPageRequest(ordering=tuple(self.ordering), after=after, offset=0, limit=POSITION_CHUNK_SIZE),
+                ),
+            )
+            yield from chunk
+            if len(chunk) < POSITION_CHUNK_SIZE:
+                return
+            after = tuple(None if value is None else str(value) for value in chunk[-1])
+
+    def __getitem__(self, window: slice) -> list[ActivityLog]:
+        merged = heapq.merge(
+            *(self._iter_positions(queryset) for queryset in self.querysets),
+            reverse=self.ordering[0].startswith("-"),
+        )
+        page_ids = [position[-1] for position in itertools.islice(merged, window.start, window.stop)]
+        rows_by_id: dict[Any, ActivityLog] = {}
+        for queryset in self.querysets:
+            rows_by_id.update((row.id, row) for row in queryset.filter(id__in=page_ids))
+        return [rows_by_id[row_id] for row_id in page_ids if row_id in rows_by_id]
+
+
+def visible_detail(instance: ActivityLog, context: dict[str, Any]) -> Optional[dict[str, Any]]:
+    visibility = PropertyValueVisibility.from_serializer_context(context)
+    if visibility is None:
+        return instance.safe_detail
+    return visibility.apply(instance, instance.safe_detail)
+
+
+def credential_type_field() -> serializers.ChoiceField:
+    return serializers.ChoiceField(
+        choices=CREDENTIAL_TYPE_CHOICES,
+        read_only=True,
+        allow_null=True,
+        help_text=(
+            "Kind of credential that authenticated the request that made the change. 'unattributed' means "
+            "the request recorded no credential. Null for changes made outside a request, such as "
+            "background jobs, and for entries recorded before PostHog stored the credential."
+        ),
+    )
+
+
+def credential_id_field() -> serializers.CharField:
+    """The raw `credential_id` column also holds internal ids, so customer-facing serializers read
+    `customer_visible_credential_id` through this field and never declare the column itself."""
+    return serializers.CharField(
+        source="customer_visible_credential_id",
+        read_only=True,
+        allow_null=True,
+        help_text=(
+            "Id of the credential that authenticated the change: the login session id for 'session', or "
+            "the key id for 'personal_api_key' and 'project_secret_key'. Null for every other credential "
+            "type and for impersonated changes."
+        ),
+    )
+
+
+class ActivityLogSerializer(serializers.ModelSerializer):
+    user = UserBasicSerializer()
+    unread = serializers.SerializerMethodField()
+    credential_type = credential_type_field()
+    credential_id = credential_id_field()
+
+    class Meta:
+        model = ActivityLog
+        # An explicit list, so that a new internal column such as `impersonated_by_id` stays out. This
+        # serializer also builds the `$activity_log_entry_created` event, so a field listed here
+        # reaches the activity log API, the advanced API and customer destinations at the same time.
+        fields = [
+            "id",
+            "user",
+            "unread",
+            "team_id",
+            "organization_id",
+            "was_impersonated",
+            "is_system",
+            "client",
+            "ip_address",
+            "credential_type",
+            "credential_id",
+            "activity",
+            "item_id",
+            "scope",
+            "detail",
+            "created_at",
+        ]
+
+    def to_representation(self, instance: ActivityLog) -> dict:
+        data = super().to_representation(instance)
+        data["detail"] = visible_detail(instance, self.context)
+        return data
+
+    def get_unread(self, obj: ActivityLog) -> bool:
+        """is the date of this log item newer than the user's bookmark"""
+        if "user" not in self.context:
+            return False
+
+        user_bookmark: Optional[NotificationViewed] = NotificationViewed.objects.filter(
+            user=self.context["user"]
+        ).first()
+
+        if user_bookmark is None:
+            return True
+        else:
+            bookmark_date = user_bookmark.last_viewed_activity_date
+            return bookmark_date < obj.created_at.replace(microsecond=obj.created_at.microsecond // 1000 * 1000)
+
+
+class TailFollowingCursorPagination(StableCursorPagination):
+    """Cursor pagination that can keep a forward cursor alive after the stream is exhausted.
+
+    Stock DRF returns `next: null` on the final page, which leaves a polling client nothing to
+    resume from: a saved "last page" URL just replays that page, so the client has to fall back
+    to a date filter plus deduplication. With `follow=true` the link stays valid, so a caller can
+    store one cursor and re-poll it as new entries arrive - the pattern Okta's System Log API
+    documents.
+
+    Opt-in rather than implied by ascending order, because a live cursor changes the termination
+    condition: a follower stops when `results` is empty, not when `next` is null. Leaving that on
+    by default would make the obvious `while next: ...` loop run forever.
+
+    Known gap: the cursor stores the last-seen `created_at` and `id`, and the next poll reads the
+    rows that sort after both. An entry written later with the same `created_at` comes back only
+    when its `id` sorts after the last-seen one.
+    """
+
+    # A follower polls this on every request, so a count would scan the activity log each time.
+    include_count = False
+    follow = False
+
+    def get_next_link(self) -> Optional[str]:
+        link = super().get_next_link()
+        if link is not None or not self.follow:
+            return link
+        if self.ordering and str(self.ordering[0]).startswith("-"):
+            # Descending walks into history and has a real end; there is no tail to follow.
+            return None
+        if not self.page:
+            # Nothing new since the caller's position, so hand the same cursor back.
+            return self.cursor_link(self.current_cursor) if self.current_cursor else None
+        return self.cursor_link(self.next_cursor(self.page))
+
+
+class ActivityLogPageNumberPagination(BoundedPageNumberPagination):
+    page_size = 100
+    page_size_query_param = "page_size"
+
+
+class ActivityLogPagination(TailFollowingCursorPagination):
+    """Cursor pages by default, and numbered pages when the request has a `page` parameter."""
+
+    page_size = 100
+    page_size_query_param = "page_size"
+    max_page_size = 1000
+    # `created_at` is not unique, so `id` breaks ties and the cursor stores both.
+    ordering = ("-created_at", "-id")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.page_number_pagination = ActivityLogPageNumberPagination()
+        self.request: Optional[Request] = None
+
+    def paginate_queryset(self, queryset, request, view=None):
+        self.request = request
+        list_scope_querysets = getattr(view, "list_scope_querysets", None)
+        scope_querysets = list_scope_querysets() if list_scope_querysets else None
+        if request.query_params.get("page"):
+            if scope_querysets:
+                queryset = MergedActivityLogQuerysets(scope_querysets, activity_log_ordering(request))
+            return self.page_number_pagination.paginate_queryset(queryset, request, view)
+        self.ordering = activity_log_ordering(request)
+        self.follow = request.query_params.get("follow") == "true"
+        if not scope_querysets:
+            return super().paginate_queryset(queryset, request, view)
+        return self._read_page(lambda page: select_merged_cursor_rows(scope_querysets, page), queryset, request, view)
+
+    def get_paginated_response(self, data):
+        if self.request and self.request.query_params.get("page"):
+            return self.page_number_pagination.get_paginated_response(data)
+        return super().get_paginated_response(data)
+
+    def get_paginated_response_schema(self, schema):
+        # The paginator picks cursor or page-number mode per request, so the schema has to describe
+        # both. Cursor responses (the default) carry no `count`, so it is documented as an optional
+        # property rather than a required one.
+        cursor_schema = super().get_paginated_response_schema(schema)
+        page_number_schema = self.page_number_pagination.get_paginated_response_schema(schema)
+        cursor_schema["properties"]["count"] = page_number_schema["properties"]["count"]
+        return cursor_schema
+
+
+class ActivityLogScopeField(serializers.ChoiceField):
+    def __init__(self, **kwargs):
+        choices = get_args(ActivityScope)
+        super().__init__(choices=choices, **kwargs)
+
+
+class ActivityLogQueryParamsSerializer(serializers.Serializer):
+    user = serializers.UUIDField(
+        required=False,
+        help_text="Filter by user UUID who performed the action.",
+    )
+    scope = ActivityLogScopeField(
+        required=False,
+        help_text='Filter by a single activity scope, e.g. "FeatureFlag", "Insight", "Dashboard", "Experiment".',
+    )
+    scopes = serializers.ListField(
+        child=ActivityLogScopeField(),
+        required=False,
+        help_text='Filter by multiple activity scopes, comma-separated. Values must be valid ActivityScope enum values. E.g. "FeatureFlag,Insight".',
+    )
+    item_id = serializers.CharField(
+        required=False,
+        help_text="Filter by the ID of the affected resource.",
+    )
+    ordering = serializers.ChoiceField(
+        choices=ACTIVITY_LOG_ORDERING_CHOICES,
+        required=False,
+        default=ACTIVITY_LOG_ORDERING_DESCENDING,
+        help_text=(
+            "Sort by when the entry was created. Defaults to newest first. Use created_at for oldest "
+            "first when polling for new entries, so a saved cursor picks up where the last request stopped."
+        ),
+    )
+    page = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        help_text="Page number for pagination. When provided, uses page-based pagination ordered by most recent first.",
+    )
+    page_size = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=1000,
+        default=100,
+        help_text="Number of results per page (default: 100, max: 1000).",
+    )
+
+
+@extend_schema(tags=["activity_logs"], extensions={"x-product": "platform_features"})
+class ActivityLogViewSet(TeamAndOrgViewSetMixin, viewsets.GenericViewSet, mixins.ListModelMixin):
+    scope_object = "activity_log"
+    queryset = ActivityLog.objects.all()
+    serializer_class = ActivityLogSerializer
+    pagination_class = ActivityLogPagination
+    filter_rewrite_rules = {"project_id": "team_id"}
+    permission_classes = [PremiumFeaturePermission]
+    premium_feature_on_cloud = AvailableFeature.AUDIT_LOGS
+
+    @extend_schema(parameters=[ActivityLogQueryParamsSerializer])
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    def _should_skip_parents_filter(self) -> bool:
+        """
+        Skip parent filtering when team has receive_org_level_activity_logs enabled.
+        We'll apply custom org-scoped filtering in safely_get_queryset instead.
+        """
+        return bool(self.team.receive_org_level_activity_logs)
+
+    def safely_get_queryset(self, queryset) -> QuerySet:
+        params = self.request.GET.dict()
+
+        queryset = apply_organization_scoped_filter(
+            queryset.select_related("user"),
+            bool(self.team.receive_org_level_activity_logs),
+            self.team_id,
+            self.organization.id,
+        )
+
+        if params.get("user"):
+            queryset = queryset.filter(user=params.get("user"))
+        if params.get("scope"):
+            queryset = queryset.filter(scope=params.get("scope"))
+        if params.get("scopes", None):
+            scopes = str(params.get("scopes", "")).split(",")
+            queryset = queryset.filter(scope__in=scopes)
+        if params.get("item_id"):
+            if set(str(params.get("scopes", "")).split(",")) == {"DataWarehouseSavedQuery", "DataQualityCheck"}:
+                # Load the product relationship only for a model's combined history feed.
+                from products.data_quality.backend.facade.activity import model_activity  # noqa: PLC0415
+
+                queryset = model_activity(queryset, self.team_id, params["item_id"])
+            else:
+                queryset = queryset.filter(item_id=params.get("item_id"))
+
+        if params.get("page"):
+            queryset = queryset.order_by(*activity_log_ordering(self.request))
+
+        lookback_date = get_activity_log_lookback_restriction(self.organization)
+        if lookback_date:
+            queryset = queryset.filter(created_at__gte=lookback_date)
+
+        queryset = apply_activity_visibility_restrictions(queryset, self.request.user)
+        queryset = exclude_loop_activity(queryset)
+        queryset = restrict_canvas_activity(queryset, self.team_id, self.request.user)
+
+        return queryset
+
+
+_IP_FILTER_RE = re.compile(r"^[0-9a-fA-F:.*]+$")
+_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def _validate_ip_or_wildcard(value: str) -> None:
+    v = (value or "").strip()
+    if not v or not _IP_FILTER_RE.match(v):
+        raise serializers.ValidationError(
+            "Invalid IP address format. Use a valid IPv4/IPv6 address or a wildcard like `203.0.113.*`."
+        )
+    if "*" in v:
+        return  # wildcard patterns are accepted as-is
+    if _IPV4_RE.match(v):
+        if not all(int(octet) <= 255 for octet in v.split(".")):
+            raise serializers.ValidationError(
+                "Invalid IP address format. Use a valid IPv4/IPv6 address or a wildcard like `203.0.113.*`."
+            )
+        return
+    if ":" not in v:
+        raise serializers.ValidationError(
+            "Invalid IP address format. Use a valid IPv4/IPv6 address or a wildcard like `203.0.113.*`."
+        )
+
+
+class AdvancedActivityLogFiltersSerializer(serializers.Serializer):
+    start_date = serializers.DateTimeField(
+        required=False,
+        help_text=(
+            "Lower bound on `created_at` (inclusive), as an ISO 8601 timestamp with a UTC offset, "
+            "such as `2026-01-15T10:30:00Z`."
+        ),
+    )
+    end_date = serializers.DateTimeField(
+        required=False,
+        help_text=(
+            "Upper bound on `created_at` (inclusive), as an ISO 8601 timestamp with a UTC offset, "
+            "such as `2026-01-15T11:30:00Z`."
+        ),
+    )
+    users = JSONTolerantListField(
+        child=serializers.UUIDField(),
+        required=False,
+        default=[],
+        help_text="Filter by users who performed the activity (user UUIDs).",
+    )
+    scopes = JSONTolerantListField(
+        child=serializers.CharField(),
+        required=False,
+        default=[],
+        help_text='Filter by activity scopes (e.g. "FeatureFlag", "Insight").',
+    )
+    activities = JSONTolerantListField(
+        child=serializers.CharField(),
+        required=False,
+        default=[],
+        help_text='Filter by activity types (e.g. "created", "updated", "deleted").',
+    )
+    clients = JSONTolerantListField(
+        child=serializers.CharField(),
+        required=False,
+        default=[],
+        help_text="Filter by API clients that generated the activity (the x-posthog-client header, or 'scout:<skill_name>' for a scout run).",
+    )
+    ip_addresses = JSONTolerantListField(
+        child=serializers.CharField(validators=[_validate_ip_or_wildcard]),
+        required=False,
+        default=[],
+        help_text=(
+            "Filter by client IP addresses. Accepts exact IPv4/IPv6 values or wildcard patterns "
+            "using `*` (e.g. `203.0.113.*`). Multiple entries are OR-combined."
+        ),
+    )
+    team_ids = JSONTolerantListField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=[],
+        help_text=(
+            "Filter by project (team) IDs. Only honored on the organization-scoped endpoint; "
+            "ignored on the project-scoped endpoint."
+        ),
+    )
+    search_text = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Free-text search across the `detail` JSON column.",
+    )
+    detail_filters = JSONStringFilterField(
+        required=False,
+        help_text=(
+            "JSON-encoded map of `detail` field paths to {operation, value} filters. "
+            "Allowed operations: exact, contains, in."
+        ),
+    )
+    hogql_filter = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="Reserved for future HogQL-based filtering.",
+    )
+    was_impersonated = OptionalBooleanField(
+        required=False,
+        help_text="When set, filters rows where the actor was impersonating another user.",
+    )
+    is_system = OptionalBooleanField(
+        required=False,
+        help_text="When set, filters rows authored by the system (no user).",
+    )
+    item_ids = JSONTolerantListField(
+        child=serializers.CharField(),
+        required=False,
+        default=[],
+        help_text="Filter by the `item_id` of the affected resource(s).",
+    )
+    ordering = serializers.ChoiceField(
+        choices=ACTIVITY_LOG_ORDERING_CHOICES,
+        required=False,
+        default=ACTIVITY_LOG_ORDERING_DESCENDING,
+        help_text=(
+            "Sort by when the entry was created. Defaults to newest first. Use created_at for oldest "
+            "first when polling for new entries, so a saved cursor picks up where the last request stopped."
+        ),
+    )
+    follow = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Keep the next link valid after the last entry, so the same cursor can be re-polled as "
+            "new entries arrive. Only applies with oldest-first ordering. When following, stop on an "
+            "empty results list rather than on a null next link."
+        ),
+    )
+    schema = serializers.ChoiceField(
+        choices=[ACTIVITY_LOG_SCHEMA_OCSF],
+        required=False,
+        help_text=(
+            "Response format. Set to ocsf to return Open Cybersecurity Schema Framework events for "
+            "ingestion into a security tool. Omit for the default PostHog format."
+        ),
+    )
+    include_values = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "Include the previous and new values of changed fields. Only applies when schema is ocsf. "
+            "Values can contain the content of the changed object, which makes responses larger and "
+            "sends that content to your security tool."
+        ),
+    )
+    page = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        help_text="Page number for pagination. When provided, uses page-based pagination ordered by most recent first.",
+    )
+    page_size = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=1000,
+        default=100,
+        help_text="Number of results per page (default: 100, max: 1000).",
+    )
+
+    def validate_detail_filters(self, value: Any) -> dict[str, Any]:
+        return validate_detail_filters(value)
+
+
+class ActivityLogFlatExportSerializer(serializers.ModelSerializer):
+    organization_id = serializers.UUIDField()
+    project_id = serializers.CharField(source="team_id")
+    user_first_name = serializers.CharField(source="user.first_name", default="")
+    user_last_name = serializers.CharField(source="user.last_name", default="")
+    user_email = serializers.CharField(source="user.email", default="")
+    detail = serializers.SerializerMethodField()
+    credential_type = credential_type_field()
+    credential_id = credential_id_field()
+
+    class Meta:
+        model = ActivityLog
+        # The export writes columns in this order, and readers of the file can rely on position, so a
+        # new field goes at the end.
+        fields = [
+            "id",
+            "organization_id",
+            "project_id",
+            "user_first_name",
+            "user_last_name",
+            "user_email",
+            "activity",
+            "scope",
+            "item_id",
+            "detail",
+            "client",
+            "ip_address",
+            "created_at",
+            "credential_type",
+            "credential_id",
+        ]
+
+    def get_detail(self, obj):
+        return json.dumps(visible_detail(obj, self.context)) if obj.detail else ""
+
+
+class StaticFiltersSerializer(serializers.Serializer):
+    users = serializers.ListField(child=serializers.DictField(), help_text="Users who have logged activity.")
+    scopes = serializers.ListField(child=serializers.DictField(), help_text="Available activity scopes.")
+    activities = serializers.ListField(child=serializers.DictField(), help_text="Available activity types.")
+    clients = serializers.ListField(
+        child=serializers.DictField(),
+        help_text="API clients that have generated activity (the x-posthog-client header, or 'scout:<skill_name>' for a scout run).",
+    )
+
+
+class AvailableFiltersResponseSerializer(serializers.Serializer):
+    static_filters = StaticFiltersSerializer(help_text="Pre-computed filter options for scopes, activities, and users.")
+    detail_fields = serializers.DictField(help_text="Discovered detail fields and their value distributions.")
+
+
+@extend_schema(extensions={"x-product": "platform_features"})
+class AdvancedActivityLogsViewSet(TeamAndOrgViewSetMixin, viewsets.GenericViewSet, mixins.ListModelMixin):
+    serializer_class = ActivityLogSerializer
+    pagination_class = ActivityLogPagination
+    logger = logging.getLogger(__name__)
+    filter_rewrite_rules = {"project_id": "team_id"}
+    scope_object = "activity_log"
+    scope_object_read_actions = ["list", "retrieve", "available_filters"]
+    queryset = ActivityLog.objects.all()
+    permission_classes = [PremiumFeaturePermission]
+    premium_feature_on_cloud = AvailableFeature.AUDIT_LOGS
+
+    def _should_skip_parents_filter(self) -> bool:
+        """
+        Skip parent filtering when team has receive_org_level_activity_logs enabled.
+        We'll apply custom org-scoped filtering in safely_get_queryset instead.
+        """
+        return bool(self.team.receive_org_level_activity_logs)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._filter_manager = None
+        self._field_discovery = None
+        self._scope_filter: Optional[Q] = None
+
+    @property
+    def filter_manager(self) -> AdvancedActivityLogFilterManager:
+        if self._filter_manager is None:
+            self._filter_manager = AdvancedActivityLogFilterManager()
+        return self._filter_manager
+
+    @property
+    def field_discovery(self) -> AdvancedActivityLogFieldDiscovery:
+        if self._field_discovery is None:
+            self._field_discovery = AdvancedActivityLogFieldDiscovery(self.organization.id)
+        return self._field_discovery
+
+    def _make_filters_serializable(self, filters_data: dict) -> dict[str, Any]:
+        serializable_filters: dict[str, Any] = {}
+        for key, value in filters_data.items():
+            if isinstance(value, datetime):
+                serializable_filters[key] = value.isoformat()
+            elif isinstance(value, list):
+                serializable_filters[key] = [str(v) if hasattr(v, "hex") else v for v in value]
+            else:
+                serializable_filters[key] = value
+        return serializable_filters
+
+    def _generate_export_filename(self, filters_data: dict, export_format: str) -> str:
+        filter_string = json.dumps(filters_data, sort_keys=True)
+        # md5 is fine here since file name collisions have no security impact
+        # nosemgrep: python.lang.security.insecure-hash-algorithms-md5.insecure-hash-algorithm-md5
+        filter_hash = hashlib.md5(filter_string.encode()).hexdigest()[:6]
+
+        has_filters = any(filters_data.values())
+
+        current_date = datetime.now().strftime("%Y%m%d")
+        filename_base = (
+            f"activity_logs_{filter_hash}_{current_date}" if has_filters else f"activity_logs_all_{current_date}"
+        )
+        return filename_base
+
+    def safely_get_queryset(self, queryset) -> QuerySet:
+        queryset = queryset.select_related("user")
+
+        if self._scope_filter is not None:
+            queryset = queryset.filter(self._scope_filter)
+        else:
+            queryset = apply_organization_scoped_filter(
+                queryset,
+                bool(self.team.receive_org_level_activity_logs),
+                self.team_id,
+                self.organization.id,
+            )
+
+        # Apply lookback restriction based on feature limits
+        lookback_date = get_activity_log_lookback_restriction(self.organization)
+        if lookback_date:
+            queryset = queryset.filter(created_at__gte=lookback_date)
+
+        queryset = apply_activity_visibility_restrictions(queryset, self.request.user)
+        queryset = exclude_loop_activity(queryset)
+        queryset = restrict_canvas_activity(queryset, self.team_id, self.request.user)
+
+        return queryset.order_by(*activity_log_ordering(self.request))
+
+    def _validated_query_params(self) -> dict[str, Any]:
+        # Validate once so serializer selection and context read the same coerced values the
+        # filters serializer produces, instead of re-parsing the raw query string.
+        validated = getattr(self, "_validated_query_params_cache", None)
+        if validated is None:
+            serializer = AdvancedActivityLogFiltersSerializer(data=self.request.query_params)
+            serializer.is_valid(raise_exception=True)
+            validated = self._validated_query_params_cache = serializer.validated_data
+        return validated
+
+    def get_serializer_class(self):
+        # This query param is set by the CSV exporter to indicate that the response should be serialized in a flat format
+        if self.request.query_params.get("is_csv_export") == "1":
+            return ActivityLogFlatExportSerializer
+
+        if self._validated_query_params().get("schema") == ACTIVITY_LOG_SCHEMA_OCSF:
+            return ActivityLogOCSFSerializer
+
+        return super().get_serializer_class()
+
+    @cached_property
+    def property_value_visibility(self) -> PropertyValueVisibility:
+        return PropertyValueVisibility(self.request.user)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["include_values"] = bool(self._validated_query_params().get("include_values"))
+        self.property_value_visibility.add_to_serializer_context(context)
+        return context
+
+    def _exclude_hidden_group_values_from_value_filters(
+        self, queryset: QuerySet[ActivityLog], filters: dict[str, Any]
+    ) -> QuerySet[ActivityLog]:
+        # Masking happens at serialization, so value filters must not match entries whose values are hidden.
+        if not filters_match_change_values(filters):
+            return queryset
+        hidden = self.property_value_visibility.hidden_group_values_filter(self.team_id, self.organization.id)
+        if hidden is None:
+            return queryset
+        return queryset.exclude(hidden)
+
+    def _get_filtered_queryset(self, scope_filter: Optional[Q] = None) -> QuerySet[ActivityLog]:
+        filters = self._validated_query_params()
+        self._scope_filter = scope_filter
+        try:
+            queryset = self.get_queryset()
+        finally:
+            self._scope_filter = None
+        queryset = self.filter_manager.apply_filters(queryset, filters)
+        return self._exclude_hidden_group_values_from_value_filters(queryset, filters)
+
+    def list_scope_querysets(self) -> Optional[list[QuerySet[ActivityLog]]]:
+        if not self.team.receive_org_level_activity_logs:
+            return None
+        return [
+            self._get_filtered_queryset(Q(team_id=self.team_id)),
+            self._get_filtered_queryset(Q(team_id__isnull=True, organization_id=self.organization.id)),
+        ]
+
+    @extend_schema(parameters=[AdvancedActivityLogFiltersSerializer])
+    def list(self, request, *args, **kwargs):
+        queryset = self._get_filtered_queryset()
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @extend_schema(responses={200: AvailableFiltersResponseSerializer})
+    @action(detail=False, methods=["GET"])
+    def available_filters(self, request, **kwargs):
+        queryset = self.get_queryset()
+        available_filters = self.field_discovery.get_available_filters(queryset)
+        return Response(available_filters)
+
+    @action(detail=False, methods=["POST"], required_scopes=["activity_log:read"])
+    def export(self, request, **kwargs):
+        export_format = request.data.get("format", "csv")
+
+        format_mapping = {
+            "csv": ExportedAsset.ExportFormat.CSV,
+            "xlsx": ExportedAsset.ExportFormat.XLSX,
+        }
+
+        if export_format not in format_mapping:
+            return Response({"error": f"Unsupported export format: {export_format}"}, status=400)
+
+        filters_serializer = AdvancedActivityLogFiltersSerializer(data=request.data.get("filters", {}))
+
+        if not filters_serializer.is_valid():
+            return Response({"error": "Filters are invalid"}, status=400)
+
+        query_params: dict[str, str | list[str]] = {}
+
+        # Transform body params to query params to include the filters in the export path.
+        # Lists become repeated keys (?users=a&users=b): the filters serializer reads them via
+        # getlist, so a comma-joined value would be validated as one item. Only unset or empty
+        # values are skipped: an explicit False is a filter too (is_system=false).
+        for key, value in filters_serializer.validated_data.items():
+            if value is None or value in ("", [], {}):
+                continue
+            if isinstance(value, list):
+                query_params[key] = [str(v) for v in value]
+            elif isinstance(value, dict):
+                query_params[key] = json.dumps(value)
+            else:
+                query_params[key] = str(value)
+
+        try:
+            serializable_filters = self._make_filters_serializable(filters_serializer.validated_data)
+            filename = self._generate_export_filename(serializable_filters, export_format)
+            source_authentication = get_export_source_authentication(request.successful_authenticator)
+            if source_authentication is None:
+                return Response(
+                    {"error": "Exports from API endpoints do not support this authentication method."},
+                    status=400,
+                )
+
+            exported_asset = ExportedAsset.objects.create(
+                team=self.team,
+                export_format=format_mapping[export_format],
+                export_context={
+                    "path": f"/api/projects/{self.team_id}/advanced_activity_logs/?{urlencode(query_params, doseq=True)}",
+                    "method": "GET",
+                    "filters": serializable_filters,
+                    "filename": filename,
+                },
+                created_by=request.user,
+                **source_authentication,
+            )
+
+            exporter.export_asset.delay(exported_asset.id)
+
+            return Response(
+                {
+                    "id": exported_asset.id,
+                    "export_format": export_format,
+                },
+                status=202,
+            )
+
+        except Exception as e:
+            self.logger.exception(f"Failed to create export: {e}")
+            capture_exception(e)
+            return Response({"error": "Failed to create export"}, status=500)
+
+
+class OrganizationActivityLogPermission(BasePermission):
+    """
+    Restrict the organization-scoped activity logs endpoint to organization admins and owners.
+
+    Used in addition to OrganizationMemberPermissions, which TeamAndOrgViewSetMixin adds for
+    org-nested viewsets (so we already know the user is in the organization).
+    """
+
+    message = "Only organization admins and owners can view organization-wide activity logs."
+
+    def has_permission(self, request: Request, view) -> bool:
+        try:
+            organization = view.organization
+        except (Organization.DoesNotExist, ValueError):
+            return False
+
+        try:
+            membership = OrganizationMembership.objects.get(user=cast(User, request.user), organization=organization)
+        except OrganizationMembership.DoesNotExist:
+            return False
+
+        return membership.effective_level >= OrganizationMembership.Level.ADMIN
+
+
+@extend_schema(tags=["activity_logs"], extensions={"x-product": "platform_features"})
+class OrganizationAdvancedActivityLogsViewSet(AdvancedActivityLogsViewSet):
+    """
+    Organization-wide view of activity logs across every project in the organization.
+
+    Mounted at /api/organizations/<organization_id>/advanced_activity_logs/.
+    Restricted to organization admins and owners.
+    """
+
+    permission_classes = [PremiumFeaturePermission, OrganizationActivityLogPermission]
+    # The parent declares {"project_id": "team_id"} but our nested route only carries
+    # organization_id, so the rewrite would KeyError on missing "project_id". Reset it.
+    filter_rewrite_rules: dict[str, str] = {}
+
+    def _should_skip_parents_filter(self) -> bool:
+        # parents_query_dict is {"organization_id": <uuid>} on this nested route, so let
+        # TeamAndOrgViewSetMixin filter the queryset by organization_id automatically.
+        return False
+
+    def safely_get_queryset(self, queryset) -> QuerySet:
+        queryset = queryset.select_related("user")
+
+        lookback_date = get_activity_log_lookback_restriction(self.organization)
+        if lookback_date:
+            queryset = queryset.filter(created_at__gte=lookback_date)
+
+        queryset = apply_activity_visibility_restrictions(queryset, self.request.user)
+        queryset = exclude_loop_activity(queryset)
+        queryset = restrict_canvas_activity_for_org(queryset, self.organization.id, self.request.user)
+
+        return queryset.order_by(*activity_log_ordering(self.request))
+
+    def _exclude_hidden_group_values_from_value_filters(
+        self, queryset: QuerySet[ActivityLog], filters: dict[str, Any]
+    ) -> QuerySet[ActivityLog]:
+        # Only organization admins reach this endpoint, and property access control does not apply to them.
+        return queryset
+
+    def list_scope_querysets(self) -> Optional[list[QuerySet[ActivityLog]]]:
+        return None
+
+    @action(detail=False, methods=["POST"])
+    def export(self, request, **kwargs):  # type: ignore[override]
+        # Override the parent's export action: it depends on self.team (for ExportedAsset.team)
+        # which is not available on org-nested routes. Defer export support until we have an
+        # org-aware ExportedAsset story.
+        return Response(
+            {"error": "Export is not yet supported on the organization-scoped activity logs endpoint."},
+            status=400,
+        )

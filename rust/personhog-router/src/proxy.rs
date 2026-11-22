@@ -1,0 +1,1092 @@
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use http_body::Frame;
+use http_body_util::{BodyExt, Full};
+use metrics::{counter, histogram};
+use personhog_common::grpc::{
+    current_caller_tag, current_client_name, ClientInFlightGuard, GZIP_OVERHEAD_HEADER,
+    PROCESSING_TIME_HEADER,
+};
+use rand::Rng;
+use tonic::body::BoxBody;
+use tonic::Code;
+use tower::{Service, ServiceExt};
+
+use crate::backend::{ChannelBackend, LeaderBackend};
+use crate::config::RetryConfig;
+use crate::grpc_http::{
+    grpc_error_response, grpc_status_code, is_grpc_error_response, unapplied_refusal_reason,
+};
+
+const SERVICE_PREFIX: &str = "/personhog.service.v1.PersonHogService/";
+const REPLICA_PREFIX: &str = "/personhog.replica.v1.PersonHogReplica/";
+const IDENTITY_PREFIX: &str = "/personhog.identity.v1.PersonHogIdentity/";
+const LIFECYCLE_PREFIX: &str = "/personhog.lifecycle.v1.PersonHogLifecycle/";
+
+pub const KNOWN_METHODS: &[&str] = &[
+    "AckPersonTombstones",
+    "CheckCohortMembership",
+    "CountCohortMembers",
+    "CountGroupTypeMappings",
+    "CreateGroup",
+    "DeleteCohortMember",
+    "DeleteCohortMembersBulk",
+    "DeleteCohortMembersByPersonIds",
+    "DeleteGroupTypeMapping",
+    "DeleteGroupTypeMappingsBatchForTeam",
+    "DeleteGroupsBatchForTeam",
+    "DeleteHashKeyOverridesByTeams",
+    "DeletePersons",
+    "DeletePersonsBatchForTeam",
+    "DeleteTombstonedPersons",
+    "EnsurePersonVersionFloors",
+    "FencePerson",
+    "FencePersons",
+    "FoldPersonDocument",
+    "GetDistinctIdRows",
+    "GetDistinctIdsForPerson",
+    "GetDistinctIdsForPersons",
+    "GetGroup",
+    "GetGroupTypeMappingByDashboardId",
+    "GetGroupTypeMappingsByProjectId",
+    "GetGroupTypeMappingsByProjectIds",
+    "GetGroupTypeMappingsByTeamId",
+    "GetGroupTypeMappingsByTeamIds",
+    "GetGroups",
+    "GetGroupsBatch",
+    "GetHashKeyOverrideContext",
+    "GetPerson",
+    "GetPersonByDistinctId",
+    "GetPersonByUuid",
+    "GetPersonTombstones",
+    "GetPersons",
+    "GetPersonsByDistinctIds",
+    "GetPersonsByDistinctIdsInTeam",
+    "GetPersonsByUuids",
+    "InsertCohortMembers",
+    "ListCohortMemberIds",
+    "ListGroups",
+    "ListPersonTombstoneQueue",
+    "ListPersonsForTeam",
+    "RaisePersonVersion",
+    "RaisePersonVersionFloors",
+    "ReleaseFence",
+    "ReleaseFences",
+    "RestorePersons",
+    "SetPersonDistinctIdVersionFloor",
+    "SetPersonVersionFloor",
+    "SplitPerson",
+    "UpdateGroup",
+    "UpdateGroupTypeMapping",
+    "UpdatePersonProperties",
+    "UpsertHashKeyOverrides",
+    "WriteDistinctIds",
+];
+
+/// Identity-server RPCs, forwarded verbatim; sorted for binary search.
+pub const IDENTITY_METHODS: &[&str] = &[
+    "GetDistinctIdsForPersons",
+    "GetOrCreatePersonByDistinctId",
+    "GetOrCreatePersonsByDistinctIds",
+    "GetPersonsByDistinctIds",
+    "MergePersons",
+];
+
+pub const LIFECYCLE_METHODS: &[&str] = &["DeletePersons"];
+
+/// Where a request path lands: the service facade, whose methods split
+/// between replica and leader, or one of the identity server's two services.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Service,
+    Identity,
+    Lifecycle,
+}
+
+impl Target {
+    fn methods(self) -> &'static [&'static str] {
+        match self {
+            Target::Service => KNOWN_METHODS,
+            Target::Identity => IDENTITY_METHODS,
+            Target::Lifecycle => LIFECYCLE_METHODS,
+        }
+    }
+}
+
+/// Split a path into its target and method. Paths outside the served
+/// services or their method lists are refused, which keeps the method label
+/// on every router metric bounded.
+#[allow(clippy::result_large_err)]
+fn resolve_target(path: &str) -> Result<(Target, &str), http::Response<BoxBody>> {
+    let (target, method) = if let Some(method) = path.strip_prefix(SERVICE_PREFIX) {
+        (Target::Service, method)
+    } else if let Some(method) = path.strip_prefix(IDENTITY_PREFIX) {
+        (Target::Identity, method)
+    } else if let Some(method) = path.strip_prefix(LIFECYCLE_PREFIX) {
+        (Target::Lifecycle, method)
+    } else {
+        return Err(grpc_error_response(Code::Unimplemented, "unknown service"));
+    };
+    if target.methods().binary_search(&method).is_err() {
+        return Err(grpc_error_response(
+            Code::Unimplemented,
+            &format!("unknown method: {method}"),
+        ));
+    }
+    Ok((target, method))
+}
+
+pub struct RawProxyService {
+    inner: Arc<RawProxyInner>,
+}
+
+struct RawProxyInner {
+    replica: Arc<ChannelBackend>,
+    identity: Option<Arc<ChannelBackend>>,
+    leader: Option<Arc<LeaderBackend>>,
+    retry_config: RetryConfig,
+    max_recv_message_size: usize,
+    response_size_warn_bytes: usize,
+}
+
+impl RawProxyService {
+    pub fn new(
+        replica: Arc<ChannelBackend>,
+        identity: Option<Arc<ChannelBackend>>,
+        leader: Option<Arc<LeaderBackend>>,
+        retry_config: RetryConfig,
+        max_recv_message_size: usize,
+        response_size_warn_bytes: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RawProxyInner {
+                replica,
+                identity,
+                leader,
+                retry_config,
+                max_recv_message_size,
+                response_size_warn_bytes,
+            }),
+        }
+    }
+}
+
+impl Clone for RawProxyService {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl tonic::server::NamedService for RawProxyService {
+    const NAME: &'static str = "personhog.service.v1.PersonHogService";
+}
+
+impl Service<http::Request<BoxBody>> for RawProxyService {
+    type Response = http::Response<BoxBody>;
+    type Error = Infallible;
+    type Future = Pin<
+        Box<dyn std::future::Future<Output = Result<http::Response<BoxBody>, Infallible>> + Send>,
+    >;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<BoxBody>) -> Self::Future {
+        let inner = self.inner.clone();
+        Box::pin(async move { Ok(inner.handle(req).await) })
+    }
+}
+
+/// tonic routes each registration by its `NamedService::NAME`, so the
+/// identity server's two services need their own registered types; both
+/// delegate to the one proxy.
+macro_rules! proxy_facet {
+    ($name:ident, $service:literal) => {
+        #[derive(Clone)]
+        pub struct $name(pub RawProxyService);
+
+        impl tonic::server::NamedService for $name {
+            const NAME: &'static str = $service;
+        }
+
+        impl Service<http::Request<BoxBody>> for $name {
+            type Response = http::Response<BoxBody>;
+            type Error = Infallible;
+            type Future = <RawProxyService as Service<http::Request<BoxBody>>>::Future;
+
+            fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                self.0.poll_ready(cx)
+            }
+
+            fn call(&mut self, req: http::Request<BoxBody>) -> Self::Future {
+                self.0.call(req)
+            }
+        }
+    };
+}
+
+proxy_facet!(
+    IdentityProxyService,
+    "personhog.identity.v1.PersonHogIdentity"
+);
+proxy_facet!(
+    LifecycleProxyService,
+    "personhog.lifecycle.v1.PersonHogLifecycle"
+);
+
+impl RawProxyInner {
+    async fn handle(&self, req: http::Request<BoxBody>) -> http::Response<BoxBody> {
+        let path = req.uri().path().to_string();
+        let (target, method_name) = match resolve_target(&path) {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+
+        let method: Arc<str> = Arc::from(method_name);
+        let client = current_client_name();
+        let caller_tag = current_caller_tag();
+        let start = Instant::now();
+
+        let (mut response, backend, channel_call_ms) = match (target, method_name) {
+            (Target::Identity | Target::Lifecycle, _) => {
+                let (resp, call_ms) = self.raw_proxy_to_identity(req, &path, method.clone()).await;
+                (resp, "identity", call_ms)
+            }
+            (Target::Service, "UpdatePersonProperties") => {
+                let (resp, call_ms) = self
+                    .raw_proxy_to_leader(req, "UpdatePersonProperties")
+                    .await;
+                (resp, "leader", call_ms)
+            }
+            // Lifecycle fence RPCs: person writes, so they route to the
+            // owning leader and share the handoff stash discipline. A batch
+            // is routed by the one person its headers name, like any other
+            // leader call; the leader checks the rest hash there too.
+            (Target::Service, "FencePerson") => {
+                let (resp, call_ms) = self.raw_proxy_to_leader(req, "FencePerson").await;
+                (resp, "leader", call_ms)
+            }
+            (Target::Service, "FencePersons") => {
+                let (resp, call_ms) = self.raw_proxy_to_leader(req, "FencePersons").await;
+                (resp, "leader", call_ms)
+            }
+            (Target::Service, "ReleaseFence") => {
+                let (resp, call_ms) = self.raw_proxy_to_leader(req, "ReleaseFence").await;
+                (resp, "leader", call_ms)
+            }
+            (Target::Service, "ReleaseFences") => {
+                let (resp, call_ms) = self.raw_proxy_to_leader(req, "ReleaseFences").await;
+                (resp, "leader", call_ms)
+            }
+            // The merge saga's document write: leader-routed like every
+            // person write.
+            (Target::Service, "FoldPersonDocument") => {
+                let (resp, call_ms) = self.raw_proxy_to_leader(req, "FoldPersonDocument").await;
+                (resp, "leader", call_ms)
+            }
+            (Target::Service, "RaisePersonVersion") => {
+                let (resp, call_ms) = self.raw_proxy_to_leader(req, "RaisePersonVersion").await;
+                (resp, "leader", call_ms)
+            }
+            (Target::Service, "GetPerson") => {
+                let is_strong = req
+                    .headers()
+                    .get("x-read-consistency")
+                    .and_then(|v| v.to_str().ok())
+                    == Some("strong");
+
+                if is_strong {
+                    let (resp, call_ms) = self.raw_proxy_to_leader(req, "GetPerson").await;
+                    (resp, "leader", call_ms)
+                } else {
+                    let (resp, call_ms) = self.raw_proxy_to_replica(req, method.clone()).await;
+                    (resp, "replica", call_ms)
+                }
+            }
+            (Target::Service, _) => {
+                let (resp, call_ms) = self.raw_proxy_to_replica(req, method.clone()).await;
+                (resp, "replica", call_ms)
+            }
+        };
+
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        counter!(
+            "personhog_router_backend_requests_total",
+            "method" => method.clone(),
+            "backend" => backend,
+            "client" => client.clone(),
+        )
+        .increment(1);
+
+        histogram!(
+            "personhog_router_backend_duration_ms",
+            "method" => method.clone(),
+            "backend" => backend,
+            "client" => client.clone(),
+            "caller_tag" => caller_tag.clone(),
+        )
+        .record(duration_ms);
+
+        let processing_ms = response
+            .headers_mut()
+            .remove(PROCESSING_TIME_HEADER)
+            .and_then(|v| v.to_str().ok().and_then(|s| s.parse::<f64>().ok()));
+
+        let gzip_overhead_ms = response
+            .headers_mut()
+            .remove(GZIP_OVERHEAD_HEADER)
+            .and_then(|v| v.to_str().ok().and_then(|s| s.parse::<f64>().ok()));
+
+        if let Some(processing_ms) = processing_ms {
+            histogram!(
+                "personhog_router_transport_overhead_ms",
+                "method" => method.clone(),
+                "backend" => backend,
+                "client" => client.clone(),
+            )
+            .record((duration_ms - processing_ms).max(0.0));
+
+            if let Some(call_ms) = channel_call_ms {
+                let replica_total_ms = processing_ms + gzip_overhead_ms.unwrap_or(0.0);
+                histogram!(
+                    "personhog_router_network_overhead_ms",
+                    "method" => method.clone(),
+                    "backend" => backend,
+                    "client" => client.clone(),
+                )
+                .record((call_ms - replica_total_ms).max(0.0));
+            }
+        }
+
+        if is_grpc_error_response(&response) {
+            counter!(
+                "personhog_router_backend_errors_total",
+                "method" => method.clone(),
+                "backend" => backend,
+                "client" => client.clone(),
+                "code" => grpc_code_label(grpc_status_code(&response)),
+            )
+            .increment(1);
+        }
+
+        let (parts, body) = response.into_parts();
+        let counted = ByteCountedBody::new(
+            body,
+            method,
+            backend,
+            client,
+            caller_tag,
+            self.response_size_warn_bytes,
+        );
+        http::Response::from_parts(parts, BoxBody::new(counted))
+    }
+
+    async fn raw_proxy_to_replica(
+        &self,
+        req: http::Request<BoxBody>,
+        method: Arc<str>,
+    ) -> (http::Response<BoxBody>, Option<f64>) {
+        let (parts, body) = req.into_parts();
+        let body_bytes = match self.collect_body_timed(body, &method).await {
+            Ok(b) => b,
+            Err(resp) => return (resp, None),
+        };
+        let new_path = format!("{REPLICA_PREFIX}{method}");
+
+        let _in_flight = ClientInFlightGuard::new("replica");
+        self.forward_with_retry(&self.replica, &parts, &body_bytes, &new_path, method)
+            .await
+    }
+
+    /// Forward an identity-server request (identity or lifecycle service)
+    /// verbatim: same path, same headers, no routing key. Identity pods are
+    /// interchangeable, so the balanced channel picks one.
+    async fn raw_proxy_to_identity(
+        &self,
+        req: http::Request<BoxBody>,
+        path: &str,
+        method: Arc<str>,
+    ) -> (http::Response<BoxBody>, Option<f64>) {
+        let identity = match &self.identity {
+            Some(backend) => backend,
+            None => {
+                return (
+                    grpc_error_response(
+                        Code::Unimplemented,
+                        "identity backend not configured for this router",
+                    ),
+                    None,
+                )
+            }
+        };
+        // Fail fast rather than park the request on an empty balancer until
+        // the client's deadline.
+        if !identity.has_endpoints() {
+            return (
+                grpc_error_response(Code::Unavailable, "identity backend has no endpoints"),
+                None,
+            );
+        }
+
+        let (parts, body) = req.into_parts();
+        let body_bytes = match self.collect_body_timed(body, &method).await {
+            Ok(b) => b,
+            Err(resp) => return (resp, None),
+        };
+
+        let _in_flight = ClientInFlightGuard::new("identity");
+        self.forward_with_retry(identity, &parts, &body_bytes, path, method)
+            .await
+    }
+
+    /// Buffer the request body under the receive cap, timing the wait. The
+    /// forwarders need the whole body in hand to replay it on a retry.
+    #[allow(clippy::result_large_err)]
+    async fn collect_body_timed(
+        &self,
+        body: BoxBody,
+        method: &Arc<str>,
+    ) -> Result<Bytes, http::Response<BoxBody>> {
+        let collect_start = Instant::now();
+        let body_bytes = collect_body_limited(body, self.max_recv_message_size).await?;
+        histogram!(
+            "personhog_router_body_collect_ms",
+            "method" => method.clone(),
+            "client" => current_client_name(),
+        )
+        .record(collect_start.elapsed().as_secs_f64() * 1000.0);
+        Ok(body_bytes)
+    }
+
+    async fn forward_with_retry(
+        &self,
+        backend: &ChannelBackend,
+        parts: &http::request::Parts,
+        body_bytes: &Bytes,
+        path: &str,
+        method: Arc<str>,
+    ) -> (http::Response<BoxBody>, Option<f64>) {
+        let mut delay_ms = self.retry_config.initial_backoff_ms;
+        let client = current_client_name();
+
+        for attempt in 0..=self.retry_config.max_retries {
+            let mut channel = backend.channel();
+
+            let ready_start = Instant::now();
+            let ready_channel = match channel.ready().await {
+                Ok(c) => c,
+                Err(e) => {
+                    histogram!(
+                        "personhog_router_channel_ready_wait_ms",
+                        "method" => method.clone(),
+                        "client" => client.clone(),
+                        "outcome" => "error",
+                    )
+                    .record(ready_start.elapsed().as_secs_f64() * 1000.0);
+
+                    let is_last = attempt >= self.retry_config.max_retries;
+                    if is_last {
+                        return (
+                            grpc_error_response(
+                                Code::Unavailable,
+                                &format!("{} channel not ready: {e}", backend.role()),
+                            ),
+                            None,
+                        );
+                    }
+
+                    retry_backoff(&mut delay_ms, &self.retry_config, &method, &client).await;
+                    continue;
+                }
+            };
+            histogram!(
+                "personhog_router_channel_ready_wait_ms",
+                "method" => method.clone(),
+                "client" => client.clone(),
+                "outcome" => "ok",
+            )
+            .record(ready_start.elapsed().as_secs_f64() * 1000.0);
+
+            let body = BoxBody::new(Full::new(body_bytes.clone()).map_err(|never| match never {}));
+
+            let mut req = http::Request::new(body);
+            *req.method_mut() = parts.method.clone();
+            *req.uri_mut() = http::Uri::builder().path_and_query(path).build().unwrap();
+            *req.version_mut() = parts.version;
+            *req.headers_mut() = parts.headers.clone();
+
+            let call_start = Instant::now();
+            match ready_channel.call(req).await {
+                Ok(response) => {
+                    let channel_call_ms = call_start.elapsed().as_secs_f64() * 1000.0;
+                    let unapplied = unapplied_refusal_reason(&response).map(str::to_owned);
+                    histogram!(
+                        "personhog_router_channel_call_ms",
+                        "method" => method.clone(),
+                        "client" => client.clone(),
+                        "outcome" => if unapplied.is_some() { "refused" } else { "ok" },
+                    )
+                    .record(channel_call_ms);
+                    if let (Some(reason), true) =
+                        (unapplied, attempt < self.retry_config.max_retries)
+                    {
+                        counter!(
+                            "personhog_router_unapplied_retries_total",
+                            "method" => method.clone(),
+                            "client" => client.clone(),
+                            "reason" => reason,
+                        )
+                        .increment(1);
+                        // The balancer re-picks an endpoint per request.
+                        retry_backoff(&mut delay_ms, &self.retry_config, &method, &client).await;
+                        continue;
+                    }
+                    return (response, Some(channel_call_ms));
+                }
+                Err(e) => {
+                    histogram!(
+                        "personhog_router_channel_call_ms",
+                        "method" => method.clone(),
+                        "client" => client.clone(),
+                        "outcome" => "error",
+                    )
+                    .record(call_start.elapsed().as_secs_f64() * 1000.0);
+
+                    let is_last = attempt >= self.retry_config.max_retries;
+                    if is_last {
+                        return (
+                            grpc_error_response(
+                                Code::Unavailable,
+                                &format!("{} backend error: {e}", backend.role()),
+                            ),
+                            None,
+                        );
+                    }
+
+                    retry_backoff(&mut delay_ms, &self.retry_config, &method, &client).await;
+                }
+            }
+        }
+
+        unreachable!()
+    }
+
+    /// Raw-forward a leader request — a strong `GetPerson` or an
+    /// `UpdatePersonProperties` — to the owning leader pod. The routing key
+    /// arrives in the `x-team-id`/`x-person-id` headers stamped by the
+    /// client, is hashed to a partition, and the request bytes are forwarded
+    /// verbatim with the partition in the `x-partition` header. The body is
+    /// never inspected, so client-compressed request frames transit
+    /// untouched.
+    ///
+    /// Both writes and strong reads go through the per-partition stash
+    /// during a handoff. Writes must buffer for the no-split-brain
+    /// guarantee; strong reads must buffer with them so read-your-write
+    /// holds across the handoff — a strong read racing ahead to the old
+    /// owner would miss any write parked in the stash before it, and a
+    /// read arriving after cutover on a router that hasn't seen Complete
+    /// would read the old owner's frozen cache after the new owner has
+    /// already accepted writes. Outside a handoff the stash is empty and
+    /// requests forward directly, surfacing the channel round-trip time
+    /// for the network-overhead metric.
+    async fn raw_proxy_to_leader(
+        &self,
+        req: http::Request<BoxBody>,
+        method: &'static str,
+    ) -> (http::Response<BoxBody>, Option<f64>) {
+        let leader = match &self.leader {
+            Some(l) => l.clone(),
+            None => {
+                return (
+                    grpc_error_response(
+                        Code::Unimplemented,
+                        "leader backend not configured for this router",
+                    ),
+                    None,
+                )
+            }
+        };
+
+        // Reject requests without a routing key before paying for body
+        // collection.
+        let (team_id, person_id) = match person_key_from_headers(req.headers()) {
+            Ok(key) => key,
+            Err(resp) => return (resp, None),
+        };
+
+        let (parts, body) = req.into_parts();
+        let body_bytes = match self.collect_body_timed(body, &Arc::from(method)).await {
+            Ok(b) => b,
+            Err(resp) => return (resp, None),
+        };
+
+        let _in_flight = ClientInFlightGuard::new("leader");
+        leader
+            .forward_or_stash(method, (team_id, person_id), parts.headers, body_bytes)
+            .await
+    }
+}
+
+/// Static label for an error response's gRPC status, separating expected
+/// admission rejections (invalid_argument) from availability and internal
+/// failures on the errors counter.
+fn grpc_code_label(code: Option<i32>) -> &'static str {
+    match code {
+        Some(3) => "invalid_argument",
+        Some(4) => "deadline_exceeded",
+        Some(5) => "not_found",
+        Some(8) => "resource_exhausted",
+        Some(9) => "failed_precondition",
+        Some(13) => "internal",
+        Some(14) => "unavailable",
+        _ => "other",
+    }
+}
+
+// ── gRPC body helpers ──────────────────────────────────────────────────
+
+async fn collect_body_limited(
+    mut body: BoxBody,
+    max_bytes: usize,
+) -> Result<Bytes, http::Response<BoxBody>> {
+    // Most unary requests arrive as a single DATA frame, which we hand on
+    // as-is without copying the payload. Only bodies that span multiple
+    // frames (large payloads split at the HTTP/2 frame size) pay for
+    // reassembly into a contiguous buffer, which the retry path needs so
+    // it can replay the request.
+    let mut first: Option<Bytes> = None;
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.map_err(|e| {
+            grpc_error_response(Code::Internal, &format!("failed to read body: {e}"))
+        })?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+
+        let collected = first.as_ref().map_or(0, Bytes::len) + buf.len();
+        if collected + data.len() > max_bytes {
+            return Err(grpc_error_response(
+                Code::ResourceExhausted,
+                &format!("received message larger than max ({max_bytes} bytes)"),
+            ));
+        }
+
+        if first.is_none() && buf.is_empty() {
+            first = Some(data);
+        } else {
+            if let Some(f) = first.take() {
+                buf.reserve(f.len() + data.len());
+                buf.extend_from_slice(&f);
+            }
+            buf.extend_from_slice(&data);
+        }
+    }
+
+    Ok(match first {
+        Some(single_frame) => single_frame,
+        None => Bytes::from(buf),
+    })
+}
+
+/// Shared retry bookkeeping for the raw-forward paths: bump the retry
+/// counter, sleep a jittered backoff, and grow the delay toward the cap.
+async fn retry_backoff(
+    delay_ms: &mut u64,
+    retry_config: &RetryConfig,
+    method: &Arc<str>,
+    client: &Arc<str>,
+) {
+    counter!(
+        "personhog_router_backend_retries_total",
+        "method" => method.clone(),
+        "status_code" => "unavailable",
+        "client" => client.clone(),
+    )
+    .increment(1);
+
+    let base = *delay_ms / 2;
+    let jittered = base + rand::thread_rng().gen_range(0..=base);
+    tokio::time::sleep(Duration::from_millis(jittered)).await;
+    *delay_ms = (*delay_ms * 2).min(retry_config.max_backoff_ms);
+}
+
+/// Routing-key headers stamped by clients on every leader-path request.
+/// The router hashes these to a partition instead of inspecting the request
+/// body; the leader independently validates them against the decoded body.
+const TEAM_ID_HEADER: &str = "x-team-id";
+const PERSON_ID_HEADER: &str = "x-person-id";
+
+/// Extract the `(team_id, person_id)` routing key from request headers.
+/// A missing or malformed header means the client predates the header
+/// contract or the request is malformed, so we fail closed rather than
+/// guess a partition.
+// `http::Response` is the error type every helper on this path returns; the
+// large variant trips `result_large_err`, but boxing here would diverge from
+// `collect_body_limited` and friends.
+#[allow(clippy::result_large_err)]
+fn person_key_from_headers(
+    headers: &http::HeaderMap,
+) -> Result<(i64, i64), http::Response<BoxBody>> {
+    let team_id = i64_header(headers, TEAM_ID_HEADER)?;
+    let person_id = i64_header(headers, PERSON_ID_HEADER)?;
+    Ok((team_id, person_id))
+}
+
+#[allow(clippy::result_large_err)]
+fn i64_header(
+    headers: &http::HeaderMap,
+    name: &'static str,
+) -> Result<i64, http::Response<BoxBody>> {
+    let value = headers.get(name).ok_or_else(|| {
+        grpc_error_response(
+            Code::InvalidArgument,
+            &format!("missing {name} header required for leader routing"),
+        )
+    })?;
+    value
+        .to_str()
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .ok_or_else(|| {
+            grpc_error_response(
+                Code::InvalidArgument,
+                &format!("{name} header is not a valid integer"),
+            )
+        })
+}
+
+/// Response body wrapper that counts bytes from DATA frames and records
+/// the total to a histogram on drop. Emits a structured warning when the
+/// response exceeds `warn_threshold` bytes.
+struct ByteCountedBody {
+    inner: BoxBody,
+    bytes_counted: usize,
+    method: Arc<str>,
+    backend: &'static str,
+    client: Arc<str>,
+    caller_tag: Arc<str>,
+    warn_threshold: usize,
+}
+
+impl ByteCountedBody {
+    fn new(
+        inner: BoxBody,
+        method: Arc<str>,
+        backend: &'static str,
+        client: Arc<str>,
+        caller_tag: Arc<str>,
+        warn_threshold: usize,
+    ) -> Self {
+        Self {
+            inner,
+            bytes_counted: 0,
+            method,
+            backend,
+            client,
+            caller_tag,
+            warn_threshold,
+        }
+    }
+}
+
+impl http_body::Body for ByteCountedBody {
+    type Data = Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Ok(ref frame))) = result {
+            if let Some(data) = frame.data_ref() {
+                this.bytes_counted += data.len();
+            }
+        }
+        result
+    }
+
+    /// hyper sets END_STREAM on the response HEADERS frame only when this
+    /// returns true. A trailers-only gRPC error needs that flag. Without it,
+    /// grpcio reads the status headers as initial metadata and reports
+    /// UNKNOWN.
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for ByteCountedBody {
+    fn drop(&mut self) {
+        histogram!(
+            "personhog_router_response_size_bytes",
+            "method" => self.method.clone(),
+            "backend" => self.backend,
+            "client" => self.client.clone(),
+            "caller_tag" => self.caller_tag.clone(),
+        )
+        .record(self.bytes_counted as f64);
+
+        if self.warn_threshold > 0 && self.bytes_counted > self.warn_threshold {
+            tracing::warn!(
+                response_size_bytes = self.bytes_counted,
+                method = %self.method,
+                backend = self.backend,
+                client = %self.client,
+                caller_tag = %self.caller_tag,
+                "oversized gRPC response"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+    use http_body_util::{Empty, StreamBody};
+
+    const METHOD_LISTS: [(&str, &[&str], &str); 3] = [
+        ("KNOWN_METHODS", KNOWN_METHODS, "service/v1/service.proto"),
+        (
+            "IDENTITY_METHODS",
+            IDENTITY_METHODS,
+            "identity/v1/identity.proto",
+        ),
+        (
+            "LIFECYCLE_METHODS",
+            LIFECYCLE_METHODS,
+            "lifecycle/v1/lifecycle.proto",
+        ),
+    ];
+
+    fn proto_rpc_names(proto_path: &str) -> Vec<String> {
+        let path = format!(
+            "{}/../../proto/personhog/{proto_path}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let proto =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+        let mut names: Vec<String> = proto
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("rpc ")
+                    .and_then(|rest| rest.split('(').next())
+                    .map(|name| name.trim().to_string())
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn method_lists_are_sorted() {
+        for (name, list, _) in METHOD_LISTS {
+            for window in list.windows(2) {
+                assert!(
+                    window[0] < window[1],
+                    "{name} is not sorted: {:?} should come after {:?}",
+                    window[0],
+                    window[1],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn method_lists_match_their_protos() {
+        for (name, list, proto_path) in METHOD_LISTS {
+            assert_eq!(
+                list.to_vec(),
+                proto_rpc_names(proto_path),
+                "{name} is out of sync with {proto_path}: add or remove entries to match"
+            );
+        }
+    }
+
+    #[test]
+    fn prefixes_match_registered_service_names() {
+        use tonic::server::NamedService;
+        assert_eq!(SERVICE_PREFIX, format!("/{}/", RawProxyService::NAME));
+        assert_eq!(IDENTITY_PREFIX, format!("/{}/", IdentityProxyService::NAME));
+        assert_eq!(
+            LIFECYCLE_PREFIX,
+            format!("/{}/", LifecycleProxyService::NAME)
+        );
+    }
+
+    #[test]
+    fn resolve_target_accepts_listed_methods_on_each_service() {
+        let cases = [
+            (
+                "/personhog.service.v1.PersonHogService/GetPerson",
+                Target::Service,
+                "GetPerson",
+            ),
+            (
+                "/personhog.identity.v1.PersonHogIdentity/GetOrCreatePersonsByDistinctIds",
+                Target::Identity,
+                "GetOrCreatePersonsByDistinctIds",
+            ),
+            (
+                "/personhog.lifecycle.v1.PersonHogLifecycle/DeletePersons",
+                Target::Lifecycle,
+                "DeletePersons",
+            ),
+        ];
+        for (path, target, method) in cases {
+            assert_eq!(resolve_target(path).ok(), Some((target, method)), "{path}");
+        }
+    }
+
+    /// A method is only known on its own service: the facade's methods do
+    /// not leak onto the identity server and vice versa.
+    #[test]
+    fn resolve_target_refuses_unknown_services_and_methods() {
+        let paths = [
+            "/personhog.service.v1.PersonHogService/FakeMethod",
+            "/personhog.service.v1.PersonHogService/",
+            "/personhog.identity.v1.PersonHogIdentity/GetPerson",
+            "/personhog.lifecycle.v1.PersonHogLifecycle/MergePersons",
+            "/personhog.replica.v1.PersonHogReplica/GetPerson",
+        ];
+        for path in paths {
+            let resp = resolve_target(path).expect_err(path);
+            assert_eq!(
+                resp.headers().get("grpc-status").unwrap(),
+                &format!("{}", Code::Unimplemented as i32),
+                "{path}"
+            );
+        }
+    }
+
+    /// Well-formed routing-key headers yield the `(team_id, person_id)`
+    /// pair the router hashes for partition placement.
+    #[test]
+    fn person_key_from_headers_extracts_key() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(TEAM_ID_HEADER, "1".parse().unwrap());
+        headers.insert(PERSON_ID_HEADER, "42".parse().unwrap());
+
+        let (team_id, person_id) = person_key_from_headers(&headers).expect("valid headers");
+        assert_eq!(team_id, 1);
+        assert_eq!(person_id, 42);
+    }
+
+    /// Missing or malformed routing-key headers fail closed with
+    /// InvalidArgument — the router must never guess a partition.
+    #[test]
+    fn person_key_from_headers_rejects_missing_or_malformed() {
+        let cases: [(Option<&str>, Option<&str>, &str); 4] = [
+            (None, Some("42"), "missing x-team-id"),
+            (Some("1"), None, "missing x-person-id"),
+            (Some("abc"), Some("42"), "non-numeric x-team-id"),
+            (Some("1"), Some("12.5"), "non-integer x-person-id"),
+        ];
+
+        for (team, person, why) in cases {
+            let mut headers = http::HeaderMap::new();
+            if let Some(v) = team {
+                headers.insert(TEAM_ID_HEADER, v.parse().unwrap());
+            }
+            if let Some(v) = person {
+                headers.insert(PERSON_ID_HEADER, v.parse().unwrap());
+            }
+            let resp = person_key_from_headers(&headers).expect_err(&format!("must reject: {why}"));
+            assert_eq!(
+                resp.headers().get("grpc-status").unwrap(),
+                &format!("{}", Code::InvalidArgument as i32),
+                "wrong status for: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_counted_body_reports_the_end_of_a_trailers_only_error() {
+        let inner = grpc_error_response(Code::Unavailable, "Server at capacity").into_body();
+        let body = ByteCountedBody::new(
+            inner,
+            Arc::from("GetPerson"),
+            "replica",
+            Arc::from("test"),
+            Arc::from(""),
+            0,
+        );
+        assert!(http_body::Body::is_end_stream(&body));
+    }
+
+    #[tokio::test]
+    async fn collect_body_limited_accepts_within_limit() {
+        let data = Bytes::from(vec![0u8; 100]);
+        let body = BoxBody::new(Full::new(data.clone()).map_err(|never| match never {}));
+        let result = collect_body_limited(body, 100).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn collect_body_limited_rejects_over_limit() {
+        let data = Bytes::from(vec![0u8; 101]);
+        let body = BoxBody::new(Full::new(data).map_err(|never| match never {}));
+        let result = collect_body_limited(body, 100).await;
+        assert!(result.is_err());
+        let resp = result.unwrap_err();
+        assert_eq!(
+            resp.headers().get("grpc-status").unwrap(),
+            &format!("{}", Code::ResourceExhausted as i32),
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_body_limited_accepts_empty() {
+        let body = BoxBody::new(Empty::<Bytes>::new().map_err(|never| match never {}));
+        let result = collect_body_limited(body, 100).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    /// Build a body that yields each chunk as its own DATA frame,
+    /// exercising the multi-frame reassembly path (large payloads arrive
+    /// split at the HTTP/2 frame size).
+    fn multi_frame_body(chunks: Vec<&'static [u8]>) -> BoxBody {
+        let frames = chunks
+            .into_iter()
+            .map(|c| Ok::<_, tonic::Status>(Frame::data(Bytes::from_static(c))));
+        BoxBody::new(StreamBody::new(stream::iter(frames)))
+    }
+
+    #[tokio::test]
+    async fn collect_body_limited_reassembles_multiple_frames() {
+        let body = multi_frame_body(vec![b"hello ", b"personhog ", b"world"]);
+        let result = collect_body_limited(body, 100).await.unwrap();
+        assert_eq!(&result[..], b"hello personhog world");
+    }
+
+    #[tokio::test]
+    async fn collect_body_limited_rejects_over_limit_across_frames() {
+        // Each frame is under the limit; their sum is not.
+        let body = multi_frame_body(vec![&[0u8; 60], &[0u8; 60]]);
+        let result = collect_body_limited(body, 100).await;
+        let resp = result.unwrap_err();
+        assert_eq!(
+            resp.headers().get("grpc-status").unwrap(),
+            &format!("{}", Code::ResourceExhausted as i32),
+        );
+    }
+}

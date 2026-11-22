@@ -1,0 +1,224 @@
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pydantic
+from anthropic import APIStatusError
+from pydantic import TypeAdapter
+from temporalio.exceptions import ApplicationError
+
+from products.review_hog.backend.reviewer.constants import ONESHOT_MODEL, ONESHOT_REASONING_EFFORT
+from products.review_hog.backend.reviewer.models.issue_deduplicator import IssueDeduplication
+from products.review_hog.backend.reviewer.sandbox.direct_llm import run_oneshot_openai_review, run_oneshot_review
+
+_MODULE = "products.review_hog.backend.reviewer.sandbox.direct_llm"
+
+
+def _api_error(status: int) -> APIStatusError:
+    request = httpx.Request("POST", "http://gateway/review_hog/v1/messages")
+    return APIStatusError("boom", response=httpx.Response(status, request=request), body=None)
+
+
+def _mock_client(final_message: AsyncMock, *, open_error: Exception | None = None) -> AsyncMock:
+    # HTTP errors raise on entering the stream; SSE errors and schema validation raise while draining it.
+    stream = MagicMock()
+    stream.get_final_message = final_message
+    manager = MagicMock()
+    manager.__aenter__ = AsyncMock(return_value=stream, side_effect=open_error)
+    manager.__aexit__ = AsyncMock(return_value=False)
+    client = AsyncMock()
+    client.messages.stream = MagicMock(return_value=manager)
+    return client
+
+
+async def _call() -> IssueDeduplication:
+    return await run_oneshot_review(
+        team_id=1,
+        user_id=2,
+        prompt="the prompt",
+        system_prompt="the system prompt",
+        model_to_validate=IssueDeduplication,
+        step_name="dedup",
+    )
+
+
+@pytest.mark.asyncio
+async def test_oneshot_call_pins_model_effort_schema_and_stage() -> None:
+    # The one-shot value proposition rides on this request shape: dropping the model/effort pin
+    # silently falls back to the gateway default, dropping output_format loses the schema guarantee,
+    # and dropping the stage header makes the call unattributable in dumps and cost queries.
+    parsed = IssueDeduplication(duplicates=[])
+    client = _mock_client(AsyncMock(return_value=MagicMock(parsed_output=parsed)))
+
+    with patch(f"{_MODULE}.build_async_anthropic_client", return_value=client) as mock_get:
+        result = await _call()
+
+    assert result is parsed
+    assert mock_get.call_args.kwargs["product"] == "review_hog"
+    assert mock_get.call_args.kwargs["ai_product"] == "review_hog"
+    assert mock_get.call_args.kwargs["team_id"] == 1
+    kwargs = client.messages.stream.call_args.kwargs
+    assert kwargs["model"] == ONESHOT_MODEL
+    assert kwargs["output_config"] == {"effort": ONESHOT_REASONING_EFFORT}
+    assert kwargs["output_format"] is IssueDeduplication
+    assert kwargs["thinking"] == {"type": "adaptive"}
+    assert kwargs["system"] == "the system prompt"
+    assert kwargs["messages"] == [{"role": "user", "content": "the prompt"}]
+    assert kwargs["extra_headers"] == {"x-posthog-property-ai_stage": "dedup"}
+
+
+@pytest.mark.asyncio
+async def test_oneshot_call_streams_rather_than_buffering() -> None:
+    client = _mock_client(AsyncMock(return_value=MagicMock(parsed_output=IssueDeduplication(duplicates=[]))))
+
+    with patch(f"{_MODULE}.build_async_anthropic_client", return_value=client):
+        await _call()
+
+    client.messages.stream.assert_called_once()
+    client.messages.parse.assert_not_called()
+    client.messages.create.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("at_open", [True, False], ids=["on_open", "mid_stream"])
+@pytest.mark.parametrize(
+    "status,non_retryable",
+    [
+        (400, True),  # schema/request rejected — retrying re-sends the same bad request forever
+        (408, False),
+        (429, False),
+        (500, False),
+    ],
+)
+async def test_api_errors_map_to_temporal_retryability(status: int, non_retryable: bool, at_open: bool) -> None:
+    error = _api_error(status)
+    if at_open:
+        client = _mock_client(AsyncMock(), open_error=error)
+    else:
+        client = _mock_client(AsyncMock(side_effect=error))
+
+    with (
+        patch(f"{_MODULE}.build_async_anthropic_client", return_value=client),
+        pytest.raises(ApplicationError) as exc_info,
+    ):
+        await _call()
+
+    assert exc_info.value.non_retryable is non_retryable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stop_reason,non_retryable",
+    [
+        ("refusal", False),  # a flake worth one more attempt
+        ("max_tokens", True),  # deterministic truncation — a retry resubmits the same doomed prompt
+    ],
+)
+async def test_no_parseable_output_retryability_branches_on_stop_reason(stop_reason: str, non_retryable: bool) -> None:
+    # No parsed output must raise (never return None into the pipeline), and the retry decision
+    # must follow the stop reason.
+    client = _mock_client(AsyncMock(return_value=MagicMock(parsed_output=None, stop_reason=stop_reason)))
+
+    with (
+        patch(f"{_MODULE}.build_async_anthropic_client", return_value=client),
+        pytest.raises(ApplicationError) as exc_info,
+    ):
+        await _call()
+
+    assert exc_info.value.non_retryable is non_retryable
+    assert stop_reason in str(exc_info.value)
+
+
+def _validation_error() -> pydantic.ValidationError:
+    try:
+        TypeAdapter(IssueDeduplication).validate_json('{"duplicates": [')
+    except pydantic.ValidationError as e:
+        return e
+    raise AssertionError("truncated JSON unexpectedly validated")
+
+
+@pytest.mark.asyncio
+async def test_truncated_json_validation_error_becomes_a_compact_application_error() -> None:
+    # The SDK validates the text block while draining the stream, so truncated JSON raises a raw
+    # pydantic.ValidationError there — past the APIError handler and before parsed_output exists.
+    # It must surface as the documented compact ApplicationError (retryable, stage-attributed),
+    # not an oversized unclassified exception that Temporal's failure serialization chokes on.
+    client = _mock_client(AsyncMock(side_effect=_validation_error()))
+
+    with (
+        patch(f"{_MODULE}.build_async_anthropic_client", return_value=client),
+        pytest.raises(ApplicationError) as exc_info,
+    ):
+        await _call()
+
+    assert exc_info.value.non_retryable is False
+    assert "dedup" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_stage_labels_both_gateway_dialects() -> None:
+    client = _mock_client(AsyncMock(return_value=MagicMock(parsed_output=IssueDeduplication(duplicates=[]))))
+
+    with patch(f"{_MODULE}.build_async_anthropic_client", return_value=client) as mock_get:
+        await _call()
+
+    assert mock_get.call_args.kwargs["ai_stage"] == "dedup"
+    assert client.messages.stream.call_args.kwargs["extra_headers"] == {"x-posthog-property-ai_stage": "dedup"}
+
+
+def _openai_client(content: str | None, finish_reason: str | None) -> MagicMock:
+    choice = MagicMock(finish_reason=finish_reason)
+    choice.message.content = content
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    choices = [] if content is None else [choice]
+    client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=choices))
+    return client
+
+
+async def _openai_call() -> IssueDeduplication:
+    return await run_oneshot_openai_review(
+        team_id=1,
+        user_id=2,
+        prompt="the prompt",
+        system_prompt="the system prompt",
+        model_to_validate=IssueDeduplication,
+        step_name="dedup",
+        model="gpt-6-luna",
+        reasoning_effort="medium",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content,finish_reason,non_retryable",
+    [
+        ('{"duplicates": [{"id": "1-1-1", "duplicate_of": "1-1-2"}]}', "stop", None),
+        ('{"duplicates": [', "stop", False),
+        ('{"duplicates": [', "length", True),
+        (None, None, False),
+    ],
+    ids=["valid", "invalid_json_retries", "truncated_fails_fast", "no_choices_retries"],
+)
+async def test_openai_oneshot_validates_its_reply_like_the_anthropic_path(
+    content: str | None, finish_reason: str | None, non_retryable: bool | None
+) -> None:
+    # An unvalidated reply would reach dedup as a dict, and a raw ValidationError is too large for
+    # Temporal's failure serialization. The call must also keep its stage label and strict schema.
+    client = _openai_client(content, finish_reason)
+
+    with patch(f"{_MODULE}.build_async_openai_client", return_value=client) as mock_get:
+        if non_retryable is None:
+            assert content is not None
+            assert await _openai_call() == IssueDeduplication.model_validate_json(content)
+        else:
+            with pytest.raises(ApplicationError) as exc_info:
+                await _openai_call()
+            assert exc_info.value.non_retryable is non_retryable
+            assert "dedup" in str(exc_info.value)
+
+    assert mock_get.call_args.kwargs["properties"]["ai_stage"] == "dedup"
+    request = client.chat.completions.create.call_args.kwargs
+    assert (request["model"], request["reasoning_effort"]) == ("gpt-6-luna", "medium")
+    assert request["response_format"]["json_schema"]["strict"] is True

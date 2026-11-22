@@ -1,0 +1,969 @@
+#!/usr/bin/env python3
+# ruff: noqa: T201 allow print statements
+"""
+CI script that checks two related concerns:
+
+1. IDOR semgrep coverage: every Django model with a team/org/user FK
+   appears in the semgrep IDOR rule regex patterns.
+2. Fail-closed manager coverage: every team-scoped model uses
+   `TeamScopedManager` (directly or via a base class). New models that
+   don't are checked against `posthog/models/scoping/baseline_unmigrated.txt`
+   — additions fail CI, removals are reported as opportunities to
+   shrink the baseline.
+3. Environment-scoped model list: the model regex in the
+   `environment-model-scoped-by-project` semgrep rule matches the
+   environment-scoped models derived from code.
+
+Usage:
+    python check-idor-model-coverage.py
+    python check-idor-model-coverage.py --regenerate-baseline
+    python check-idor-model-coverage.py --regenerate-environment-models
+
+Exit codes:
+    0 - All checks pass
+    1 - Missing models, new fail-closed gaps, or other errors
+"""
+
+import os
+import re
+import sys
+import argparse
+from pathlib import Path
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+BASELINE_FILE = REPO_ROOT / "posthog/models/scoping/baseline_unmigrated.txt"
+SEMGREP_RULES_FILE = REPO_ROOT / ".semgrep/rules/security/idor-team-scoped-models.yaml"
+ENVIRONMENT_RULE_ID = "environment-model-scoped-by-project"
+
+
+def setup_django() -> None:
+    """Initialize Django settings for model introspection."""
+    sys.path.insert(0, str(REPO_ROOT))
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "posthog.settings")
+    import django
+
+    django.setup()
+
+
+def get_scoped_models() -> tuple[dict[str, set[str]], set[str], set[str], set[str]]:
+    """
+    Scan all Django models and categorize by scope.
+
+    The semgrep rules use these categories:
+        - team_scoped: models with team FK (primary IDOR protection)
+        - org_scoped: models with organization FK (but not team)
+        - user_scoped: models with user FK only (no team/org)
+
+    Note: Models with both user and team FKs are treated as team_scoped
+    since the team filter is the primary access control mechanism.
+
+    Returns:
+        Tuple of (scoped_models_dict, excluded_models_set,
+                  legitimately_unscoped_set, needs_team_id_set).
+    """
+    from django.apps import apps
+    from django.db.models import ForeignKey
+
+    # Models to exclude from coverage checking.
+    # Every entry here means "this model does NOT need to appear in semgrep IDOR rules."
+    # When adding a model to a semgrep rule, remove it from here so CI verifies coverage.
+    EXCLUDED_MODELS: set[str] = {
+        # --- Core identity (not tenant-scoped themselves) ---
+        "Organization",
+        "Team",
+        "User",
+        # --- Abstract models / base classes (no table) ---
+        "UUIDModel",
+        "UUIDClassicModel",
+        "CreatedMetaFields",
+        "DeletedMetaFields",
+        # --- Through/junction tables (access controlled by parent) ---
+        "CohortPeople",
+        "DashboardTile",
+        "ExperimentToSavedMetric",
+        "FeatureFlagHashKeyOverride",
+        "GroupTypeMapping",
+        "TaggedItem",
+        "Tile",
+        # --- Categorization mismatch ---
+        # PersonalAPIKey has a deprecated team FK so the script sees it as team_scoped,
+        # but the semgrep rule correctly lists it under user_scoped. Excluding prevents
+        # a false "missing from team_scoped" error.
+        "PersonalAPIKey",
+        # RoleMembership has a direct user FK but org is indirect (via role), so the
+        # script sees it as user_scoped while semgrep correctly has it in org_scoped.
+        "RoleMembership",
+        # IdJagIdentity has a direct user FK but org is indirect (via its IdentityProviderConfig),
+        # so the script sees it as user_scoped while semgrep has it in org_scoped.
+        "IdJagIdentity",
+        # --- Ingestion/event tables (not queried by user-supplied ID) ---
+        "CoreEvent",
+        "ElementGroup",
+        "Event",
+        "SessionRecordingEvent",
+        # --- Persons system (managed separately, not looked up by user input) ---
+        "FlatPersonOverride",
+        "Group",
+        "PendingPersonOverride",
+        "Person",
+        "PersonDistinctId",
+        "PersonOverride",
+        "PersonOverrideMapping",
+        # --- Schema/definition models (read-only, synced from events) ---
+        "EventDefinition",
+        "EventProperty",
+        "PropertyDefinition",
+        # --- Plugin system deprecated internals ---
+        "PluginAttachment",
+        "PluginLogEntry",
+        "PluginSourceFile",
+        "PluginStorage",
+        # --- Third-party/external models ---
+        "LogEntry",
+        "OAuthAccessToken",
+        "OAuthApplication",
+        "OAuthDeviceGrant",
+        "OAuthGrant",
+        "OAuthIDToken",
+        "OAuthRefreshToken",
+        "DeviceGrant",
+        "StaticDevice",
+        "TOTPDevice",
+        "UserSocialAuth",
+        "UserIntegration",
+        "MCPOAuthState",
+        "MCPServerTemplate",
+        "MCPServerInstallationTool",
+        # --- Internal infra (audit, async, caching, scheduling) ---
+        "ActivityLog",
+        "AsyncDeletion",
+        # Instance-wide log of deletion Dagster runs, read by staff in Django admin only.
+        "DeletionRunLog",
+        "AsyncMigration",
+        "AsyncMigrationError",
+        # Outbound email delivery queue — looked up by PK / comment FK from internal
+        # tasks (send + sweeper), never by user-supplied ID through an API.
+        "EmailOutboxMessage",
+        "InstanceSetting",
+        "Schedule",
+        # --- Auto-scoped via ProductTeamModel (TeamScopedManager handles filtering) ---
+        "SplineReticulator",  # CI scaffold (hogli product:bootstrap)
+        # stamphog lives on a separate product DB; every model is a ProductTeamModel whose
+        # fail-closed manager (.for_team / safely_get_queryset) scopes every query by team_id.
+        "StamphogRepoConfig",
+        "StamphogInstallation",
+        "PullRequest",
+        "ReviewRun",
+        "DigestChannel",
+        "DigestRun",
+        "RoutingRun",
+        "RoutingRunOwner",
+        # --- Accessed via parent FK (no direct team-scoped lookup needed) ---
+        "AlertSubscription",
+        "Approval",
+        "ApprovalRequest",
+        "Artifact",
+        "BatchExportLogEntry",
+        "BatchExportRun",
+        # Comment↔Slack-thread mirror mapping — looked up by source_comment FK or
+        # (scope, item_id) within team scope, and by internally-generated task-arg id;
+        # never by user-supplied CommentSlackThread id through an API. Fail-closed via
+        # TeamScopedManager (TeamScopedRootMixin) on top.
+        "CommentSlackThread",
+        # Watch rows for a DAG node. The watch and unwatch actions resolve the node from the URL
+        # first and write the row through it, and no endpoint takes a user-supplied row id.
+        # Fail-closed via TeamScopedManager (TeamScopedRootMixin) on top.
+        "NodeSubscription",
+        "EndpointVersion",
+        "ErrorTrackingIssueAssignment",
+        "StreamlitAppVersion",
+        "FeatureFlagEvaluationContext",
+        "ProductPushCampaign",
+        "Run",
+        "RunSnapshot",
+        "TicketAssignment",
+        # --- Internal config / OneToOne settings ---
+        # OneToOne extension of Organization, read via the org relation
+        # (enrichment_record), never looked up by user-supplied ID.
+        "OrganizationEnrichment",
+        # Write-once OneToOne record of the partner that created an Organization, written by the
+        # partner account-creation paths; no API endpoint, never looked up by user-supplied ID.
+        # Remove this exemption the moment an endpoint exposes it, or the org_scoped rule stops
+        # protecting it silently.
+        "OrganizationProvisioning",
+        # Write-once idempotency guard keyed on the org, claimed via get_or_create from an
+        # internal enrichment write-back path, never looked up by user-supplied ID.
+        "EnrichmentSignupSnapshot",
+        # Append-only raw provider-payload archive written by the internal enrichment path;
+        # no API endpoint, never looked up by user-supplied ID.
+        "OrganizationEnrichmentFetch",
+        # Instance-global classifier definition, so there is no team_id to scope on. Seeded by
+        # migration and read by the batch runner; no API endpoint, never looked up by user-supplied ID.
+        "EnrichmentPromptConfig",
+        # Instance-global versioned ICP curated-list rows (created_by is authorship provenance,
+        # not access scoping). Written by a management command, read by the enrichment scorer;
+        # admin-only surface, never looked up by user-supplied ID.
+        "IcpScoringConfig",
+        # Shadow classifier output, org-scoped rather than team-scoped. Written only by the batch
+        # runner and read-only in admin; no API endpoint, never looked up by user-supplied ID.
+        # It carries an Organization FK, so the org_scoped rule would otherwise cover it: remove this
+        # exemption the moment an endpoint exposes it, or the rule stops protecting it silently.
+        "EnrichmentLabelResult",
+        # Model kept to avoid a deletion migration but has no API endpoint
+        "ErrorTrackingAutoCaptureControls",
+        "DuckLakeBackfill",
+        "DuckLakeCatalog",
+        "DuckgresServer",
+        "EvaluationConfig",
+        "RemoteConfig",
+        "TeamAccessControlConfig",
+        "TeamConversationsSlackConfig",
+        "TeamConversationsTeamsChannelSync",
+        "TeamConversationsTicketConfig",
+        "TeamCustomerAnalyticsConfig",
+        "TeamDefaultEvaluationContext",
+        "TeamBusinessKnowledgeConfig",
+        "TeamDataQualityConfig",
+        "TeamDataWarehouseConfig",
+        "TeamExperimentsConfig",
+        # Staff-only OneToOne extension keyed on the team, edited in Django admin and read by the
+        # events cleanup schedule; no endpoint looks it up by a user-supplied ID.
+        "TeamEventsRetentionConfig",
+        # OneToOne extension keyed on the team, written and read only by the events cleanup schedule;
+        # no endpoint looks it up by a user-supplied ID.
+        "TeamEventsPlanDeletion",
+        "TeamFeatureFlagsConfig",
+        # Staff-only OneToOne extension keyed on the team, written by a management command and read
+        # by the realtime cohort pipeline; no endpoint looks it up by a user-supplied ID.
+        "RealtimeCohortTeamAccess",
+        # OneToOne extension of Team keyed on team_id, only ever read as get(team=team) via
+        # get_or_create_team_extension; no endpoint looks it up by a user-supplied ID.
+        "TeamFeatureFlagPolicyConfig",
+        # OneToOne extension keyed on the authorized Team; no independently addressable config ID.
+        "TeamHeatmapConfig",
+        "TeamEventVolume",
+        "TeamTasksConfig",
+        "TeamLogsConfig",
+        "TeamMarketingAnalyticsConfig",
+        "TeamRevenueAnalyticsConfig",
+        # OneToOne extension keyed on the team, read by team_id from the suggestion refresher and endpoint;
+        # no endpoint looks it up by a user-supplied ID.
+        "TeamReplayVisionConfig",
+        "TeamTracingConfig",
+        "WarehouseSuggestionTeamConfig",
+        "TeamJsSnippetConfig",
+        "TeamProvisioningConfig",
+        # --- User preferences with no IDOR risk (read own data only) ---
+        "FeatureFlagOverride",
+        "NotificationReadState",
+        "NotificationArchiveState",
+        "NotificationViewed",
+        "SessionRecordingPlaylistViewed",
+        "UserPromptState",
+        # --- Deprecated / special ---
+        "DataWarehouseViewLink",
+        "ErrorTrackingGroup",
+        "ExplicitTeamMembership",
+        # --- Other internal (no user-facing lookup by ID) ---
+        "AlertCheck",
+        "CohortCalculationHistory",
+        "ColumnConfiguration",
+        "DataDeletionRequest",
+        "ErrorTrackingIssueFingerprint",
+        "ExperimentTimeseriesRecalculation",
+        "GroupUsageMetric",
+        "HogFunctionInvocationLog",
+        "HostDefinition",
+        "MaterializedColumnSlot",
+        "MessagingRecord",
+        "OrganizationResourceAccess",
+        "PreaggregationJob",
+        "ProductIntent",
+        "SCIMDirectory",
+        "SCIMProvisionedUser",
+        "SchemaPropertyGroup",
+        "SessionRecordingComment",
+        "SessionSummary",
+        "SharePassword",
+        # Per-(Slack workspace, Slack channel) approval state — looked up by
+        # `(slack_workspace_id, slack_channel_id)` from the Slack event handler,
+        # never by user-supplied ID. `approved_by` is for audit only.
+        "SlackChannel",
+        # Instance-wide bank of metrics dashboards, read only through staff endpoints. `reviewed_by` is for audit only.
+        "MetricsDashboardTemplate",
+        "UserActivity",
+        "UserGroup",
+        "UserGroupMembership",
+        "ResourceTransfer",
+    }
+
+    # Legitimately unscoped — these models correctly have no team_id.
+    # Silent pass in CI. Adding here requires a category comment.
+    LEGITIMATELY_UNSCOPED: set[str] = {
+        # --- Django/third-party internals ---
+        "AccessAttempt",
+        "AccessAttemptExpiration",
+        "AccessFailureLog",
+        "AccessLog",
+        "Association",
+        "Code",
+        "ContentType",
+        "Group",
+        "LogEntry",
+        "Nonce",
+        "OAuthAccessToken",
+        "OAuthApplication",
+        "OAuthDeviceGrant",
+        "OAuthGrant",
+        "OAuthIDToken",
+        "OAuthRefreshToken",
+        "Partial",
+        "Permission",
+        "Session",
+        "StaticDevice",
+        "StaticToken",
+        "TOTPDevice",
+        "UserSocialAuth",
+        # --- Core identity (are the scope, not scoped themselves) ---
+        "Organization",
+        "Team",
+        "User",
+        # --- Instance-level config ---
+        "CIMDProvisioningReview",  # one row per self-registered OAuth partner app, read only by staff
+        "DeletionRunLog",  # one row per deletion Dagster run, across all teams
+        "AsyncMigration",
+        "AsyncMigrationError",
+        "InstanceSetting",
+        "DevStackImageTarget",
+        "DevStackImageAttempt",
+        "License",
+        "SandboxSenderTenantState",
+        # --- Deprecated ---
+        "Prompt",
+        "PromptSequence",
+        "UserPromptState",
+        # --- Global catalogs ---
+        "SignalFilterSourceDefinition",  # instance-global internal source capability metadata
+        "SignalFilterCatalogVersion",  # immutable shared recipes, never tenant observations
+        "CommunitySkill",  # instance-global community skills catalog, synced from GitHub
+        "CommunitySkillFile",  # bundled files of a CommunitySkill (scoped via the catalog row)
+        "HogFunctionTemplate",
+        "MetricsDashboardTemplate",  # instance-global bank of metrics dashboards; staff approve generated rows
+        "MCPServer",
+        "MCPRegistryServer",  # instance-global MCP registry index, crawled from the official registry
+        "MCPRegistryTool",  # tools of an MCPRegistryServer (scoped via the catalog row)
+        "MCPRankingRun",  # one scoring pass over the global registry index
+        "MCPRankingScore",  # per-server score of an MCPRankingRun (scoped via the run/catalog rows)
+        "EmailHardBounce",  # instance-global email addresses that do not exist, written from hard bounces
+        # --- Special (has source_team + destination_team, not a plain team) ---
+        "ResourceTransfer",
+        # --- Organization-scoped (correctly above team level) ---
+        "OrganizationDomain",
+        "OrganizationIPRestrictions",
+        "OrganizationIntegration",
+        "OrganizationInvite",
+        "OrganizationMembership",
+        "OrganizationResourceAccess",
+        "Plugin",
+        "PluginSourceFile",
+        "Project",
+        "ProxyRecord",
+        "Role",
+        "RoleMembership",
+        "LinkedIdentityProviderConfig",
+        "IdJagIdentity",
+        # --- User-scoped (cross-tenant by design) ---
+        "IdentityProviderEmailVerification",
+        "NotificationViewed",
+        "SCIMProvisionedUser",
+        "SCIMRequestLog",
+        "WebauthnCredential",
+        # --- Infra / no tenant data ---
+        "EventBuffer",
+        "EventIngestionRestrictionConfig",
+        "GlobalRateLimitThresholdConfig",
+        "MessagingRecord",
+        "UserActivitySummaryQueueCursor",  # one global read position per input source, no rows of a team
+        "MailgunDomainRegistration",  # sending domains this region added to the shared Mailgun account; outlives teams
+    }
+
+    # Baseline violations — these models SHOULD have team_id but don't yet.
+    # Emits a warning (not error) in CI. Shrink this list over time.
+    # When adding team_id to a model, remove it from here.
+    NEEDS_TEAM_ID: set[str] = {
+        # --- Through/junction tables (scoped only via parent FK chain) ---
+        "ActionStep",  # via Action
+        "AlertCheck",  # via AlertConfiguration
+        "AlertSubscription",  # via AlertConfiguration
+        "Approval",  # via ChangeRequest
+        "CohortPeople",  # via Cohort
+        "ConversationCheckpoint",  # via Conversation
+        "ConversationCheckpointBlob",  # via ConversationCheckpoint
+        "ConversationCheckpointWrite",  # via ConversationCheckpoint
+        "Element",  # via Event/ElementGroup
+        "ErrorTrackingExternalReference",  # via ErrorTrackingIssue
+        "ErrorTrackingIssueCohort",  # via ErrorTrackingIssue
+        "EvaluationReportRun",  # via EvaluationReport
+        "EventSchema",  # via EventDefinition
+        "ExperimentMetricResult",  # via Experiment
+        "ExperimentToSavedMetric",  # via Experiment
+        "ExternalDataSourceRevenueAnalyticsConfig",  # via ExternalDataSource
+        "FeatureFlagDashboards",  # via FeatureFlag
+        "FeatureFlagEvaluationContext",  # via FeatureFlag
+        "FeatureFlagRoleAccess",  # via FeatureFlag
+        "HeatmapSnapshot",  # via SavedHeatmap
+        "LLMSkillFile",  # via LLMSkill
+        "LogsAlertCheck",  # via LogsAlertConfiguration
+        "LogsAlertEvent",  # via LogsAlertConfiguration
+        "VisionAlertEvent",  # via VisionAlertConfiguration
+        "NotificationReadState",  # via NotificationEvent
+        "NotificationArchiveState",  # via NotificationEvent
+        "PluginStorage",  # via PluginConfig
+        "ResourceNotebook",  # via Notebook
+        "SchemaPropertyGroupProperty",  # via SchemaPropertyGroup
+        "ScoreDefinitionVersion",  # via ScoreDefinition
+        "SessionRecordingExternalReference",  # via SessionRecording
+        "SessionRecordingPlaylistItem",  # via Playlist
+        "SharePassword",  # via SharingConfiguration
+        "SourceBatchStatus",  # via SourceBatch
+        "QueueJobStatus",  # via QueueJob
+        # Keyed by (lane, group_key), not a direct team_id column — group_key is a
+        # generic caller-defined string (e.g. "team:schema") rather than always a
+        # team scope, unlike SourceGroupLease which carries team_id explicitly.
+        "QueueJobLease",
+        "StreamlitAppSandbox",  # via StreamlitApp
+        "TaggedItem",  # via Tag/Dashboard/Insight
+        "TicketAssignment",  # via Ticket
+        "UserGroupMembership",  # via UserGroup
+        # --- Other models missing direct team_id ---
+        "BatchExportDestination",  # via Integration
+        "BatchExportRun",  # via BatchExport
+        "SandboxSnapshot",  # via Integration
+        "SlackUserProfileCache",  # via Integration
+        "SlackSettings",  # via Integration
+    }
+
+    team_scoped: set[str] = set()
+    org_scoped: set[str] = set()
+    user_scoped: set[str] = set()
+    no_scope: set[str] = set()
+
+    organization_scoped_overrides = {
+        "AITrainingConsent",  # Plain organization_id survives organization deletion.
+        # Billing alerts inherit scope through BillingAlertConfiguration; team is an execution context.
+        "BillingAlertConfiguration",
+        "BillingAlertEvaluationClaim",
+        "BillingAlertEvent",
+    }
+
+    for model in apps.get_models():
+        model_name = model.__name__
+
+        # Skip abstract models
+        if model._meta.abstract:
+            continue
+
+        # Skip proxy models
+        if model._meta.proxy:
+            continue
+
+        if model_name in organization_scoped_overrides:
+            org_scoped.add(model_name)
+            continue
+
+        # Check for FK fields and plain team_id (ProductTeamModel uses BigIntegerField)
+        has_team_fk = False
+        has_org_fk = False
+        has_user_fk = False
+
+        for field in model._meta.get_fields():
+            # Plain team_id field (e.g., ProductTeamModel's BigIntegerField)
+            if getattr(field, "name", None) == "team_id" and not isinstance(field, ForeignKey):
+                has_team_fk = True
+                continue
+
+            if not isinstance(field, ForeignKey):
+                continue
+
+            # ForeignKey.related_model can be the string "self" for
+            # self-referencing relations; we only care about Team / Organization
+            # / User FKs, so treat self-references as a non-match and skip.
+            related_model = field.related_model
+            if isinstance(related_model, str):
+                continue
+            related_model_name = related_model.__name__
+
+            if related_model_name == "Team":
+                has_team_fk = True
+            elif related_model_name == "Organization":
+                has_org_fk = True
+            elif related_model_name == "User":
+                has_user_fk = True
+
+        # Categorize based on FK combinations
+        # Team FK takes precedence (even if user FK also exists)
+        # Include ALL models (excluded ones tracked separately)
+        if has_team_fk:
+            team_scoped.add(model_name)
+        elif has_org_fk:
+            org_scoped.add(model_name)
+        elif has_user_fk:
+            user_scoped.add(model_name)
+        else:
+            no_scope.add(model_name)
+
+    return (
+        {
+            "team_scoped": team_scoped,
+            "org_scoped": org_scoped,
+            "user_scoped": user_scoped,
+            "no_scope": no_scope,
+        },
+        EXCLUDED_MODELS,
+        LEGITIMATELY_UNSCOPED,
+        NEEDS_TEAM_ID,
+    )
+
+
+def parse_semgrep_models(yaml_path: Path) -> dict[str, set[str]]:
+    """
+    Parse the semgrep YAML file and extract model names from regex patterns.
+
+    Returns dict matching the scope categories.
+    """
+    with open(yaml_path) as f:
+        data = yaml.safe_load(f)
+
+    # Map rule IDs to scope categories
+    # Note: user+team scoped models are treated as team_scoped in semgrep
+    rule_scope_map = {
+        "idor-taint-user-input-to-model-get": "team_scoped",
+        "idor-lookup-without-team": "team_scoped",
+        "idor-taint-user-input-to-org-model": "org_scoped",
+        "idor-lookup-without-org": "org_scoped",
+        "idor-taint-user-input-to-user-model": "user_scoped",
+        "idor-lookup-without-user": "user_scoped",
+        # User+team models are treated as team_scoped for comparison
+        "idor-taint-user-input-to-user-team-model": "team_scoped",
+        "idor-lookup-without-user-and-team": "team_scoped",
+        ENVIRONMENT_RULE_ID: "env_scoped",
+    }
+
+    result: dict[str, set[str]] = {
+        "team_scoped": set(),
+        "org_scoped": set(),
+        "user_scoped": set(),
+        "env_scoped": set(),
+    }
+
+    for rule in data.get("rules", []):
+        rule_id = rule.get("id", "")
+        scope = rule_scope_map.get(rule_id)
+
+        if not scope:
+            continue
+
+        # Extract regex from rule - handle both taint and pattern rules
+        regex_pattern = None
+
+        # For taint rules, look in pattern-sinks
+        if "pattern-sinks" in rule:
+            for sink in rule["pattern-sinks"]:
+                if "metavariable-regex" in sink:
+                    regex_pattern = sink["metavariable-regex"].get("regex", "")
+                    break
+                # Handle patterns list with metavariable-regex inside
+                for pattern_item in sink.get("patterns", []):
+                    if "metavariable-regex" in pattern_item:
+                        regex_pattern = pattern_item["metavariable-regex"].get("regex", "")
+                        break
+
+        # For non-taint rules, look in patterns list
+        if not regex_pattern and "patterns" in rule:
+            for pattern_item in rule["patterns"]:
+                if "metavariable-regex" in pattern_item:
+                    regex_pattern = pattern_item["metavariable-regex"].get("regex", "")
+                    break
+
+        if regex_pattern:
+            # Extract model names from regex like (?x)(Model1|Model2|...)
+            # Remove (?x) extended mode flag and whitespace
+            clean_pattern = re.sub(r"\s+", "", regex_pattern)
+            clean_pattern = clean_pattern.replace("(?x)", "")
+
+            # Extract names from alternation group
+            match = re.search(r"\(([^)]+)\)", clean_pattern)
+            if match:
+                models_str = match.group(1)
+                models = [m.strip() for m in models_str.split("|") if m.strip()]
+                result[scope].update(models)
+
+    return result
+
+
+def compute_unmigrated_to_fail_closed(
+    team_scoped: set[str],
+    excluded: set[str],
+    legitimately_unscoped: set[str],
+    needs_team_id: set[str],
+) -> set[str]:
+    """Models that are team-scoped but still on a non-fail-closed manager.
+
+    Derived from the same model registry the IDOR check uses. The baseline
+    is the algebraic result of:
+
+        team_scoped
+          - excluded                # already off the IDOR coverage hook
+                                    # (through tables, accessed-via-parent FK, etc.)
+                                    # — same reasons exempt them from fail-closed
+          - legitimately_unscoped   # no team_id by design
+          - needs_team_id           # no team_id yet (future opt-in)
+          - models on TeamScopedManager (introspected, not listed)
+          = unmigrated baseline
+
+    Introspection means migrating a model is enough to drop it from the
+    set — there's no parallel list to keep in sync.
+    """
+    from django.apps import apps
+
+    from posthog.models.scoping.manager import TeamScopedManager
+
+    fail_closed: set[str] = set()
+    for model in apps.get_models():
+        if model._meta.proxy:
+            continue
+        # Look up the manager that `Model.objects.X` resolves to.
+        # Reviewers (codex, copilot) flagged a `any(...)` scan as bypassable:
+        # a new model could keep `objects = RootTeamManager()` and add a
+        # secondary scoped manager just to satisfy CI — call sites would
+        # still be unscoped. Anchoring on `objects` (the manager app code
+        # actually reaches for) closes that loophole. This stays correct
+        # after PR #57879 sets `default_manager_name = "all_teams"` on
+        # ProductTeamModel, since that change moves the *framework*-default
+        # manager (`_default_manager`, used by admin / related queries)
+        # without touching `objects`.
+        objects_manager = model._meta.managers_map.get("objects")
+        if isinstance(objects_manager, TeamScopedManager):
+            fail_closed.add(model.__name__)
+
+    candidates = team_scoped - excluded - legitimately_unscoped - needs_team_id
+    return candidates - fail_closed
+
+
+def read_baseline() -> set[str]:
+    if not BASELINE_FILE.exists():
+        return set()
+    return {
+        line.strip() for line in BASELINE_FILE.read_text().splitlines() if line.strip() and not line.startswith("#")
+    }
+
+
+def write_baseline(unmigrated: set[str]) -> None:
+    header = (
+        "# Models that are team-scoped but still on a non-fail-closed manager.\n"
+        "#\n"
+        "# DO NOT EDIT BY HAND. This file is the mechanical output of\n"
+        "# `--regenerate-baseline` — adding entries by hand defeats the algebra and\n"
+        "# turns this back into a hand-curated allowlist (the IDOR-list problem).\n"
+        "#\n"
+        "# Auto-generated by .github/scripts/check-idor-model-coverage.py\n"
+        "# Regenerate with: python .github/scripts/check-idor-model-coverage.py --regenerate-baseline\n"
+        "#\n"
+        "# Adopting fail-closed: change the model's base from RootTeamMixin to\n"
+        "# TeamScopedRootMixin (main DB) or ProductTeamModel (separate DB), then\n"
+        "# audit every call site to either be inside team scope or use .unscoped().\n"
+        "# Once that's done, regenerate this file and the model drops out.\n"
+    )
+    body = "\n".join(sorted(unmigrated)) + ("\n" if unmigrated else "")
+    BASELINE_FILE.write_text(header + body)
+
+
+def check_fail_closed_baseline(
+    team_scoped: set[str],
+    excluded: set[str],
+    legitimately_unscoped: set[str],
+    needs_team_id: set[str],
+    *,
+    regenerate: bool,
+) -> tuple[bool, bool]:
+    """Return (has_errors, has_warnings) for the fail-closed baseline check."""
+    current = compute_unmigrated_to_fail_closed(team_scoped, excluded, legitimately_unscoped, needs_team_id)
+
+    print(f"\n{'=' * 60}")
+    print("Fail-closed manager baseline check")
+    print("=" * 60)
+
+    if regenerate:
+        write_baseline(current)
+        print(f"\n  Regenerated {BASELINE_FILE.relative_to(REPO_ROOT)}")
+        print(f"  {len(current)} models still on a non-fail-closed manager.")
+        return False, False
+
+    baseline = read_baseline()
+    new_violations = current - baseline
+    migrated = baseline - current
+
+    print(f"\n  Baseline: {len(baseline)} models")
+    print(f"  Current:  {len(current)} models")
+
+    if new_violations:
+        sorted_violations = sorted(new_violations)
+        models_list = ", ".join(sorted_violations)
+        print(f"::error::New team-scoped models without TeamScopedManager: {models_list}")
+        print(f"\n  ❌ ERROR: {len(new_violations)} new model(s) with team_id but not fail-closed:")
+        for model in sorted_violations:
+            print(f"     - {model}")
+        print("\n  New main-DB models should inherit TeamScopedRootMixin.")
+        print("  New separate-DB models should inherit ProductTeamModel.")
+        print("  See posthog/models/scoping/README.md for the contract.")
+        return True, False
+
+    if migrated:
+        print(f"\n  ✅ {len(migrated)} model(s) migrated since baseline (regenerate to shrink):")
+        for model in sorted(migrated):
+            print(f"     - {model}")
+        print(f"\n  Run: python {Path(__file__).relative_to(REPO_ROOT)} --regenerate-baseline")
+        return False, True
+
+    print("  ✅ Fail-closed baseline matches.")
+    return False, False
+
+
+def get_environment_scoped_models(team_scoped: set[str]) -> set[str]:
+    """Team-scoped models whose rows belong to one environment, not to the whole project.
+
+    Project-level models drop out in two ways. RootTeamMixin (and its fail-closed
+    TeamScopedRootMixin) and ProductTeamModel rewrite team_id to the project's root
+    team on save. Models with a `project` relation to Project (own or inherited) are
+    keyed by the project directly.
+    """
+    from django.apps import apps
+
+    from posthog.models.project import Project
+    from posthog.models.scoping.product_mixin import ProductTeamModel
+    from posthog.models.utils import RootTeamMixin
+
+    environment_scoped: set[str] = set()
+    for model in apps.get_models():
+        if model._meta.proxy or model.__name__ not in team_scoped:
+            continue
+        if issubclass(model, (RootTeamMixin, ProductTeamModel)):
+            continue
+        # A field named `project` can hold something else, such as a release's application name.
+        has_project_relation = any(
+            field.name == "project" and field.related_model is Project for field in model._meta.get_fields()
+        )
+        if has_project_relation:
+            continue
+        environment_scoped.add(model.__name__)
+    return environment_scoped
+
+
+def render_environment_model_regex(models: set[str]) -> str:
+    """Return the regex block scalar body, indented to sit under `regex: |` in the rule."""
+    indent = " " * 20
+    names = sorted(models, key=str.lower)
+    lines = [f"{indent}(?x)^("]
+    lines.append(f"{indent}    {names[0]}")
+    lines.extend(f"{indent}    |{name}" for name in names[1:])
+    lines.append(f"{indent})$")
+    return "\n".join(lines) + "\n"
+
+
+def write_environment_model_regex(models: set[str]) -> None:
+    text = SEMGREP_RULES_FILE.read_text()
+    rule_start = text.index(f"- id: {ENVIRONMENT_RULE_ID}\n")
+    next_rule = text.find("\n    - id: ", rule_start + 1)
+    rule_end = len(text) if next_rule == -1 else next_rule
+    # The first `regex: |` block inside the rule holds the model list. The search stops at the
+    # next rule, so a missing block cannot rewrite another rule's list.
+    regex_block = re.compile(r"(regex: \|\n)(.*?\)\$\n)", re.DOTALL)
+    match = regex_block.search(text, rule_start, rule_end)
+    if match is None:
+        raise ValueError(f"No `regex: |` block found in rule {ENVIRONMENT_RULE_ID}")
+    new_text = text[: match.start(2)] + render_environment_model_regex(models) + text[match.end(2) :]
+    SEMGREP_RULES_FILE.write_text(new_text)
+
+
+def check_environment_model_list(
+    team_scoped: set[str],
+    semgrep_environment_models: set[str],
+    *,
+    regenerate: bool,
+) -> bool:
+    """Return True when the rule's model list differs from the code."""
+    expected = get_environment_scoped_models(team_scoped)
+
+    print(f"\n{'=' * 60}")
+    print("Environment-scoped model list check")
+    print("=" * 60)
+
+    if regenerate:
+        write_environment_model_regex(expected)
+        print(f"\n  Regenerated the {ENVIRONMENT_RULE_ID} model list ({len(expected)} models).")
+        return False
+
+    missing = expected - semgrep_environment_models
+    extra = semgrep_environment_models - expected
+    if not missing and not extra:
+        print(f"  ✅ {ENVIRONMENT_RULE_ID} lists all {len(expected)} environment-scoped models.")
+        return False
+
+    print(f"::error::The {ENVIRONMENT_RULE_ID} model list is out of date")
+    for model in sorted(missing):
+        print(f"     + {model} (environment-scoped, missing from the rule)")
+    for model in sorted(extra):
+        print(f"     - {model} (in the rule, but not environment-scoped)")
+    print(f"\n  Run: python {Path(__file__).relative_to(REPO_ROOT)} --regenerate-environment-models")
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--regenerate-baseline",
+        action="store_true",
+        help="Rewrite the fail-closed baseline file from the current code state.",
+    )
+    parser.add_argument(
+        "--regenerate-environment-models",
+        action="store_true",
+        help=f"Rewrite the model list of the {ENVIRONMENT_RULE_ID} semgrep rule from the current code state.",
+    )
+    args = parser.parse_args()
+
+    setup_django()
+
+    # Get models from code
+    code_models, excluded_models, legitimately_unscoped, needs_team_id = get_scoped_models()
+
+    # Get models from semgrep rules
+    semgrep_models = parse_semgrep_models(SEMGREP_RULES_FILE)
+
+    # Compare and report
+    has_errors = False
+    has_warnings = False
+
+    scope_labels = {
+        "team_scoped": "Team-scoped",
+        "org_scoped": "Organization-scoped",
+        "user_scoped": "User-scoped",
+    }
+
+    # Union of all code models across scopes for staleness checks.
+    # A model is only stale if it doesn't exist in ANY scope (cross-scope
+    # categorization differences between script and semgrep are fine).
+    all_code_models = code_models["team_scoped"] | code_models["org_scoped"] | code_models["user_scoped"]
+
+    print("=" * 60)
+    print("IDOR Semgrep Rule Coverage Check")
+    print("=" * 60)
+
+    for scope, label in scope_labels.items():
+        all_in_code = code_models[scope]
+        semgrep_set = semgrep_models[scope]
+
+        # Split into excluded vs needs-checking
+        excluded_in_scope = all_in_code & excluded_models
+        to_check = all_in_code - excluded_models
+
+        missing = to_check - semgrep_set
+        # Models in semgrep that don't exist in code at all (in any scope)
+        stale = semgrep_set - all_code_models
+
+        print(f"\n{label} models:")
+        print(f"  In code: {len(all_in_code)} ({len(excluded_in_scope)} excluded)")
+        print(f"  In semgrep: {len(semgrep_set)}")
+
+        if missing:
+            has_errors = True
+            print(f"\n  ❌ ERROR: Models missing from semgrep rules:")
+            for model in sorted(missing):
+                print(f"     - {model}")
+
+        if stale:
+            has_warnings = True
+            print(f"\n  ⚠️  WARNING: Models in semgrep but not found in code (may be stale):")
+            for model in sorted(stale):
+                print(f"     - {model}")
+
+        if not missing and not stale:
+            print("  ✅ All models covered")
+
+    # Check for models with no team/org/user scope at all
+    acknowledged = legitimately_unscoped | needs_team_id
+    unacknowledged = code_models["no_scope"] - acknowledged
+
+    print(f"\n{'=' * 60}")
+    print("Unscoped model check")
+    print("=" * 60)
+
+    baseline_in_code = code_models["no_scope"] & needs_team_id
+    if baseline_in_code:
+        has_warnings = True
+        models_list = ", ".join(sorted(baseline_in_code))
+        # GitHub Actions annotation — shows in PR checks tab
+        print(f"::warning::{len(baseline_in_code)} models need team_id (baseline debt): {models_list}")
+        print(f"\n  ⚠️  WARNING: {len(baseline_in_code)} models need team_id (baseline debt):")
+        for model in sorted(baseline_in_code):
+            print(f"     - {model}")
+
+    if unacknowledged:
+        has_errors = True
+        models_list = ", ".join(sorted(unacknowledged))
+        # GitHub Actions annotation
+        print(f"::error::New unscoped models without team_id: {models_list}")
+        print(f"\n  ❌ ERROR: New models with no team_id, org, or user FK:")
+        for model in sorted(unacknowledged):
+            print(f"     - {model}")
+        print("\n  Every model storing tenant data must have team_id.")
+        print("  To fix:")
+        print("    - Add team_id to the model (preferred)")
+        print("    - Add to LEGITIMATELY_UNSCOPED if correctly unscoped")
+        print("    - Add to NEEDS_TEAM_ID as last resort (baseline debt)")
+
+    if not unacknowledged and not baseline_in_code:
+        print("  ✅ No unacknowledged unscoped models")
+
+    fail_closed_errors, fail_closed_warnings = check_fail_closed_baseline(
+        code_models["team_scoped"],
+        excluded_models,
+        legitimately_unscoped,
+        needs_team_id,
+        regenerate=args.regenerate_baseline,
+    )
+    has_errors = has_errors or fail_closed_errors
+    has_warnings = has_warnings or fail_closed_warnings
+
+    environment_list_errors = check_environment_model_list(
+        code_models["team_scoped"],
+        semgrep_models["env_scoped"],
+        regenerate=args.regenerate_environment_models,
+    )
+    has_errors = has_errors or environment_list_errors
+
+    print("\n" + "=" * 60)
+
+    if has_errors:
+        print("\n❌ FAILED: Some models need attention.")
+        print("\nTo fix IDOR semgrep gaps:")
+        print("  1. Add the missing models to .semgrep/rules/security/idor-team-scoped-models.yaml")
+        print("  2. Or add them to EXCLUDED_MODELS in this script if they don't need IDOR protection")
+        print("  3. For unscoped models: add team_id, or add to LEGITIMATELY_UNSCOPED / NEEDS_TEAM_ID")
+        print("To fix fail-closed manager gaps:")
+        print("  4. New main-DB models: inherit TeamScopedRootMixin")
+        print("  5. New separate-DB models: inherit ProductTeamModel")
+        print("  See posthog/models/scoping/README.md for the contract.")
+        return 1
+
+    if has_warnings:
+        print("\n⚠️  PASSED with warnings.")
+
+    print("\n✅ All checks passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

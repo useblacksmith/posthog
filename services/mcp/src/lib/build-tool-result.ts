@@ -1,0 +1,293 @@
+import { RESOURCE_URI_META_KEY } from '@modelcontextprotocol/ext-apps/server'
+
+import { isEmptyToolResult } from '@/lib/empty-tool-result'
+import { estimateTokens } from '@/lib/estimate-tokens'
+import { getNextPageHint } from '@/lib/next-page-hint'
+import { formatResponse } from '@/lib/response'
+import { buildTimeSeriesChartData } from '@/lib/time-series-chart-data'
+import { isPrepareConfirmedActionResult } from '@/tools/confirmed-action-runtime'
+import { POSTHOG_FORMATTED_RESULTS_OVERRIDE_KEY, POSTHOG_META_KEY, POSTHOG_TEXT_PROJECTION_KEY } from '@/tools/types'
+import { APP_DATA_META_KEY, type AnalyticsMetadata, type WithAnalytics } from '@/ui-apps/types'
+
+export interface ToolResultMeta {
+    ui?: { resourceUri?: string }
+    [POSTHOG_META_KEY]?: { outputFormat?: 'optimized' | 'json' }
+}
+
+export interface BuildToolResultOptions {
+    /** Raw return value from the tool handler (object or string). */
+    handlerResult: unknown
+    /** Tool-level `_meta` — determines UI app eligibility and JSON response flag. */
+    toolMeta?: ToolResultMeta | undefined
+    /** Tool name; embedded in analytics metadata for UI apps. */
+    toolName: string
+    /** The input params passed to the tool (used to read `output_format=json` escape hatch). */
+    params: unknown
+    /** Whether formatted-result text should win over structuredContent for this client profile. */
+    suppressStructuredContentForFormattedResults?: boolean | undefined
+    /**
+     * For inline-exec UI-app hosts (PostHog Desktop, Claude Code): when a compact
+     * formatted table is available, drop top-level `structuredContent` toward the model so
+     * it reads the compact table instead of the verbose JSON, and re-home the app payload
+     * onto `_meta` for the UI app (see APP_DATA_META_KEY). When there is NO formatted table
+     * the payload stays in the standard `structuredContent` field and the text channel gets
+     * a pointer instead of a second copy of it. Overridden by an explicit `output_format`.
+     */
+    forceUiDataToMeta?: boolean | undefined
+    /** Native widgets need the handler object even when the tool has no MCP UI resource. */
+    includeAppData?: boolean | undefined
+    /** PostHog distinctId for analytics metadata (only read when a UI resource is present). */
+    distinctId?: string | undefined
+    mcpClientName?: string | undefined
+    /**
+     * When set, the inner tool's `_meta.ui.resourceUri` is placed on the response payload
+     * under both the new (`ui.resourceUri`) and legacy (`ui/resourceUri`) keys. Used by the
+     * single-exec wrapper to surface UI apps through the generic `exec` tool — clients only
+     * see `exec` registered, so the UI metadata has to ride on the per-call response.
+     */
+    includeUiResponseMeta?: boolean
+    includeRenderNote?: boolean
+    appendTimeSeriesChartData?: boolean | undefined
+}
+
+/**
+ * Nominal brand stamped on payloads assembled by the exec wrapper. Detection
+ * is a field check rather than structural matching so regular tool handlers
+ * that happen to return a `{content:[{type:'text',…}]}` shape can never
+ * accidentally short-circuit the `buildToolResultPayload` pipeline.
+ */
+export const EXEC_BUILT_PAYLOAD = '__execBuiltPayload' as const
+
+export interface ToolResultPayload {
+    content: Array<{ type: 'text'; text: string }>
+    structuredContent?: Record<string, unknown>
+    _meta?: Record<string, unknown>
+    [EXEC_BUILT_PAYLOAD]?: true
+}
+
+/**
+ * Detects a payload already assembled by the exec wrapper so `MCP.registerTool`
+ * can pass it through unchanged — re-running `buildToolResultPayload` would
+ * object-rest-destructure its `content` / `structuredContent` fields.
+ *
+ * We require the exec brand (rather than detecting by shape) so future tool
+ * handlers can't accidentally match and skip the pipeline (coding-agent
+ * suppression, analytics injection, UI-resourceUri normalization, etc.).
+ */
+export function isToolCallPayload(value: unknown): value is ToolResultPayload {
+    return (
+        typeof value === 'object' && value !== null && (value as Record<string, unknown>)[EXEC_BUILT_PAYLOAD] === true
+    )
+}
+
+interface BuiltResponseText {
+    structuredContentOnly: boolean
+    footers: string[]
+    resultEmpty: boolean
+}
+
+const builtResponseText = new WeakMap<ToolResultPayload, BuiltResponseText>()
+
+/** Stamp a payload as exec-built so `isToolCallPayload` recognizes it. */
+export function markExecPayload(payload: ToolResultPayload): ToolResultPayload {
+    const marked: ToolResultPayload = { ...payload, [EXEC_BUILT_PAYLOAD]: true }
+    const built = builtResponseText.get(payload)
+    if (built) {
+        builtResponseText.set(marked, built)
+    }
+    return marked
+}
+
+export function toolResultAnalyticsProperties(response: ToolResultPayload): Record<string, unknown> {
+    const built = builtResponseText.get(response)
+    return built?.resultEmpty ? { mcp_result_empty: true } : {}
+}
+
+/**
+ * Placeholder that replaces the text content when the payload rides in
+ * `structuredContent` alone (see `buildToolResultPayload`). Kept short and
+ * literal so the model knows where to read the result from.
+ */
+export const STRUCTURED_CONTENT_ONLY_TEXT = "Full result is in this response's structuredContent field."
+
+export const UI_APP_RENDER_NOTE =
+    'The user already sees this result as an interactive view in the conversation. State your conclusion in text and do not repeat this data in your reply.'
+
+/**
+ * Estimate output tokens from what the client actually receives — the serialized
+ * TOON/JSON/formatted string, not the raw handler object. TOON is materially
+ * smaller than JSON for tabular results, so measuring the raw object would
+ * over-count. `structuredContent` is normally excluded because it duplicates the
+ * text for UI tools; when the text is only the `STRUCTURED_CONTENT_ONLY_TEXT`
+ * pointer it duplicates nothing, so the structured payload is what gets counted.
+ */
+export function estimateResponseTokens(response: ToolResultPayload): number {
+    const built = builtResponseText.get(response)
+    if (response.structuredContent && built?.structuredContentOnly) {
+        return estimateTokens(response.structuredContent) + estimateTokens(built.footers.join('\n\n'))
+    }
+    return estimateTokens(response.content.map((part) => part.text).join(''))
+}
+
+/**
+ * Assembles the MCP tool-call response payload.
+ *
+ * Response channel choices:
+ * 1. When the handler returns a primitive string, we pass it through to `formatResponse`
+ *    unchanged. Earlier, object-rest on a string exploded it into a character-indexed
+ *    dict ({"0":"{","1":"\""...}).
+ * 2. When `formattedResults` is present AND the resolved client profile needs formatted
+ *    text to win AND the caller didn't opt into JSON via `output_format=json`, we drop
+ *    `structuredContent`. Coding agents surface `structuredContent` to the model in
+ *    preference to `content[].text`, so keeping it would hide the formatted table
+ *    behind raw JSON.
+ * 3. Conversely, a UI tool with no `formattedResults` on an inline-exec UI host keeps
+ *    `structuredContent` and drops the mirrored text, so the payload reaches the agent
+ *    exactly once instead of once per channel.
+ * 4. Native widgets use app metadata regardless of UI resources. Their models read
+ *    the text channel unless the caller explicitly requests JSON.
+ */
+export function buildToolResultPayload(opts: BuildToolResultOptions): ToolResultPayload {
+    const {
+        handlerResult,
+        toolMeta,
+        toolName,
+        params,
+        suppressStructuredContentForFormattedResults,
+        forceUiDataToMeta,
+        includeAppData,
+        distinctId,
+        mcpClientName,
+        includeUiResponseMeta,
+        includeRenderNote,
+        appendTimeSeriesChartData,
+    } = opts
+
+    const isStringResult = typeof handlerResult === 'string'
+    const formattedResults: string | undefined = isStringResult
+        ? undefined
+        : ((handlerResult as Record<string, unknown> | null | undefined)?.[POSTHOG_FORMATTED_RESULTS_OVERRIDE_KEY] as
+              | string
+              | undefined)
+
+    let rawResult: Record<string, unknown> | unknown[] | string
+    if (isStringResult) {
+        rawResult = handlerResult as string
+    } else if (Array.isArray(handlerResult)) {
+        rawResult = [...handlerResult]
+    } else {
+        const { [POSTHOG_FORMATTED_RESULTS_OVERRIDE_KEY]: _ignored, ...rest } = (handlerResult ?? {}) as Record<
+            string,
+            unknown
+        >
+        rawResult = rest
+    }
+
+    const resourceUri = toolMeta?.ui?.resourceUri
+    const hasUiResource = !!resourceUri
+    // Caller's per-call `output_format` wins over the tool's YAML default in `_meta`.
+    const callerOutputFormat = (params as { output_format?: 'optimized' | 'json' } | undefined)?.output_format
+    const effectiveOutputFormat = callerOutputFormat ?? toolMeta?.[POSTHOG_META_KEY]?.outputFormat
+    const useJson = effectiveOutputFormat === 'json'
+    const callerWantsJson = callerOutputFormat === 'json'
+    const isTextProjection =
+        !isStringResult && (handlerResult as Record<string, unknown> | null)?.[POSTHOG_TEXT_PROJECTION_KEY] === true
+
+    let structuredContent: WithAnalytics<typeof rawResult> | typeof rawResult = rawResult
+    if (hasUiResource && !isStringResult) {
+        const analyticsMetadata: AnalyticsMetadata = {
+            distinctId: distinctId ?? '',
+            toolName,
+            ...(mcpClientName ? { mcpClientName } : {}),
+        }
+        structuredContent = {
+            ...(rawResult as Record<string, unknown>),
+            _analytics: analyticsMetadata,
+        }
+    }
+
+    // Native widgets read metadata independently of the model's text format, so with app data
+    // present `structuredContent` would be a third copy of the rows the text and `_meta` already
+    // carry. MCP UI hosts only suppress it when a compact table can replace it for the model.
+    const suppressStructuredContent =
+        !!includeAppData ||
+        (!callerWantsJson &&
+            formattedResults !== undefined &&
+            (!!forceUiDataToMeta || !!suppressStructuredContentForFormattedResults))
+
+    // Inline-exec UI hosts surface BOTH `content[].text` and `structuredContent` to the
+    // model. A UI tool with no compact formatted table has nothing smaller to offer the
+    // text channel, so mirroring the payload there hands the agent a second full copy of
+    // the same rows. Carry it once, in `structuredContent` — the field the UI app reads
+    // from too — and leave a pointer in the text. `output_format` opts back into the
+    // mirrored serialization for callers that parse the text channel.
+    const structuredContentOnly =
+        !includeAppData &&
+        !!forceUiDataToMeta &&
+        hasUiResource &&
+        !isStringResult &&
+        !useJson &&
+        formattedResults === undefined
+
+    const body = structuredContentOnly
+        ? STRUCTURED_CONTENT_ONLY_TEXT
+        : ((useJson && (includeAppData || isTextProjection) ? undefined : formattedResults) ??
+          (useJson ? JSON.stringify(rawResult) : formatResponse(rawResult)))
+
+    const footers: string[] = []
+
+    const chartData = appendTimeSeriesChartData && !useJson ? buildTimeSeriesChartData(handlerResult) : undefined
+    if (chartData) {
+        footers.push(chartData)
+    }
+
+    if (!isStringResult && !useJson && !structuredContentOnly && !isPrepareConfirmedActionResult(handlerResult)) {
+        const nextPageHint = getNextPageHint(toolName, rawResult)
+        if (nextPageHint) {
+            footers.push(nextPageHint)
+        }
+    }
+
+    if (includeRenderNote && hasUiResource && !useJson) {
+        footers.push(UI_APP_RENDER_NOTE)
+    }
+
+    const text = [body, ...footers].join('\n\n')
+
+    const payload: ToolResultPayload = {
+        content: [{ type: 'text', text }],
+    }
+    builtResponseText.set(payload, {
+        structuredContentOnly,
+        footers,
+        resultEmpty: isEmptyToolResult(handlerResult, toolName),
+    })
+    if (hasUiResource && !suppressStructuredContent) {
+        payload.structuredContent = structuredContent as Record<string, unknown>
+    }
+    if (includeUiResponseMeta && resourceUri) {
+        payload._meta = {
+            ui: { resourceUri },
+            [RESOURCE_URI_META_KEY]: resourceUri,
+        }
+    }
+    // Native widgets and MCP UI apps need the full data even when the model reads
+    // compact text. Their hosts preserve `_meta` without passing it to the model.
+    // Directly registered tools already advertise their UI resource in tools/list,
+    // so their app data must not depend on includeUiResponseMeta.
+    if ((includeAppData && !isStringResult) || (suppressStructuredContent && hasUiResource)) {
+        payload._meta = {
+            ...payload._meta,
+            [APP_DATA_META_KEY]: structuredContent as Record<string, unknown>,
+        }
+    }
+    // `-prepare` tools have no UI resource, so UI apps driving a confirmed action
+    // read the hash from the app-only `_meta` channel instead of structuredContent.
+    if (isPrepareConfirmedActionResult(handlerResult)) {
+        payload._meta = {
+            ...payload._meta,
+            [APP_DATA_META_KEY]: rawResult as Record<string, unknown>,
+        }
+    }
+    return payload
+}

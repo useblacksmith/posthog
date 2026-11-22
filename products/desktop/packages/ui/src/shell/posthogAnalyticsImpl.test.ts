@@ -1,0 +1,437 @@
+import { ANALYTICS_EVENTS } from "@posthog/shared/analytics-events";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const mockPosthog = {
+  init: vi.fn(),
+  register: vi.fn(),
+  unregister: vi.fn(),
+  onFeatureFlags: vi.fn(),
+  isFeatureEnabled: vi.fn(),
+  startSessionRecording: vi.fn(),
+  capture: vi.fn(),
+  identify: vi.fn(),
+  group: vi.fn(),
+  reset: vi.fn(),
+  captureException: vi.fn(),
+  reloadFeatureFlags: vi.fn(),
+};
+
+vi.mock("posthog-js/dist/module.full.no-external", () => ({
+  default: mockPosthog,
+}));
+
+vi.mock("posthog-js/dist/posthog-recorder", () => ({}));
+
+async function loadAnalytics() {
+  vi.resetModules();
+  return await import("./posthogAnalyticsImpl");
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.stubEnv("VITE_POSTHOG_API_KEY", "test-key");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+describe("onFeatureFlagsLoaded", () => {
+  it("delivers pre-init subscribers when init runs", async () => {
+    const { initializePostHog, onFeatureFlagsLoaded } = await loadAnalytics();
+
+    const cb = vi.fn();
+    onFeatureFlagsLoaded(cb);
+
+    expect(mockPosthog.onFeatureFlags).not.toHaveBeenCalled();
+
+    initializePostHog();
+
+    expect(mockPosthog.onFeatureFlags).toHaveBeenCalledTimes(1);
+    expect(mockPosthog.onFeatureFlags).toHaveBeenCalledWith(cb);
+  });
+
+  it("does not register a buffered listener that unsubscribed before init", async () => {
+    const { initializePostHog, onFeatureFlagsLoaded } = await loadAnalytics();
+
+    const cb = vi.fn();
+    const off = onFeatureFlagsLoaded(cb);
+    off();
+
+    initializePostHog();
+
+    expect(mockPosthog.onFeatureFlags).not.toHaveBeenCalled();
+  });
+
+  it("propagates unsubscribe to PostHog when called after init", async () => {
+    const realUnsub = vi.fn();
+    mockPosthog.onFeatureFlags.mockReturnValue(realUnsub);
+
+    const { initializePostHog, onFeatureFlagsLoaded } = await loadAnalytics();
+
+    const off = onFeatureFlagsLoaded(vi.fn());
+    initializePostHog();
+    off();
+
+    expect(realUnsub).toHaveBeenCalledTimes(1);
+  });
+
+  it("routes post-init subscribers directly to PostHog", async () => {
+    const realUnsub = vi.fn();
+    mockPosthog.onFeatureFlags.mockReturnValue(realUnsub);
+
+    const { initializePostHog, onFeatureFlagsLoaded } = await loadAnalytics();
+    initializePostHog();
+
+    const cb = vi.fn();
+    const off = onFeatureFlagsLoaded(cb);
+
+    expect(mockPosthog.onFeatureFlags).toHaveBeenCalledWith(cb);
+
+    off();
+    expect(realUnsub).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("registerAppVersion", () => {
+  it("registers app_version as a super property after init", async () => {
+    const { initializePostHog, registerAppVersion } = await loadAnalytics();
+
+    initializePostHog();
+    registerAppVersion("1.2.3");
+
+    expect(mockPosthog.register).toHaveBeenCalledWith({ app_version: "1.2.3" });
+  });
+
+  it("does nothing before init", async () => {
+    const { registerAppVersion } = await loadAnalytics();
+
+    registerAppVersion("1.2.3");
+
+    expect(mockPosthog.register).not.toHaveBeenCalled();
+  });
+
+  it("re-registers app_version after resetUser clears super properties", async () => {
+    const { initializePostHog, registerAppVersion, resetUser } =
+      await loadAnalytics();
+
+    initializePostHog();
+    registerAppVersion("1.2.3");
+
+    resetUser();
+
+    expect(mockPosthog.reset).toHaveBeenCalledTimes(1);
+    expect(mockPosthog.register).toHaveBeenLastCalledWith({
+      team: "posthog-code",
+      app_version: "1.2.3",
+    });
+  });
+});
+
+describe("registerAdapterSubscription", () => {
+  it("reports the saved access when connected", async () => {
+    const { initializePostHog, registerAdapterSubscription } =
+      await loadAnalytics();
+    initializePostHog();
+
+    registerAdapterSubscription("claude", {
+      access: "own-subscription",
+      connected: true,
+    });
+
+    expect(mockPosthog.register).toHaveBeenCalledWith({
+      claude_model_access: "own-subscription",
+      claude_subscription_connected: true,
+    });
+  });
+
+  it("reports the gateway as effective access when disconnected", async () => {
+    const { initializePostHog, registerAdapterSubscription } =
+      await loadAnalytics();
+    initializePostHog();
+
+    registerAdapterSubscription("claude", {
+      access: "own-subscription",
+      connected: false,
+    });
+
+    expect(mockPosthog.register).toHaveBeenCalledWith({
+      claude_model_access: "posthog-gateway",
+      claude_subscription_connected: false,
+    });
+  });
+});
+
+describe("track", () => {
+  it("stamps inbox_client on inbox events", async () => {
+    const { initializePostHog, track } = await loadAnalytics();
+    initializePostHog();
+
+    track(ANALYTICS_EVENTS.SIGNAL_SOURCE_CONNECTED, {
+      source_product: "github",
+      is_first_connection: true,
+      via_setup_wizard: false,
+    });
+
+    expect(mockPosthog.capture).toHaveBeenCalledWith(
+      ANALYTICS_EVENTS.SIGNAL_SOURCE_CONNECTED,
+      expect.objectContaining({ inbox_client: "code" }),
+    );
+  });
+
+  it("stamps inbox_client on triage events", async () => {
+    const { initializePostHog, track } = await loadAnalytics();
+    initializePostHog();
+
+    track(ANALYTICS_EVENTS.INBOX_TRIAGE_STARTED, {
+      triage_id: "triage-1",
+      queue_size: 3,
+      scope: "for-you",
+      has_active_filters: false,
+    });
+
+    expect(mockPosthog.capture).toHaveBeenCalledWith(
+      ANALYTICS_EVENTS.INBOX_TRIAGE_STARTED,
+      expect.objectContaining({ inbox_client: "code" }),
+    );
+  });
+
+  it("does not stamp inbox_client on non-inbox events", async () => {
+    const { initializePostHog, track } = await loadAnalytics();
+    initializePostHog();
+
+    track(ANALYTICS_EVENTS.PROMPT_HISTORY_OPENED, { entry_count: 3 });
+
+    expect(mockPosthog.capture).toHaveBeenCalledWith(
+      ANALYTICS_EVENTS.PROMPT_HISTORY_OPENED,
+      expect.not.objectContaining({ inbox_client: expect.anything() }),
+    );
+  });
+
+  it("does nothing before init", async () => {
+    const { track } = await loadAnalytics();
+
+    track(ANALYTICS_EVENTS.SIGNAL_SOURCE_CONNECTED, {
+      source_product: "github",
+      is_first_connection: true,
+      via_setup_wizard: false,
+    });
+
+    expect(mockPosthog.capture).not.toHaveBeenCalled();
+  });
+});
+
+describe("networkMetricPath", () => {
+  it.each([
+    "https://us.posthog.com",
+    "https://eu.posthog.com",
+    "http://localhost:8010",
+    "https://app.dev.posthog.dev",
+  ])("keeps API paths for %s without authentication", async (origin) => {
+    const { networkMetricPath } = await loadAnalytics();
+
+    expect(
+      networkMetricPath({
+        url: `${origin}/api/projects/1/tasks/`,
+        method: "GET",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("collapses the path for a presigned artifact URL on another host", async () => {
+    const { networkMetricPath } = await loadAnalytics();
+
+    const path = networkMetricPath({
+      url: "https://s3.example.com/bucket/artifacts/ab12cd34_customer-roadmap.pdf?X-Amz-Signature=abc",
+      method: "GET",
+    });
+
+    expect(path).toBe("external");
+  });
+
+  it("collapses the path for an unparseable URL", async () => {
+    const { networkMetricPath } = await loadAnalytics();
+
+    const path = networkMetricPath({ url: "not a url", method: "GET" });
+
+    expect(path).toBe("external");
+  });
+
+  it.each([
+    "https://us.posthog.com.example.com/api/projects/1/tasks/",
+    "https://us.posthog.com:8443/api/projects/1/tasks/",
+    "https://internal-c.posthog.com/api/projects/1/tasks/",
+    "https://posthog.example.com/api/projects/1/tasks/",
+  ])("redacts an unknown backend: %s", async (url) => {
+    const { networkMetricPath } = await loadAnalytics();
+
+    expect(networkMetricPath({ url, method: "GET" })).toBe("external");
+  });
+
+  it("uses the existing custom cloud configuration", async () => {
+    const { networkMetricPath } = await loadAnalytics();
+    const { configureCustomCloud } = await import("@posthog/shared");
+    const request = {
+      url: "https://posthog.example.com/api/projects/1/tasks/",
+      method: "GET",
+    };
+
+    expect(networkMetricPath(request)).toBe("external");
+    configureCustomCloud({
+      url: "https://posthog.example.com",
+      oauthClientId: "test-client",
+    });
+    expect(networkMetricPath(request)).toBeUndefined();
+    configureCustomCloud(null);
+    expect(networkMetricPath(request)).toBe("external");
+  });
+
+  it.each([
+    {
+      case: "a skill name",
+      url: "https://us.posthog.com/api/environments/1/llm_skills/name/incident-runbook",
+      expected: "/api/environments/:id/llm_skills/name/:id",
+    },
+    {
+      case: "a nested skill file path",
+      url: "https://us.posthog.com/api/environments/1/llm_skills/name/incident-runbook/files/docs/readme.md",
+      expected: "/api/environments/:id/llm_skills/name/:id/files/:id",
+    },
+    {
+      case: "an MCP tool name",
+      url: "https://us.posthog.com/api/environments/1/mcp_server_installations/0f8c2b1e-1111-4222-8333-444455556666/tools/lookup_customer_record/",
+      expected: "/api/environments/:id/mcp_server_installations/:id/tools/:id/",
+    },
+  ])("templates $case on the app's own backend", async ({ url, expected }) => {
+    const { networkMetricPath } = await loadAnalytics();
+
+    const path = networkMetricPath({ url, method: "GET" });
+
+    expect(path).toBe(expected);
+  });
+
+  it("leaves the fixed MCP tools refresh action untemplated", async () => {
+    const { networkMetricPath } = await loadAnalytics();
+
+    const path = networkMetricPath({
+      url: "https://us.posthog.com/api/environments/1/mcp_server_installations/0f8c2b1e-1111-4222-8333-444455556666/tools/refresh/",
+      method: "POST",
+    });
+
+    expect(path).toBeUndefined();
+  });
+});
+
+describe("metrics.network.attributes callback", () => {
+  it.each(["https://us.posthog.com", "https://eu.posthog.com"])(
+    "keeps API paths for %s with a separate analytics host",
+    async (origin) => {
+      vi.stubEnv("VITE_POSTHOG_API_HOST", "https://internal-c.posthog.com");
+      const { initializePostHog } = await loadAnalytics();
+
+      initializePostHog();
+      const attributesCallback =
+        mockPosthog.init.mock.calls[0][1].metrics.network.attributes;
+
+      expect(
+        attributesCallback({
+          url: `${origin}/api/projects/1/tasks/`,
+          method: "GET",
+        }),
+      ).toBeUndefined();
+    },
+  );
+
+  it("returns { path: 'external' } for requests to other hosts", async () => {
+    const { initializePostHog } = await loadAnalytics();
+
+    initializePostHog();
+
+    const attributesCallback =
+      mockPosthog.init.mock.calls[0][1].metrics.network.attributes;
+    const result = attributesCallback({
+      url: "https://s3.example.com/bucket/artifacts/secret_filename.pdf",
+      method: "GET",
+    });
+
+    expect(result).toEqual({ path: "external" });
+  });
+});
+
+describe("initializePostHog", () => {
+  it("is idempotent across repeat calls", async () => {
+    const { initializePostHog } = await loadAnalytics();
+
+    initializePostHog();
+    initializePostHog();
+
+    expect(mockPosthog.init).toHaveBeenCalledTimes(1);
+  });
+
+  it("does nothing when no API key is set", async () => {
+    vi.stubEnv("VITE_POSTHOG_API_KEY", "");
+    const { initializePostHog, onFeatureFlagsLoaded } = await loadAnalytics();
+
+    const cb = vi.fn();
+    onFeatureFlagsLoaded(cb);
+    initializePostHog();
+
+    expect(mockPosthog.init).not.toHaveBeenCalled();
+    expect(mockPosthog.onFeatureFlags).not.toHaveBeenCalled();
+  });
+
+  it("disables replay canvas capture regardless of remote config", async () => {
+    const { initializePostHog } = await loadAnalytics();
+
+    initializePostHog();
+
+    expect(mockPosthog.init).toHaveBeenCalledWith(
+      "test-key",
+      expect.objectContaining({
+        session_recording: { captureCanvas: { recordCanvas: false } },
+      }),
+    );
+  });
+
+  it("configures metrics for the desktop service", async () => {
+    const { initializePostHog } = await loadAnalytics();
+
+    initializePostHog();
+
+    expect(mockPosthog.init).toHaveBeenCalledWith(
+      "test-key",
+      expect.objectContaining({
+        metrics: {
+          serviceName: "posthog-desktop",
+          environment: "development",
+          network: { attributes: expect.any(Function) },
+        },
+      }),
+    );
+  });
+
+  it("bootstraps posthog with the main-owned session id", async () => {
+    const { initializePostHog } = await loadAnalytics();
+
+    initializePostHog("0190abcd-1234-7890-8abc-def012345678");
+
+    expect(mockPosthog.init).toHaveBeenCalledWith(
+      "test-key",
+      expect.objectContaining({
+        bootstrap: { sessionID: "0190abcd-1234-7890-8abc-def012345678" },
+        session_idle_timeout_seconds: 36_000,
+      }),
+    );
+  });
+
+  it("omits bootstrap when no session id is provided", async () => {
+    const { initializePostHog } = await loadAnalytics();
+
+    initializePostHog();
+
+    expect(mockPosthog.init).toHaveBeenCalledWith(
+      "test-key",
+      expect.not.objectContaining({ bootstrap: expect.anything() }),
+    );
+  });
+});

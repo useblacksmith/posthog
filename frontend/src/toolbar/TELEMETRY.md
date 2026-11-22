@@ -1,0 +1,438 @@
+# Toolbar telemetry events
+
+All events are sent via `toolbarPosthogJS`, the toolbar's internal PostHog instance,
+unless noted otherwise. Events go to PostHog's internal project (prod) or `localhost:8000` (dev).
+
+## Lifecycle
+
+### `toolbar loaded`
+
+Fired once when the toolbar finishes initialization.
+
+| Property                   | Type                                   | Description                                                                    |
+| -------------------------- | -------------------------------------- | ------------------------------------------------------------------------------ |
+| `is_authenticated`         | `boolean`                              | Whether the user had valid tokens at load time                                 |
+| `source`                   | `'url' \| 'localstorage' \| 'unknown'` | Whether the toolbar was launched from PostHog or auto-loaded from localStorage |
+| `ui_host`                  | `string`                               | Resolved PostHog UI host                                                       |
+| `api_host`                 | `string`                               | Resolved API host                                                              |
+| `ui_host_explicit`         | `boolean`                              | Whether `uiHost` was explicitly provided in toolbar params                     |
+| `ui_host_matches_api_host` | `boolean`                              | Whether UI and API hosts are the same                                          |
+| `load_duration_ms`         | `number \| undefined`                  | Time from `ph_load_toolbar` call to initialization complete                    |
+
+**File:** `shared/toolbarConfigLogic.ts`
+
+### `toolbar ui host check`
+
+Fired after the CORS reachability check to the PostHog app.
+
+| Property           | Type              | Description                                                          |
+| ------------------ | ----------------- | -------------------------------------------------------------------- |
+| `ui_host`          | `string`          | Host being checked                                                   |
+| `api_host`         | `string`          | API host for reference                                               |
+| `ui_host_source`   | `string`          | How the UI host was resolved                                         |
+| `is_authenticated` | `boolean`         | Auth state at time of check                                          |
+| `status`           | `'ok' \| 'error'` | Check result                                                         |
+| `error_type`       | `string`          | Only on error: `timeout`, `network_or_cors`, `http_error`, `unknown` |
+| `duration_ms`      | `number`          | Time taken for the check                                             |
+
+**File:** `shared/toolbarConfigLogic.ts`
+
+## Authentication
+
+### `toolbar authenticate`
+
+Fired when the user triggers authentication.
+
+| Property           | Type      | Description                          |
+| ------------------ | --------- | ------------------------------------ |
+| `is_authenticated` | `boolean` | Auth state when action was triggered |
+
+**File:** `shared/toolbarConfigLogic.ts`
+
+### `toolbar oauth exchange`
+
+Fired after an OAuth authorization code exchange attempt.
+
+| Property      | Type                                      | Description                               |
+| ------------- | ----------------------------------------- | ----------------------------------------- |
+| `status`      | `'success' \| 'error' \| 'network_error'` | Outcome of the exchange                   |
+| `duration_ms` | `number`                                  | Time taken for the exchange               |
+| `error`       | `string`                                  | Only on `error` status: error description |
+
+`error` is `missing_project` when the OAuth callback named no project, and the code is not exchanged.
+
+**File:** `shared/toolbarConfigLogic.ts`
+
+### `toolbar oauth tokens discarded`
+
+Fired when the toolbar drops stored OAuth tokens instead of restoring them, which signs the user out.
+
+| Property          | Type     | Description                                                              |
+| ----------------- | -------- | ------------------------------------------------------------------------ |
+| `reason`          | `string` | `uihost_mismatch`, `legacy_untrusted_host` or `missing_project`          |
+| `stored_ui_host`  | `string` | Only on `uihost_mismatch`: the uiHost the tokens were issued for         |
+| `current_ui_host` | `string` | On `uihost_mismatch` and `legacy_untrusted_host`: the uiHost of the page |
+
+`missing_project` means the tokens were stored without the project they are scoped to.
+
+**File:** `shared/toolbarConfigLogic.ts`
+
+### `toolbar token refresh`
+
+Fired after a token refresh attempt (triggered automatically on 401 responses).
+
+| Property      | Type                   | Description                       |
+| ------------- | ---------------------- | --------------------------------- |
+| `status`      | `'success' \| 'error'` | Outcome of the refresh            |
+| `duration_ms` | `number`               | Time taken for the refresh        |
+| `http_status` | `number`               | Only on `error`: HTTP status code |
+
+**File:** `shared/toolbarAuth.ts`
+
+### `toolbar token expired`
+
+Fired when the OAuth token expires or a 403 is received.
+No properties.
+
+**File:** `shared/toolbarConfigLogic.ts`
+
+### `toolbar logout`
+
+Fired when the user logs out from the toolbar.
+No properties.
+
+**File:** `shared/toolbarConfigLogic.ts`
+
+### `toolbar ui host config modal opened`
+
+Fired when the UI host configuration modal is shown (auth error state).
+
+| Property  | Type     | Description           |
+| --------- | -------- | --------------------- |
+| `ui_host` | `string` | Current UI host value |
+
+**File:** `shared/toolbarConfigLogic.ts`
+
+## API requests
+
+### `toolbar api request`
+
+Fired after every `toolbarFetch` call, and after the entitlements request, which carries the session cookie instead of a bearer token.
+Covers all toolbar API endpoints.
+
+| Property          | Type      | Description                                     |
+| ----------------- | --------- | ----------------------------------------------- |
+| `method`          | `string`  | HTTP method (`GET`, `POST`, `PATCH`, `DELETE`)  |
+| `pathname`        | `string`  | API path (e.g., `/api/projects/1/actions/`)     |
+| `status`          | `number`  | HTTP status, or 0 if the request never landed   |
+| `duration_ms`     | `number`  | Total time including any token retry            |
+| `did_token_retry` | `boolean` | Whether a 401 triggered a token refresh + retry |
+
+**File:** `shared/toolbarFetch.ts`
+
+## Menu and mode
+
+### `toolbar menu opened`
+
+Fired when a toolbar menu becomes visible.
+
+| Property        | Type        | Description                      |
+| --------------- | ----------- | -------------------------------- |
+| `menu`          | `MenuState` | Menu that was opened             |
+| `previous_menu` | `MenuState` | Menu that was previously visible |
+
+**File:** `shared/bar/toolbarLogic.ts`
+
+### `toolbar menu closed`
+
+Fired when a toolbar menu is closed (state returns to `'none'`).
+
+| Property | Type        | Description          |
+| -------- | ----------- | -------------------- |
+| `menu`   | `MenuState` | Menu that was closed |
+
+**File:** `shared/bar/toolbarLogic.ts`
+
+### `toolbar mode triggered`
+
+Fired when a toolbar mode is toggled on or off.
+
+| Property  | Type      | Description                                                             |
+| --------- | --------- | ----------------------------------------------------------------------- |
+| `mode`    | `string`  | One of: `heatmap`, `inspect`, `actions`, `experiments`, `product-tours` |
+| `enabled` | `boolean` | Whether the mode was enabled or disabled                                |
+
+**Files:** `shared/elements/elementsLogic.ts`, `shared/elements/heatmapToolbarMenuLogic.ts`,
+`shared/actions/actionsTabLogic.tsx`, `shared/experiments/experimentsTabLogic.tsx`,
+`shared/product-tours/productToursLogic.ts`
+
+## Heatmaps / clickmaps
+
+### `toolbar clickmap processed`
+
+Fired when a clickmap matching run ends, including runs cancelled because a newer run superseded them (see `completed`).
+A user paginating emits one event per page with cumulative `event_count` — group by `trigger` when aggregating.
+
+| Property                 | Type      | Description                                                                                                      |
+| ------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------- |
+| `event_count`            | `number`  | Element stats rows processed                                                                                     |
+| `matched_element_count`  | `number`  | Rows matched to a visible DOM element                                                                            |
+| `index_matched_count`    | `number`  | Rows matched via the DOM index fast path (before visibility trimming)                                            |
+| `fallback_matched_count` | `number`  | Rows matched via the selector fallback (before visibility trimming); rising values signal index drift            |
+| `match_cache_hit_count`  | `number`  | Rows resolved from the per-row match cache (keyed on the server's chain hash) instead of re-matching             |
+| `page_element_count`     | `number`  | Elements collected from the page for matching                                                                    |
+| `has_shadow_roots`       | `boolean` | Whether open shadow roots were detected; selects which fallback implementation runs, not whether a fallback runs |
+| `duration_ms`            | `number`  | Wall-clock processing time, including main-thread yields; DOM index build time is included only on a cold cache  |
+| `trigger`                | `string`  | What started the run: `initial`, `auto-load` (the background full fetch), `pagination`, `refresh`, or `toggle`   |
+| `cache_hit`              | `boolean` | Whether the page-elements cache was warm (no collect + index rebuild)                                            |
+| `completed`              | `boolean` | False when the run did not finish — superseded by a newer run, or failed mid-processing                          |
+
+**File:** `shared/elements/heatmapToolbarMenuLogic.ts`
+
+### `toolbar heatmap load all started`
+
+Fired when someone presses "Load all" in the heatmap menu to page through the remaining click data. No properties.
+
+**File:** `floating/components/stats/HeatmapToolbarMenu.tsx`
+
+### `toolbar heatmap load all stopped`
+
+Fired when someone presses "Stop loading" to end a run early. A run that ends on its own, or at the page cap, does not emit this.
+
+| Property        | Type     | Description                                   |
+| --------------- | -------- | --------------------------------------------- |
+| `pages_loaded`  | `number` | Pages the run had loaded when it was stopped  |
+| `element_count` | `number` | Element stats rows loaded when it was stopped |
+
+**File:** `floating/components/stats/HeatmapToolbarMenu.tsx`
+
+### `toolbar heatmap area selection started`
+
+Fired when the user starts picking an area to filter the heatmap/clickmap to (the target icon in the heatmap menu).
+
+| Property          | Type      | Description                                                                                        |
+| ----------------- | --------- | -------------------------------------------------------------------------------------------------- |
+| `candidate_count` | `number`  | Area candidates rendered as hover targets                                                          |
+| `capped`          | `boolean` | Whether the candidate list hit its rendering cap (candidates beyond the cap, if any, were dropped) |
+
+**File:** `shared/elements/heatmapToolbarMenuLogic.ts`
+
+### `toolbar heatmap area filter changed`
+
+Fired when the heatmap area filter is applied, changed, or cleared.
+
+| Property        | Type                       | Description                                                                                                       |
+| --------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `enabled`       | `boolean`                  | Whether a filter is now applied (`false` = cleared)                                                               |
+| `has_selector`  | `boolean`                  | Whether a stable CSS selector was derived for the area (without one, only pixel bounds filtering runs)            |
+| `tag_name`      | `string \| null`           | Lowercase tag name of the selected area element                                                                   |
+| `trigger`       | `'user' \| 'element_lost'` | `user` = picked or cleared in the UI; `element_lost` = the tracked node left the DOM and could not be re-resolved |
+| `arrow_stepped` | `boolean \| undefined`     | Only on `trigger: 'user'`: whether arrow keys refined the selection before it was applied                         |
+
+**File:** `shared/elements/heatmapToolbarMenuLogic.ts`
+
+## Element inspection
+
+### `toolbar selected HTML element`
+
+Fired when an element is selected in inspect mode.
+
+| Property          | Type             | Description                          |
+| ----------------- | ---------------- | ------------------------------------ |
+| `element_tag`     | `string \| null` | HTML tag name                        |
+| `element_type`    | `string \| null` | `type` attribute value               |
+| `has_href`        | `boolean`        | Whether element has an href          |
+| `has_class`       | `boolean`        | Whether element has classes          |
+| `has_id`          | `boolean`        | Whether element has an id            |
+| `has_name`        | `boolean`        | Whether element has a name attribute |
+| `has_data_attr`   | `boolean`        | Whether element has data attributes  |
+| `data_attributes` | `string[]`       | List of data attribute names         |
+
+**File:** `shared/elements/elementsLogic.ts`
+
+## Actions
+
+### `toolbar_manual_selector_modal_opened`
+
+Fired when the manual CSS selector editing modal is opened.
+
+| Property   | Type             | Description                   |
+| ---------- | ---------------- | ----------------------------- |
+| `selector` | `string \| null` | Current selector being edited |
+
+**File:** `floating/components/actions/ActionsEditingToolbarMenu.tsx`
+
+### `toolbar_manual_selector_applied`
+
+Fired when a user applies a manual CSS selector.
+
+| Property         | Type     | Description                   |
+| ---------------- | -------- | ----------------------------- |
+| `chosenSelector` | `string` | The selector that was applied |
+
+**File:** `floating/components/actions/ActionsEditingToolbarMenu.tsx`
+
+## Feature flags
+
+### `toolbar feature flag overridden`
+
+Fired when a feature flag override is applied.
+No properties.
+
+**File:** `shared/flags/flagsToolbarLogic.ts`
+
+### `toolbar feature flag override removed`
+
+Fired when a feature flag override is removed.
+No properties.
+
+**File:** `shared/flags/flagsToolbarLogic.ts`
+
+### `toolbar flags impersonated`
+
+Fired when flags are loaded for a different distinct ID.
+
+| Property      | Type     | Description                        |
+| ------------- | -------- | ---------------------------------- |
+| `distinct_id` | `string` | The distinct ID being impersonated |
+
+**File:** `shared/flags/flagsToolbarLogic.ts`
+
+### `toolbar feature flag comparison started`
+
+Fired when a flag comparison starts capturing the page.
+
+| Property      | Type                  | Description                                                                                     |
+| ------------- | --------------------- | ----------------------------------------------------------------------------------------------- |
+| `state_count` | `number`              | Captures the comparison takes: off plus on, or off plus each variant                            |
+| `source`      | `string \| undefined` | `'extension'` when the browser extension ran the comparison. The floating toolbar leaves it out |
+
+**Files:** `shared/flags/flagComparisonLogic.ts`, `extension/browser/extensionTelemetry.ts`
+
+### `toolbar feature flag comparison completed`
+
+Fired when every capture of a flag comparison succeeds.
+
+| Property      | Type                  | Description                                                                                                                                                                         |
+| ------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `state_count` | `number`              | Captures the comparison took                                                                                                                                                        |
+| `identical`   | `boolean`             | `true` when every capture matched the flag-off capture                                                                                                                              |
+| `duration_ms` | `number`              | Time from the start of the comparison to the last capture. With `source: 'extension'`, it runs until the panel receives the images, so it also counts their conversion and transfer |
+| `source`      | `string \| undefined` | `'extension'` when the browser extension ran the comparison. The floating toolbar leaves it out                                                                                     |
+
+**Files:** `shared/flags/flagComparisonLogic.ts`, `extension/browser/extensionTelemetry.ts`
+
+### `toolbar feature flag comparison failed`
+
+Fired when a comparison stops early: a capture fails or times out, for example on a cross-origin image or font, or the flag overrides change during the run.
+
+| Property | Type                  | Description                                                                                                                       |
+| -------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `reason` | `string`              | One of `capture_failed`, `capture_timeout`, `capture_still_running`, `overrides_changed` or `captures_too_large` (extension only) |
+| `source` | `string \| undefined` | `'extension'` when the browser extension ran the comparison. The floating toolbar leaves it out                                   |
+
+**Files:** `shared/flags/flagComparisonLogic.ts`, `extension/browser/extensionTelemetry.ts`
+
+## Product tours
+
+### `product tour recording started`
+
+Fired when session recording starts for product tour editing.
+No properties.
+
+**File:** `shared/product-tours/productToursLogic.ts`
+
+### `product tour step added`
+
+Fired when a new step is added to a tour.
+
+| Property     | Type             | Description                 |
+| ------------ | ---------------- | --------------------------- |
+| `step_type`  | `string`         | Type of step added          |
+| `step_index` | `number`         | Index of the new step       |
+| `tour_id`    | `string \| null` | ID of the tour being edited |
+
+**File:** `shared/product-tours/productToursLogic.ts`
+
+### `product tour step removed`
+
+Fired when a step is removed from a tour.
+
+| Property          | Type             | Description                   |
+| ----------------- | ---------------- | ----------------------------- |
+| `step_type`       | `string \| null` | Type of step removed          |
+| `step_index`      | `number`         | Index of the removed step     |
+| `tour_id`         | `string \| null` | ID of the tour                |
+| `remaining_steps` | `number`         | Steps remaining after removal |
+
+**File:** `shared/product-tours/productToursLogic.ts`
+
+### `product tour consent selected`
+
+Fired when the user selects session recording consent.
+
+| Property  | Type      | Description               |
+| --------- | --------- | ------------------------- |
+| `consent` | `boolean` | Whether consent was given |
+
+**File:** `shared/product-tours/productToursLogic.ts`
+
+### `product tour preview started`
+
+Fired when the user starts previewing a product tour.
+
+| Property     | Type             | Description                    |
+| ------------ | ---------------- | ------------------------------ |
+| `tour_id`    | `string \| null` | ID of the tour being previewed |
+| `step_count` | `number`         | Number of steps in the tour    |
+
+**File:** `shared/product-tours/productToursLogic.ts`
+
+## Screenshots
+
+### `media preview uploaded`
+
+Fired after a successful screenshot/media upload.
+
+| Property | Type        | Description        |
+| -------- | ----------- | ------------------ |
+| `source` | `'toolbar'` | Always `'toolbar'` |
+
+**File:** `shared/screenshot-upload/screenshotUploadLogic.ts`
+
+## Browser extension
+
+### `toolbar extension panel state`
+
+Fired when the side panel shows a new state.
+
+| Property             | Type                  | Description                                                     |
+| -------------------- | --------------------- | --------------------------------------------------------------- |
+| `state`              | `string`              | The state kind, for example `'ready'` or `'unauthorized-url'`   |
+| `unsupported_reason` | `string \| undefined` | Why the toolbar can't run on the page, for `'unsupported-page'` |
+
+**File:** `extension/logics/panel/extensionPanelLogic.ts`
+
+### `toolbar extension page tool used`
+
+Fired when the user runs a tool on the page from the extension.
+
+| Property  | Type                   | Description                                                                                                                                                                                                                                                                                                                                                                                                              |
+| --------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `tool`    | `string`               | `'inspect'`, `'heatmap'`, `'save-heatmap'`, `'heatmap-variant-filter'`, `'actions'`, `'create-action'`, `'save-action'`, `'flags'`, `'override-flag'`, `'compare-flag'`, `'clear-flag-overrides'`, `'impersonate-flags'`, `'events'`, `'export-events'`, `'web-vitals'`, `'experiments'`, `'create-experiment'`, `'save-experiment'`, `'more'`, `'pii-masking'`, `'screenshot-for-event'`, or `'view-session-recording'` |
+| `payload` | `boolean \| undefined` | `true` when `'override-flag'` sets a payload                                                                                                                                                                                                                                                                                                                                                                             |
+| `enabled` | `boolean \| undefined` | `true` when `'heatmap-variant-filter'` picks a variant, `false` when it clears it                                                                                                                                                                                                                                                                                                                                        |
+
+**File:** `extension/browser/extensionTelemetry.ts`
+
+### `toolbar extension authenticated`
+
+Fired when the extension finishes the toolbar OAuth flow for a project, which gives the page tools their own access.
+
+| Property      | Type                  | Description                                                                 |
+| ------------- | --------------------- | --------------------------------------------------------------------------- |
+| `status`      | `string`              | `'success'` or `'error'`                                                    |
+| `interactive` | `boolean`             | `true` when the user clicked **Connect**, `false` when the panel started it |
+| `error`       | `string \| undefined` | The error message, for `'error'`                                            |
+
+**File:** `extension/logics/panel/extensionAuthLogic.ts`

@@ -1,0 +1,129 @@
+"""Tests for render_hogql_example."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import time_machine
+from posthog.test.base import BaseTest
+from unittest.mock import MagicMock, patch
+
+import products.posthog_ai.scripts.hogql_example as hogql_example_module
+from products.posthog_ai.scripts.hogql_example import render_hogql_example
+
+SAMPLE_QUERY = {"kind": "TrendsQuery", "series": [{"kind": "EventsNode", "event": "$pageview"}]}
+
+
+@pytest.fixture(autouse=True)
+def _reset_cached_team() -> None:
+    hogql_example_module._cached_team = None
+
+
+@patch("django.conf.settings.DEBUG", False)
+def test_raises_when_debug_is_false() -> None:
+    with pytest.raises(RuntimeError, match="only available when DEBUG=True"):
+        render_hogql_example(SAMPLE_QUERY)
+
+
+@patch("django.conf.settings.DEBUG", True)
+@patch("posthog.models.team.Team.objects.first", return_value=None)
+def test_raises_when_no_team(_mock_first: MagicMock) -> None:
+    with pytest.raises(RuntimeError, match="requires at least one Team"):
+        render_hogql_example(SAMPLE_QUERY)
+
+
+class TestRenderHogQLExample(BaseTest):
+    """End-to-end tests that exercise the real query runner pipeline.
+
+    These guard against regressions where the rendered HogQL would silently
+    drift to wall-clock time, or where the renderer would corrupt global
+    process state.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        hogql_example_module._cached_team = None
+
+    @patch("django.conf.settings.DEBUG", True)
+    def test_trends_relative_range_pins_to_frozen_time(self) -> None:
+        # FROZEN_TIME = 2025-12-10. -7d should anchor to 2025-12-03.
+        result = render_hogql_example(
+            {
+                "kind": "TrendsQuery",
+                "series": [{"kind": "EventsNode", "event": "$pageview"}],
+                "dateRange": {"date_from": "-7d"},
+            }
+        )
+
+        assert "2025-12-10" in result
+        assert "2025-12-03" in result
+
+    @patch("django.conf.settings.DEBUG", True)
+    def test_render_does_not_mock_the_global_clock(self) -> None:
+        # Clock mocking is process-global, so a freeze here hands concurrent Temporal
+        # activities and request handlers the wrong time. A single-threaded test cannot
+        # observe that, so assert the renderer never travels at all.
+        def _explode(*args: object, **kwargs: object) -> object:
+            raise AssertionError(
+                "render_hogql_example called time_machine.travel — this mocks the clock "
+                "process-globally and corrupts concurrent workers. Use _pin_runner_now instead."
+            )
+
+        with patch.object(time_machine, "travel", _explode):
+            render_hogql_example(
+                {
+                    "kind": "TrendsQuery",
+                    "series": [{"kind": "EventsNode", "event": "$pageview"}],
+                    "dateRange": {"date_from": "-7d"},
+                }
+            )
+
+    @patch("django.conf.settings.DEBUG", True)
+    def test_output_is_deterministic_across_calls(self) -> None:
+        query = {
+            "kind": "TrendsQuery",
+            "series": [{"kind": "EventsNode", "event": "$pageview"}],
+            "dateRange": {"date_from": "-30d"},
+        }
+
+        first = render_hogql_example(query)
+        second = render_hogql_example(query)
+
+        assert first == second
+
+
+class TestRenderHogQLExampleMocked:
+    """Cheap mock-based tests for control-flow branches that don't need a DB."""
+
+    def test_pins_context_now_as_well_as_the_date_range(self) -> None:
+        # Some runners resolve sub-ranges off `context.now` rather than off query_date_range, so
+        # both surfaces have to be pinned. A stub stands in for the runner because the branch is
+        # generic: reaching it through a real query kind ties this suite to whichever product
+        # owns that kind, and the trends case above already covers the pipeline end to end.
+        runner = SimpleNamespace(context=SimpleNamespace(now=None))
+
+        hogql_example_module._pin_runner_now(runner, hogql_example_module._FROZEN_DATETIME)
+
+        assert runner.context.now == hogql_example_module._FROZEN_DATETIME
+
+    @patch("posthog.hogql.printer.utils.to_printed_hogql", return_value="SELECT 1")
+    @patch("posthog.hogql.filters.replace_filters")
+    @patch("posthog.hogql_queries.query_runner.get_query_runner")
+    @patch("posthog.models.team.Team.objects.first")
+    @patch("django.conf.settings.DEBUG", True)
+    def test_caches_team_across_calls(
+        self,
+        mock_first: MagicMock,
+        mock_get_runner: MagicMock,
+        _mock_replace_filters: MagicMock,
+        _mock_to_hogql: MagicMock,
+    ) -> None:
+        fake_team = MagicMock()
+        mock_first.return_value = fake_team
+        mock_get_runner.return_value = MagicMock()
+
+        render_hogql_example(SAMPLE_QUERY)
+        render_hogql_example(SAMPLE_QUERY)
+
+        mock_first.assert_called_once()

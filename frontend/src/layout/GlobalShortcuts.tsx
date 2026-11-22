@@ -1,0 +1,229 @@
+import { useActions, useValues } from 'kea'
+import { router } from 'kea-router'
+import { useRef } from 'react'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import { newAccountMenuLogic } from 'lib/components/Account/newAccountMenuLogic'
+import { commandLogic } from 'lib/components/Command/commandLogic'
+import { openJumpToTimestampModal } from 'lib/components/DateFilter/openJumpToTimestampModal'
+import { helpMenuLogic } from 'lib/components/HelpMenu/helpMenuLogic'
+import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
+import { useShortcut } from 'lib/components/Shortcuts/useShortcut'
+import { openCHQueriesDebugModal } from 'lib/components/Shortcuts/utils/DebugCHQueries'
+import { superpowersLogic } from 'lib/components/Superpowers/superpowersLogic'
+import { removeProjectIdIfPresent } from 'lib/utils/kea-router'
+import { urls } from 'scenes/urls'
+
+import hesoyamSfx from 'public/hesoyam.mp3'
+
+import { billingCouponsClaimCreate } from 'products/billing/frontend/generated/api'
+
+import { sidePanelLogic } from './navigation-3000/sidepanel/sidePanelLogic'
+import { sidePanelStateLogic } from './navigation-3000/sidepanel/sidePanelStateLogic'
+import { themeLogic } from './navigation-3000/themeLogic'
+
+export function GlobalShortcuts(): null {
+    const hesoyamInFlight = useRef(false)
+    const { superpowersEnabled, user, excludedFromPostHogTeamCohort } = useValues(superpowersLogic)
+    const { setExcludedFromPostHogTeamCohort } = useActions(superpowersLogic)
+    const { toggleCommand } = useActions(commandLogic)
+    const { toggleHelpMenu } = useActions(helpMenuLogic)
+    const { toggleAccountMenu, toggleProjectSwitcher, toggleOrgSwitcher } = useActions(newAccountMenuLogic)
+    const { openSuperpowers } = useActions(superpowersLogic)
+    const { toggleTheme } = useActions(themeLogic)
+    const { openSidePanel, closeSidePanel } = useActions(sidePanelStateLogic)
+    const { sidePanelOpen } = useValues(sidePanelStateLogic)
+
+    const { defaultTab } = useValues(sidePanelLogic)
+
+    useShortcut({
+        name: 'Search',
+        keybind: [keyBinds.search],
+        intent: 'Search',
+        interaction: 'function',
+        callback: () => {
+            toggleCommand('keyboard-shortcut')
+        },
+        priority: 10,
+    })
+
+    useShortcut({
+        name: 'DebugClickhouseQueries',
+        keybind: [['command', 'option', 'tab']],
+        intent: 'Debug clickhouse queries',
+        interaction: 'function',
+        callback: openCHQueriesDebugModal,
+        disabled: !superpowersEnabled,
+    })
+
+    useShortcut({
+        name: 'Superpowers',
+        keybind: [['command', 'shift', 'p']],
+        intent: 'Open superpowers panel',
+        interaction: 'function',
+        callback: openSuperpowers,
+        disabled: !superpowersEnabled,
+    })
+
+    useShortcut({
+        name: 'TogglePostHogTeamCohort',
+        keybind: [],
+        intent: 'Toggle PostHog Team cohort',
+        interaction: 'function',
+        callback: () => setExcludedFromPostHogTeamCohort(!excludedFromPostHogTeamCohort),
+        disabled: !user?.is_staff,
+    })
+
+    useShortcut({
+        name: 'SQLEditor',
+        keybind: [keyBinds.sqlEditor],
+        intent: 'Open SQL editor',
+        interaction: 'function',
+        callback: () => {
+            if (removeProjectIdIfPresent(router.values.location.pathname) !== urls.sqlEditor()) {
+                router.actions.push(urls.sqlEditor())
+            }
+        },
+    })
+
+    useShortcut({
+        name: 'toggle-context-panel',
+        keybind: [keyBinds.toggleRightNav],
+        intent: 'Toggle context panel',
+        interaction: 'function',
+        callback: () => {
+            if (sidePanelOpen) {
+                closeSidePanel()
+            } else {
+                openSidePanel(defaultTab)
+            }
+        },
+    })
+
+    useShortcut({
+        name: 'toggle-help-menu',
+        keybind: [keyBinds.helpMenu],
+        intent: 'Toggle help menu',
+        interaction: 'function',
+        callback: () => toggleHelpMenu(),
+    })
+
+    useShortcut({
+        name: 'toggle-new-account-menu',
+        keybind: [keyBinds.newAccountMenu],
+        intent: 'Toggle new account menu',
+        interaction: 'function',
+        callback: () => toggleAccountMenu(),
+    })
+
+    useShortcut({
+        name: 'toggle-project-switcher',
+        keybind: [keyBinds.projectSwitcher],
+        intent: 'Toggle project switcher',
+        interaction: 'function',
+        callback: () => toggleProjectSwitcher(),
+    })
+
+    useShortcut({
+        name: 'toggle-org-switcher',
+        keybind: [keyBinds.orgSwitcher],
+        intent: 'Toggle organization switcher',
+        interaction: 'function',
+        callback: () => toggleOrgSwitcher(),
+    })
+
+    useShortcut({
+        name: 'toggle-theme',
+        keybind: [keyBinds.theme],
+        intent: 'Toggle theme (dark / light)',
+        interaction: 'function',
+        callback: () => toggleTheme(),
+    })
+
+    useShortcut({
+        name: 'jump-to-timestamp',
+        keybind: [keyBinds.jumpToTimestamp],
+        intent: 'Jump to timestamp',
+        interaction: 'function',
+        callback: openJumpToTimestampModal,
+    })
+
+    useShortcut({
+        name: 'Hesoyam',
+        keybind: [keyBinds.hesoyam],
+        intent: 'Easter egg',
+        hidden: true,
+        matchInEditable: true,
+        interaction: 'function',
+        callback: async () => {
+            if (hesoyamInFlight.current) {
+                return
+            }
+            hesoyamInFlight.current = true
+            try {
+                await billingCouponsClaimCreate({ campaign_slug: 'hesoyam' })
+
+                new Audio(hesoyamSfx).play().catch(() => {})
+
+                lemonToast.success(
+                    <>
+                        <style>{`
+                            @keyframes hesoyam-fill {
+                                0% { width: 55%; }
+                                100% { width: 85%; }
+                            }
+                            @keyframes hesoyam-bonus-pop {
+                                0% { opacity: 0; transform: scale(0.5) translateY(2px); }
+                                60% { opacity: 1; transform: scale(1.15) translateY(-1px); }
+                                100% { opacity: 1; transform: scale(1) translateY(0); }
+                            }
+                        `}</style>
+                        <div className="flex items-center gap-3 font-mono" style={{ minWidth: 280 }}>
+                            <span className="text-xs font-bold uppercase tracking-wider opacity-90">Total respect</span>
+                            <div className="flex-1 flex items-center gap-1.5">
+                                <div
+                                    className="h-3 rounded-sm flex-1 overflow-hidden"
+                                    style={{ backgroundColor: 'rgba(255,255,255,0.15)' }}
+                                >
+                                    <div
+                                        className="h-full rounded-sm"
+                                        style={{
+                                            width: '85%',
+                                            background: 'linear-gradient(90deg, #4b9c4b 0%, #6bcf6b 100%)',
+                                            animation: 'hesoyam-fill 0.8s ease-out',
+                                        }}
+                                    />
+                                </div>
+                                <span className="text-xs font-bold opacity-70">+</span>
+                            </div>
+                            <span
+                                className="font-bold"
+                                style={{
+                                    color: '#5dde5d',
+                                    fontSize: '0.8125rem',
+                                    lineHeight: 1,
+                                    textShadow: '0 0 8px rgba(93, 222, 93, 0.5)',
+                                    animation: 'hesoyam-bonus-pop 0.5s ease-out 0.7s both',
+                                }}
+                            >
+                                +$5
+                            </span>
+                        </div>
+                    </>
+                )
+            } catch (error: any) {
+                // Stay quiet on errors that aren't "already redeemed" so we
+                // don't advertise the easter egg's existence.
+                const detail = (error?.detail ?? error?.data?.detail ?? '').toString().toLowerCase()
+                if (detail.includes('already claimed')) {
+                    lemonToast.info('Nice try. You already used this cheat code.')
+                }
+            } finally {
+                hesoyamInFlight.current = false
+            }
+        },
+    })
+
+    return null
+}
