@@ -1,0 +1,16 @@
+frontend/src/generated/core/api.schemas.ts
+hog/.sampo/changesets/pr-128971.md
+posthog/api/organization.py
+posthog/api/test/test_organization.py
+products/desktop/packages/api-client/src/generated.ts
+products/platform_features/frontend/generated/api.schemas.ts
+products/platform_features/frontend/generated/api.zod.ts
+products/platform_features/mcp/tools.yaml
+services/mcp/schema/cli-catalog-tools.json
+services/mcp/schema/generated-tool-definitions.json
+services/mcp/src/api/generated.ts
+services/mcp/src/generated/platform_features/api.ts
+services/mcp/src/hono/request-state-resolver.ts
+services/mcp/src/tools/generated/platform_features.ts
+services/mcp/tests/hono/request-state-resolver.test.ts
+services/mcp/tests/unit/__snapshots__/tool-schemas/organization-create.json
