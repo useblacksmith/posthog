@@ -1,0 +1,682 @@
+#!/usr/bin/env node
+import { execSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import { AUTHENTICATED_SHELL, ENTRY, LOGGED_OUT_BOOT } from './bootEntries.mjs'
+import { planCssGroups, stableCssBytes } from './stableCssPlan.mjs'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const frontendDir = path.resolve(__dirname, '..')
+const metaPath = path.join(frontendDir, 'posthog-app-esbuild-meta.json')
+
+// --report-only: record results without failing the build. Used by build:with-report
+// because the CI bundle-size job runs that script for BOTH the PR build and the base
+// build — a base-branch budget breach must not abort the job for every open PR.
+// Budget breaches are surfaced as warnings in the dedicated workflow step via --assert-report.
+const reportOnly = process.argv.includes('--report-only')
+
+// --assert-report <path>: skip measuring; read a previously written report and surface any
+// recorded violations as warnings (GitHub Actions annotations) without failing CI — the
+// bundle-size Signals scout tracks regressions from the PR comment, so the check informs.
+const assertReportIndex = process.argv.indexOf('--assert-report')
+const failForbiddenHits = process.argv.includes('--fail-forbidden-hits')
+
+// The rich text stack loads with the first text tile, comment or editor, through
+// lib/components/RichContentEditor/LazyRichContent. A hit means a static import of an editor module.
+const RICH_TEXT_STACK = ['node_modules/@tiptap/', 'node_modules/prosemirror-', 'node_modules/marked/']
+// The emoji picker loads with the editor that opens it.
+const EMOJI_PICKER = 'node_modules/frimousse/'
+
+// The eager graph is everything a root actually SHIPS on the critical path — the bytes a
+// browser downloads and parses before that surface is interactive. It is measured from the
+// esbuild OUTPUT chunks: the root's entry chunk plus every chunk reachable through static
+// (import-statement) chunk edges, plus the CSS the stable build loads before the root runs (see
+// `stableCssBytes`). Lazy (dynamic-import) chunks are excluded, and tree-shaken
+// code is already gone from the output — so a side-effect-free re-export barrel only costs
+// what its used exports actually ship, not its whole surface (the earlier input-graph metric
+// counted the whole barrel and mistook reachability for shipped weight).
+// Total dist size can't see this regression class (a fake-lazy import moves no total bytes
+// but shifts them onto the eager path), which is why this check exists.
+//
+// Budgets are eager output bytes (shipped JS + the stable build's CSS for the root, minified).
+// Ratchet policy: when a bundle-splitting win lands, lower the budget to lock it in;
+// raise a budget only as a conscious, reviewed decision in the PR that needs it.
+// A test library: its expectLogic and jest matchers ship with any import. Use objectsEqual from
+// lib/utils/objects and delay from lib/utils/async instead. No app module imports it, so the guard is
+// a tripwire, and the verify prefix checks the kea package layout that it relies on.
+const KEA_TEST_UTILS = { pattern: 'node_modules/kea-test-utils/', verifyPrefix: 'node_modules/kea/' }
+// The published @posthog/quill dist inlines a second copy of quill-primitives. The app resolves the
+// umbrella to its re-export source (root tsconfig paths), so a hit means that mapping stopped applying.
+const QUILL_UMBRELLA_DIST = {
+    pattern: 'packages/quill/packages/quill/dist/',
+    verifyPrefix: 'packages/quill/packages/primitives/dist/',
+}
+
+const ROOTS = [
+    {
+        root: ENTRY,
+        label: 'entry (logged-out pages, app bootstrap)',
+        // 2026-10-11: 0.97 MiB eager output (0.17 MiB JS + 0.80 MiB stable CSS, 23 files).
+        // ~20% headroom so routine churn doesn't trip the warn; ratchet down on a split win.
+        budgetBytes: 1_200_000,
+        forbidden: [
+            'node_modules/monaco-editor/',
+            'products/product_analytics/frontend/insights/activityDescriptions',
+            // Inlined hoggie SVGs are huge (up to ~1 MiB each), and one static barrel import
+            // from eager code drags every hoggie used anywhere in the app onto the eager
+            // path. All app code uses pngHoggie (lib/brand/hoggies) instead - the package's
+            // `hoggies/png/*` URL stubs are allowed (a few bytes each, the image bytes stay
+            // out of the JS bundle entirely). Nothing imports the SVG modules today (oxlint
+            // no-restricted-imports bans them), so these are tripwires: verifyPrefix checks
+            // the package is still laid out as expected via the PNG stubs that DO ship.
+            {
+                pattern: 'node_modules/@posthog/brand/dist/generated/hoggies/svg/',
+                verifyPrefix: 'node_modules/@posthog/brand/dist/generated/hoggies/',
+            },
+            {
+                pattern: 'node_modules/@posthog/brand/dist/generated/hoggies/components/',
+                verifyPrefix: 'node_modules/@posthog/brand/dist/generated/hoggies/',
+            },
+        ],
+    },
+    {
+        // index.tsx imports App and bootApp as sibling dynamic imports, so neither alone is what
+        // a logged-out page downloads: measure the deduplicated union of all three closures.
+        root: LOGGED_OUT_BOOT,
+        label: 'logged-out boot: index + App + bootApp (preloaded by every page, including /login)',
+        // The backend preloads the App closure for logged-out pages too (preload-manifest.json
+        // `js`), so this is the whole JS cost of /login. 2026-11-11: 2.85 MiB eager output = 1.99 MiB
+        // JS (537 files) + 0.86 MiB stable CSS. ~1.5% headroom.
+        budgetBytes: 3_033_000,
+        forbidden: [
+            'node_modules/monaco-editor/',
+            // No logged-out page renders a table or a sortable multi-select. A hit means a module on the
+            // App path imports from the `@posthog/lemon-ui` barrel, which ships every Lemon component.
+            // Import the component from its own folder, for example `lib/lemon-ui/LemonButton`.
+            'src/lib/lemon-ui/LemonTable/LemonTable.tsx',
+            'node_modules/@dnd-kit/',
+            // Authenticated-only code. Either of these on the App path means a component that
+            // logged-out pages render has grown a static import into the logged-in app.
+            'src/layout/navigation-3000/navigationLogic.tsx',
+            'src/scenes/dashboard/dashboardLogic.tsx',
+            // Nothing a logged-out page renders shows markdown, rich text or a code block; a hit means a
+            // PostHog AI tool card component became a static import.
+            'src/lib/lemon-ui/LemonMarkdown/',
+            'src/lib/components/RichContentEditor/',
+            'src/lib/components/CodeSnippet/',
+            // The taxonomy JSON is a quarter-MiB lookup table for the property editors, not for /login.
+            'src/taxonomy/core-filter-definitions-by-group.json',
+            // zod is for schemas of the logged-in app. A hit means a module on the App path imports a
+            // file that builds a schema. Move the zod-free code of that file into its own module, as
+            // sqlEditorDraftCleanup does for sqlEditorDraftStorage.
+            'node_modules/zod/',
+            // Billing is for logged-in users, and billingLogic pulls in eventUsageLogic. A hit means a
+            // module on the App path imports billingLogic. Read billing values from a logic or component
+            // that only logged-in pages load.
+            'src/lib/logic/billing/billingLogic.tsx',
+            // Product setup statuses need a logged-in team, so AuthenticatedShell mounts the preload.
+            'src/lib/components/ProductEmptyState/productSetupPreloadLogic.ts',
+            KEA_TEST_UTILS,
+        ],
+    },
+    {
+        root: AUTHENTICATED_SHELL,
+        label: 'authenticated shell (every logged-in page)',
+        // 2026-11-10: 3.85 MiB, stable CSS included. ~1.5% headroom.
+        budgetBytes: 4_098_000,
+        forbidden: [
+            'node_modules/monaco-editor/',
+            'products/product_analytics/frontend/insights/activityDescriptions',
+            KEA_TEST_UTILS,
+            // Widget previews render product UI (recordings player, error tracking list, logs) and
+            // are only needed by the add-widget modal; the recordings player logic pulls in rrweb.
+            {
+                pattern: 'products/dashboards/frontend/widgets/previews/',
+                verifyPrefix: 'products/dashboards/frontend/widgets/',
+            },
+            'src/scenes/session-recordings/player/sessionRecordingPlayerLogic.ts',
+            // The replay submenu of the project tree pulls in the playlist and saved filter logics.
+            'src/layout/panel-layout/ProjectTree/menus/SessionReplayMenuItems.tsx',
+            // A hit means a module on the shell path imports taxonomy/registerCoreFilterDefinitions.
+            'src/taxonomy/core-filter-definitions-by-group.json',
+            // The project notice logic pulls in dompurify and the sample data logic.
+            'src/layout/navigation/projectNoticeLogic.tsx',
+            // Only impersonating staff see this notice, and it pulls in react-draggable.
+            'src/layout/navigation/ImpersonationNotice/ImpersonationNotice.tsx',
+            // Toolbar-only code. App modules reach the mounted toolbar through lib/toolbar/toolbarRuntime.ts.
+            'src/toolbar/shared/toolbarConfigLogic.ts',
+            'src/toolbar/shared/toolbarFetch.ts',
+            // The cohort saved toast pulls in the workflows audience code and generated API clients.
+            'src/scenes/cohorts/cohortSavedToast.ts',
+            // The wizard run card opens this drawer on click, and the drawer pulls in quill primitives.
+            'products/wizard/frontend/runs/WizardRunDetailsDrawer.tsx',
+            // The Today layout renders only behind the today-rail-nav flag, and it pulls in quill primitives.
+            'src/layout/today/TodayShell.tsx',
+            'src/layout/today/TodayContextPanelFloating.tsx',
+            'src/layout/today/TodaySidePanel.tsx',
+            'src/layout/today/TodayTopBar.tsx',
+            // The rail's pane actions pull in the new-analytics menu and the canvas block library.
+            'src/layout/today/todayRailItems.tsx',
+            // The export nudge loads the subscriptions code after the shell. It pulls in the subscriptions logic.
+            'products/subscriptions/frontend/components/Subscriptions/exportNudge/exportNudgeLogic.ts',
+            // The pay gate loads the payment logic on click. It pulls in the billing product logic.
+            'src/scenes/billing/paymentEntryLogic.ts',
+            // The support tab icon loads after the shell renders. Its ticket logic pulls in zod.
+            'products/conversations/frontend/components/SidePanel/sidepanelTicketsLogic.ts',
+            'node_modules/zod/',
+            // The login scene's logics. Shell code reads the login redirect from lib/utils/loginRedirect.
+            'src/scenes/authentication/auth/loginLogic.ts',
+            'src/scenes/authentication/shared/passkeyLogic.ts',
+            // The cohort criteria normalizer belongs to the cohort scenes. It pulls in the cohort row editor.
+            'src/scenes/cohorts/CohortFilters/constants.tsx',
+            // The persons scene loads its own logic. The shared cohorts model has no reason to import it.
+            'products/persons/frontend/logics/personsLogic.tsx',
+            // The surveys scene constants hold the question type tables. lib/api reads its page size from lib/constants.
+            'src/scenes/surveys/constants.tsx',
+            // The rich text editor stack is for the scenes that edit text. Rendered markdown needs none of it.
+            'node_modules/@tiptap/',
+            'node_modules/prosemirror-',
+            // The RE2 regex engine checks regex filters before a query runs, and the shell runs no queries.
+            // A hit means a module on the shell path imports lib/utils/regexp or re2js again.
+            'node_modules/re2js/',
+            // react-markdown and its remark plugins load on first render. Shell code uses LazyLemonMarkdown.
+            'node_modules/react-markdown/',
+            // The command palette loads on its first open, and its flagged search pulls in quill.
+            'src/lib/components/Command/Command.tsx',
+            'packages/quill/packages/',
+            // The zod-en-locale-only plugin in common/esbuilder/utils.mjs keeps every locale except
+            // `en` out of the build. A hit on another locale means zod moved its locales barrel and
+            // the plugin no longer matches it.
+            {
+                pattern: 'zod/v4/locales/de.js',
+                verifyPrefix: 'zod/v4/locales/en.js',
+            },
+            // See the entry root's note: inline-SVG hoggies must stay off the eager path.
+            {
+                pattern: 'node_modules/@posthog/brand/dist/generated/hoggies/svg/',
+                verifyPrefix: 'node_modules/@posthog/brand/dist/generated/hoggies/',
+            },
+            {
+                pattern: 'node_modules/@posthog/brand/dist/generated/hoggies/components/',
+                verifyPrefix: 'node_modules/@posthog/brand/dist/generated/hoggies/',
+            },
+        ],
+    },
+    // The most visited logged-in scenes, whose JS gates their LCP. A scene root counts every chunk the
+    // scene needs, so code it shares with the shell is in both numbers.
+    {
+        root: 'src/scenes/dashboard/Dashboard.tsx',
+        label: 'dashboard scene',
+        // 2026-11-10: 7.76 MiB, stable CSS included. ~2% headroom.
+        budgetBytes: 8_300_000,
+        forbidden: [
+            QUILL_UMBRELLA_DIST,
+            ...RICH_TEXT_STACK,
+            EMOJI_PICKER,
+            // Neither scene plays recordings. A hit means a static import pulled the playlist and player onto it.
+            'src/scenes/session-recordings/playlist/SessionRecordingsPlaylist.tsx',
+            // Only web analytics insights render this tile. A hit means a static import put the web
+            // analytics stack on every page that shows an insight.
+            'src/scenes/web-analytics/tiles/WebAnalyticsTile.tsx',
+            // The generated schema validators parse the URL filters of other scenes. A hit means a module
+            // on this path imports queries/schema-guards or queries/web-analytics-schema-guards.
+            'src/queries/validators.js',
+            'src/queries/web-analytics-validators.js',
+            // The RE2 engine checks regex filters, and lib/utils/regexp loads it on first use.
+            // A hit means a module imports re2js directly again.
+            'node_modules/re2js/',
+            KEA_TEST_UTILS,
+            // Query loads each node renderer in its own chunk. The debug renderers draw only on the debug scene.
+            'src/scenes/debug/HogDebug.tsx',
+            'src/queries/QueryEditor/QueryEditor.tsx',
+        ],
+    },
+    {
+        root: [
+            AUTHENTICATED_SHELL,
+            'src/scenes/project-homepage/ProjectHomepage.tsx',
+            'src/scenes/project-homepage/today/TodayHome.tsx',
+        ],
+        label: 'today home path',
+        // 2026-11-10: 4.81 MiB, stable CSS included. ~1.5% headroom.
+        budgetBytes: 5_119_000,
+        forbidden: [
+            QUILL_UMBRELLA_DIST,
+            'src/scenes/project-homepage/ai-first/AiFirstHomepage.tsx',
+            'src/scenes/project-homepage/today/TodayReportPage.tsx',
+            'src/queries/Query/Query.tsx',
+            // esbuild splits chunks by what can reach a file, so one static import through the quill-charts
+            // barrel puts every chart type on the home load. The home sparklines load lazily instead.
+            'packages/quill/packages/charts/',
+            // The home starts runs but shows no run thread. A hit means a module on the home path imports
+            // `posthog_ai/frontend/api/logics` statically. Import `api/launch`, and load `api/logics`
+            // with a dynamic import where the run starts.
+            'products/posthog_ai/frontend/logics/runStreamLogic.ts',
+        ],
+    },
+    {
+        root: [
+            AUTHENTICATED_SHELL,
+            'src/scenes/project-homepage/ProjectHomepage.tsx',
+            'src/scenes/project-homepage/ai-first/AiFirstHomepage.tsx',
+        ],
+        label: 'AI-first home path',
+        // 2026-11-10: 6.04 MiB, stable CSS included. ~1.5% headroom.
+        budgetBytes: 6_428_000,
+        forbidden: [
+            QUILL_UMBRELLA_DIST,
+            'products/posthog_ai/frontend/components/tool/widgets/VisualizationWidget.tsx',
+            'products/posthog_ai/frontend/components/tool/widgets/RecordingsWidget.tsx',
+            'src/queries/Query/Query.tsx',
+            // The input box renders the thread's question and approval forms only while the agent
+            // waits for an answer, and notebook code only when a notebook update arrives.
+            'products/posthog_ai/frontend/api/primitives.ts',
+            'src/scenes/notebooks/Notebook/notebookLogic.ts',
+        ],
+    },
+    {
+        root: 'src/scenes/activity/explore/EventsScene.tsx',
+        label: 'events scene',
+        // 2026-11-10: 6.77 MiB, stable CSS included. ~2% headroom.
+        budgetBytes: 7_241_000,
+        forbidden: [
+            QUILL_UMBRELLA_DIST,
+            ...RICH_TEXT_STACK,
+            EMOJI_PICKER,
+            // Neither scene plays recordings. A hit means a static import pulled the playlist and player onto it.
+            'src/scenes/session-recordings/playlist/SessionRecordingsPlaylist.tsx',
+            // Only web analytics insights render this tile. A hit means a static import put the web
+            // analytics stack on every page that shows an insight.
+            'src/scenes/web-analytics/tiles/WebAnalyticsTile.tsx',
+            // The generated schema validators parse the URL filters of other scenes. A hit means a module
+            // on this path imports queries/schema-guards or queries/web-analytics-schema-guards.
+            'src/queries/validators.js',
+            'src/queries/web-analytics-validators.js',
+            // The RE2 engine checks regex filters, and lib/utils/regexp loads it on first use.
+            // A hit means a module imports re2js directly again.
+            'node_modules/re2js/',
+            KEA_TEST_UTILS,
+            // The scene draws only a data table. Query loads every other node renderer in its own chunk.
+            'src/queries/nodes/InsightViz/InsightViz.tsx',
+            'src/queries/nodes/DataVisualization/DataVisualization.tsx',
+            'src/queries/nodes/WebOverview/WebOverview.tsx',
+            'src/scenes/debug/HogDebug.tsx',
+            'src/queries/QueryEditor/QueryEditor.tsx',
+        ],
+    },
+    {
+        root: 'src/scenes/web-analytics/WebAnalyticsScene.tsx',
+        label: 'web analytics scene',
+        // 2026-11-10: 7.80 MiB, stable CSS included. ~2% headroom.
+        budgetBytes: 8_342_000,
+        forbidden: [
+            QUILL_UMBRELLA_DIST,
+            ...RICH_TEXT_STACK,
+            EMOJI_PICKER,
+            // Only the live tab renders this dashboard. Its world map holds about 1 MiB of country shapes.
+            'src/scenes/web-analytics/LiveMetricsDashboard/LiveWebAnalyticsMetrics.tsx',
+            'products/product_analytics/frontend/insights/trends/WorldMap/countryVectors.tsx',
+            // URL filters use the small validators in web-analytics-validators.js. The large module holds
+            // the validators of other scenes.
+            'src/queries/validators.js',
+            // The RE2 engine checks regex filters, and lib/utils/regexp loads it on first use.
+            // A hit means a module imports re2js directly again.
+            'node_modules/re2js/',
+            KEA_TEST_UTILS,
+            // Query loads each node renderer in its own chunk. The debug renderers draw only on the debug scene.
+            'src/scenes/debug/HogDebug.tsx',
+            'src/queries/QueryEditor/QueryEditor.tsx',
+        ],
+    },
+    {
+        root: 'src/scenes/session-recordings/detail/SessionRecordingDetail.tsx',
+        label: 'replay detail scene',
+        // 2026-11-10: 6.95 MiB, stable CSS included. ~2% headroom.
+        budgetBytes: 7_433_000,
+        forbidden: [
+            QUILL_UMBRELLA_DIST,
+            ...RICH_TEXT_STACK,
+            // The player shows a snapshot of a few settings. A hit means it imports settingsLogic again,
+            // which holds every settings page.
+            'src/scenes/settings/SettingsMap.tsx',
+            // A browser cannot read files. The polyfill plugin in common/esbuilder/utils.mjs stubs out
+            // fs and fs/promises, and a hit means a library's file reader pulled in the jspm fs polyfill.
+            {
+                pattern: '@jspm/core/nodelibs/browser/fs',
+                verifyPrefix: '@jspm/core/nodelibs/browser/',
+            },
+            // The RE2 engine checks regex filters, and lib/utils/regexp loads it on first use.
+            // A hit means a module imports re2js directly again.
+            'node_modules/re2js/',
+            KEA_TEST_UTILS,
+            // The d3 barrel pulls in d3-selection and d3-transition for their side effects. Import array
+            // helpers such as range from d3-array.
+            'node_modules/d3/src/',
+        ],
+    },
+]
+
+function fail(message) {
+    console.error(`\n❌ ${message}`)
+    process.exitCode = 1
+}
+
+function warnViolation(message) {
+    console.warn(`\n⚠️ ${message}`)
+    const encoded = message.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')
+    // console.info (not console.log, which oxlint strips) writes to stdout, where GitHub Actions parses workflow commands.
+    console.info(`::warning title=Eager graph budget::${encoded}`)
+}
+
+function assertReport(reportFilePath) {
+    if (!fs.existsSync(reportFilePath)) {
+        warnViolation(`Report not found at ${reportFilePath} — did the build run the check?`)
+        return { violations: 1, forbiddenHits: 0, analysisErrors: 1 }
+    }
+    const reportToAssert = JSON.parse(fs.readFileSync(reportFilePath, 'utf-8'))
+    let violations = 0
+    let forbiddenHits = 0
+    for (const message of reportToAssert.warnings ?? []) {
+        warnViolation(message)
+    }
+    const topLevelErrors = reportToAssert.errors ?? []
+    for (const message of topLevelErrors) {
+        warnViolation(message)
+        violations++
+    }
+    for (const r of reportToAssert.roots) {
+        const rootForbiddenHits = r.forbiddenHits ?? []
+        if (r.overBudget) {
+            warnViolation(
+                `Eager graph for '${r.root}' ships ${formatMiB(r.bytes)}, over the ${formatMiB(r.budgetBytes)} budget.\n` +
+                    `Largest eagerly-shipped files:\n` +
+                    r.largest.map(({ file, bytes }) => `   ${formatMiB(bytes).padStart(9)}  ${file}`).join('\n') +
+                    `\nMake the offending import lazy (React.lazy / dynamic import()), or raise the budget in ` +
+                    `frontend/bin/check-eager-graph.mjs as a conscious decision in this PR.`
+            )
+            violations++
+        }
+        for (const hit of rootForbiddenHits) {
+            warnViolation(
+                `'${hit.module}' ships eagerly from '${r.root}' — it must stay behind a dynamic import.\n` +
+                    `Import chain:\n   ${hit.chain.join('\n   -> ')}`
+            )
+            violations++
+            forbiddenHits++
+        }
+        if (topLevelErrors.length === 0 && !r.overBudget && rootForbiddenHits.length === 0) {
+            console.info(`🟢 ${r.label}: ${formatMiB(r.bytes)} within ${formatMiB(r.budgetBytes)}`)
+        }
+    }
+    return { violations, forbiddenHits, analysisErrors: topLevelErrors.length }
+}
+
+if (assertReportIndex !== -1) {
+    const { violations, forbiddenHits, analysisErrors } = assertReport(process.argv[assertReportIndex + 1])
+    if (violations) {
+        console.warn(
+            `\n⚠️ Eager graph check — ${violations} issue(s) above. Not failing CI: the bundle-size ` +
+                `Signals scout tracks eager-graph regressions from the PR comment. Trim the eager closure when you can.`
+        )
+    } else {
+        // Neutral wording: warnings (e.g. a stale forbidden pattern) may have printed above
+        // without counting as violations, so don't declare an unqualified all-clear.
+        console.info('\nNo eager graph budget violations.')
+    }
+    if (failForbiddenHits && (forbiddenHits > 0 || analysisErrors > 0)) {
+        console.error(
+            `\n❌ Eager graph check found ${forbiddenHits} forbidden eager import(s) and ${analysisErrors} analysis error(s).`
+        )
+        process.exit(1)
+    }
+    process.exit(0)
+}
+
+function formatMiB(bytes) {
+    return `${(bytes / 1024 / 1024).toFixed(2)} MiB`
+}
+
+function eagerClosure(inputs, root) {
+    const parentOf = new Map()
+    const seen = new Set([root])
+    const queue = [root]
+    while (queue.length) {
+        const file = queue.shift()
+        for (const imp of inputs[file]?.imports || []) {
+            if (imp.kind === 'dynamic-import' || seen.has(imp.path) || !inputs[imp.path]) {
+                continue
+            }
+            seen.add(imp.path)
+            parentOf.set(imp.path, file)
+            queue.push(imp.path)
+        }
+    }
+    return { seen, parentOf }
+}
+
+function chainTo(parentOf, target) {
+    const chain = []
+    let cur = target
+    while (cur !== undefined && chain.length < 50) {
+        chain.unshift(cur)
+        cur = parentOf.get(cur)
+    }
+    return chain
+}
+
+if (!fs.existsSync(metaPath)) {
+    fail(`Metafile not found at ${metaPath} — run \`pnpm --filter=@posthog/frontend build\` first.`)
+    process.exit(1)
+}
+
+const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'))
+const inputs = meta.inputs
+const outputs = meta.outputs
+if (!outputs) {
+    fail(`Metafile at ${metaPath} has no "outputs" — rebuild with metafile output enabled.`)
+    process.exit(1)
+}
+
+// esbuild makes every code-split point (real entry points and dynamically-imported
+// modules alike) an entryPoint of some output chunk, so a root maps to exactly one chunk.
+function entryChunk(root) {
+    for (const [name, chunk] of Object.entries(outputs)) {
+        if (chunk.entryPoint === root) {
+            return name
+        }
+    }
+    return null
+}
+
+// The eager download for a root: its entry chunk plus every chunk reachable through static
+// (import-statement) chunk edges. dynamic-import edges are the lazy boundaries — stop there.
+function eagerChunkClosure(entry) {
+    const seen = new Set([entry])
+    const queue = [entry]
+    while (queue.length) {
+        const chunk = queue.shift()
+        for (const imp of outputs[chunk].imports || []) {
+            if (imp.kind !== 'import-statement' || seen.has(imp.path) || !outputs[imp.path]) {
+                continue
+            }
+            seen.add(imp.path)
+            queue.push(imp.path)
+        }
+    }
+    return seen
+}
+
+const cssPlan = planCssGroups(meta)
+
+const summaryLines = ['## Eager graph check', '', '| Root | Eager size | Budget | Files |', '| --- | --- | --- | --- |']
+const report = { roots: [], errors: [], warnings: [] }
+
+// Computed once: the full set of module paths known to this build. Shared across all roots
+// because `inputs` is the global metafile index, not per-root.
+const allInputKeys = Object.keys(inputs)
+
+// Forbidden entries are strings, or { pattern, verifyPrefix } when the pattern is a pure
+// tripwire that legitimately matches nothing in a healthy build.
+const forbiddenPattern = (entry) => (typeof entry === 'string' ? entry : entry.pattern)
+const forbiddenVerify = (entry) => (typeof entry === 'string' ? entry : entry.verifyPrefix)
+
+// Self-verify: each forbidden pattern's verify prefix should match at least one module present
+// anywhere in the metafile inputs. If it matches nothing, the path string is stale (dist layout
+// changed, package renamed) and the guard silently stops enforcing. Tripwire entries verify a
+// broader prefix instead, since matching nothing is their healthy state. Warn once per unique
+// prefix so a pattern shared across roots doesn't produce duplicate annotations.
+for (const verifySubstr of new Set(ROOTS.flatMap((r) => r.forbidden.map(forbiddenVerify)))) {
+    if (!allInputKeys.some((f) => f.includes(verifySubstr))) {
+        const msg =
+            `Forbidden pattern (or its verify prefix) '${verifySubstr}' does not match any module in the build — ` +
+            `the path may be stale. Update it in frontend/bin/check-eager-graph.mjs.`
+        warnViolation(msg)
+        report.warnings.push(msg)
+    }
+}
+
+for (const { root: rootSpec, label, budgetBytes, forbidden } of ROOTS) {
+    // A root is one entry module, or several whose closures are downloaded together.
+    const rootModules = Array.isArray(rootSpec) ? rootSpec : [rootSpec]
+    const root = rootModules.join(' + ')
+    const entries = rootModules.map((module) => ({ module, entry: entryChunk(module) }))
+    const missing = entries.filter(({ entry }) => !entry)
+    if (missing.length > 0) {
+        const message = missing
+            .map(({ module }) => {
+                const candidates = Object.values(outputs)
+                    .map((c) => c.entryPoint)
+                    .filter((e) => e && e.endsWith(path.basename(module)))
+                    .slice(0, 5)
+                return `Root '${module}' is not an entry chunk in the metafile. Was it moved, or is it no longer a code-split boundary? Candidates: ${candidates.join(', ')}`
+            })
+            .join('\n')
+        report.errors.push(message)
+        fail(message)
+        continue
+    }
+    const eagerChunks = new Set(entries.flatMap(({ entry }) => [...eagerChunkClosure(entry)]))
+
+    // Attribute each input module the bytes it actually contributes to the eager chunks —
+    // tree-shaken modules contribute nothing, so a barrel only counts its used exports.
+    const eagerBytesByFile = new Map()
+    let totalBytes = 0
+    for (const chunk of eagerChunks) {
+        totalBytes += outputs[chunk].bytes
+        for (const [file, info] of Object.entries(outputs[chunk].inputs || {})) {
+            if (info.bytesInOutput > 0) {
+                eagerBytesByFile.set(file, (eagerBytesByFile.get(file) || 0) + info.bytesInOutput)
+            }
+        }
+    }
+    // CSS is not an `imports` edge, so the chunk walk never reaches it.
+    totalBytes += stableCssBytes(
+        cssPlan,
+        entries.map(({ entry }) => entry)
+    )
+    const largest = [...eagerBytesByFile.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15)
+
+    const overBudget = totalBytes > budgetBytes
+
+    // A forbidden module is a hit when it ships in the eager OUTPUT. The import chain we show
+    // is a best-effort trace through the INPUT graph — module-level `import` edges are what a
+    // human reads — computed once per root, only when there is a hit. The two graphs can
+    // diverge (a module can ship eagerly via a bundler-injected or re-export edge with no
+    // source-level import path), so the chain is a pointer, not the byte source, and may be
+    // short when the output edge has no input-graph counterpart.
+
+    const hitFiles = new Map()
+    for (const forbiddenSubstr of forbidden.map(forbiddenPattern)) {
+        const hit = [...eagerBytesByFile.keys()].find((f) => f.includes(forbiddenSubstr))
+        if (hit) {
+            hitFiles.set(forbiddenSubstr, hit)
+        }
+    }
+    const forbiddenHits = []
+    if (hitFiles.size > 0) {
+        // One parent map across all root modules; a module reachable from several keeps its first chain.
+        const parentOf = new Map()
+        for (const module of rootModules) {
+            for (const [child, parent] of eagerClosure(inputs, module).parentOf) {
+                if (!parentOf.has(child)) {
+                    parentOf.set(child, parent)
+                }
+            }
+        }
+        for (const [module, hit] of hitFiles) {
+            forbiddenHits.push({ module, chain: chainTo(parentOf, hit) })
+        }
+    }
+
+    const status = overBudget || forbiddenHits.length > 0 ? '🟡' : '🟢'
+    console.info(`${status} ${label}`)
+    console.info(`   root: ${root}`)
+    console.info(
+        `   eager output: ${eagerBytesByFile.size} files, ${formatMiB(totalBytes)} (budget ${formatMiB(budgetBytes)})`
+    )
+    summaryLines.push(
+        `| ${status} \`${root}\` | ${formatMiB(totalBytes)} | ${formatMiB(budgetBytes)} | ${eagerBytesByFile.size} |`
+    )
+
+    if (overBudget) {
+        fail(
+            `Eager graph for '${root}' ships ${formatMiB(totalBytes)}, over the ${formatMiB(budgetBytes)} budget.\n` +
+                `Something newly shipped on the eager path is inflating it. Largest eagerly-shipped files:\n` +
+                largest.map(([f, b]) => `   ${formatMiB(b).padStart(10)}  ${f}`).join('\n') +
+                `\nMake the offending import lazy (React.lazy / dynamic import()), or raise the budget in ` +
+                `frontend/bin/check-eager-graph.mjs as a conscious decision in this PR.`
+        )
+    }
+
+    for (const hit of forbiddenHits) {
+        fail(
+            `'${hit.module}' ships eagerly from '${root}' — it must stay behind a dynamic import.\n` +
+                `Import chain:\n   ${hit.chain.join('\n   -> ')}`
+        )
+    }
+
+    report.roots.push({
+        root,
+        label,
+        bytes: totalBytes,
+        files: eagerBytesByFile.size,
+        budgetBytes,
+        overBudget,
+        forbidden: forbidden.map(forbiddenPattern),
+        forbiddenHits,
+        largest: largest.map(([f, b]) => ({ file: f, bytes: b })),
+    })
+}
+
+// Consumed by the workflow's comment + enforcement steps; written even on failure so
+// the PR comment can show what went over. The filename and the embedded sha carry the
+// built tree's HEAD because the CI bundle-size job runs this for BOTH the PR build and
+// the base build in the same workspace — the PR build's report is found by sha, and the
+// plain filename (last write = the base build) doubles as the base-branch measurement
+// for the comment's vs-base delta.
+try {
+    report.sha = execSync('git rev-parse HEAD', { cwd: frontendDir, encoding: 'utf-8' }).trim()
+} catch (err) {
+    console.error(`Could not resolve HEAD sha for the report: ${err.message}`)
+}
+const serialized = JSON.stringify(report, null, 2)
+fs.writeFileSync(path.join(frontendDir, 'eager-graph-report.json'), serialized)
+if (report.sha) {
+    fs.writeFileSync(path.join(frontendDir, `eager-graph-report-${report.sha}.json`), serialized)
+}
+
+if (process.env.GITHUB_STEP_SUMMARY) {
+    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines.join('\n') + '\n')
+}
+
+if (process.exitCode) {
+    console.error('\nEager graph check failed — see above.')
+    if (reportOnly) {
+        console.error('Running with --report-only: violations recorded in the report, not failing the build.')
+        process.exit(0)
+    }
+} else {
+    console.info('\nAll eager graph budgets respected.')
+}

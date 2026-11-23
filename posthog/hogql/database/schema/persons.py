@@ -1,0 +1,516 @@
+from typing import Optional, Self, cast
+
+import posthoganalytics
+
+from posthog.hogql import ast
+from posthog.hogql.ast import And, CompareOperation, CompareOperationOp, Field, JoinExpr, SelectQuery
+from posthog.hogql.base import Expr
+from posthog.hogql.constants import HogQLQuerySettings
+from posthog.hogql.context import HogQLContext
+from posthog.hogql.database.argmax import argmax_select
+from posthog.hogql.database.lazy_join_tags import PERSONS_PDI, PERSONS_REVENUE_ANALYTICS
+from posthog.hogql.database.models import (
+    BooleanDatabaseField,
+    DateTimeDatabaseField,
+    FieldOrTable,
+    IntegerDatabaseField,
+    LazyJoin,
+    LazyJoinToAdd,
+    LazyTable,
+    LazyTableToAdd,
+    StringJSONDatabaseField,
+    Table,
+    UUIDDatabaseField,
+)
+from posthog.hogql.database.schema.persons_pdi import PersonsPDITable
+from posthog.hogql.database.schema.persons_revenue_analytics import PersonsRevenueAnalyticsTable
+from posthog.hogql.database.schema.util.where_clause_extractor import (
+    WhereClauseExtractor,
+    is_nondeterministic_function,
+    top_level_conjuncts,
+    unwrap_table_alias_type,
+)
+from posthog.hogql.errors import ResolutionError
+from posthog.hogql.parser import parse_select
+from posthog.hogql.visitor import CloningVisitor, TraversingVisitor, clone_expr
+
+from posthog.schema_enums import PersonsArgMaxVersion
+
+PERSONS_FIELDS: dict[str, FieldOrTable] = {
+    "id": UUIDDatabaseField(
+        name="id", nullable=False, description="Stable person identifier; join target for `events.person_id`."
+    ),
+    "created_at": DateTimeDatabaseField(
+        name="created_at", nullable=False, description="When the person was first seen by PostHog."
+    ),
+    "team_id": IntegerDatabaseField(name="team_id", nullable=False),
+    "properties": StringJSONDatabaseField(
+        name="properties",
+        nullable=False,
+        description="JSON map of person properties (latest known values). Access keys with `properties.email` etc.",
+    ),
+    "is_identified": BooleanDatabaseField(
+        name="is_identified",
+        nullable=False,
+        description="True once the person has been identified (vs. an anonymous distinct_id).",
+    ),
+    "last_seen_at": DateTimeDatabaseField(
+        name="last_seen_at", nullable=True, description="Timestamp of the most recent event for this person."
+    ),
+    "pdi": LazyJoin(
+        from_field=["id"],
+        join_table=PersonsPDITable(),
+        resolver=PERSONS_PDI,
+    ),
+    "revenue_analytics": LazyJoin(
+        from_field=["id"],
+        join_table=PersonsRevenueAnalyticsTable(),
+        resolver=PERSONS_REVENUE_ANALYTICS,
+    ),
+}
+
+
+# Virtual properties that resolve only through the revenue analytics join.
+REVENUE_ANALYTICS_VIRTUAL_PROPERTIES = frozenset({"$virt_mrr", "$virt_revenue"})
+
+
+def _is_virtual_field_requiring_join(expr: ast.Expr) -> bool:
+    """
+    Check if an expression references a virtual field that requires a joined table.
+    Virtual fields like $virt_mrr require the revenue_analytics joined table to be resolved,
+    and cannot be used directly in the raw_persons argMax optimization.
+    """
+    if isinstance(expr, ast.Field):
+        # Check if the field chain contains a virtual field that requires revenue analytics
+        for chain_item in expr.chain:
+            if isinstance(chain_item, str) and chain_item.startswith("$virt_"):
+                # Currently, all $virt_ fields that require joins are revenue analytics fields
+                if chain_item in REVENUE_ANALYTICS_VIRTUAL_PROPERTIES:
+                    return True
+    elif isinstance(expr, ast.Call):
+        # Check arguments of function calls recursively
+        for arg in expr.args:
+            if _is_virtual_field_requiring_join(arg):
+                return True
+    elif hasattr(expr, "left") and hasattr(expr, "right"):
+        # Check binary operations (comparisons, arithmetic, etc.)
+        return _is_virtual_field_requiring_join(expr.left) or _is_virtual_field_requiring_join(expr.right)
+    elif hasattr(expr, "expr"):
+        # Check wrapped expressions (aliases, etc.)
+        return _is_virtual_field_requiring_join(expr.expr)
+
+    return False
+
+
+def select_from_persons_table(
+    join_or_table: LazyJoinToAdd | LazyTableToAdd,
+    context: HogQLContext,
+    node: SelectQuery,
+    *,
+    filter: Optional[Expr] = None,
+):
+    version = context.modifiers.personsArgMaxVersion
+    if version == PersonsArgMaxVersion.AUTO:
+        version = PersonsArgMaxVersion.V1
+        # If selecting properties, use the faster v2 query. Otherwise, v1 is faster.
+        for field_chain in join_or_table.fields_accessed.values():
+            if field_chain[0] == "properties":
+                version = PersonsArgMaxVersion.V2
+                break
+
+    and_conditions = []
+
+    if filter is not None:
+        and_conditions.append(filter)
+
+    # For now, only do this optimization for directly querying the persons table (without joins or as part of a subquery) to avoid knock-on effects to insight queries
+    # The SELECT id FROM persons that transforms/negated_person_filters.py emits inside NOT IN has persons as its own
+    # FROM, so it takes this path and reads only the persons that fail its filters.
+    if (
+        node.select_from
+        and node.select_from.type
+        and hasattr(node.select_from.type, "table")
+        and node.select_from.type.table
+        and isinstance(node.select_from.type.table, PersonsTable)
+    ):
+        extractor = WhereClauseExtractor(context)
+        extractor.add_local_tables(join_or_table)
+        where = extractor.get_inner_where(node)
+        if where:
+            select = argmax_select(
+                table_name="raw_persons",
+                select_fields=join_or_table.fields_accessed,
+                group_fields=["id"],
+                argmax_field="version",
+                deleted_field="is_deleted",
+                timestamp_field_to_clamp="created_at",
+            )
+            inner_select = cast(
+                ast.SelectQuery,
+                parse_select(
+                    """
+                SELECT id FROM raw_persons as where_optimization
+                """
+                ),
+            )
+
+            inner_select.where = where
+            select.where = ast.CompareOperation(
+                left=ast.Field(chain=["id"]), right=inner_select, op=ast.CompareOperationOp.In
+            )
+            return select
+
+    if version == PersonsArgMaxVersion.V2:
+        select = cast(
+            ast.SelectQuery,
+            parse_select(
+                """
+            SELECT id FROM raw_persons WHERE (id, version) IN (
+               SELECT id, max(version) as version
+               FROM raw_persons
+               GROUP BY id
+               HAVING equals(argMax(raw_persons.is_deleted, raw_persons.version), 0)
+               AND argMax(raw_persons.created_at, raw_persons.version) < now() + interval 1 day
+            )
+            """
+            ),
+        )
+        select.settings = HogQLQuerySettings(optimize_aggregation_in_order=True)
+        if filter is not None:
+            cast(ast.SelectQuery, cast(ast.CompareOperation, select.where).right).where = filter
+
+        # Deferred: posthog.hogql.property imports database schema modules, so a top-level import here is circular.
+        from posthog.hogql.property import has_aggregation, has_window_function  # noqa: PLC0415
+
+        # Push ORDER BY + LIMIT into the inner deduplication subquery so ClickHouse can stop early.
+        # Skip when there's an outer WHERE -- a premature inner LIMIT would exclude valid rows
+        # before the filter runs (e.g. cohort members dropped because LIMIT grabbed other rows first).
+        # Skip aggregate, DISTINCT, and window-function selects too: they must see every person, and
+        # the executor stamps a default LIMIT on every query, so pushing it down would cap
+        # e.g. `SELECT count() FROM persons` at the page size instead of counting the whole team.
+        # JOIN, HAVING, QUALIFY, ARRAY JOIN, LIMIT BY, and WITH TIES / PERCENT also filter or reshape
+        # rows after deduplication, so they need the full person set as well.
+        can_push_to_inner = (
+            node.select_from
+            and not node.select_from.next_join
+            and node.select_from.type
+            and hasattr(node.select_from.type, "table")
+            and node.select_from.type.table
+            and isinstance(node.select_from.type.table, PersonsTable)
+            and not node.group_by  # TODO: support group_by
+            and node.limit
+            and not node.where
+            and not node.prewhere
+            and not node.having
+            and not node.qualify
+            and not node.array_join_op
+            and not node.limit_by
+            and not node.limit_with_ties
+            and not node.limit_percent
+            and not node.distinct
+            and not any(has_aggregation(expr) for expr in node.select)
+            and not node.window_exprs
+            and not any(has_window_function(expr) for expr in node.select)
+        )
+        if can_push_to_inner:
+            compare = cast(ast.CompareOperation, select.where)
+            right_select = cast(ast.SelectQuery, compare.right)
+            if node.order_by:
+                right_select.order_by = [CloningVisitor(clear_locations=True).visit(x) for x in node.order_by]
+
+                order_by_without_virtual_fields = []
+                for order_by in right_select.order_by:
+                    # Skip virtual field order_by expressions - they'll be handled by the outer query as they require
+                    # a join with revenue analytics table
+                    if not _is_virtual_field_requiring_join(order_by.expr):
+                        order_by.expr = ast.Call(
+                            name="argMax", args=[order_by.expr, ast.Field(chain=["raw_persons", "version"])]
+                        )
+                        order_by_without_virtual_fields.append(order_by)
+                right_select.order_by = order_by_without_virtual_fields
+
+            node_limit = cast(ast.Constant, node.limit)
+            node_offset = cast(ast.Constant, node.offset)
+            effective_limit = node_limit.value + (node_offset.value if node.offset else 0) + 1
+            right_select.limit = ast.Constant(value=effective_limit)
+            right_select.offset = ast.Constant(value=0)
+
+        for field_name, field_chain in join_or_table.fields_accessed.items():
+            # We need to always select the 'id' field for the join constraint. The field name here is likely to
+            # be "persons__id" if anything, but just in case, let's avoid duplicates.
+            if field_name != "id":
+                select.select.append(
+                    ast.Alias(
+                        alias=field_name,
+                        expr=ast.Field(chain=field_chain),
+                    )
+                )
+    else:
+        select = argmax_select(
+            table_name="raw_persons",
+            select_fields=join_or_table.fields_accessed,
+            group_fields=["id"],
+            argmax_field="version",
+            deleted_field="is_deleted",
+            timestamp_field_to_clamp="created_at",
+        )
+        select.settings = HogQLQuerySettings(optimize_aggregation_in_order=True)
+        if filter is not None:
+            if select.where:
+                select.where = And(exprs=[select.where, filter])
+            else:
+                select.where = filter
+
+    if context.modifiers.optimizeJoinedFilters:
+        extractor = WhereClauseExtractor(context)
+        extractor.add_local_tables(join_or_table)
+        where = extractor.get_inner_where(node)
+        if where and select.where:
+            select.where = And(exprs=[select.where, where])
+        elif where:
+            select.where = where
+
+    return select
+
+
+class _CopyableConjunctVisitor(TraversingVisitor):
+    def __init__(self, table_types: tuple[ast.Type, ...]):
+        super().__init__()
+        self.table_types = table_types
+        self.reads_table = False
+        self.copyable = True
+
+    def visit_field(self, node: ast.Field):
+        field_type = node.type.field_type if isinstance(node.type, ast.PropertyType) else node.type
+        if isinstance(field_type, ast.FieldType) and any(field_type.table_type is t for t in self.table_types):
+            self.reads_table = True
+        else:
+            self.copyable = False
+
+    # A nested subquery already has its lazy joins expanded. A copy of it would also run a second time.
+    def visit_select_query(self, node: ast.SelectQuery):
+        self.copyable = False
+
+    def visit_select_set_query(self, node: ast.SelectSetQuery):
+        self.copyable = False
+
+    def visit_call(self, node: ast.Call):
+        if is_nondeterministic_function(node.name):
+            self.copyable = False
+        super().visit_call(node)
+
+
+# The copy drops the hidden alias that the resolver puts on every field. The resolver adds it back.
+class _AliasStrippingCloner(CloningVisitor):
+    def visit_alias(self, node: ast.Alias) -> Expr:
+        return self.visit(node.expr)
+
+
+def _is_relative_sample(sample: Optional[ast.SampleExpr]) -> bool:
+    """True for `SAMPLE k` with k at most 1, which SAMPLE BY applies to the same rows in the subquery and the outer query.
+
+    ClickHouse turns `SAMPLE n` (a row count) into a ratio from each query's own row estimate.
+    The subquery reads with fewer terms, so its ratio can be smaller and skip rows that the outer query keeps.
+    """
+    if sample is None:
+        return False
+    ratio = sample.sample_value
+    return ratio.left.value <= (ratio.right.value if ratio.right is not None else 1)
+
+
+def build_person_id_pushdown_predicate(join_to_add: LazyJoinToAdd, node: SelectQuery) -> Optional[Expr]:
+    """Build `id IN (SELECT <join key> FROM <left table> WHERE <conjuncts>)` for the joined persons subquery.
+
+    The join key is the join's `from_field`, so the set holds the same person ids that the join condition reads.
+
+    The conjuncts are the top-level AND terms of the outer WHERE and PREWHERE that read only the left table.
+    A term must read at least one left-table column, because a constant term narrows nothing.
+    Every row that the outer query keeps satisfies all of them. Its person stays in the set. The join returns the same
+    rows. A term is copied whole or left out. Leaving a term out only widens the set.
+    The subquery reads the left table before the outer scan does. A row that arrives between the two reads can lack
+    its person columns.
+    Returns None unless the left table is the query's own FROM table and at least one term qualifies.
+    """
+    # A lazy left table, such as the union of events and flag_evaluations, is already a subquery in `node`. Its recorded
+    # scan holds the FROM entry as the query wrote it.
+    scan = join_to_add.from_scan
+    left = scan.join if scan is not None else node.select_from
+    left_types: tuple[ast.Type, ...] = (
+        scan.types if scan is not None else (left.type,) if left is not None and left.type is not None else ()
+    )
+    if (
+        left is None
+        or not isinstance(left.table, ast.Field)
+        or left.table_args
+        or not left_types
+        or left_types[0] is not join_to_add.lazy_join_type.table_type
+        or (scan is not None and (node.select_from is None or node.select_from.alias != join_to_add.from_table))
+    ):
+        return None
+
+    cloner = _AliasStrippingCloner(clear_types=True, clear_locations=True)
+    conjuncts: list[Expr] = []
+    for where in (node.where, node.prewhere):
+        if where is None:
+            continue
+        for conjunct in top_level_conjuncts(where):
+            visitor = _CopyableConjunctVisitor(left_types)
+            visitor.visit(conjunct)
+            if visitor.copyable and visitor.reads_table:
+                conjuncts.append(cloner.visit(conjunct))
+    if not conjuncts:
+        return None
+
+    return ast.CompareOperation(
+        op=ast.CompareOperationOp.In,
+        left=ast.Field(chain=["id"]),
+        # The resolver turns this into GLOBAL IN. GLOBAL IN does not deduplicate the set that it ships to each shard.
+        right=ast.SelectQuery(
+            distinct=True,
+            select=[ast.Field(chain=[join_to_add.from_table, *join_to_add.lazy_join.from_field])],
+            select_from=ast.JoinExpr(
+                table=ast.Field(chain=list(left.table.chain)),
+                alias=left.alias,
+                sample=cloner.visit(left.sample) if _is_relative_sample(left.sample) else None,
+            ),
+            where=conjuncts[0] if len(conjuncts) == 1 else ast.And(exprs=conjuncts),
+        ),
+    )
+
+
+def _person_id_pushdown_applies(join_to_add: LazyJoinToAdd, context: HogQLContext) -> bool:
+    if context.modifiers.personIdPushdown is not None:
+        return context.modifiers.personIdPushdown
+    left = unwrap_table_alias_type(join_to_add.lazy_join_type.table_type)
+    return isinstance(left, (ast.TableType, ast.LazyTableType)) and left.table.person_id_pushdown_default
+
+
+def persons_join_is_inner(context: HogQLContext) -> bool:
+    """True when the persons join drops each row that has no persons row."""
+    team = context.team
+    if team is None or team.organization is None:
+        raise ResolutionError("Organization is required to join with persons table")
+    organization = team.organization
+    # TODO: @raquelmsmith: Remove flag check and use left join for all once deletes are caught up
+    return bool(
+        posthoganalytics.feature_enabled(
+            "personless-events-not-supported",
+            str(team.uuid),
+            groups={"organization": str(organization.id)},
+            group_properties={
+                "organization": {
+                    "id": str(organization.id),
+                    "created_at": organization.created_at,
+                }
+            },
+            only_evaluate_locally=True,
+            send_feature_flag_events=False,
+        )
+    )
+
+
+def join_with_persons_table(
+    join_to_add: LazyJoinToAdd,
+    context: HogQLContext,
+    node: SelectQuery,
+):
+    from posthog.hogql import ast
+
+    if not join_to_add.fields_accessed:
+        raise ResolutionError("No fields requested from persons table")
+    pushdown = (
+        build_person_id_pushdown_predicate(join_to_add, node)
+        if _person_id_pushdown_applies(join_to_add, context)
+        else None
+    )
+    join_expr = ast.JoinExpr(table=select_from_persons_table(join_to_add, context, node, filter=pushdown))
+
+    join_expr.join_type = "INNER JOIN" if persons_join_is_inner(context) else "LEFT JOIN"
+
+    join_expr.alias = join_to_add.to_table
+    join_expr.constraint = ast.JoinConstraint(
+        expr=ast.CompareOperation(
+            op=ast.CompareOperationOp.Eq,
+            left=ast.Field(chain=[join_to_add.from_table, *join_to_add.lazy_join.from_field]),
+            right=ast.Field(chain=[join_to_add.to_table, "id"]),
+        ),
+        constraint_type="ON",
+    )
+    return join_expr
+
+
+class RawPersonsTable(Table):
+    description: str = (
+        "Raw, un-deduplicated persons rows (one per version). Query `persons` instead unless you need to "
+        "resolve the latest version yourself via `is_deleted`/`version`."
+    )
+    fields: dict[str, FieldOrTable] = {
+        **PERSONS_FIELDS,
+        "is_deleted": BooleanDatabaseField(name="is_deleted", nullable=False),
+        "version": IntegerDatabaseField(name="version", nullable=False),
+    }
+
+    def to_printed_clickhouse(self, context):
+        return "person"
+
+    def to_printed_hogql(self):
+        return "raw_persons"
+
+
+# Persons is a lazy table that allows you to insert a where statement inside of the person subselect
+# It pulls any "persons.id in ()" statement inside of the argmax subselect
+# This is useful when executing a query for a large team.
+class PersonsTable(LazyTable):
+    description: str = "Deduplicated people in the project, with their latest properties. One row per person."
+    fields: dict[str, FieldOrTable] = PERSONS_FIELDS
+    filter: Optional[Expr] = None
+
+    @staticmethod
+    def _is_promotable_expr(expr, alias: Optional[str] = None):
+        return (
+            isinstance(expr, CompareOperation)
+            and expr.op == CompareOperationOp.In
+            and isinstance(expr.left, Field)
+            and expr.left.chain == [alias or "persons", "id"]
+        )
+
+    @staticmethod
+    def _partition_exprs(exprs, alias: Optional[str] = None):
+        not_promotable = []
+        promotable = []
+        for expr in exprs:
+            if PersonsTable._is_promotable_expr(expr, alias):
+                # Erase "persons" from the chain before bringing inside
+                expr.left = Field(chain=["id"])
+                promotable.append(expr)
+            else:
+                not_promotable.append(expr)
+
+        return promotable, not_promotable
+
+    # If the join has a clause we can bring inside the subselect, create a new table that represents that
+    def create_new_table_with_filter(self, join: JoinExpr) -> Self:
+        if join.constraint is not None and isinstance(join.constraint.expr, And):
+            exprs = cast(And, join.constraint.expr).exprs
+            promotable, not_promotable = PersonsTable._partition_exprs(exprs, join.alias)
+            if len(promotable) == 0:
+                return self
+            join.constraint.expr.exprs = not_promotable
+            p = self.model_copy()
+            if len(promotable) == 1:
+                p.filter = promotable[0]
+            elif len(promotable) > 1:
+                p.filter = And(exprs=promotable)
+            return p
+        return self
+
+    def lazy_select(self, table_to_add: LazyTableToAdd, context, node):
+        if self.filter is not None:
+            return select_from_persons_table(table_to_add, context, node, filter=clone_expr(self.filter, True))
+        return select_from_persons_table(table_to_add, context, node)
+
+    def to_printed_clickhouse(self, context):
+        return "person"
+
+    def to_printed_hogql(self):
+        return "persons"

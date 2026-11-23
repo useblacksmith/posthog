@@ -1,0 +1,605 @@
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from posthog.test.base import APIBaseTest, ClickhouseTestMixin
+from unittest.mock import patch
+
+from parameterized import parameterized
+from rest_framework import status
+
+from posthog.clickhouse.client import sync_execute
+from posthog.clickhouse.traces.spans import TRACE_SPANS_DISTRIBUTED_TABLE_SQL, TRACE_SPANS_TABLE_SQL
+
+from products.engineering_analytics.backend.logic.job_logs.coordinator import _query_jobs_with_diagnostics
+from products.engineering_analytics.backend.logic.queries._test_spans import selector_from_nodeid
+from products.engineering_analytics.backend.logic.views.source_schema import WORKFLOW_JOBS_COLUMNS
+from products.engineering_analytics.backend.tests._github_fixtures import (
+    GITHUB_SOURCE_PREFIX,
+    connect_github_jobs,
+    connect_github_source_without_data,
+    create_github_warehouse_table,
+)
+from products.warehouse_sources.backend.facade.models import ExternalDataSource
+
+T_RERUN_RECOVERY = "posthog/api/test/test_rerun/TestRerun::test_green_on_attempt_2"
+T_STALE_REREPORT = "posthog/api/test/test_stale/TestStale::test_reported_twice"
+T_CROSS_RUN_PASS = "posthog/api/test/test_cross/TestCross::test_passes_in_another_run"
+T_PASS_THEN_FAIL = "posthog/api/test/test_order/TestOrder::test_fails_after_passing"
+T_MATRIX_LEGS = "posthog/api/test/test_legs/TestLegs::test_fails_in_two_legs"
+T_IN_JOB_RETRY = "posthog/api/test/test_injob/TestInJob::test_pytest_retry"
+T_IN_JOB_SELECTOR = "posthog/api/test/test_injob.py::TestInJob::test_pytest_retry"
+T_THREE_PRS = "posthog/api/test/test_three/TestThree::test_fails_on_three_prs"
+T_TWO_PRS = "posthog/api/test/test_two/TestTwo::test_fails_on_two_prs"
+T_MASTER = "posthog/api/test/test_master/TestMaster::test_breaks_trunk"
+T_QUARANTINED = "posthog/api/test/test_quarantined/TestQuarantined::test_still_fails"
+T_OLD = "posthog/api/test/test_old/TestOld::test_old_flake"
+T_NO_RUN_ID = "posthog/api/test/test_norun/TestNoRun::test_unstamped_spans"
+T_TIE_A = "posthog/api/test/test_tie_a/TestTie::test_retry"
+T_TIE_B = "posthog/api/test/test_tie_b/TestTie::test_retry"
+T_FOREIGN = "posthog/api/test/test_foreign/TestForeign::test_other_service"
+T_OTHER_REPO = "posthog/api/test/test_other_repo/TestOtherRepo::test_flaky"
+T_JEST_RECOVERY = "products/surveys/frontend/surveyLogic.test.ts::surveyLogic saves"
+T_JEST_CROSS_LEG = "frontend/src/scenes/legacy.test.ts::legacy scene renders"
+T_SETUP_BREAK = "posthog/api/test/test_setup/TestSetup::test_errors_when_setup_breaks"
+T_SPAN_ONLY_BREAK = "posthog/api/test/test_setup/TestSetup::test_errors_without_a_broken_run"
+T_JOB_RERUN = "posthog/api/test/test_shard/TestShard::test_fails_with_its_whole_job"
+T_LEGACY_JOB_A = "posthog/api/test/test_legacy_a/TestLegacyA::test_one"
+T_LEGACY_JOB_B = "posthog/api/test/test_legacy_b/TestLegacyB::test_two"
+
+
+class TestFlakyTestsAPI(ClickhouseTestMixin, APIBaseTest):
+    # ClickhouseTestMixin turns this off. It is on here so one class-level team can key the
+    # class-level span seed.
+    CLASS_DATA_LEVEL_SETUP = True
+
+    @classmethod
+    def setUpTestData(cls) -> None:
+        super().setUpTestData()
+        connect_github_source_without_data(cls.team, prefix="flaky", repository="PostHog/posthog")
+        sync_execute("DROP TABLE IF EXISTS trace_spans_distributed")
+        sync_execute("DROP TABLE IF EXISTS trace_spans")
+        sync_execute(TRACE_SPANS_TABLE_SQL())
+        sync_execute(TRACE_SPANS_DISTRIBUTED_TABLE_SQL())
+
+        now = datetime.now(UTC).replace(microsecond=0)
+        recent = now - timedelta(days=1)
+        earlier = now - timedelta(days=2)
+        # Inside a -30d window but outside the -7d default.
+        old = now - timedelta(days=10)
+
+        rows = [
+            # Failed on attempt 1 and passed on the re-run of the same commit.
+            cls._span(1, T_RERUN_RECOVERY, "failed", ts=earlier, run="100", branch="master"),
+            cls._span(2, T_RERUN_RECOVERY, "passed", ts=recent, run="100", attempt="2", branch="master"),
+            # The same failure arrives under two attempts of one run.
+            cls._span(3, T_STALE_REREPORT, "failed", ts=earlier, run="200", branch="master"),
+            cls._span(4, T_STALE_REREPORT, "failed", ts=earlier, run="200", attempt="2", branch="master"),
+            # The pass is in a different run, so it is a different commit.
+            cls._span(8, T_CROSS_RUN_PASS, "failed", ts=earlier, run="300", branch="master"),
+            cls._span(9, T_CROSS_RUN_PASS, "passed", ts=recent, run="301", attempt="2", branch="master"),
+            # The pass comes on an earlier attempt than the failure.
+            cls._span(24, T_PASS_THEN_FAIL, "passed", ts=earlier, run="1400", attempt="2", branch="master"),
+            cls._span(25, T_PASS_THEN_FAIL, "failed", ts=recent, run="1400", attempt="3", branch="master"),
+            # Two matrix legs of one run fail the test.
+            cls._span(5, T_MATRIX_LEGS, "failed", ts=earlier, run="250", branch="master"),
+            cls._span(6, T_MATRIX_LEGS, "failed", ts=recent, run="250", branch="master"),
+            # A passing leg in the same run is not a recovery.
+            cls._span(7, T_MATRIX_LEGS, "passed", ts=recent, run="250", attempt="", branch="master"),
+            # Attempt 2 reports a failing leg and a passing leg together.
+            cls._span(26, T_MATRIX_LEGS, "failed", ts=recent, run="250", attempt="2", branch="master"),
+            cls._span(27, T_MATRIX_LEGS, "passed", ts=recent, run="250", attempt="2", branch="master"),
+            # An in-job pytest retry. The span carries test.selector, which wins over the nodeid reconstruction.
+            cls._span(
+                10,
+                T_IN_JOB_RETRY,
+                "rerun_passed",
+                ts=recent,
+                run="400",
+                pr="401",
+                branch="f1",
+                selector=T_IN_JOB_SELECTOR,
+                runner_name="runner-example",
+            ),
+            # Failures on 3 distinct PRs with no recovery.
+            cls._span(11, T_THREE_PRS, "failed", ts=earlier, run="500", pr="501", branch="f1"),
+            cls._span(12, T_THREE_PRS, "failed", ts=earlier, run="501", pr="502", branch="f2"),
+            cls._span(13, T_THREE_PRS, "error", ts=recent, run="502", pr="503", branch="f3"),
+            cls._span(14, T_TWO_PRS, "failed", ts=recent, run="600", pr="601", branch="x1"),
+            cls._span(15, T_TWO_PRS, "failed", ts=recent, run="601", pr="602", branch="x2"),
+            cls._span(16, T_MASTER, "failed", ts=recent, run="700", branch="master"),
+            cls._span(17, T_QUARANTINED, "xfailed", ts=recent, run="800", branch="master"),
+            cls._span(18, T_OLD, "rerun_passed", ts=old, run="900", pr="901", branch="old1"),
+            cls._span(28, T_NO_RUN_ID, "failed", ts=recent, run="", branch="master"),
+            cls._span(29, T_NO_RUN_ID, "failed", ts=recent, run="", branch="master"),
+            cls._span(19, T_TIE_B, "rerun_passed", ts=recent, run="1000", pr="1001", branch="tie"),
+            cls._span(20, T_TIE_A, "rerun_passed", ts=recent, run="1001", pr="1002", branch="tie"),
+            # This span would qualify, but its service is not a CI service.
+            cls._span(
+                21,
+                T_FOREIGN,
+                "rerun_passed",
+                ts=recent,
+                run="1100",
+                pr="1101",
+                service="other-service",
+                runner_name="runner-example",
+            ),
+            # This span would qualify, but it belongs to another repository.
+            cls._span(
+                22,
+                T_OTHER_REPO,
+                "rerun_passed",
+                ts=recent,
+                run="1200",
+                pr="1201",
+                repo="PostHog/posthog.com",
+                runner_name="runner-example",
+            ),
+            # A job-root span carries no test.outcome.
+            cls._span(23, "Backend CI / core (1)", None, ts=recent, run="1300", branch="master"),
+            # One run attempt errored tests in three jobs, which is a CI setup break.
+            *[
+                cls._span(
+                    40 + shard,
+                    f"{T_SETUP_BREAK}_{shard}",
+                    "error",
+                    ts=recent,
+                    run="1700",
+                    branch="master",
+                    job=f"backend:core:{shard}",
+                )
+                for shard in (1, 2, 3)
+            ],
+            # The same shape in a run that GitHub reports as healthy.
+            *[
+                cls._span(
+                    70 + shard,
+                    f"{T_SPAN_ONLY_BREAK}_{shard}",
+                    "error",
+                    ts=recent,
+                    run="1900",
+                    branch="master",
+                    job=f"backend:core:{shard}",
+                )
+                for shard in (1, 2, 3)
+            ],
+            # One job attempt failed two tests and its re-run passed both. Two tests is below the
+            # default SETUP_BREAK_MIN_JOB_FAILURES.
+            *[
+                span
+                for index in (1, 2)
+                for span in (
+                    cls._span(
+                        50 + index,
+                        f"{T_JOB_RERUN}_{index}",
+                        "failed",
+                        ts=earlier,
+                        run="1800",
+                        branch="master",
+                        job="backend:core:4",
+                    ),
+                    cls._span(
+                        60 + index,
+                        f"{T_JOB_RERUN}_{index}",
+                        "passed",
+                        ts=recent,
+                        run="1800",
+                        attempt="2",
+                        branch="master",
+                        job="backend:core:4",
+                    ),
+                )
+            ],
+            # Two jobs without a job key in one run attempt, each failing a different test. Both
+            # fall under the synthetic 'legacy' job_key.
+            cls._span(70, T_LEGACY_JOB_A, "failed", ts=earlier, run="1900", branch="master"),
+            cls._span(71, T_LEGACY_JOB_B, "failed", ts=earlier, run="1900", branch="master"),
+            # A Jest recovery counts only within the job that failed.
+            cls._span(
+                30,
+                T_JEST_RECOVERY,
+                "failed",
+                ts=earlier,
+                run="1500",
+                branch="master",
+                selector=T_JEST_RECOVERY,
+                service="ci-frontend",
+                job="frontend:EE:1",
+            ),
+            cls._span(
+                31,
+                T_JEST_RECOVERY,
+                "passed",
+                ts=recent,
+                run="1500",
+                attempt="2",
+                branch="master",
+                selector=T_JEST_RECOVERY,
+                service="ci-frontend",
+                job="frontend:EE:1",
+            ),
+            cls._span(
+                32,
+                T_JEST_CROSS_LEG,
+                "failed",
+                ts=earlier,
+                run="1600",
+                branch="master",
+                selector=T_JEST_CROSS_LEG,
+                service="ci-frontend",
+                job="frontend:EE:1",
+            ),
+            cls._span(
+                33,
+                T_JEST_CROSS_LEG,
+                "passed",
+                ts=recent,
+                run="1600",
+                attempt="2",
+                branch="master",
+                selector=T_JEST_CROSS_LEG,
+                service="ci-frontend",
+                job="frontend:FOSS:1",
+            ),
+        ]
+        sync_execute(
+            "INSERT INTO trace_spans (uuid, team_id, trace_id, span_id, parent_span_id, name, kind, "
+            "timestamp, end_time, observed_timestamp, status_code, service_name, attributes_map_str, "
+            "resource_attributes) VALUES " + ",".join(rows)
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        sync_execute("DROP TABLE IF EXISTS trace_spans_distributed")
+        sync_execute("DROP TABLE IF EXISTS trace_spans")
+        sync_execute(TRACE_SPANS_TABLE_SQL())
+        sync_execute(TRACE_SPANS_DISTRIBUTED_TABLE_SQL())
+        super().tearDownClass()
+
+    def test_job_log_discovery_includes_recovered_jobs_without_collecting_unrelated_passes(self) -> None:
+        now = datetime.now(UTC).replace(microsecond=0)
+        jobs = [
+            (1, 400, 1, "runner-example", "success"),
+            (2, 400, 1, "another-runner", "success"),
+            (3, 400, 2, "runner-example", "success"),
+            (4, 999, 1, "runner-example", "success"),
+            (5, 999, 1, "another-runner", "failure"),
+            (6, 1100, 1, "runner-example", "success"),
+            (7, 1200, 1, "runner-example", "success"),
+            (8, 1000, 1, "", "success"),
+        ]
+        create_github_warehouse_table(
+            self,
+            "github_workflow_jobs",
+            WORKFLOW_JOBS_COLUMNS,
+            [
+                dict.fromkeys(WORKFLOW_JOBS_COLUMNS)
+                | {
+                    "id": job_id,
+                    "run_id": run_id,
+                    "run_attempt": attempt,
+                    "runner_name": runner,
+                    "conclusion": conclusion,
+                    "started_at": (now - timedelta(days=2)).isoformat(),
+                    "completed_at": now.isoformat(),
+                }
+                for job_id, run_id, attempt, runner, conclusion in jobs
+            ],
+        )
+        rows = _query_jobs_with_diagnostics(
+            self.team, GITHUB_SOURCE_PREFIX, (now - timedelta(hours=12)).isoformat(), "posthog/POSTHOG"
+        )
+        assert {row["job_id"] for row in rows} == {1, 5}
+
+    @classmethod
+    def _span(
+        cls,
+        index: int,
+        name: str,
+        outcome: str | None,
+        *,
+        ts: datetime,
+        run: str = "",
+        attempt: str = "1",
+        pr: str = "",
+        branch: str = "",
+        selector: str = "",
+        service: str = "ci-backend",
+        repo: str = "PostHog/posthog",
+        job: str = "",
+        runner_name: str = "",
+        ci_engine: str = "",
+        head_sha: str = "",
+        native_workflow_run_id: str = "",
+    ) -> str:
+        # Physical attributes carry a type suffix ('test.outcome__str'), which the `attributes` ALIAS
+        # column strips. Resource attributes are stored as given.
+        attr_pairs = ([f"'test.outcome__str', '{outcome}'"] if outcome else []) + (
+            [f"'test.selector__str', '{selector}'"] if selector else []
+        )
+        if job:
+            attr_pairs.append(f"'test.job_key__str', '{job}'")
+        if runner_name:
+            attr_pairs.append(f"'test.runner_name__str', '{runner_name}'")
+        attrs = f"map({', '.join(attr_pairs)})" if attr_pairs else "map()"
+        resource_pairs = [
+            f"'{key}', '{value}'"
+            for key, value in (
+                ("ci.run_id", run),
+                ("ci.run_attempt", attempt),
+                ("ci.pr_number", pr),
+                ("ci.branch", branch),
+                ("ci.repository", repo),
+                ("ci.engine", ci_engine),
+                ("ci.sha", head_sha),
+                ("ci.native_workflow_run_id", native_workflow_run_id),
+            )
+            if value
+        ]
+        resource = f"map({', '.join(resource_pairs)})"
+        stamp = ts.strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            f"('uuid-{index}', {cls.team.id}, 'trace-{index}', 'span-{index}', 'parent', '{name}', 1, "
+            f"'{stamp}', '{stamp}', '{stamp}', 0, '{service}', {attrs}, {resource})"
+        )
+
+    def setUp(self) -> None:
+        super().setUp()
+        # GitHub reports three failed jobs for run 1700, one for run 1800, and none for run 1900,
+        # so only the first two runs may drop a trial.
+        connect_github_jobs(
+            self,
+            prefix="flaky",
+            jobs=[(70 + shard, 1700, 1, "failure") for shard in (1, 2, 3)]
+            + [(80, 1800, 1, "failure"), (81, 1800, 2, "success")]
+            + [(90 + shard, 1900, 1, "success") for shard in (1, 2, 3)],
+        )
+
+    def _get(self, **params: str) -> dict:
+        response = self.client.get(f"/api/projects/{self.team.id}/engineering_analytics/flaky_tests/", params)
+        assert response.status_code == status.HTTP_200_OK, response.content
+        return response.json()
+
+    def _rows(self, **params: str) -> dict[str, dict]:
+        return {item["nodeid"]: item for item in self._get(**params)["items"]}
+
+    def test_default_window_qualifies_only_actionable_tests(self) -> None:
+        data = self._get()
+
+        # Run 1900 has the shape of run 1700 but GitHub reports no failed job for it, so its tests
+        # keep their failures.
+        assert {row["nodeid"] for row in data["items"]} == {
+            T_RERUN_RECOVERY,
+            T_STALE_REREPORT,
+            T_CROSS_RUN_PASS,
+            T_PASS_THEN_FAIL,
+            T_MATRIX_LEGS,
+            T_IN_JOB_RETRY,
+            T_THREE_PRS,
+            T_MASTER,
+            T_QUARANTINED,
+            T_TIE_A,
+            T_TIE_B,
+            T_NO_RUN_ID,
+            T_JEST_RECOVERY,
+            T_JEST_CROSS_LEG,
+            *(f"{T_SPAN_ONLY_BREAK}_{shard}" for shard in (1, 2, 3)),
+            f"{T_JOB_RERUN}_1",
+            f"{T_JOB_RERUN}_2",
+            T_LEGACY_JOB_A,
+            T_LEGACY_JOB_B,
+        }
+        assert data["truncated"] is False
+        assert data["limit"] == 50
+
+    def test_a_job_attempt_failing_enough_tests_is_not_flake_proof(self) -> None:
+        with patch("products.engineering_analytics.backend.logic.queries._test_spans.SETUP_BREAK_MIN_JOB_FAILURES", 2):
+            rows = self._rows()
+
+        assert f"{T_JOB_RERUN}_1" not in rows
+        assert f"{T_JOB_RERUN}_2" not in rows
+        assert rows[T_RERUN_RECOVERY]["classification"] == "confirmed_flake"
+
+    def test_legacy_jobs_do_not_merge_toward_the_job_attempt_threshold(self) -> None:
+        with patch("products.engineering_analytics.backend.logic.queries._test_spans.SETUP_BREAK_MIN_JOB_FAILURES", 2):
+            rows = self._rows()
+
+        assert T_LEGACY_JOB_A in rows
+        assert T_LEGACY_JOB_B in rows
+
+    @parameterized.expand(
+        [
+            ("recovered_on_rerun_attempt", T_RERUN_RECOVERY, "confirmed_flake"),
+            ("recovered_via_in_job_retry", T_IN_JOB_RETRY, "confirmed_flake"),
+            ("passed_then_failed_in_one_run", T_PASS_THEN_FAIL, "confirmed_flake"),
+            ("pass_in_a_different_run", T_CROSS_RUN_PASS, "suspected_regression"),
+            ("pass_in_another_matrix_leg", T_MATRIX_LEGS, "suspected_regression"),
+            ("no_recovery_recorded", T_THREE_PRS, "suspected_regression"),
+            ("failing_while_xfailed", T_QUARANTINED, "quarantined"),
+            ("jest_same_job_recovery", T_JEST_RECOVERY, "confirmed_flake"),
+            ("jest_cross_job_pass", T_JEST_CROSS_LEG, "suspected_regression"),
+        ]
+    )
+    def test_classification_needs_proof_to_call_a_test_flaky(self, _name: str, nodeid: str, expected: str) -> None:
+        assert self._rows()[nodeid]["classification"] == expected
+
+    @parameterized.expand(
+        [
+            ("same_identity", ("github_actions", "workflow-a"), ("github_actions", "sha-a", "workflow-a"), 1),
+            ("different_engine", ("github_actions", "workflow-a"), ("depot_ci", "sha-a", "workflow-a"), 0),
+            ("different_commit", ("github_actions", "workflow-a"), ("github_actions", "sha-b", "workflow-a"), 0),
+            ("different_workflow", ("github_actions", "workflow-a"), ("github_actions", "sha-a", "workflow-b"), 0),
+            ("missing_depot_workflow", ("depot_ci", ""), ("depot_ci", "sha-a", ""), 0),
+        ]
+    )
+    def test_retry_recovery_requires_engine_workflow_and_commit_identity(
+        self, _name: str, failed: tuple[str, str], passed: tuple[str, str, str], recovered: int
+    ) -> None:
+        failed_engine, failed_workflow = failed
+        engine, sha, workflow = passed
+        nodeid = "posthog/api/test/test_identity/TestIdentity::test_retry"
+        stamp = datetime.now(UTC) - timedelta(hours=1)
+        rows = [
+            self._span(
+                9001,
+                nodeid,
+                "failed",
+                ts=stamp,
+                run="9900",
+                branch="master",
+                ci_engine=failed_engine,
+                head_sha="sha-a",
+                native_workflow_run_id=failed_workflow,
+            ),
+            self._span(
+                9002,
+                nodeid,
+                "passed",
+                ts=stamp,
+                run="9900",
+                attempt="2",
+                branch="master",
+                ci_engine=engine,
+                head_sha=sha,
+                native_workflow_run_id=workflow,
+            ),
+        ]
+        sync_execute(
+            "INSERT INTO trace_spans (uuid, team_id, trace_id, span_id, parent_span_id, name, kind, timestamp, end_time, observed_timestamp, status_code, service_name, attributes_map_str, resource_attributes) VALUES "
+            + ",".join(rows)
+        )
+        try:
+            assert self._rows()[nodeid]["same_commit_recovery_run_count"] == recovered
+        finally:
+            sync_execute(
+                "ALTER TABLE trace_spans DELETE WHERE uuid IN ('uuid-9001', 'uuid-9002') SETTINGS mutations_sync = 2"
+            )
+
+    def test_evidence_is_counted_once_per_run(self) -> None:
+        rows = self._rows()
+
+        legs = rows[T_MATRIX_LEGS]
+        assert legs["failed_run_count"] == 1
+        assert legs["master_failed_run_count"] == 1
+        assert legs["same_commit_recovery_run_count"] == 0
+
+        stale = rows[T_STALE_REREPORT]
+        assert stale["failed_run_count"] == 1
+        assert stale["same_commit_recovery_run_count"] == 0
+        assert stale["master_failed_run_count"] == 1
+
+        recovered_on_rerun = rows[T_RERUN_RECOVERY]
+        assert recovered_on_rerun["same_commit_recovery_run_count"] == 1
+        assert recovered_on_rerun["failed_run_count"] == 1
+        # The pass on attempt 2 is not a signal, so last_signal_at is the time of the failure.
+        assert recovered_on_rerun["last_signal_at"] < rows[T_MASTER]["last_signal_at"]
+
+        recovered = rows[T_IN_JOB_RETRY]
+        assert recovered["same_commit_recovery_run_count"] == 1
+        assert recovered["selector"] == T_IN_JOB_SELECTOR
+
+        three_prs = rows[T_THREE_PRS]
+        assert (three_prs["failed_run_count"], three_prs["failed_pr_count"]) == (3, 3)
+        # These spans carry no test.selector, so the selector is reconstructed from the nodeid.
+        assert three_prs["selector"] == "posthog/api/test/test_three.py::TestThree::test_fails_on_three_prs"
+
+        master = rows[T_MASTER]
+        assert (master["master_failed_run_count"], master["failed_pr_count"]) == (1, 0)
+
+        quarantined = rows[T_QUARANTINED]
+        assert quarantined["quarantined_failed_run_count"] == 1
+        assert (quarantined["failed_run_count"], quarantined["master_failed_run_count"]) == (0, 0)
+
+        jest_recovered = rows[T_JEST_RECOVERY]
+        assert jest_recovered["runner"] == "jest"
+        assert jest_recovered["selector"] == T_JEST_RECOVERY
+        assert jest_recovered["same_commit_recovery_run_count"] == 1
+
+        jest_cross_leg = rows[T_JEST_CROSS_LEG]
+        assert jest_cross_leg["runner"] == "jest"
+        assert jest_cross_leg["same_commit_recovery_run_count"] == 0
+
+    def test_ranking_leads_with_trunk_breakage_and_breaks_ties_on_nodeid(self) -> None:
+        nodeids = [item["nodeid"] for item in self._get()["items"]]
+
+        assert nodeids.index(T_MASTER) < nodeids.index(T_THREE_PRS)
+        assert nodeids.index(T_TIE_A) < nodeids.index(T_TIE_B)
+
+    def test_spans_without_run_id_stay_distinct_runs(self) -> None:
+        no_run = self._rows()[T_NO_RUN_ID]
+        assert (no_run["failed_run_count"], no_run["master_failed_run_count"]) == (2, 2)
+        assert no_run["classification"] == "suspected_regression"
+
+    def test_min_failed_prs_controls_the_no_recovery_threshold(self) -> None:
+        assert T_TWO_PRS not in self._rows()
+        assert T_TWO_PRS in self._rows(min_failed_prs="2")
+
+    def test_wider_window_includes_older_signal(self) -> None:
+        assert T_OLD in self._rows(date_from="-30d")
+
+    def test_source_without_repository_fails_closed(self) -> None:
+        ExternalDataSource.objects.filter(team_id=self.team.id).update(job_inputs={})
+        data = self._get()
+        assert data["items"] == []
+        assert data["truncated"] is False
+
+    def test_limit_caps_and_flags_truncation(self) -> None:
+        data = self._get(limit="1")
+        assert len(data["items"]) == 1
+        assert data["truncated"] is True
+        assert data["limit"] == 1
+
+    def test_runner_filters_before_limit(self) -> None:
+        data = self._get(runner="jest", limit="1")
+
+        assert len(data["items"]) == 1
+        assert data["items"][0]["runner"] == "jest"
+        assert data["truncated"] is True
+
+    @parameterized.expand(
+        [
+            ("test_substring", {"test": "TESTTHREE::test_fails"}, T_THREE_PRS, 3),
+            # A pytest selector keeps '.py', which the nodeid drops, so it matches through the selector.
+            ("pytest_selector", {"test": "test_injob.py::TestInJob"}, T_IN_JOB_RETRY, 0),
+            # A PR or branch scope still counts the test's failures on every other PR.
+            ("pr_number", {"pr_number": "502"}, T_THREE_PRS, 3),
+            ("branch", {"branch": "f2"}, T_THREE_PRS, 3),
+            ("pr_number_below_the_bar", {"pr_number": "601", "min_failed_prs": "1"}, T_TWO_PRS, 2),
+        ]
+    )
+    def test_test_and_scope_filters_apply_before_limit(
+        self, _name: str, params: dict, expected: str, expected_failed_prs: int
+    ) -> None:
+        items = self._get(limit="1", **params)["items"]
+
+        assert [item["nodeid"] for item in items] == [expected]
+        assert items[0]["failed_pr_count"] == expected_failed_prs
+
+    @parameterized.expand(
+        [
+            ("window_over_30_days", {"date_from": "-45d"}),
+            ("reversed_window", {"date_from": "-1d", "date_to": "-5d"}),
+            ("zero_min_failed_prs", {"min_failed_prs": "0"}),
+            ("zero_limit", {"limit": "0"}),
+            ("oversized_limit", {"limit": "201"}),
+            ("non_integer_threshold", {"min_failed_prs": "lots"}),
+            ("unknown_runner", {"runner": "playwright"}),
+            ("non_integer_pr_number", {"pr_number": "abc"}),
+        ]
+    )
+    def test_invalid_params_return_400(self, _name: str, params: dict) -> None:
+        response = self.client.get(f"/api/projects/{self.team.id}/engineering_analytics/flaky_tests/", params)
+        assert response.status_code == status.HTTP_400_BAD_REQUEST, response.content
+
+
+@pytest.mark.parametrize(
+    "nodeid,expected",
+    [
+        ("posthog/api/test/test_event/TestEvents::test_x", "posthog/api/test/test_event.py::TestEvents::test_x"),
+        ("posthog/tasks/test/test_calc::test_sum", "posthog/tasks/test/test_calc.py::test_sum"),
+        ("posthog/test/test_a/TestOuter/TestInner::test_x", "posthog/test/test_a.py::TestOuter::TestInner::test_x"),
+        ("test_bare", "test_bare"),
+    ],
+)
+def test_selector_from_nodeid(nodeid: str, expected: str) -> None:
+    assert selector_from_nodeid(nodeid) == expected

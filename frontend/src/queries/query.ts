@@ -1,0 +1,586 @@
+import api, { ApiMethodOptions, isAbortError } from 'lib/api'
+import { ApiError, NetworkError } from 'lib/api-error'
+import { ApiRequestTiming, flattenRequestTiming } from 'lib/apiRequestTiming'
+import posthog from 'lib/posthog-typed'
+import { delay, retryWithBackoff } from 'lib/utils/async'
+import { uuid } from 'lib/utils/dom'
+import { HogQLQueryString } from 'lib/utils/hogql'
+
+import { isSharedView } from '~/exporter/exporterViewLogic'
+import { queryUsesDataWarehouse } from '~/queries/schema/node-accessors'
+import {
+    isDataTableNode,
+    isDataVisualizationNode,
+    isHogQLQuery,
+    isInsightQueryNode,
+    isPersonsNode,
+} from '~/queries/schema/node-guards'
+import {
+    DashboardFilter,
+    DataNode,
+    HogQLQuery,
+    HogQLQueryResponse,
+    HogQLVariable,
+    NodeKind,
+    PersonsNode,
+    QueryStatus,
+    RefreshType,
+    WebStatsTableQueryResponse,
+} from '~/queries/schema/schema-general'
+import { OnlineExportContext, QueryExportContext } from '~/types'
+
+import { dataWarehouseSourcesFromResponse, isAsyncResponse } from './utils'
+
+export function waitForPageVisible(signal?: AbortSignal): Promise<void> {
+    if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        return Promise.resolve()
+    }
+
+    return new Promise<void>((resolve, reject) => {
+        const onVisibilityChange = (): void => {
+            if (document.visibilityState === 'visible') {
+                cleanup()
+                resolve()
+            }
+        }
+
+        const onAbort = (): void => {
+            cleanup()
+            reject(new DOMException('Aborted', 'AbortError'))
+        }
+
+        const cleanup = (): void => {
+            document.removeEventListener('visibilitychange', onVisibilityChange)
+            signal?.removeEventListener('abort', onAbort)
+        }
+
+        if (signal?.aborted) {
+            reject(new DOMException('Aborted', 'AbortError'))
+            return
+        }
+
+        document.addEventListener('visibilitychange', onVisibilityChange)
+        signal?.addEventListener('abort', onAbort)
+    })
+}
+
+function waitForPollingReady(signal?: AbortSignal): Promise<void> {
+    const isReady = (): boolean =>
+        (typeof navigator === 'undefined' || navigator.onLine !== false) &&
+        (typeof document === 'undefined' || document.visibilityState !== 'hidden')
+
+    if (signal?.aborted) {
+        return Promise.reject(new DOMException('Aborted', 'AbortError'))
+    }
+    if (isReady()) {
+        return Promise.resolve()
+    }
+
+    return new Promise<void>((resolve, reject) => {
+        const cleanup = (): void => {
+            window.removeEventListener('online', onReady)
+            document.removeEventListener('visibilitychange', onReady)
+            signal?.removeEventListener('abort', onAbort)
+        }
+        const onReady = (): void => {
+            if (isReady()) {
+                cleanup()
+                resolve()
+            }
+        }
+        const onAbort = (): void => {
+            cleanup()
+            reject(new DOMException('Aborted', 'AbortError'))
+        }
+
+        window.addEventListener('online', onReady)
+        document.addEventListener('visibilitychange', onReady)
+        signal?.addEventListener('abort', onAbort)
+    })
+}
+
+const QUERY_ASYNC_MAX_INTERVAL_SECONDS = 3
+const QUERY_ASYNC_TOTAL_POLL_SECONDS = 10 * 60 + 6 // keep in sync with backend-side timeout (currently 10min) + a small buffer
+export const QUERY_TIMEOUT_ERROR_MESSAGE = 'Query timed out'
+/** Matches MANAGED_WAREHOUSE_QUERY_UNAVAILABLE_CODE in posthog/api/query.py. */
+const MANAGED_WAREHOUSE_UNAVAILABLE_CODE = 'managed_warehouse_connection_unavailable'
+
+const TRANSIENT_SUBMIT_ATTEMPTS = 3
+const TRANSIENT_SUBMIT_DELAY_MS = 600
+const TRANSIENT_SUBMIT_RETRY_BUDGET_MS = 20_000
+const MAX_RECORDED_SUBMIT_TIMINGS = 6
+
+type QuerySubmitTelemetry = {
+    client_query_id?: string
+    submit_attempts: number
+    retry_wait_ms: number
+    retry_status: number | null
+    retry_recovered: boolean
+    submit_request_timings: ApiRequestTiming[]
+    result_poll_timing?: ApiRequestTiming
+}
+
+function requestTimingProperties(telemetry: QuerySubmitTelemetry): Record<string, string | number | undefined> {
+    return {
+        ...flattenRequestTiming(telemetry.submit_request_timings.at(-1), ''),
+        ...flattenRequestTiming(telemetry.result_poll_timing, 'result_poll_'),
+    }
+}
+
+function capacityWaitMs(error: unknown): number | undefined {
+    if (!(error instanceof ApiError) || error.status !== 503) {
+        return undefined
+    }
+    const seconds = error.retryAfterSeconds
+    return seconds !== null ? seconds * 1000 : undefined
+}
+
+/**
+ * Treat eligible 502/503 responses as potentially transient and retry within a bounded budget.
+ * A 502 does not establish whether the original query started (RFC 9110, section 15.6.3).
+ * Do not resubmit forced refreshes after a 502, since they bypass completed result caches.
+ * Only retry a 503 with a numeric `Retry-After` that fits the total retry-start budget.
+ * Without a fitting numeric hint the error goes to the caller at once, because an early
+ * resubmit only adds load. A 504 means the gateway stopped waiting while the backend can still be
+ * running the query, so a resubmit can compute it a second time.
+ */
+function isRetryableSubmitFailure(error: unknown, refresh: RefreshType): boolean {
+    if (!(error instanceof ApiError)) {
+        return false
+    }
+    if (error.status === 502) {
+        return refresh !== 'force_blocking' && refresh !== 'force_async' && !error.headers?.has('Retry-After')
+    }
+    return capacityWaitMs(error) !== undefined
+}
+
+/**
+ * A missing query status can be recovered by submitting again. An unavailable managed
+ * warehouse also answers 404, but resubmitting cannot fix that.
+ */
+export function isExpiredQueryStatusError(e: any): boolean {
+    return e?.status === 404 && e?.code !== MANAGED_WAREHOUSE_UNAVAILABLE_CODE
+}
+
+/**
+ * Parse error message that may be in ErrorDetail string format.
+ * Backend sometimes serializes ValidationError.detail as a string like:
+ * "[ErrorDetail(string='Message', code='code')]"
+ *
+ * This function safely extracts the message and code, falling back to the
+ * original string if parsing fails.
+ */
+export function parseErrorMessage(errorMessage: string | undefined): { message: string; code: string | null } {
+    if (!errorMessage || typeof errorMessage !== 'string') {
+        return { message: errorMessage || '', code: null }
+    }
+
+    // Try to match list format: [ErrorDetail(string='...', code='...')]
+    const listMatch = errorMessage.match(/\[ErrorDetail\(string='([^']*)',\s*code='([^']*)'\)\]/)
+    if (listMatch) {
+        return { message: listMatch[1], code: listMatch[2] }
+    }
+
+    // Try to match single format: ErrorDetail(string='...', code='...')
+    const singleMatch = errorMessage.match(/ErrorDetail\(string='([^']*)',\s*code='([^']*)'\)/)
+    if (singleMatch) {
+        return { message: singleMatch[1], code: singleMatch[2] }
+    }
+
+    // Fallback: return original string unchanged
+    return { message: errorMessage, code: null }
+}
+
+//get export context for a given query
+export function queryExportContext<N extends DataNode>(
+    query: N,
+    methodOptions?: ApiMethodOptions,
+    refresh?: boolean
+): OnlineExportContext | QueryExportContext {
+    if (isDataTableNode(query) || isDataVisualizationNode(query)) {
+        return queryExportContext(query.source, methodOptions, refresh)
+    } else if (isInsightQueryNode(query)) {
+        return {
+            source: query,
+        }
+    } else if (isPersonsNode(query)) {
+        return { path: getPersonsEndpoint(query) }
+    }
+    return { source: query }
+}
+
+function annotatePollError(e: any, queryId: string): void {
+    // Parse error message to extract clean message and code if present
+    const parsed = parseErrorMessage(e.data?.query_status?.error_message ?? e.data?.detail ?? e.detail)
+    e.detail = parsed.message
+
+    // Prefer the structured code from QueryStatus over one parsed out of the message
+    e.code = e.data?.query_status?.error_code ?? e.data?.code ?? parsed.code ?? e.code
+
+    // Attach queryId to error for downstream error handling
+    e.queryId = queryId
+}
+
+export async function pollForResults(
+    queryId: string,
+    methodOptions?: ApiMethodOptions,
+    onPoll?: (response: QueryStatus) => void,
+    onResultPollTiming?: (timing: ApiRequestTiming) => void
+): Promise<QueryStatus> {
+    // A hidden or offline tab must not consume the polling deadline while it cannot poll.
+    let activeElapsedMs = 0
+    let currentDelay = 300 // start low, because all queries will take at minimum this
+
+    while (activeElapsedMs < QUERY_ASYNC_TOTAL_POLL_SECONDS * 1000) {
+        await waitForPollingReady(methodOptions?.signal)
+        const iterationStart = performance.now()
+        await delay(currentDelay, methodOptions?.signal)
+        currentDelay = Math.min(currentDelay * 1.25, QUERY_ASYNC_MAX_INTERVAL_SECONDS * 1000)
+        activeElapsedMs += performance.now() - iterationStart
+        await waitForPollingReady(methodOptions?.signal)
+
+        try {
+            let pollTiming: ApiRequestTiming | undefined
+            const statusResponse = (
+                await api.queryStatus.get(
+                    queryId,
+                    true,
+                    onResultPollTiming && {
+                        onRequestTiming: (timing) => {
+                            pollTiming = timing
+                        },
+                    }
+                )
+            ).query_status
+            if (statusResponse.complete) {
+                if (pollTiming) {
+                    onResultPollTiming?.(pollTiming)
+                }
+                return statusResponse
+            }
+            if (onPoll) {
+                onPoll(statusResponse)
+            }
+        } catch (e: any) {
+            if (e instanceof NetworkError && e.reason === 'offline') {
+                continue
+            }
+            annotatePollError(e, queryId)
+            throw e
+        }
+    }
+
+    // if we get here, the query timed out
+    const timeoutError = new Error(QUERY_TIMEOUT_ERROR_MESSAGE)
+    ;(timeoutError as Error & { queryId?: string }).queryId = queryId
+    throw timeoutError
+}
+
+/**
+ * Execute a query node and return the response, use async query if enabled
+ */
+async function executeQuery<N extends DataNode>(
+    queryNode: N,
+    submitTelemetry: QuerySubmitTelemetry,
+    methodOptions?: ApiMethodOptions,
+    refresh?: RefreshType,
+    queryId?: string,
+    setPollResponse?: (response: QueryStatus) => void,
+    filtersOverride?: DashboardFilter | null,
+    variablesOverride?: Record<string, HogQLVariable> | null,
+    /**
+     * Whether to limit the function to just polling the provided query ID.
+     * This is important in shared contexts, where we cannot create arbitrary queries via POST – we can only GET.
+     */
+    pollOnly = false,
+    limitContext?: 'posthog_ai',
+    /**
+     * When the backend serves a cached result while kicking off a background recompute
+     * (stale-while-revalidate: `is_cached` is true *and* an incomplete `query_status` is
+     * attached), return the cached results immediately instead of blocking on the recompute.
+     */
+    acceptStaleCache = false,
+    /** True on the retry below, so a failed retry cannot start another one. */
+    retriedAfterExpiry = false
+): Promise<NonNullable<N['response']>> {
+    if (!pollOnly) {
+        const refreshParam: RefreshType = refresh || 'blocking'
+        // Share a client ID for tracing and cancellation; it does not guarantee a single execution.
+        const clientQueryId = queryId || uuid()
+        const submitStartedAt = performance.now()
+        let requestDurationMs = 0
+        let retryStatus: number | null = retriedAfterExpiry ? 404 : null
+
+        const response = await retryWithBackoff(
+            async () => {
+                submitTelemetry.client_query_id = clientQueryId
+                submitTelemetry.submit_attempts++
+                if (retryStatus !== null) {
+                    submitTelemetry.retry_status = retryStatus
+                }
+                const requestStartedAt = performance.now()
+                try {
+                    return await api.query(queryNode, {
+                        requestOptions: {
+                            ...methodOptions,
+                            onRequestTiming: (timing) => {
+                                if (submitTelemetry.submit_request_timings.length < MAX_RECORDED_SUBMIT_TIMINGS) {
+                                    submitTelemetry.submit_request_timings.push(timing)
+                                }
+                                methodOptions?.onRequestTiming?.(timing)
+                            },
+                        },
+                        clientQueryId,
+                        refresh: refreshParam,
+                        filtersOverride,
+                        variablesOverride,
+                        limitContext,
+                    })
+                } catch (error) {
+                    retryStatus = error instanceof ApiError ? (error.status ?? null) : null
+                    throw error
+                } finally {
+                    requestDurationMs += performance.now() - requestStartedAt
+                }
+            },
+            {
+                maxAttempts: TRANSIENT_SUBMIT_ATTEMPTS,
+                initialDelayMs: TRANSIENT_SUBMIT_DELAY_MS,
+                backoffMultiplier: 2,
+                signal: methodOptions?.signal,
+                shouldRetry: (error) => isRetryableSubmitFailure(error, refreshParam),
+                getDelayMs: capacityWaitMs,
+                maxRetryTimeMs: TRANSIENT_SUBMIT_RETRY_BUDGET_MS,
+            }
+        ).finally(() => {
+            // Exclude request time so slow responses do not look like long retry waits.
+            submitTelemetry.retry_wait_ms += Math.max(
+                0,
+                Math.round(performance.now() - submitStartedAt - requestDurationMs)
+            )
+        })
+
+        // A successful response with no content (such as a 204) parses to null.
+        if (!response) {
+            const message = 'The server returned an empty response. Try again.'
+            throw new ApiError(message, undefined, undefined, { detail: message })
+        }
+
+        if (response.detail) {
+            throw new Error(response.detail)
+        }
+
+        if (!isAsyncResponse(response)) {
+            // Executed query synchronously or from cache
+            submitTelemetry.retry_recovered =
+                submitTelemetry.submit_attempts > 1 && (!('results' in response) || response.results != null)
+            return response
+        }
+
+        if (acceptStaleCache && 'is_cached' in response && response.is_cached) {
+            // Cached results are already present alongside a background recompute, so use them
+            // now rather than discarding them to poll a job that may take a while (or be stuck).
+            submitTelemetry.retry_recovered =
+                submitTelemetry.submit_attempts > 1 &&
+                'results' in response &&
+                response.results != null &&
+                !response.query_status.error
+            return response
+        }
+
+        queryId = response.query_status.id
+    } else {
+        if (refresh !== 'async' && refresh !== 'force_async') {
+            throw new Error('pollOnly is only supported for async queries')
+        }
+        if (!queryId) {
+            throw new Error('pollOnly requires a queryId')
+        }
+    }
+
+    let statusResponse: QueryStatus
+    try {
+        statusResponse = await pollForResults(queryId, methodOptions, setPollResponse, (timing) => {
+            submitTelemetry.result_poll_timing = timing
+        })
+    } catch (e: any) {
+        // A backgrounded tab can outlive the query's status. Submit once more to recover its result.
+        //
+        // So run it again, once. force_async becomes async, to read the cached result instead of
+        // recomputing it. The query ID is reused, so cancels and log lookups still find the run;
+        // safe because the server only joins a query that is still running.
+        //
+        // A warehouse that is down also answers 404. Do not retry that one. A shared or exported
+        // view may only read, so it cannot submit at all; report the expired status rather than
+        // the permission error the server would answer with.
+        if (retriedAfterExpiry || !isExpiredQueryStatusError(e) || isSharedView()) {
+            throw e
+        }
+        return await executeQuery(
+            queryNode,
+            submitTelemetry,
+            methodOptions,
+            refresh === 'force_async' ? 'async' : refresh,
+            queryId,
+            setPollResponse,
+            filtersOverride,
+            variablesOverride,
+            false,
+            limitContext,
+            acceptStaleCache,
+            true
+        )
+    }
+    submitTelemetry.retry_recovered =
+        submitTelemetry.submit_attempts > 1 && statusResponse.results != null && !statusResponse.error
+    return statusResponse.results
+}
+
+export interface QueryRequestOptions extends ApiMethodOptions {
+    captureQueryTelemetry?: boolean
+    queryTelemetry?: 'metadata'
+}
+
+// Return data for a given query
+export async function performQuery<N extends DataNode>(
+    queryNode: N,
+    options?: QueryRequestOptions,
+    refresh?: RefreshType,
+    queryId?: string,
+    setPollResponse?: (status: QueryStatus) => void,
+    filtersOverride?: DashboardFilter | null,
+    variablesOverride?: Record<string, HogQLVariable> | null,
+    pollOnly = false,
+    limitContext?: 'posthog_ai',
+    acceptStaleCache = false
+): Promise<NonNullable<N['response']>> {
+    const { captureQueryTelemetry = true, queryTelemetry, ...apiMethodOptions } = options ?? {}
+    const telemetryQuery = queryTelemetry === 'metadata' ? { kind: queryNode.kind } : queryNode
+    let response: NonNullable<N['response']>
+    const logParams: Record<string, any> = {}
+    const submitTelemetry: QuerySubmitTelemetry = {
+        client_query_id: queryId,
+        submit_attempts: 0,
+        retry_wait_ms: 0,
+        retry_status: null,
+        retry_recovered: false,
+        submit_request_timings: [],
+    }
+    const startTime = performance.now()
+
+    try {
+        if (isPersonsNode(queryNode)) {
+            // nosemgrep: prefer-codegen-api -- Legacy raw API call with a URL built at runtime and an unchecked response type. Use a generated function if one covers this endpoint.
+            response = await api.get(getPersonsEndpoint(queryNode), apiMethodOptions)
+        } else {
+            response = await executeQuery(
+                queryNode,
+                submitTelemetry,
+                apiMethodOptions,
+                refresh,
+                queryId,
+                setPollResponse,
+                filtersOverride,
+                variablesOverride,
+                pollOnly,
+                limitContext,
+                acceptStaleCache
+            )
+            if (queryTelemetry !== 'metadata' && isHogQLQuery(queryNode) && response && typeof response === 'object') {
+                logParams.clickhouse_sql = (response as HogQLQueryResponse)?.clickhouse
+            }
+            if (response && typeof response === 'object') {
+                // Web analytics responses report which read path served them, whether a
+                // lazy-precompute read was served stale, and why a live read skipped precompute.
+                // Undefined elsewhere, so these props only land on events that carry them. The
+                // shape comes from the generated schema, so renaming a field there fails the
+                // build instead of silently capturing undefined.
+                const { preComputeStrategy, preComputeStale, preComputeIneligibleReason } = response as Partial<
+                    Pick<
+                        WebStatsTableQueryResponse,
+                        'preComputeStrategy' | 'preComputeStale' | 'preComputeIneligibleReason'
+                    >
+                >
+                logParams.precompute_strategy = preComputeStrategy
+                logParams.precompute_stale = preComputeStale
+                logParams.precompute_ineligible_reason = preComputeIneligibleReason
+            }
+        }
+        const warehouseSources = dataWarehouseSourcesFromResponse(response)
+        if (captureQueryTelemetry) {
+            posthog.capture('query completed', {
+                query: telemetryQuery,
+                queryId,
+                duration: performance.now() - startTime,
+                is_cached: response?.is_cached,
+                uses_data_warehouse_source: warehouseSources.length > 0 || queryUsesDataWarehouse(queryNode),
+                data_warehouse_source_ids: warehouseSources.map((s) => s.id),
+                data_warehouse_source_types: warehouseSources.map((s) => s.source_type).filter(Boolean),
+                ...logParams,
+                ...submitTelemetry,
+                ...requestTimingProperties(submitTelemetry),
+            })
+            const historySources = warehouseSources.filter((s) => s.uses_history_table)
+            if (historySources.length > 0) {
+                posthog.capture('data warehouse history table queried', {
+                    query_kind: queryNode.kind,
+                    queryId,
+                    is_cached: response?.is_cached,
+                    data_warehouse_source_ids: historySources.map((s) => s.id),
+                    data_warehouse_source_types: historySources.map((s) => s.source_type).filter(Boolean),
+                })
+            }
+        }
+        return response
+    } catch (e) {
+        // A superseded query or navigating away mid-request aborts, not fails — skip so the
+        // 'query failed' metric isn't drowned in cancellation noise.
+        if (captureQueryTelemetry && !isAbortError(e)) {
+            // Raw error detail/message can echo query fragments, so telemetry only gets status and code
+            const error = e as (Error & { status?: number; code?: string | null; queryId?: string }) | null
+            posthog.capture('query failed', {
+                query: telemetryQuery,
+                queryId: error?.queryId ?? queryId,
+                duration: performance.now() - startTime,
+                error_status: error?.status ?? null,
+                error_code: error?.code ?? null,
+                uses_data_warehouse_source: queryUsesDataWarehouse(queryNode),
+                ...logParams,
+                ...submitTelemetry,
+                ...requestTimingProperties(submitTelemetry),
+                retry_recovered: false,
+            })
+        }
+        throw e
+    }
+}
+
+export function getPersonsEndpoint(query: PersonsNode): string {
+    const params = {
+        properties: [...(query.fixedProperties || []), ...(query.properties || [])],
+        ...(query.search ? { search: query.search } : {}),
+        ...(query.distinctId ? { distinct_id: query.distinctId } : {}),
+        ...(query.limit ? { limit: query.limit } : {}),
+        ...(query.offset ? { offset: query.offset } : {}),
+    }
+    if (query.cohort) {
+        return api.cohorts.determineListUrl(query.cohort, params)
+    }
+    return api.persons.determineListUrl(params)
+}
+
+export async function hogqlQuery(
+    queryString: HogQLQueryString,
+    values?: Record<string, any>,
+    refresh?: RefreshType
+): Promise<HogQLQueryResponse> {
+    return await performQuery<HogQLQuery>(
+        {
+            kind: NodeKind.HogQLQuery,
+            query: queryString,
+            values,
+        },
+        undefined,
+        refresh
+    )
+}

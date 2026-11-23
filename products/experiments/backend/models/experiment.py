@@ -1,0 +1,802 @@
+from collections.abc import Callable, Collection, Sequence
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Literal
+
+from django.contrib.postgres.fields import ArrayField
+from django.db import models
+from django.db.models import QuerySet
+from django.db.models.fields.json import KeyTextTransform
+from django.utils import timezone
+
+from posthog.exceptions_capture import capture_exception
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.activity_logging.model_activity import ModelActivityMixin
+from posthog.models.file_system.constants import DEFAULT_SURFACE
+from posthog.models.file_system.file_system_mixin import FileSystemSyncMixin
+from posthog.models.file_system.file_system_representation import FileSystemRepresentation
+from posthog.models.scoping.root_mixin import TeamScopedRootMixin
+from posthog.models.tagged_items_relation import Taggable
+from posthog.models.utils import RootTeamManager, RootTeamMixin, UUIDModel
+
+from products.feature_flags.backend.facade.filters import (
+    CohortRestrictionBlocker,
+    group_cohort_restriction_blocker,
+    groups_carry_restriction_marker,
+)
+from products.feature_flags.backend.facade.rules import (
+    ExperimentRuleConfig,
+    ExperimentRuleError,
+    experiment_rule_from_filters,
+    experiment_rule_from_snapshot,
+    experiment_rule_snapshot,
+    same_rule_id,
+)
+
+if TYPE_CHECKING:
+    from posthog.models.team import Team
+
+
+# Structured key stamped on each feature-flag release group when an experiment's exposure is frozen.
+# Frozen-exposure state is derived from this key, not stored on the experiment — the same spirit as
+# is_paused being derived from feature_flag.active rather than persisted. Unknown group keys pass
+# through flag validation and are ignored by the Rust flag matcher, so this is additive metadata;
+# that pass-through contract is pinned by test_flag_update_after_freeze_preserves_frozen_state.
+EXPOSURE_FROZEN_GROUP_KEY = "exposure_frozen"
+
+# Companion key recording which snapshot cohort the freeze AND-ed into the group, so unfreezing
+# can remove exactly that condition even if users added their own cohort conditions meanwhile.
+EXPOSURE_FROZEN_COHORT_KEY = "exposure_frozen_cohort"
+
+# Human-readable note prepended to each release group's `description` when freezing. Purely
+# informational — the description stays user-editable prose and carries no state.
+EXPOSURE_FROZEN_GROUP_MARKER = "Added automatically when the experiment exposure was frozen to stop new enrollment."
+
+# Why an experiment's exposure can't be frozen right now. Experiment-state reasons plus the
+# flag-shape reasons computed flag-side by group_cohort_restriction_blocker.
+ExposureFreezeBlocker = (
+    Literal["draft", "stopped", "paused", "already_frozen", "no_flag", "flag_deleted", "flag_rule"]
+    | CohortRestrictionBlocker
+)
+
+
+class LiveExperimentManager(RootTeamManager):
+    """Experiments the API still shows, which is every row whose `deleted` is not true.
+
+    This is a manager rather than a filter because the flag ownership table in
+    `products/feature_flags/backend/ownership.py` reads each owning relation through a named
+    manager, so only a manager can keep a deleted experiment out of it.
+
+    `deleted` is nullable, and `filter_experiments_queryset` counts a null as live, so this
+    excludes true instead of keeping false. An experiment a user can still open must keep its
+    flag, because that page is where the user unlinks it.
+
+    Inherits `RootTeamManager` because `RootTeamMixin` makes that the default manager, and a manager
+    on the model that does not inherit it would lose the project-scoped team rewriting.
+    """
+
+    def get_queryset(self):
+        return super().get_queryset().exclude(deleted=True)
+
+
+class Experiment(Taggable, FileSystemSyncMixin, ModelActivityMixin, RootTeamMixin, models.Model):
+    class ExperimentType(models.TextChoices):
+        WEB = "web", "web"
+        PRODUCT = "product", "product"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        RUNNING = "running", "Running"
+        STOPPED = "stopped", "Stopped"
+
+    name = models.CharField(max_length=400)
+    description = models.CharField(max_length=3000, null=True, blank=True)
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE)
+
+    # Filters define the target metric of an Experiment
+    filters = models.JSONField(default=dict, blank=True)
+
+    # DEPRECATED: catch-all config blob being split into dedicated homes.
+    # Feature flag config (feature_flag_variants, rollout_percentage, aggregation_group_type_index,
+    # feature_flag_payloads, ensure_experience_continuity) belongs on the linked FeatureFlag.
+    # Running-time calculator state (minimum_detectable_effect, recommended_running_time,
+    # recommended_sample_size, exposure_estimate_config) belongs in `running_time_calculation`.
+    # Do not add new keys here.
+    parameters = models.JSONField(default=dict, null=True)
+
+    # A list of filters for secondary metrics
+    secondary_metrics = models.JSONField(default=list, null=True, blank=True)
+
+    created_by = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True)
+    feature_flag = models.ForeignKey("feature_flags.FeatureFlag", blank=False, on_delete=models.RESTRICT)
+    exposure_cohort = models.ForeignKey("cohorts.Cohort", on_delete=models.SET_NULL, null=True, blank=True)
+    holdout = models.ForeignKey("ExperimentHoldout", on_delete=models.SET_NULL, null=True, blank=True)
+
+    start_date = models.DateTimeField(null=True, blank=True)
+    end_date = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+    # Optimistic-concurrency token: bumped on every user-facing update so stale
+    # clients can be detected. Null (pre-backfill rows) is treated as 0.
+    version = models.IntegerField(default=0, null=True, blank=True)
+    archived = models.BooleanField(default=False)
+    # Whether archiving this experiment also auto-archived its linked feature flag,
+    # so unarchiving only undoes an archive the experiment itself performed.
+    feature_flag_auto_archived = models.BooleanField(default=False, db_default=False)
+    deleted = models.BooleanField(default=False, null=True)
+    type = models.CharField(max_length=40, choices=ExperimentType, null=True, blank=True, default="product")
+    variants = models.JSONField(default=dict, null=True, blank=True)
+
+    exposure_criteria = models.JSONField(default=dict, null=True, blank=True)
+
+    metrics = models.JSONField(default=list, null=True, blank=True)
+    metrics_secondary = models.JSONField(default=list, null=True, blank=True)
+    primary_metrics_ordered_uuids = models.JSONField(default=None, null=True, blank=True)
+    secondary_metrics_ordered_uuids = models.JSONField(default=None, null=True, blank=True)
+    saved_metrics: models.ManyToManyField = models.ManyToManyField(
+        "ExperimentSavedMetric", blank=True, related_name="experiments", through="ExperimentToSavedMetric"
+    )
+
+    stats_config = models.JSONField(default=dict, null=True, blank=True)
+    scheduling_config = models.JSONField(default=dict, null=True, blank=True)
+
+    # Running-time calculator state: minimum_detectable_effect, recommended_running_time,
+    # recommended_sample_size, exposure_estimate_config. Canonical home for these keys,
+    # which historically lived in `parameters`.
+    running_time_calculation = models.JSONField(default=dict, null=True, blank=True)
+
+    # Variant keys dropped from statistical analysis. Canonical home for what historically
+    # lived in `parameters.excluded_variants`. `null`/empty both mean "no exclusions".
+    excluded_variants = ArrayField(models.TextField(), null=True, blank=True)
+
+    only_count_matured_users = models.BooleanField(default=False)
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status,
+        default=None,
+        null=True,
+        blank=True,
+    )
+
+    conclusion = models.CharField(
+        max_length=30,
+        choices=[
+            ("won", "Won"),
+            ("lost", "Lost"),
+            ("inconclusive", "Inconclusive"),
+            ("stopped_early", "Stopped Early"),
+            ("invalid", "Invalid"),
+        ],
+        null=True,
+        blank=True,
+    )
+    conclusion_comment = models.TextField(
+        null=True,
+        blank=True,
+    )
+
+    # Latest flag-cleanup Desktop task opened when this experiment ended. A bare UUID, not a FK —
+    # tasks is an isolated product, so details are read through its facade.
+    flag_cleanup_task_id = models.UUIDField(null=True, blank=True)
+
+    # GitHub repository (`org/repo`) holding this experiment's flag code, used for the
+    # flag-cleanup PR. When null, cleanup falls back to the team's only cached repo and
+    # is skipped when the team has several — never inferred.
+    repository = models.CharField(max_length=255, null=True, blank=True)
+
+    # A started experiment's rule ID selects v2 analysis; legacy experiments keep both fields null.
+    feature_flag_rule_id = models.UUIDField(null=True, blank=True)
+    # The immutable first-start snapshot preserves the rule and relevant flag context after winner shipping.
+    feature_flag_rule_snapshot = models.JSONField(null=True, blank=True)
+
+    # Django puts a locally declared manager first, so without this line `live_objects` becomes
+    # the default manager and hides soft-deleted rows from readers such as restore.
+    objects = RootTeamManager()  # type: ignore[misc]
+    live_objects = LiveExperimentManager()
+
+    class Meta:
+        db_table = "posthog_experiment"
+        constraints = [
+            # Rule IDs are UUIDs that no later experiment may reuse, so uniqueness is global, not per team.
+            models.UniqueConstraint(
+                fields=["feature_flag_rule_id"],
+                condition=models.Q(feature_flag_rule_id__isnull=False),
+                name="posthog_experiment_feature_flag_rule_id_uniq",
+            )
+        ]
+        indexes = [
+            # The hourly recalculation scans select running experiments across all teams.
+            models.Index(
+                fields=["start_date"],
+                name="posthog_exp_running_start_idx",
+                condition=models.Q(deleted=False, status="running"),
+            ),
+        ]
+
+    def __str__(self):
+        return self.name or "Untitled"
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        self._assert_rule_snapshot_before_start()
+        self.status = self.computed_status
+        if "update_fields" in kwargs:
+            kwargs["update_fields"] = [*list(kwargs["update_fields"]), "status"]
+        super().save(*args, **kwargs)
+
+    def _assert_rule_snapshot_before_start(self) -> None:
+        """The launch paths write the rule snapshot. This stops any other write from starting a rule-linked
+        experiment without one, because a started experiment cannot get its snapshot afterwards.
+
+        It reads the instance dict, so a deferred field costs no query. A deferred field is one this
+        save cannot have changed.
+        """
+        loaded = self.__dict__
+        if loaded.get("feature_flag_rule_id") is None or loaded.get("start_date") is None:
+            return
+        if "feature_flag_rule_snapshot" in loaded and loaded["feature_flag_rule_snapshot"] is None:
+            raise ValueError("An experiment on a feature flag rule cannot start without its rule snapshot")
+
+    @property
+    def is_rule_linked(self) -> bool:
+        """Whether the experiment runs on one rule of a config version 2 feature flag.
+
+        This is the only decision between the two analysis contracts. Do not read it from the flag's
+        current config format or from an event name: a legacy experiment stays legacy when its flag
+        changes, and a rule-linked experiment stays rule-linked after its rule is replaced or removed.
+        """
+        return self.feature_flag_rule_id is not None
+
+    @property
+    def is_launched(self) -> bool:
+        return self.start_date is not None
+
+    @property
+    def is_draft(self) -> bool:
+        return not self.is_launched
+
+    @property
+    def is_running(self) -> bool:
+        return self.is_launched and self.end_date is None
+
+    @property
+    def is_stopped(self) -> bool:
+        return self.is_launched and self.end_date is not None
+
+    @property
+    def hours_since_start(self) -> float | None:
+        # Counts to now also after the end date.
+        if self.start_date is None:
+            return None
+        return (timezone.now() - self.start_date).total_seconds() / 3600
+
+    def launched_at(self, *, read_activity_log: bool) -> datetime | None:
+        """
+        The later of the start date and the latest launch in the activity log. The start date can be moved back to
+        before the launch, so it can be earlier than the first variant the flag served. Without `read_activity_log`,
+        for a reader who may not read the experiment's activity log, it is the start date.
+        """
+        start_date = self.start_date
+        if start_date is None or not read_activity_log:
+            return start_date
+        # A launch logs the start date that it sets on a draft. An experiment created with a start date logs none, and
+        # its start date stands.
+        try:
+            logged = (
+                ActivityLog.objects.filter(
+                    team_id=self.team_id,
+                    scope="Experiment",
+                    item_id=str(self.id),
+                    activity="updated",
+                    detail__contains={"changes": [{"field": "start_date", "before": None}]},
+                )
+                .order_by("-created_at")
+                .values_list("created_at", flat=True)
+                .first()
+            )
+        except Exception as error:
+            # The start date is a safe fallback, so a failed lookup must not fail the caller.
+            capture_exception(error)
+            return start_date
+        return start_date if logged is None or logged < start_date else logged
+
+    def hours_since_launch(self, at: datetime | None = None, *, read_activity_log: bool) -> float | None:
+        """The hours from `launched_at` to `at`, or to now."""
+        launched_at = self.launched_at(read_activity_log=read_activity_log)
+        if launched_at is None:
+            return None
+        # Counts to now also after the end date.
+        return ((at or timezone.now()) - launched_at).total_seconds() / 3600
+
+    @property
+    def is_paused(self) -> bool:
+        # Pause is not stored on the experiment — it is the running state with the linked flag deactivated.
+        return self.is_running and self.feature_flag_id is not None and not self.feature_flag.active
+
+    @property
+    def is_exposure_frozen(self) -> bool:
+        # Frozen exposure is not stored on the experiment — it is the running state with the linked flag's
+        # release groups narrowed to a static snapshot of the already-exposed cohort. We detect it from the
+        # structured key stamped on each group when the cohort condition was AND'd in — the same predicate
+        # the experiments list endpoint uses.
+        if not self.is_running or self.feature_flag_id is None:
+            return False
+        # Paused takes precedence: a deactivated flag serves no one, so reporting "frozen" would
+        # misdescribe the experiment and hide the pause/resume lifecycle (Resume only renders for
+        # paused). The group stamps survive, so resuming lands back in the frozen state.
+        if not self.feature_flag.active:
+            return False
+        # A freeze stamps v1 release groups, which a rule-linked experiment's flag does not have.
+        if self.is_rule_linked:
+            return False
+        # Enrollment is closed only when EVERY release group is stamped, so that add/edit groups
+        # surfaces as the experiment reverting to "running".
+        return groups_carry_restriction_marker(self.feature_flag.filters or {}, marker_key=EXPOSURE_FROZEN_GROUP_KEY)
+
+    @property
+    def freeze_exposure_blocker(self) -> ExposureFreezeBlocker | None:
+        """Why exposure can't be frozen right now, or None. Single source for the freeze
+        validator's preconditions and the serializer's can_freeze_exposure gate — the service
+        maps each blocker to its user-facing validation message, so the UI gate can't drift
+        from what the validator enforces."""
+        if self.is_draft:
+            return "draft"
+        if self.is_stopped:
+            return "stopped"
+        if self.is_paused:
+            # A paused flag serves no one, so there is no live enrollment to freeze; freezing anyway
+            # would mislabel the (inactive) experiment as "exposure_frozen". Resume first.
+            return "paused"
+        if self.is_exposure_frozen:
+            return "already_frozen"
+        # Guard on the id, not the relation: feature_flag is a non-nullable FK, so accessing
+        # self.feature_flag when it's unset raises RelatedObjectDoesNotExist rather than
+        # returning None. Widened to Optional because django-stubs types the id as int, but an
+        # unsaved in-memory instance can still carry None.
+        feature_flag_id: int | None = self.feature_flag_id
+        if feature_flag_id is None:
+            return "no_flag"
+        if self.feature_flag.deleted:
+            return "flag_deleted"
+        if self.is_rule_linked:
+            return "flag_rule"
+        # The flag-shape preconditions (group aggregation, evaluation order, empty groups) live
+        # flag-side in group_cohort_restriction_blocker. Fail closed rather than freeze partially.
+        flag_blocker = group_cohort_restriction_blocker(self.feature_flag.filters or {})
+        if flag_blocker == "group_aggregation":
+            return flag_blocker
+        # An experiment-level holdout blocks freezing even before the flag filters carry holdout keys.
+        if self.holdout_id is not None or flag_blocker == "holdout":
+            return "holdout"
+        return flag_blocker
+
+    @property
+    def can_freeze_exposure(self) -> bool:
+        return self.freeze_exposure_blocker is None
+
+    @property
+    def computed_status(self) -> "Experiment.Status":
+        if self.is_stopped:
+            return Experiment.Status.STOPPED
+        if self.is_running:
+            return Experiment.Status.RUNNING
+        return Experiment.Status.DRAFT
+
+    @property
+    def status_label(self) -> str:
+        """Public status string (draft/running/paused/exposure_frozen/stopped) — single source for the API
+        serializer and dashboard widgets."""
+        if self.is_exposure_frozen:
+            return "exposure_frozen"
+        if self.is_paused:
+            return "paused"
+        return self.status or self.computed_status.value
+
+    def get_feature_flag_key(self):
+        # Strip the soft-delete tombstone so the API and analytics surface the original
+        # key, matching what the query runners resolve against historical events.
+        return self.feature_flag.key_without_tombstone()
+
+    def get_analytics_metadata(self) -> dict[str, Any]:
+        try:
+            variants = experiment_variants(self)
+        except ExperimentRuleError:
+            # A draft whose rule was removed still reports its lifecycle events.
+            variants = []
+
+        return {
+            "experiment_id": self.id,
+            "experiment_name": self.name,
+            "feature_flag_key": self.get_feature_flag_key(),
+            "type": self.type,
+            "status": self.status or self.computed_status,
+            "metrics_count": len(self.metrics or []),
+            "secondary_metrics_count": len(self.metrics_secondary or []),
+            "saved_metrics_count": self.saved_metrics.count(),
+            "has_description": bool(self.description),
+            "has_conclusion_comment": bool(self.conclusion_comment),
+            "variant_count": len(variants),
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def get_file_system_unfiled(cls, team: "Team", surface: str = DEFAULT_SURFACE) -> QuerySet["Experiment"]:
+        base_qs = cls.objects.filter(team=team).exclude(deleted=True)
+        return cls._filter_unfiled_queryset(base_qs, team, type="experiment", ref_field="id", surface=surface)
+
+    def get_file_system_representation(self) -> FileSystemRepresentation:
+        return FileSystemRepresentation(
+            base_folder=self._get_assigned_folder("Unfiled/Experiments"),
+            type="experiment",  # sync with APIScopeObject in scopes.py
+            ref=str(self.id),
+            name=self.name or "Untitled",
+            href=f"/experiments/{self.id}",
+            meta={
+                "created_at": str(self.created_at),
+                "created_by": self.created_by_id,
+            },
+            should_delete=False,  # always keep in FileSystem
+        )
+
+
+def _live_experiments() -> "QuerySet[Experiment]":
+    """Single source of truth for the `has_experiment` predicate: a flag has a linked
+    experiment iff a non-deleted Experiment row references it. The Rust flags service
+    (rust/feature-flags/src/flags/feature_flag_list.rs) mirrors this in hand-written SQL,
+    so keep the two in lockstep.
+    """
+    return Experiment.objects.filter(deleted=False)
+
+
+def live_experiments_for_flag(feature_flag_id: int) -> "QuerySet[Experiment]":
+    return _live_experiments().filter(feature_flag_id=feature_flag_id)
+
+
+def live_experiment_flag_ids(feature_flag_ids: Collection[int], *, using: str) -> frozenset[int]:
+    """The ids among `feature_flag_ids` that a live experiment uses, read in one query from the database alias
+    `using`. An empty collection returns an empty set without a query."""
+    return frozenset(
+        _live_experiments()
+        .using(using)
+        .filter(feature_flag_id__in=list(feature_flag_ids))
+        .values_list("feature_flag_id", flat=True)
+    )
+
+
+def flag_has_live_experiment(feature_flag_id: int) -> bool:
+    """`live_experiments_for_flag` for one flag."""
+    return live_experiments_for_flag(feature_flag_id).exists()
+
+
+def metric_display_rank(ordered_uuids: Sequence[str] | None) -> Callable[[str], int]:
+    """Sort key over metric uuids in the order the experiment's metrics page lists them, from
+    `primary_metrics_ordered_uuids` / `secondary_metrics_ordered_uuids`.
+
+    Metrics missing from the ordering array rank last rather than vanishing, and share one rank so
+    a stable sort keeps their stored order. Every surface that presents metrics in display order
+    ranks with this, so they cannot disagree on which metric a user put first.
+    """
+    order = {uuid: index for index, uuid in enumerate(ordered_uuids or [])}
+    fallback = len(order)
+    return lambda uuid: order.get(uuid, fallback)
+
+
+def get_experiment_rule(experiment: Experiment) -> ExperimentRuleConfig:
+    """The experiment's normalized rule config — the single home for experiment-to-rule resolution.
+
+    A v1 flag hosting an experiment is one implicit experiment rule, so this reads the
+    whole linked flag through the flag-side derivation.
+
+    A rule-linked experiment reads the one rule that `feature_flag_rule_id` names. Before the
+    launch that is the rule as the flag holds it now. From the launch on it is the snapshot
+    taken then, so results do not change when the rule is edited, replaced or removed. It
+    raises `ExperimentRuleError` when the rule or the snapshot cannot be read, and never falls
+    back to the legacy reading or to the flag's current config.
+    """
+    if not experiment.is_rule_linked:
+        return experiment_rule_from_filters(experiment.feature_flag.filters or {})
+    snapshot = (
+        experiment.feature_flag_rule_snapshot
+        if experiment.is_launched
+        else build_rule_snapshot(experiment.feature_flag, experiment.feature_flag_rule_id)
+    )
+    rule = experiment_rule_from_snapshot(snapshot)
+    if not same_rule_id(rule.rule_id, experiment.feature_flag_rule_id):
+        raise ExperimentRuleError(f"The rule snapshot of experiment {experiment.id} holds another rule")
+    return rule
+
+
+def build_rule_snapshot(feature_flag: Any, rule_id: Any) -> dict[str, Any]:
+    """The snapshot of one experiment rule of a config version 2 flag, as the flag holds it now.
+
+    Raises `ExperimentRuleError` when the flag has no experiment rule with this ID, and
+    `ConfigFormatError` when the flag is not config version 2.
+    """
+    return experiment_rule_snapshot(
+        feature_flag.filters or {},
+        str(rule_id),
+        flag_id=feature_flag.id,
+        flag_key=feature_flag.key_without_tombstone(),
+        flag_version=feature_flag.version,
+    )
+
+
+def experiment_variants(experiment: Experiment) -> list[dict]:
+    """The variants an experiment analyses, as v1 variant dicts (`key`, `rollout_percentage`).
+
+    A legacy experiment reads the flag's variants, as before. A rule-linked experiment reads its
+    rule (see `get_experiment_rule`, which also says when this raises).
+    """
+    if not experiment.is_rule_linked:
+        return experiment.feature_flag.variants
+    return get_experiment_rule(experiment).variants
+
+
+def exposure_flag_key(feature_flag: Any, rule: ExperimentRuleConfig | None) -> str:
+    """The flag key that an experiment's exposure events carry.
+
+    A legacy experiment (`rule` is None) reads the flag's current key, as before. A rule-linked
+    experiment reads the key its rule holds, which from the launch on is the key in the snapshot:
+    a flag renamed later keeps the results it had. Exposures sent under a later key do not count.
+    """
+    if rule is not None and rule.flag_key is not None:
+        return rule.flag_key
+    return feature_flag.key_without_tombstone()
+
+
+LEGACY_METRIC_KINDS: frozenset[str] = frozenset({"ExperimentTrendsQuery", "ExperimentFunnelsQuery"})
+
+
+def experiment_has_legacy_metrics(experiment: "Experiment") -> bool:
+    """Check if experiment uses legacy metric formats."""
+    all_metrics = (experiment.metrics or []) + (experiment.metrics_secondary or [])
+    if any(m.get("kind") in LEGACY_METRIC_KINDS for m in all_metrics):
+        return True
+
+    if experiment.experimenttosavedmetric_set.filter(saved_metric__query__kind__in=LEGACY_METRIC_KINDS).exists():
+        return True
+
+    return False
+
+
+def saved_metric_has_legacy_query(saved_metric: "ExperimentSavedMetric") -> bool:
+    """Check if saved metric uses legacy query format."""
+    return saved_metric.query.get("kind") in LEGACY_METRIC_KINDS if saved_metric.query else False
+
+
+class ExperimentHoldout(ModelActivityMixin, RootTeamMixin, models.Model):
+    name = models.CharField(max_length=400)
+    description = models.CharField(max_length=400, null=True, blank=True)
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+")
+
+    # Filters define the definition of the holdout
+    # This is then replicated across flags for experiments in the holdout
+    filters = models.JSONField(default=list)
+
+    created_by = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "posthog_experimentholdout"
+
+    def save(self, *args: Any, skip_activity_log: bool = False, **kwargs: Any) -> None:
+        if skip_activity_log:
+            # Bypass ModelActivityMixin.save() and call Model.save() directly
+            super(ModelActivityMixin, self).save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)
+
+    @property
+    def exclusion_percentage(self) -> float | None:
+        # Only the first release-condition group's rollout_percentage is denormalized onto
+        # linked flags as the holdout's exclusion percentage (see the holdout API help text).
+        return self.filters[0]["rollout_percentage"] if self.filters else None
+
+
+class ExperimentSavedMetric(Taggable, ModelActivityMixin, RootTeamMixin, models.Model):
+    name = models.CharField(max_length=400)
+    description = models.CharField(max_length=400, null=True, blank=True)
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+")
+
+    query = models.JSONField()
+
+    # Metadata for the saved metric
+    # has things like if this metric was migrated from a legacy metric
+    metadata = models.JSONField(null=True, blank=True, default=dict)
+
+    created_by = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "posthog_experimentsavedmetric"
+
+
+class ExperimentToSavedMetric(ModelActivityMixin, models.Model):
+    activity_logging_on_delete = True
+
+    experiment = models.ForeignKey("Experiment", on_delete=models.CASCADE)
+    saved_metric = models.ForeignKey("ExperimentSavedMetric", on_delete=models.CASCADE)
+
+    # Metadata for the saved metric at the time of the experiment creation
+    # has stuff like whether this metric is primary, it has breakdowns,
+    # and any other information we need for the metric, other than the query.
+    metadata = models.JSONField(default=dict)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "posthog_experimenttosavedmetric"
+
+    def __str__(self):
+        return f"{self.experiment.name} - {self.saved_metric.name} - {self.metadata}"
+
+
+class ExperimentMetricResult(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+
+    experiment = models.ForeignKey("Experiment", on_delete=models.CASCADE)
+    metric_uuid = models.CharField(max_length=255)
+    fingerprint = models.CharField(max_length=64, null=True, blank=True)  # SHA256 hash is 64 chars
+    # The version 1 key of the calculation config the row was computed from, salted like `fingerprint` on a
+    # recalculation row. It hashes only inputs the experiment owns, so the chart still shows the row after a team
+    # setting moves `fingerprint` away from the current key. No reuse check reads it.
+    display_key = models.CharField(max_length=64, null=True, blank=True)
+    query_from = models.DateTimeField()
+    query_to = models.DateTimeField()
+    status = models.CharField(max_length=20, choices=Status, default=Status.PENDING)
+    result = models.JSONField(null=True, blank=True, default=None)
+    query_id = models.CharField(max_length=255, null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    error_message = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ["experiment", "metric_uuid", "query_to"]
+        indexes = [
+            models.Index(fields=["experiment", "metric_uuid", "query_to"]),
+        ]
+        db_table = "posthog_experimentmetricresult"
+
+    def __str__(self):
+        return f"ExperimentMetricResult({self.experiment_id}, {self.metric_uuid}, {self.query_from}, {self.status})"
+
+
+class ExperimentTimeseriesRecalculation(UUIDModel):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        IN_PROGRESS = "in_progress", "In Progress"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+        CANCELED = "canceled", "Canceled"
+
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+")
+    experiment = models.ForeignKey("Experiment", on_delete=models.CASCADE)
+    metric = models.JSONField()
+    fingerprint = models.CharField(max_length=64)  # SHA256 hash
+
+    status = models.CharField(max_length=20, choices=Status, default=Status.PENDING)
+    last_successful_date = models.DateField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["status"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                models.F("experiment"),
+                KeyTextTransform("uuid", "metric"),
+                models.F("fingerprint"),
+                condition=models.Q(status__in=["pending", "in_progress"]),
+                name="unique_active_backfill_per_metric_key",
+            ),
+        ]
+        db_table = "posthog_experimenttimeseriesrecalculation"
+
+    def __str__(self):
+        metric_uuid = self.metric.get("uuid", "unknown")
+        return f"ExperimentTimeseriesRecalculation(exp={self.experiment_id}, metric={metric_uuid}, fingerprint={self.fingerprint}, status={self.status})"
+
+
+class ExperimentMetricsRecalculation(TeamScopedRootMixin, UUIDModel):
+    """Tracks batch recalculation of all metrics for an experiment.
+
+    The primary key (`id`, a uuid7 from UUIDModel) is the recalculation_id passed to the recalculation workflow.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        IN_PROGRESS = "in_progress", "In Progress"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+
+    class Trigger(models.TextChoices):
+        MANUAL = "manual", "Manual"
+        AGENT_MCP = "agent_mcp", "Agent (MCP)"
+        COLD_RUN = "cold_run", "Cold Run"
+        # The frontend refreshes results on page load when they stop more than its staleness threshold before the
+        # window end, which is now for a running experiment and the end date for a stopped one. Advances the window to
+        # that end, so every metric recomputes.
+        STALE_REFRESH = "stale_refresh", "Stale Refresh"
+        # Deprecated: feature no longer available.
+        AUTO_REFRESH = "auto_refresh", "Auto Refresh"
+        # Experiment-scoped change (start/end date, excluded variants, exposure criteria): advances the
+        # window to now, so every metric recomputes.
+        EXPERIMENT_CONFIG_CHANGE = "experiment_config_change", "Experiment Config Change"
+        # Metric-scoped change (add metric, breakdown add/remove/attribution/limit): reuses the latest
+        # completed window, so unchanged metrics load from cache and only new or changed metrics recompute.
+        METRIC_CONFIG_CHANGE = "metric_config_change", "Metric Config Change"
+        # A user retries the failed metrics of the latest run: reuses its window, so the metrics that already
+        # have rows load from cache and only the failed ones recompute.
+        MANUAL_RETRY = "manual_retry", "Manual Retry"
+        # The frontend fills a gap it found in the latest run on page load (a metric with no row, or one
+        # added after the run finished). Same window reuse as MANUAL_RETRY; kept separate so analytics can
+        # tell a user action from an automatic heal.
+        HEAL_LATEST_RUN = "heal_latest_run", "Heal Latest Run"
+        # Deprecated: never emitted, retained for old rows.
+        CONFIG_CHANGE = "config_change", "Config Change"
+        EXPERIMENT_LAUNCH = "experiment_launch", "Experiment Launch"
+        EXPERIMENT_STOP = "experiment_stop", "Experiment Stop"
+        EXPERIMENT_UPDATE = "experiment_update", "Experiment Update"
+        # Written by the daily timeseries workflow, not by a user: a completed run assembled from the
+        # timeseries points of one daily run, so the latest read serves fresh data without a recompute.
+        TIMESERIES_SYNC = "timeseries_sync", "Timeseries Sync"
+        # Written by the scheduled recalculation workflow, not by a user: advances the window to now
+        # so every metric recomputes on fresh data.
+        SCHEDULED = "scheduled", "Scheduled"
+
+    class RequestTrigger(models.TextChoices):
+        """The subset of Trigger a client may send on POST. Each value must also exist on Trigger.
+
+        The rest are set server side: agent_mcp by the view from the client header, timeseries_sync and
+        scheduled by their workflows. auto_refresh and the deprecated values have no sender.
+        """
+
+        MANUAL = "manual", "Manual"
+        MANUAL_RETRY = "manual_retry", "Manual Retry"
+        COLD_RUN = "cold_run", "Cold Run"
+        STALE_REFRESH = "stale_refresh", "Stale Refresh"
+        HEAL_LATEST_RUN = "heal_latest_run", "Heal Latest Run"
+        EXPERIMENT_CONFIG_CHANGE = "experiment_config_change", "Experiment Config Change"
+        METRIC_CONFIG_CHANGE = "metric_config_change", "Metric Config Change"
+
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+")
+    experiment = models.ForeignKey("Experiment", on_delete=models.CASCADE)
+
+    status = models.CharField(max_length=20, choices=Status, default=Status.PENDING)
+    total_metrics = models.PositiveIntegerField(default=0)
+
+    metric_errors = models.JSONField(default=dict)
+    metric_retries = models.JSONField(default=dict)
+    metric_uuids = models.JSONField(default=list)
+
+    query_to = models.DateTimeField(null=True, blank=True)
+
+    trigger = models.CharField(max_length=30, choices=Trigger, default=Trigger.MANUAL)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["experiment", "status"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["experiment"],
+                condition=models.Q(status__in=["pending", "in_progress"]),
+                name="unique_active_metrics_recalculation_per_experiment",
+            ),
+        ]
+        db_table = "posthog_experimentmetricsrecalculation"
+
+    def __str__(self):
+        return f"ExperimentMetricsRecalculation(exp={self.experiment_id}, status={self.status}, total={self.total_metrics})"

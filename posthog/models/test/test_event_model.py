@@ -1,0 +1,638 @@
+import re
+from uuid import uuid4
+
+from posthog.test.base import BaseTest, ClickhouseTestMixin
+
+from django.test import SimpleTestCase, override_settings
+
+from parameterized import parameterized
+
+from posthog.clickhouse.client import sync_execute
+from posthog.models import Element
+from posthog.models.element.element import elements_to_string
+from posthog.models.event import MAX_SELECTOR_LENGTH, Selector, SelectorTooLongError
+from posthog.models.event.event import _find_attribute_selectors, _split_classes
+from posthog.models.event.util import bulk_create_events, create_event, events_only_in_active_schema
+from posthog.models.property.util import build_selector_regex
+from posthog.test.test_journeys import journeys_for
+
+REFERENCE_ATTRIBUTE_REGEX = r"\[\s*([^\]\s=]+)\s*=\s*(['\"])(.*?)\2\s*\]"
+REFERENCE_CLASS_SPLIT_REGEX = r"\.(?![^\[]*\])"
+
+
+class TestSelectors(SimpleTestCase):
+    def test_selector_splitting(self):
+        selector1 = Selector("div > span > a")
+        selector2 = Selector("div span > a")
+        selector3 = Selector("div span a")
+        selector4 = Selector("div > span a")
+
+        self.assertEqual(len(selector1.parts), 3)
+        self.assertEqual(len(selector2.parts), 3)
+        self.assertEqual(len(selector3.parts), 3)
+        self.assertEqual(len(selector4.parts), 3)
+
+    def test_selector_child(self):
+        selector1 = Selector("div span")
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "span"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+        self.assertEqual(selector1.parts[1].data, {"tag_name": "div"})
+        self.assertEqual(selector1.parts[1].direct_descendant, False)
+        self.assertEqual(selector1.parts[1].unique_order, 0)
+
+    def test_selector_child_direct_descendant(self):
+        selector1 = Selector("div > span")
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "span"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+        self.assertEqual(selector1.parts[1].data, {"tag_name": "div"})
+        self.assertEqual(selector1.parts[1].direct_descendant, True)
+        self.assertEqual(selector1.parts[1].unique_order, 0)
+
+    def test_selector_attribute(self):
+        selector1 = Selector('div[data-id="5"] > span')
+
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "span"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+        self.assertEqual(
+            selector1.parts[1].data,
+            {"tag_name": "div", "attributes__attr__data-id": "5"},
+        )
+        self.assertEqual(selector1.parts[1].direct_descendant, True)
+        self.assertEqual(selector1.parts[1].unique_order, 0)
+
+    def test_selector_id(self):
+        selector1 = Selector('[id="5"] > span')
+
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "span"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+        self.assertEqual(selector1.parts[1].data, {"attr_id": "5"})
+        self.assertEqual(selector1.parts[1].direct_descendant, True)
+        self.assertEqual(selector1.parts[1].unique_order, 0)
+
+    def test_selector_attribute_with_spaces(self):
+        selector1 = Selector('  [data-id="foo bar]"]  ')
+
+        self.assertEqual(selector1.parts[0].data, {"attributes__attr__data-id": "foo bar]"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+    def test_selector_with_spaces(self):
+        selector1 = Selector("span    ")
+
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "span"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+    def test_class(self):
+        selector1 = Selector("div.classone.classtwo > span")
+
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "span"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+        self.assertEqual(
+            selector1.parts[1].data,
+            {"tag_name": "div", "attr_class__contains": ["classone", "classtwo"]},
+        )
+        self.assertEqual(selector1.parts[1].direct_descendant, True)
+        self.assertEqual(selector1.parts[1].unique_order, 0)
+
+    def test_nth_child(self):
+        selector1 = Selector("div > span:nth-child(3)")
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "span", "nth_child": "3"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+        self.assertEqual(selector1.parts[1].data, {"tag_name": "div"})
+        self.assertEqual(selector1.parts[1].direct_descendant, True)
+        self.assertEqual(selector1.parts[1].unique_order, 0)
+
+    @parameterized.expand(
+        [
+            (
+                "a class name that contains the pseudo-class text",
+                "div.foo-nth-child(2)",
+                [{"tag_name": "div", "attr_class__contains": ["foo-nth-child(2)"]}],
+            ),
+            ("the pseudo-class text with no colon", "nth-child(2)", [{"tag_name": "nth-child(2)"}]),
+        ]
+    )
+    def test_nth_child_without_a_colon_is_not_a_positional_selector(self, _name, selector, expected):
+        self.assertEqual([part.data for part in Selector(selector).parts], expected)
+
+    def test_unique_order(self):
+        selector1 = Selector("div > div")
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "div"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+        self.assertEqual(selector1.parts[1].data, {"tag_name": "div"})
+        self.assertEqual(selector1.parts[1].direct_descendant, True)
+        self.assertEqual(selector1.parts[1].unique_order, 1)
+
+    def test_asterisk_in_query(self):
+        # Sometimes people randomly add * but they don't do very much, so just remove them
+        selector1 = Selector("div > *")
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "div"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+        self.assertEqual(len(selector1.parts), 1)
+
+    def test_asterisk_in_middle_of_query(self):
+        selector1 = Selector("div > * > div")
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "div"})
+        self.assertEqual(selector1.parts[0].direct_descendant, False)
+        self.assertEqual(selector1.parts[0].unique_order, 0)
+
+        self.assertEqual(selector1.parts[1].data, {"tag_name": "div"})
+        self.assertEqual(selector1.parts[1].direct_descendant, False)
+        self.assertEqual(selector1.parts[1].unique_order, 1)
+
+    def test_slash_colon(self):
+        # Make sure we strip these for full text search to work in the database
+        selector1 = Selector("div#root\\:id")
+        self.assertEqual(selector1.parts[0].data, {"tag_name": "div", "attr_id": "root:id"})
+
+    def test_class_before_attribute(self):
+        # A class that precedes an attribute selector must not be captured as the tag name
+        selector1 = Selector('.btn[ng-disabled="true"]')
+        self.assertEqual(
+            selector1.parts[0].data,
+            {"attr_class__contains": ["btn"], "attributes__attr__ng-disabled": "true"},
+        )
+
+    def test_multiple_attributes(self):
+        selector1 = Selector('[type="button"][ng-click="save()"]')
+        self.assertEqual(
+            selector1.parts[0].data,
+            {"attributes__attr__type": "button", "attributes__attr__ng-click": "save()"},
+        )
+
+    @parameterized.expand(
+        [
+            ("open_brackets", "[" * MAX_SELECTOR_LENGTH, 1, {"tag_name": "[" * MAX_SELECTOR_LENGTH}),
+            (
+                "unclosed_attribute_values",
+                "[a='" * (MAX_SELECTOR_LENGTH // 4),
+                1,
+                {"tag_name": "[a='" * (MAX_SELECTOR_LENGTH // 4)},
+            ),
+            ("unclosed_keys", "[a" * (MAX_SELECTOR_LENGTH // 2), 1, {"tag_name": "[a" * (MAX_SELECTOR_LENGTH // 2)}),
+            (
+                "dots_without_brackets",
+                "a" + "." * (MAX_SELECTOR_LENGTH - 1),
+                1,
+                {"tag_name": "a", "attr_class__contains": [""] * (MAX_SELECTOR_LENGTH - 1)},
+            ),
+            ("many_attributes", "[a='b']" * (MAX_SELECTOR_LENGTH // 7), 1, {"attributes__attr__a": "b"}),
+            ("many_parts", "a " * (MAX_SELECTOR_LENGTH // 2), MAX_SELECTOR_LENGTH // 2, {"tag_name": "a"}),
+        ]
+    )
+    def test_max_length_selector_parses(self, _name, selector, part_count, first_part_data):
+        parsed = Selector(selector, escape_slashes=False)
+        self.assertEqual(len(parsed.parts), part_count)
+        self.assertEqual(parsed.parts[0].data, first_part_data)
+        build_selector_regex(parsed)
+
+    def test_attribute_parser_matches_reference_regex(self):
+        selectors = [
+            '[data-id="foo bar]"]',
+            "[[a='b']",
+            "[a = 'x' ] [b='y\\'z']",
+            "[a='x' y']",
+            "div[a='1'][b=\"2\"].c:nth-child(2)",
+            "[a='[b=\"c\"]']",
+            "[a='unclosed",
+            "[='x']",
+            "[title='first\nsecond']",
+            "[a='x\n'][b='y']",
+            "[a='x'\n]",
+            "[\x1ca\xa0=\u3000'x'\x85]",
+            "[a\u200bb='x']",
+            "[a='\ud800'][b=\"\udfff\"]",
+        ]
+        for selector in selectors:
+            expected = [
+                (m.start(), m.end(), m.group(1), m.group(3)) for m in re.finditer(REFERENCE_ATTRIBUTE_REGEX, selector)
+            ]
+            actual = [(m.start, m.end, m.key, m.value) for m in _find_attribute_selectors(selector)]
+            self.assertEqual(actual, expected, selector)
+
+    def test_class_split_matches_reference_regex(self):
+        for tag in [
+            "div.a.b",
+            "div.shadow-[0_4px_6px_rgba(0,0,0,0.1)].text-blue-500",
+            "a.b]c.d[e.f",
+            ".",
+            "a[.]b.c",
+            "a.b\n]c.d",
+            "",
+            ".a.",
+            "a.[[b.c]",
+            "]]..[[",
+            "\ud800.a",
+        ]:
+            self.assertEqual(_split_classes(tag), re.split(REFERENCE_CLASS_SPLIT_REGEX, tag), tag)
+
+    def test_selector_length_is_capped(self):
+        Selector("a" * MAX_SELECTOR_LENGTH)
+        with self.assertRaises(SelectorTooLongError):
+            Selector("a" * (MAX_SELECTOR_LENGTH + 1))
+
+
+class TestSelectorRegexMatching(SimpleTestCase):
+    @parameterized.expand(
+        [
+            (
+                "a sibling class the selector does not name can carry any character",
+                ".flex",
+                [Element(tag_name="div", attr_class=["flex", "w-1/2", "!mt-0", "hover:bg-blue-500/75"])],
+                True,
+            ),
+            (
+                "a target class can carry slashes and bangs",
+                ".bg-yellow/50",
+                [Element(tag_name="div", attr_class=["bg-yellow/50"])],
+                True,
+            ),
+            (
+                "a tailwind arbitrary-value target class",
+                ".max-w-[1045px]",
+                [Element(tag_name="div", attr_class=["max-w-[1045px]"])],
+                True,
+            ),
+            (
+                "an attribute value with a pre-escaped quote",
+                'div[title="say \\"hi\\""]',
+                [Element(tag_name="div", attributes={"attr__title": 'say "hi"'})],
+                True,
+            ),
+            (
+                "a single-quoted attribute value containing double quotes",
+                "div[title='say \"hi\"']",
+                [Element(tag_name="div", attributes={"attr__title": 'say "hi"'})],
+                True,
+            ),
+            (
+                "a neighboring attribute value containing a quote",
+                'div[title="hi"]',
+                [Element(tag_name="div", attributes={"attr__data-x": 'a"b', "attr__title": "hi"})],
+                True,
+            ),
+            (
+                "a semicolon inside an attribute value stays inside the element",
+                'input[type="text"]',
+                [
+                    Element(
+                        tag_name="input", attributes={"attr__style": "display: flex; gap: 4px", "attr__type": "text"}
+                    )
+                ],
+                True,
+            ),
+            (
+                "two attributes with others between them, in any order",
+                '[type="button"][ng-click="continue()"]',
+                [
+                    Element(
+                        tag_name="button",
+                        attributes={
+                            "attr__type": "button",
+                            "attr__ng-disabled": "busy",
+                            "attr__ng-click": "continue()",
+                        },
+                    )
+                ],
+                True,
+            ),
+            (
+                "two attributes in single quotes after a tag",
+                "button[type='button'][data-x='a']",
+                [Element(tag_name="button", attributes={"attr__data-x": "a", "attr__type": "button"})],
+                True,
+            ),
+            (
+                "two attributes on different elements",
+                '[type="button"][ng-click="continue()"]',
+                [
+                    Element(tag_name="button", attributes={"attr__type": "button"}),
+                    Element(tag_name="div", attributes={"attr__ng-click": "continue()"}),
+                ],
+                False,
+            ),
+            (
+                "a tag and its two attributes on different elements",
+                "button[type='button'][data-x='a']",
+                [
+                    Element(tag_name="button"),
+                    Element(tag_name="div", attributes={"attr__data-x": "a", "attr__type": "button"}),
+                ],
+                False,
+            ),
+            (
+                "a tag and a class on different elements",
+                'button.btn[type="submit"]',
+                [
+                    Element(tag_name="button"),
+                    Element(tag_name="div", attr_class=["btn"], attributes={"attr__type": "submit"}),
+                ],
+                False,
+            ),
+            (
+                "two attributes followed by a class the element does not have",
+                'button[type="button"][data-x="a"].active',
+                [Element(tag_name="button", attributes={"attr__data-x": "a", "attr__type": "button"})],
+                False,
+            ),
+            (
+                "the same attribute with two different values",
+                '[data-x="a"][data-x="b"]',
+                [Element(tag_name="div", attributes={"attr__data-x": "b"})],
+                False,
+            ),
+            (
+                "the same id attribute with two different values",
+                '[id="a"][id="b"]',
+                [Element(tag_name="div", attr_id="b")],
+                False,
+            ),
+            (
+                "an id and an id attribute with different values",
+                '#a[id="b"]',
+                [Element(tag_name="div", attr_id="a")],
+                False,
+            ),
+            (
+                "the same position with two different values",
+                "li:nth-child(1):nth-child(2)",
+                [Element(tag_name="li", nth_child=2)],
+                False,
+            ),
+            (
+                "two attributes with an escaped quote in a value",
+                "[title='it\\'s'][data-x='a']",
+                [Element(tag_name="div", attributes={"attr__data-x": "a", "attr__title": "it's"})],
+                True,
+            ),
+            (
+                "two attribute names that only match the end of longer names",
+                'button[foo="1"][bar="2"]',
+                [Element(tag_name="button", attributes={"attr__data-bar": "2", "attr__data-foo": "1"})],
+                False,
+            ),
+            (
+                "one attribute name that matches the end of a longer name",
+                'button[label="Save"]',
+                [Element(tag_name="button", attributes={"attr__aria-label": "Save"})],
+                True,
+            ),
+            (
+                "two attributes after a tag and a position",
+                'button:nth-child(2)[type="button"][data-x="a"]',
+                [Element(tag_name="button", nth_child=2, attributes={"attr__data-x": "a", "attr__type": "button"})],
+                True,
+            ),
+            (
+                "two attributes after a tag and a position the element does not have",
+                'button:nth-child(2)[type="button"][data-x="a"]',
+                [Element(tag_name="div", nth_child=1, attributes={"attr__data-x": "a", "attr__type": "button"})],
+                False,
+            ),
+            (
+                "an attribute value with nested quotes and an equals sign",
+                "[ng-class=\"{'selected': data.raising_for=='myself'}\"]",
+                [Element(tag_name="div", attributes={"attr__ng-class": "{'selected': data.raising_for=='myself'}"})],
+                True,
+            ),
+            (
+                "attribute value mismatch",
+                'div[title="hi"]',
+                [Element(tag_name="div", attributes={"attr__title": "bye"})],
+                False,
+            ),
+            (
+                "class not on the element",
+                ".flex",
+                [Element(tag_name="div", attr_class=["lex"])],
+                False,
+            ),
+            (
+                "direct child combinator still matches parent and child",
+                "a > b",
+                [Element(tag_name="b"), Element(tag_name="a")],
+                True,
+            ),
+            (
+                "descendant combinator still matches parent and child",
+                "a b",
+                [Element(tag_name="b"), Element(tag_name="a")],
+                True,
+            ),
+            (
+                "direct child combinator does not match the reversed order",
+                "a > b",
+                [Element(tag_name="a"), Element(tag_name="b")],
+                False,
+            ),
+            (
+                "a descendant part does not match text inside another element",
+                "form button.btn",
+                [
+                    Element(tag_name="button", attr_class=["btn"]),
+                    Element(tag_name="a", href="/form-signup"),
+                ],
+                False,
+            ),
+            (
+                "class and attribute have to land on the same element",
+                '.btn[ng-disabled="true"]',
+                [
+                    Element(tag_name="span", attr_class=["btn"]),
+                    Element(tag_name="div", attributes={"attr__ng-disabled": "true"}),
+                ],
+                False,
+            ),
+            (
+                "nth-child and nth-of-type together",
+                "button.btn:nth-child(3):nth-of-type(1)",
+                [Element(tag_name="button", attr_class=["btn"], nth_child=3, nth_of_type=1)],
+                True,
+            ),
+            (
+                "an id alongside an attribute the chain sorts before it",
+                '#submit[type="button"]',
+                [Element(tag_name="button", attr_id="submit", attributes={"attr__type": "button"})],
+                True,
+            ),
+        ]
+    )
+    def test_selector_matches_elements_chain(self, _name, selector, elements, expected):
+        regex = build_selector_regex(Selector(selector, escape_slashes=False))
+        self.assertEqual(bool(re.search(regex, elements_to_string(elements))), expected)
+
+    @parameterized.expand(
+        [
+            ("pseudo-class after a class", ".btn:hover", True),
+            ("pseudo-class after a tag", "button:hover", True),
+            ("attribute operator", '[href^="http"]', True),
+            ("tailwind variant, which is a real class", ".hover:bg-blue", False),
+            ("class named after a pseudo-class, with no colon to make it one", ".active", False),
+            ("tailwind arbitrary value", ".sm:[max-width:640px]", False),
+            ("universal selector, which the compiler supports", "*", False),
+        ]
+    )
+    def test_unsupported_syntax_detection(self, _name, selector, expected):
+        self.assertEqual(Selector(selector, escape_slashes=False).has_unsupported_syntax(), expected)
+
+
+class TestSelectorRegexMonotonicity(SimpleTestCase):
+    SELECTORS = [
+        ".flex",
+        ".class",
+        ".bg-yellow/50",
+        ".!ml-auto",
+        ".max-w-[1045px]",
+        "div",
+        "a > b",
+        "a b",
+        'div[title="say \\"hi\\""]',
+        "div[title='say \"hi\"']",
+        'a[href="/pricing"]',
+        '[id="submit"]',
+        "button.btn:nth-child(3)",
+    ]
+
+    ELEMENT_CHAINS = [
+        [Element(tag_name="div", attr_class=["flex", "w-1/2"])],
+        [Element(tag_name="div", attr_class=["bg-yellow/50", "!ml-auto"])],
+        [Element(tag_name="div", attr_class=["max-w-[1045px]", "shadow-[0_4px_6px_rgba(0,0,0,0.1)]"])],
+        [Element(tag_name="div", attr_class=["class"], attributes={"attr__title": 'say "hi"'})],
+        [Element(tag_name="input", attributes={"attr__style": "display: flex; gap: 4px", "attr__type": "text"})],
+        [Element(tag_name="b"), Element(tag_name="a")],
+        [Element(tag_name="b"), Element(tag_name="div"), Element(tag_name="a")],
+        [Element(tag_name="a", href="/pricing", attr_class=["px-2", "hover:underline"])],
+        [Element(tag_name="button", attr_class=["btn"], nth_child=3), Element(tag_name="form")],
+        [Element(tag_name="button", attr_id="submit", attributes={"attr__type": "button"})],
+        # an attribute value that itself looks like a class followed by more text,
+        # which the old tail could wander into
+        [Element(tag_name="span", attributes={"attr__title": "x.class y"})],
+    ]
+
+    @staticmethod
+    def _pre_fix_build_selector_regex(selector: Selector) -> str:
+        # Frozen copy of build_selector_regex from before the tail and
+        # quote-escaping fix, kept to prove the fix only widens matching.
+        regex = r""
+        for tag in selector.parts:
+            if tag.data.get("tag_name") and isinstance(tag.data["tag_name"], str) and tag.data["tag_name"] != "*":
+                regex += re.escape(tag.data["tag_name"])
+            if tag.data.get("attr_class__contains"):
+                regex += r".*?\." + r"\..*?".join([re.escape(s) for s in sorted(tag.data["attr_class__contains"])])
+            if tag.ch_attributes:
+                regex += r".*?"
+                for key, value in sorted(tag.ch_attributes.items()):
+                    regex += rf'{re.escape(key)}="{re.escape(str(value))}".*?'
+            regex += r'([-_a-zA-Z0-9\.:"= \[\]\(\),]*?)?($|;|:([^;^\s]*(;|$|\s)))'
+            if tag.direct_descendant:
+                regex += r".*"
+        return r"(^|;)" + regex if regex else r""
+
+    # The tail widening only adds matches, with one deliberate exception: the old
+    # tail ran past a quote and found a class name inside an attribute value, on an
+    # element that carries no such class. Element-confined matching drops that.
+    INTENDED_NARROWING = (".class", 'span:attr__title="x.class y"nth-child="0"nth-of-type="0"')
+
+    def test_fix_widens_matching_except_inside_quoted_values(self):
+        chains = [elements_to_string(elements) for elements in self.ELEMENT_CHAINS]
+        newly_matching_pairs = 0
+        narrowing_seen = False
+        for selector_string in self.SELECTORS:
+            selector = Selector(selector_string, escape_slashes=False)
+            old_regex = self._pre_fix_build_selector_regex(selector)
+            new_regex = build_selector_regex(selector)
+            for chain in chains:
+                old_match = bool(re.search(old_regex, chain))
+                new_match = bool(re.search(new_regex, chain))
+                with self.subTest(selector=selector_string, chain=chain):
+                    if (selector_string, chain) == self.INTENDED_NARROWING:
+                        narrowing_seen = True
+                        self.assertTrue(old_match)
+                        self.assertFalse(new_match)
+                    elif old_match:
+                        self.assertTrue(new_match)
+                if new_match and not old_match:
+                    newly_matching_pairs += 1
+        # the corpus has to exercise the widening, or the superset check is vacuous
+        self.assertGreater(newly_matching_pairs, 0)
+        # and it has to still reach the narrowing, or that assertion is skipped silently
+        self.assertTrue(narrowing_seen)
+
+
+@override_settings(CLICKHOUSE_HOGQL_USE_NEW_EVENTS_SCHEMA=True)
+class TestNativeEventInserts(ClickhouseTestMixin, BaseTest):
+    @parameterized.expand(["bulk", "single"])
+    def test_native_only_scope_restores_dual_writes(self, insertion: str) -> None:
+        def insert(event: str) -> None:
+            if insertion == "bulk":
+                bulk_create_events([{"team": self.team, "event": event, "distinct_id": "test"}])
+            else:
+                create_event(event_uuid=uuid4(), team=self.team, event=event, distinct_id="test")
+
+        with self.assertRaisesRegex(ValueError, "fixture failed"):
+            with events_only_in_active_schema():
+                with events_only_in_active_schema():
+                    insert("nested")
+                insert("outer")
+                raise ValueError("fixture failed")
+
+        insert("after")
+
+        self.assertEqual(
+            sync_execute(
+                "SELECT event FROM events WHERE team_id = %(team_id)s ORDER BY event", {"team_id": self.team.pk}
+            ),
+            [("after",)],
+        )
+        self.assertEqual(
+            sync_execute(
+                "SELECT event FROM events_json WHERE team_id = %(team_id)s ORDER BY event", {"team_id": self.team.pk}
+            ),
+            [("after",), ("nested",), ("outer",)],
+        )
+
+    @parameterized.expand(["bulk", "single", "journey"])
+    def test_properties_follow_ingestion_cleanup(self, insertion: str) -> None:
+        properties = {
+            "$feature/enabled": True,
+            "$feature/disabled": False,
+            "$feature_flags": {"existing": "control"},
+            "$sdk_debug_replay_internal_buffer_length": 0,
+        }
+        if insertion == "journey":
+            journeys_for({"test": [{"event": "test", "properties": properties}]}, self.team)
+        elif insertion == "bulk":
+            bulk_create_events([{"team": self.team, "event": "test", "distinct_id": "test", "properties": properties}])
+        else:
+            create_event(event_uuid=uuid4(), team=self.team, event="test", distinct_id="test", properties=properties)
+
+        result = sync_execute(
+            "SELECT properties.`$feature_flags`, "
+            "toJSONString(temporary_properties.`$sdk_debug_replay_internal_buffer_length`), "
+            "isNull(properties.`$sdk_debug_replay_internal_buffer_length`) "
+            "FROM events_json WHERE team_id = %(team_id)s",
+            {"team_id": self.team.pk},
+        )
+        assert result == [
+            (
+                {"disabled": "false", "enabled": "true", "existing": "control"},
+                "0",
+                1,
+            )
+        ]

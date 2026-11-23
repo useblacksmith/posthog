@@ -1,0 +1,15 @@
+.PlayerMeta {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow: hidden;
+
+    .Link {
+        color: var(--text-3000);
+
+        &:hover {
+            color: var(--color-accent);
+        }
+    }
+}

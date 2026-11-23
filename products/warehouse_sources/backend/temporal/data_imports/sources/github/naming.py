@@ -1,0 +1,138 @@
+"""Repo-qualified schema naming for the multi-repo GitHub source.
+
+Multi-repo sources name their schema rows `owner/repo.endpoint` (e.g. `posthog/posthog.issues`),
+mirroring the SQL sources' `schema.table` qualified naming. The persisted
+`sync_type_config.schema_metadata` (`source_repository` / `source_endpoint`) is the authoritative
+source of a row's location — repo names may themselves contain dots, so name parsing is only a
+fallback and always matches against the known endpoint catalog rather than splitting blindly.
+Legacy single-repo sources keep bare endpoint names (`issues`); those resolve to the config's
+`repository` field.
+"""
+
+import re
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
+
+from products.warehouse_sources.backend.temporal.data_imports.sources.github.settings import ENDPOINTS
+
+if TYPE_CHECKING:
+    from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.github import (
+        GithubSourceConfig,
+    )
+
+SCHEMA_METADATA_REPOSITORY_KEY = "source_repository"
+SCHEMA_METADATA_ENDPOINT_KEY = "source_endpoint"
+
+# Longest first so `pull_requests` wins over any shorter overlapping endpoint name.
+_ENDPOINT_SUFFIXES = sorted(ENDPOINTS, key=lambda name: len(name), reverse=True)
+
+
+# GitHub hosts whose URLs name a repository the API can serve.
+_GITHUB_URL_HOSTS = ("github.com", "www.github.com")
+
+# The scp-style clone URL (`git@github.com:owner/repo.git`), which has no scheme for urlsplit to read.
+_GITHUB_SCP_URL = re.compile(r"^(?:ssh://)?git@github\.com[:/](?P<path>.+)$", re.IGNORECASE)
+
+
+def _strip_git_suffix(name: str) -> str:
+    # GitHub rejects a repository name ending in `.git`, so any casing of that suffix belongs to
+    # the clone URL rather than to the name.
+    return name[: -len(".git")] if name.lower().endswith(".git") else name
+
+
+def normalize_repository(repository: str) -> str:
+    """`owner/repo` when the value is a GitHub URL, the stripped input without a `.git` suffix otherwise.
+
+    A clone URL, a browser URL and a bare `github.com/owner/repo` all name the repository as
+    unambiguously as `owner/repo` does, so read them rather than rejecting input whose meaning
+    is clear."""
+    value = repository.strip()
+    scp_match = _GITHUB_SCP_URL.match(value)
+    if scp_match:
+        path = scp_match.group("path")
+    elif "://" in value or value.lower().startswith(tuple(f"{host}/" for host in _GITHUB_URL_HOSTS)):
+        parsed = urlsplit(value if "://" in value else f"https://{value}")
+        if (parsed.hostname or "").lower() not in _GITHUB_URL_HOSTS:
+            return value
+        path = parsed.path
+    else:
+        return _strip_git_suffix(value) or value
+
+    # Anything past owner/repo is a browser URL's view of the repo (/tree/main, /issues), not part
+    # of its name.
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return value
+    owner, repo = parts[0], _strip_git_suffix(parts[1])
+    if not repo:
+        return value
+    return f"{owner}/{repo}"
+
+
+def qualified_schema_name(repository: str, endpoint: str) -> str:
+    return f"{repository}.{endpoint}"
+
+
+def split_schema_name(schema_name: str) -> tuple[str | None, str]:
+    """`(repository | None, endpoint)` for a schema row name.
+
+    Matches the longest known endpoint suffix (`.endswith(".issues")` etc.) so repo names
+    containing dots parse deterministically. Bare or unrecognized names return them unchanged
+    with no repository.
+    """
+    for endpoint in _ENDPOINT_SUFFIXES:
+        if schema_name.endswith(f".{endpoint}"):
+            repository = schema_name[: -(len(endpoint) + 1)]
+            if repository:
+                return repository, endpoint
+    return None, schema_name
+
+
+def schema_repo_endpoint(
+    schema_metadata: dict[str, Any] | None,
+    schema_name: str,
+    legacy_repository: str | None,
+) -> tuple[str | None, str]:
+    """Config-free `(repository | None, endpoint)` for a schema row: metadata first,
+    qualified-name parse second, `legacy_repository` for bare rows last.
+
+    Repository is `None` only for a bare row with no legacy repo to attribute it to. Repo
+    names are normalized (stripped, lowercased) since GitHub full names are case-insensitive
+    and the repo half of schema names and webhook keys must compare stably. Shared by the
+    sync-side resolver here and cross-product readers (engineering_analytics) via the facade.
+    Argument order mirrors `resolve_schema_repo_endpoint` (metadata, name) so they don't diverge.
+    """
+    metadata = schema_metadata if isinstance(schema_metadata, dict) else {}
+    repository = metadata.get(SCHEMA_METADATA_REPOSITORY_KEY)
+    endpoint = metadata.get(SCHEMA_METADATA_ENDPOINT_KEY)
+    if isinstance(repository, str) and repository and isinstance(endpoint, str) and endpoint:
+        return repository.strip().lower(), endpoint
+
+    parsed_repository, parsed_endpoint = split_schema_name(schema_name)
+    if parsed_repository is not None:
+        return parsed_repository.strip().lower(), parsed_endpoint
+
+    normalized_legacy = normalize_repository(legacy_repository or "").lower()
+    return (normalized_legacy or None), parsed_endpoint
+
+
+def resolve_schema_repo_endpoint(
+    schema_metadata: dict[str, Any] | None,
+    schema_name: str,
+    config: "GithubSourceConfig",
+) -> tuple[str, str]:
+    """`(repository, endpoint)` for a schema row: metadata first, qualified-name parse second,
+    the config's legacy `repository` for bare rows last."""
+    repository, endpoint = schema_repo_endpoint(schema_metadata, schema_name, config.repository)
+    if repository is None:
+        # Phrase matches get_non_retryable_errors so an unresolvable row fails permanently
+        # with the curated message instead of retrying forever.
+        raise ValueError(f"No repositories configured for schema '{schema_name}'")
+    return repository, endpoint
+
+
+def schema_metadata_for(repository: str, endpoint: str) -> dict[str, str]:
+    return {
+        SCHEMA_METADATA_REPOSITORY_KEY: repository,
+        SCHEMA_METADATA_ENDPOINT_KEY: endpoint,
+    }

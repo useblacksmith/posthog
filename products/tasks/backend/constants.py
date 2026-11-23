@@ -1,0 +1,549 @@
+import json
+import hashlib
+from collections.abc import Mapping
+from typing import Any, Literal, get_args
+
+import posthoganalytics
+
+from products.tasks.backend import model_catalog
+
+# Canonical PR/CI snapshot vocabulary, as produced by the GitHub integration's
+# pull-request snapshot (`_map_pr_state` / `_map_ci_status`) and persisted on
+# ``TaskRun.output`` (``pr_state`` / ``ci_status``) for the task list filters.
+PR_STATES = ("open", "draft", "merged", "closed")
+CI_STATUSES = ("passing", "failing", "pending", "none")
+
+# Keep backend validation and drain retry decisions aligned with the agent's
+# RETRYABLE_UPSTREAM_ERROR_CLASSIFICATIONS in adapters/error-classification.ts.
+UPSTREAM_RETRYABLE_ERROR_CATEGORIES = (
+    "upstream_stream_terminated",
+    "upstream_connection_error",
+    "upstream_timeout",
+    "upstream_provider_failure",
+    "upstream_rate_limited",
+)
+
+TASK_DESCRIPTION_PREVIEW_LENGTH = 1000
+
+# Host prefix of the PR URLs written to ``TaskRun.output['pr_url']`` — GitHub's ``html_url``.
+# ``task_run_github_pr_run_idx`` is a partial index on exactly this prefix test, and Postgres only
+# skips the JSONB scan while a query repeats the predicate verbatim, so readers filtering on the
+# prefix must use this constant rather than a literal of their own.
+GITHUB_PR_URL_PREFIX = "https://github.com/"
+ARTIFACT_OPEN_NETWORK_WRITER_KEY = "written_with_open_network"
+ARTIFACT_SCRIPT_SHA256_KEY = "script_sha256"
+FINAL_MESSAGE_MAX_CHARS = 20_000
+
+
+def is_html_artifact(name: str, content_type: str) -> bool:
+    mime_type = content_type.split(";", 1)[0].strip().lower()
+    return mime_type == "text/html" or name.lower().endswith((".html", ".htm"))
+
+
+PERMISSION_REQUEST_ID_MAX_LENGTH = 200
+
+# Shared with the MCP server (services/mcp/src/hono/constants.ts): one flag decides both whether
+# the MCP serves product skills through `learn` and whether a sandbox launches without bundled skills.
+MCP_EXEC_SKILLS_FEATURE_FLAG = "mcp-exec-skills"
+# `interaction_origin` of eval harness runs; becomes the `x-posthog-mcp-consumer` value "eval".
+EVAL_INTERACTION_ORIGIN = "eval"
+MODAL_VM_SANDBOX_FEATURE_FLAG = "tasks-modal-vm-sandbox"
+# Gates the nightly prebaked dev-stack image bake (see logic/services/dev_stack_image.py).
+DEV_STACK_IMAGE_BAKE_FEATURE_FLAG = "tasks-dev-stack-image-bake"
+# Routes a plain default-template run onto the hogland (Firecracker) sandbox backend.
+HOGLAND_SANDBOX_FEATURE_FLAG = "tasks-hogland-sandbox"
+HOGLAND_HOTPLUG_GOLDEN_FEATURE_FLAG = "tasks-hogland-hotplug-golden"
+PI_CLOUD_RUNTIME_FEATURE_FLAG = "pi-harness"
+GITLAB_TASKS_FEATURE_FLAG = "tasks-gitlab"
+REASONING_EFFORTS = model_catalog.REASONING_EFFORTS
+PI_ACP_FEATURE_FLAG = "pi-acp"
+TASK_ANALYSIS_FEATURE_FLAG = "posthog-code-task-analysis"
+# Per-user gate for carrying Claude Code auto memory between cloud sandboxes.
+PERSIST_AGENT_MEMORY_FEATURE_FLAG = "tasks-persist-agent-memory"
+
+ANALYSIS_TARGET_TASK_ID_STATE_KEY = "analysis_target_task_id"
+ANALYSIS_TARGET_RUN_ID_STATE_KEY = "analysis_target_run_id"
+ANALYSIS_TARGET_REPOSITORY_STATE_KEY = "analysis_target_repository"
+ANALYSIS_TARGET_IMAGE_ID_STATE_KEY = "analysis_target_custom_image_id"
+ANALYSIS_TARGET_IMAGE_NAME_STATE_KEY = "analysis_target_custom_image_name"
+TASK_ANALYSIS_ACTIVITIES_STATE_KEY = "task_analysis_activities"
+# Dispatch stamps every cloud run, and the run-log mirror skips unstamped runs such as local ones.
+AGENT_OTEL_TELEMETRY_STATE_KEY = "agent_otel_telemetry_enabled"
+PR_LOOP_ENABLED_STATE_KEY = "pr_loop_enabled"
+# TaskRun.state marker for runs completed by the inactivity timeout; kept out of
+# error_message so a normal completion never reads as a failure.
+TIMED_OUT_INACTIVITY_STATE_KEY = "timed_out_inactivity"
+STOPPED_BEFORE_TURN_CLOSED_STATE_KEY = "stopped_before_turn_closed"
+# The skills-store stubs the sandbox agent writes into its skill roots at session start.
+STORE_SKILLS_STATE_KEY = "store_skills"
+# Separate from `store_skills`, which is also empty when the store is on and the user owns no skills.
+STORE_SKILLS_BRIDGE_STATE_KEY = "store_skills_bridge"
+AGENT_INSTRUCTIONS_STATE_KEY = "agent_instructions"
+# Matches the cap PostHog Code applies to its local personalization.
+AGENT_INSTRUCTIONS_MAX_LENGTH = 20_000
+SAME_RUN_RESUME_STATE_KEY = "same_run_resume"
+SAME_RUN_RESUME_IDLE_STATE_KEY = "same_run_resume_idle"
+_LEGACY_SAME_RUN_RESUME_STATE_KEY = "handoff_resumed"
+_LEGACY_SAME_RUN_RESUME_IDLE_STATE_KEY = "handoff_resume_idle"
+SERVER_OWNED_RESUME_STATE_KEYS = frozenset(
+    {
+        SAME_RUN_RESUME_STATE_KEY,
+        SAME_RUN_RESUME_IDLE_STATE_KEY,
+        _LEGACY_SAME_RUN_RESUME_STATE_KEY,
+        _LEGACY_SAME_RUN_RESUME_IDLE_STATE_KEY,
+    }
+)
+
+
+def is_same_run_resume_state(state: Mapping[str, Any] | None) -> bool:
+    if not state:
+        return False
+    return state.get(SAME_RUN_RESUME_STATE_KEY) is True or state.get(_LEGACY_SAME_RUN_RESUME_STATE_KEY) is True
+
+
+def is_same_run_resume_idle_state(state: Mapping[str, Any] | None) -> bool:
+    if not state:
+        return False
+    return (
+        state.get(SAME_RUN_RESUME_IDLE_STATE_KEY) is True or state.get(_LEGACY_SAME_RUN_RESUME_IDLE_STATE_KEY) is True
+    )
+
+
+DEV_STACK_PREVIEW_STATE_KEY = "dev_stack_preview"
+DEV_STACK_PREVIEW_FEATURE_FLAG = "tasks-dev-stack-preview"
+DEV_STACK_PREVIEW_PORT = 8020
+
+
+def get_required_model_flag(model: str | None) -> str | None:
+    """The feature flag a caller needs to select `model`, or None when it's generally available.
+
+    Read from the catalog, which is also what the pickers project into TypeScript, so a
+    model cannot be offered on one surface and gated on another. The lookup folds a
+    provider-qualified id onto the model it names, so a gate matching raw strings cannot
+    read `anthropic/zai-org/glm-5.3` as an unknown model and skip the check.
+    """
+    if not model:
+        return None
+    return model_catalog.access_flag_for_model(model)
+
+
+def _decode_vm_sandbox_payload(payload: object) -> object:
+    """Flag payloads may arrive JSON-encoded; decode strings, mapping bad JSON to None."""
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except (ValueError, TypeError):
+            return None
+    return payload
+
+
+def vm_sandbox_allowed_origin_products(payload: object) -> set[str]:
+    """Origin products allowed on the Modal VM runtime, parsed from the flag's payload."""
+    payload = _decode_vm_sandbox_payload(payload)
+    value = payload.get("origin_products") if isinstance(payload, dict) else payload
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return {item for item in value if isinstance(item, str)}
+    return set()
+
+
+def vm_sandbox_default_base_origin_products(payload: object) -> set[str]:
+    """Origins allowed to run on the bare VM *base* image even without a custom image.
+
+    This is the knob that makes the VM runtime the default for standard cloud runs: an
+    origin listed here provisions on `SandboxTemplate.VM_BASE` instead of the gVisor
+    default base, without requiring the user to pick a custom image. Read only from the
+    explicit dict key — unlike `origin_products`, a bare-list payload keeps its legacy
+    `origin_products` meaning and never opts an origin into the default base."""
+    payload = _decode_vm_sandbox_payload(payload)
+    value = payload.get("default_base_origin_products") if isinstance(payload, dict) else None
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return {item for item in value if isinstance(item, str)}
+    return set()
+
+
+def vm_sandbox_origin_rollout_percentages(payload: object) -> dict[str, float]:
+    payload = _decode_vm_sandbox_payload(payload)
+    value = payload.get("origin_product_rollout_percentages") if isinstance(payload, dict) else None
+    if not isinstance(value, dict):
+        return {}
+
+    return {
+        origin: float(percentage)
+        for origin, percentage in value.items()
+        if isinstance(origin, str)
+        and isinstance(percentage, int | float)
+        and not isinstance(percentage, bool)
+        and 0 <= percentage <= 100
+    }
+
+
+def vm_sandbox_origin_in_rollout(origin_product: str | None, run_id: str, percentages: dict[str, float]) -> bool:
+    origin_key = origin_product or ""
+    percentage = percentages.get(origin_key, 0)
+    if percentage <= 0:
+        return False
+    if percentage >= 100:
+        return True
+
+    digest = hashlib.sha256(f"{origin_key}:{run_id}".encode()).digest()
+    bucket = int.from_bytes(digest[:8], "big") / 2**64 * 100
+    return bucket < percentage
+
+
+# Published Modal image name of the prebaked PostHog dev-stack VM image. Unlike
+# spec-built custom images, this one is a sandbox *filesystem snapshot* publish
+# (see logic/services/dev_stack_image.py), which Modal cannot layer build steps on.
+DEV_STACK_IMAGE_NAME = "posthog-dev-stack"
+
+
+def vm_sandbox_default_custom_image(payload: object) -> str | None:
+    """Modal image name that VM runs fall back to when no custom image was picked.
+
+    This is how the *default* VM image is routed per organization: the flag's payload
+    variants are org-targeted, so e.g. PostHog's own org can point its standard VM runs
+    at the prebaked posthog dev-stack image (see
+    `products/tasks/backend/logic/services/dev_stack_image.py`) while every other org
+    keeps the plain VM base. A user- or environment-picked custom image always wins over
+    this default. Read only from the explicit dict key."""
+    payload = _decode_vm_sandbox_payload(payload)
+    value = payload.get("default_custom_image") if isinstance(payload, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def get_vm_sandbox_flag_payload(*, distinct_id: str, organization_id: str) -> object:
+    """Raw payload of the Modal VM-sandbox flag; resolves to None when the flag is off."""
+    return posthoganalytics.get_feature_flag_payload(
+        MODAL_VM_SANDBOX_FEATURE_FLAG,
+        distinct_id=distinct_id,
+        groups={"organization": organization_id},
+        group_properties={"organization": {"id": organization_id}},
+        only_evaluate_locally=False,
+        send_feature_flag_events=False,
+    )
+
+
+MAX_CUSTOM_IMAGES_PER_TEAM = 20
+MAX_CUSTOM_IMAGES_PER_USER = 10
+TASK_SESSION_MAX_SIZE_BYTES = 10 * 1024 * 1024
+
+OVERLAP_CLONE_BOOT_FEATURE_FLAG = "tasks-overlap-clone-boot"
+DESKTOP_WORKSPACE_WARM_FEATURE_FLAG = "task-cloud-desktop-workspace-warm"
+BAKED_REPO_CLONE_FEATURE_FLAG = "tasks-baked-repo-clone"
+# Kill switch: rtk command-output compression is on by default in cloud sandboxes;
+# enabling this flag disables it fleet-wide — over any per-run override — without
+# an image rebuild.
+RTK_DISABLED_FEATURE_FLAG = "tasks-rtk-disabled"
+BENJAMIN_FEATURE_FLAG = "task-cloud-run-benjamin-plus"
+AGENT_SERVER_SHADOW_FEATURE_FLAG = "agent-server-shadow-observer"
+CLAUDE_OWN_SUBSCRIPTION_CLOUD_FEATURE_FLAG = "posthog-code-claude-own-subscription-cloud"
+OWN_SUBSCRIPTION_CLOUD_FEATURE_FLAGS: dict[str, str] = {
+    "claude": CLAUDE_OWN_SUBSCRIPTION_CLOUD_FEATURE_FLAG,
+}
+# The plan name a person reads when a subscription run is refused. Every layer that gates,
+# refuses, or explains one of these runs takes the name from here.
+SUBSCRIPTION_PLAN_NAMES: dict[str, str] = {"claude": "Claude plan", "codex": "ChatGPT plan"}
+CODEX_SUBSCRIPTION_EGRESS_DOMAINS: tuple[str, ...] = ("chatgpt.com",)
+
+RESUME_SNAPSHOT_KIND = "directory"
+DEFAULT_SANDBOX_WORKING_DIR = "/tmp/workspace"
+# Directory a sandbox clones repositories under, as `<root>/<organization>/<repository>`. Anything
+# that tells an agent where its checkout is must read it from here (see `sandbox_repo_path`), or a
+# prompt sends the agent to a path the clone never used.
+SANDBOX_REPOSITORIES_ROOT = f"{DEFAULT_SANDBOX_WORKING_DIR}/repos"
+GITLAB_HOST = "gitlab.com"
+# Directory resume snapshots capture a directory and re-mount it into the next sandbox. The mount
+# REPLACES the target directory in the running sandbox, so only the quiescent workspace dir is safe:
+# mounting over a live system directory (the old "/tmp" default) rips scratch space and sockets out
+# from under Modal's in-sandbox helpers and kills the sandbox on its first filesystem operation.
+# A snapshot's content layout matches the path it was captured from, so snapshots created for a
+# path outside this allowlist cannot be remapped — they must be invalidated on resume instead.
+DEFAULT_DIRECTORY_RESUME_SNAPSHOT_MOUNT_PATH = DEFAULT_SANDBOX_WORKING_DIR
+ALLOWED_DIRECTORY_RESUME_SNAPSHOT_MOUNT_PATHS: frozenset[str] = frozenset({DEFAULT_SANDBOX_WORKING_DIR})
+
+ClaudePermissionMode = Literal["default", "acceptEdits", "plan", "bypassPermissions", "auto"]
+CodexPermissionMode = Literal["plan", "auto", "read-only", "full-access"]
+InitialPermissionMode = ClaudePermissionMode | CodexPermissionMode
+
+# Starting a task authorizes its selected PostHog project, not projects reached through connections.
+# Relay both connection wrappers so the client can require fresh approval before they run.
+POSTHOG_EXEC_PERMISSION_REGEX = r"^posthog-connection-(call|forward)$"
+
+INITIAL_PERMISSION_MODE_CHOICES: list[str] = list(get_args(ClaudePermissionMode))
+CODEX_INITIAL_PERMISSION_MODE_CHOICES: list[str] = list(get_args(CodexPermissionMode))
+ALL_INITIAL_PERMISSION_MODE_CHOICES: list[str] = [
+    arg for member in get_args(InitialPermissionMode) for arg in get_args(member)
+]
+
+DEFAULT_TRUSTED_DOMAINS = [
+    # PostHog Services
+    "posthog.com",
+    "*.posthog.com",
+    # Version Control
+    "github.com",
+    "www.github.com",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "codeload.github.com",
+    "avatars.githubusercontent.com",
+    "camo.githubusercontent.com",
+    "gist.github.com",
+    "gitlab.com",
+    "www.gitlab.com",
+    "registry.gitlab.com",
+    "bitbucket.org",
+    "www.bitbucket.org",
+    "api.bitbucket.org",
+    # Container Registries
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "index.docker.io",
+    "hub.docker.com",
+    "www.docker.com",
+    "production.cloudflare.docker.com",
+    "download.docker.com",
+    "*.gcr.io",
+    "ghcr.io",
+    "mcr.microsoft.com",
+    "*.data.mcr.microsoft.com",
+    # Cloud Platforms
+    "cloud.google.com",
+    "accounts.google.com",
+    "gcloud.google.com",
+    "*.googleapis.com",
+    "storage.googleapis.com",
+    "compute.googleapis.com",
+    "container.googleapis.com",
+    "azure.com",
+    "portal.azure.com",
+    "microsoft.com",
+    "www.microsoft.com",
+    "*.microsoftonline.com",
+    "packages.microsoft.com",
+    "dotnet.microsoft.com",
+    "dot.net",
+    "visualstudio.com",
+    "dev.azure.com",
+    "oracle.com",
+    "www.oracle.com",
+    "java.com",
+    "www.java.com",
+    "java.net",
+    "www.java.net",
+    "download.oracle.com",
+    "yum.oracle.com",
+    # Package Managers - JavaScript/Node
+    "registry.npmjs.org",
+    "www.npmjs.com",
+    "www.npmjs.org",
+    "npmjs.com",
+    "npmjs.org",
+    "yarnpkg.com",
+    "registry.yarnpkg.com",
+    # Package Managers - Python
+    "pypi.org",
+    "www.pypi.org",
+    "files.pythonhosted.org",
+    "pythonhosted.org",
+    "test.pypi.org",
+    "pypi.python.org",
+    "pypa.io",
+    "www.pypa.io",
+    # Package Managers - Ruby
+    "rubygems.org",
+    "www.rubygems.org",
+    "api.rubygems.org",
+    "index.rubygems.org",
+    "ruby-lang.org",
+    "www.ruby-lang.org",
+    "rubyforge.org",
+    "www.rubyforge.org",
+    "rubyonrails.org",
+    "www.rubyonrails.org",
+    "rvm.io",
+    "get.rvm.io",
+    # Package Managers - Rust
+    "crates.io",
+    "www.crates.io",
+    "static.crates.io",
+    "rustup.rs",
+    "static.rust-lang.org",
+    "www.rust-lang.org",
+    # Package Managers - Go
+    "proxy.golang.org",
+    "sum.golang.org",
+    "index.golang.org",
+    "golang.org",
+    "www.golang.org",
+    "goproxy.io",
+    "pkg.go.dev",
+    # Package Managers - JVM
+    "maven.org",
+    "repo.maven.org",
+    "central.maven.org",
+    "repo1.maven.org",
+    "jcenter.bintray.com",
+    "gradle.org",
+    "www.gradle.org",
+    "services.gradle.org",
+    "spring.io",
+    "repo.spring.io",
+    # Package Managers - Other Languages
+    "packagist.org",
+    "www.packagist.org",
+    "repo.packagist.org",
+    "nuget.org",
+    "www.nuget.org",
+    "api.nuget.org",
+    "pub.dev",
+    "api.pub.dev",
+    "hex.pm",
+    "www.hex.pm",
+    "cpan.org",
+    "www.cpan.org",
+    "metacpan.org",
+    "www.metacpan.org",
+    "api.metacpan.org",
+    "cocoapods.org",
+    "www.cocoapods.org",
+    "cdn.cocoapods.org",
+    "haskell.org",
+    "www.haskell.org",
+    "hackage.haskell.org",
+    "swift.org",
+    "www.swift.org",
+    # Linux Distributions
+    "archive.ubuntu.com",
+    "security.ubuntu.com",
+    "ubuntu.com",
+    "www.ubuntu.com",
+    "*.ubuntu.com",
+    "ppa.launchpad.net",
+    "launchpad.net",
+    "www.launchpad.net",
+    # Development Tools & Platforms
+    "dl.k8s.io",
+    "pkgs.k8s.io",
+    "k8s.io",
+    "www.k8s.io",
+    "releases.hashicorp.com",
+    "apt.releases.hashicorp.com",
+    "rpm.releases.hashicorp.com",
+    "archive.releases.hashicorp.com",
+    "hashicorp.com",
+    "www.hashicorp.com",
+    "repo.anaconda.com",
+    "conda.anaconda.org",
+    "anaconda.org",
+    "www.anaconda.com",
+    "anaconda.com",
+    "continuum.io",
+    "apache.org",
+    "www.apache.org",
+    "archive.apache.org",
+    "downloads.apache.org",
+    "eclipse.org",
+    "www.eclipse.org",
+    "download.eclipse.org",
+    "nodejs.org",
+    "www.nodejs.org",
+    # Cloud Services & Monitoring
+    "statsig.com",
+    "www.statsig.com",
+    "api.statsig.com",
+    "*.sentry.io",
+    # Content Delivery & Mirrors
+    "*.sourceforge.net",
+    "packagecloud.io",
+    "*.packagecloud.io",
+    # Schema & Configuration
+    "json-schema.org",
+    "www.json-schema.org",
+    "json.schemastore.org",
+    "www.schemastore.org",
+]
+
+RESERVED_SANDBOX_ENVIRONMENT_VARIABLE_KEYS: frozenset[str] = frozenset(
+    {
+        "POSTHOG_PERSONAL_API_KEY",
+        "POSTHOG_WIZARD_API_KEY",
+        "POSTHOG_API_URL",
+        "POSTHOG_PROJECT_ID",
+        "JWT_PUBLIC_KEY",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITLAB_TOKEN",
+        "POSTHOG_GIT_PROVIDER",
+        "LLM_GATEWAY_URL",
+        "AI_GATEWAY_URL",
+        "AI_GATEWAY_PRODUCTS",
+        "AI_GATEWAY_TOKEN",
+        "AI_GATEWAY_TOKEN_CAP_USD",
+        "AI_GATEWAY_PRODUCT",
+        "AI_GATEWAY_AI_STAGE",
+        "POSTHOG_RESUME_RUN_ID",
+        "POSTHOG_AGENT_OTEL_LOGS_URL",
+        "POSTHOG_AGENT_OTEL_LOGS_TOKEN",
+        "POSTHOG_AGENT_OTEL_TRACES_URL",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "DISABLE_TELEMETRY",
+        "DISABLE_ERROR_REPORTING",
+        # The workflow gates the wiki mount on these being present, so a
+        # user-supplied copy would mount the org wiki for a team whose
+        # context-layer flag is off.
+        "POSTHOG_CONTEXT_LAYER_PATH",
+        "POSTHOG_CONTEXT_LAYER_COMMITS_PATH",
+    }
+)
+
+BLOCKED_SANDBOX_ENVIRONMENT_VARIABLE_PREFIXES: tuple[str, ...] = ("LD_", "DYLD_", "GIT_")
+BLOCKED_SANDBOX_ENVIRONMENT_VARIABLE_KEYS: frozenset[str] = frozenset(
+    {
+        "NODE_OPTIONS",
+        "NODE_REPL_EXTERNAL_MODULE",
+        "BASH_ENV",
+        "PROMPT_COMMAND",
+        "PYTHONSTARTUP",
+        "PERL5OPT",
+        "RUBYOPT",
+    }
+)
+
+# Stripped from the agent-server's process environment at launch (env -u).
+# Two categories:
+#   - code-injection vectors a resume snapshot could smuggle in (NODE_*, LD_*, DYLD_*);
+#   - the GitHub token, so the agent-server holds no frozen copy of the acting user's
+#     credentials. The token is delivered per command via the live /tmp/agent-env file
+#     (re-sourced by BASH_ENV, seeded before this unset), so git/gh still authenticate;
+#     removing the static process-env copy is what lets a mid-session logout or rebind
+#     actually take effect instead of being resurrected from os.environ.
+SANDBOX_AGENT_LAUNCH_UNSET_ENV_VARS: tuple[str, ...] = (
+    "NODE_OPTIONS",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+)
+
+
+def is_blocked_sandbox_env_key(key: str) -> bool:
+    if key in BLOCKED_SANDBOX_ENVIRONMENT_VARIABLE_KEYS:
+        return True
+    return any(key.startswith(prefix) for prefix in BLOCKED_SANDBOX_ENVIRONMENT_VARIABLE_PREFIXES)
+
+
+def filter_user_sandbox_env_vars(env_vars: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    safe: dict[str, str] = {}
+    skipped: list[str] = []
+    for key, value in env_vars.items():
+        if key in RESERVED_SANDBOX_ENVIRONMENT_VARIABLE_KEYS or is_blocked_sandbox_env_key(key):
+            skipped.append(key)
+            continue
+        safe[key] = value
+    return safe, skipped

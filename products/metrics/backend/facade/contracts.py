@@ -1,0 +1,683 @@
+"""
+Contract types for metrics.
+
+Stable, framework-free frozen dataclasses that define what this
+product exposes to the rest of the codebase.
+
+Characteristics:
+- No Django imports
+- Immutable (frozen=True)
+- Used by facade as inputs/outputs
+
+Do NOT depend on Django models, DRF serializers, or request objects.
+
+These define the query wire shape used by the viewer, the dashboard
+widget, and (later) alerting. The response is always a list of
+`MetricSeries` — a single ungrouped query returns one series with empty
+labels, so consumers never branch on "single vs multi series".
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from dataclasses import dataclass
+from typing import Any
+
+from .enums import (
+    AttributeScope,
+    DashboardImportPhase,
+    DashboardImportSource,
+    DashboardImportState,
+    DashboardTemplateSource,
+    DashboardTemplateStatus,
+    FilterOp,
+    MetricAggregation,
+    MetricQueryProvenanceMode,
+    MetricRangeFunction,
+    MetricType,
+    PanelImportOutcome,
+    PanelProgressState,
+    PanelQueryLanguage,
+)
+
+# Each clause runs its own ClickHouse query on the shared logs cluster, so
+# the clause count per request is hard-capped.
+MAX_CLAUSES_PER_QUERY = 10
+DEFAULT_QUERY_COUNT_DAYS = 30
+MAX_QUERY_COUNT_DAYS = 90
+MAX_PROMQL_LENGTH = 8192
+MAX_SPARKLINE_BATCH_SIZE = 20
+
+
+class MetricQueryTooManyRowsError(ValueError):
+    """The query has more (time bucket, series) rows than the row budget allows.
+
+    A caller can retry with a coarser interval, because fewer buckets give fewer rows.
+    """
+
+
+# Private-alpha gate. Every read surface (viewset, query runner, MCP tools)
+# must check the same flag, or one of them becomes a bypass.
+METRICS_FEATURE_FLAG = "metrics"
+
+# Extra gate for the error-spike overlay PoC, layered on top of METRICS_FEATURE_FLAG.
+# Staff-only while it is a proof of concept.
+METRICS_ERROR_OVERLAYS_FEATURE_FLAG = "metrics-error-overlays"
+
+# Gates the Grafana and screenshot dashboard import, on top of METRICS_FEATURE_FLAG.
+METRICS_DASHBOARD_IMPORT_FEATURE_FLAG = "metrics-dashboard-import"
+
+# Gates the suggested dashboards menu, and the background analysis and AI generation for a team.
+METRICS_SUGGESTED_DASHBOARDS_FEATURE_FLAG = "metrics-suggested-dashboards"
+
+# Gates recording rules, on top of METRICS_FEATURE_FLAG. It gates both the API and the evaluation, so turning it
+# off for a project also stops the rules that project already has.
+METRICS_RECORDING_RULES_FEATURE_FLAG = "metrics-recording-rules"
+
+# Each rule runs one PromQL query a minute, one after another inside the team's evaluation budget.
+MAX_RECORDING_RULES_PER_TEAM = 20
+
+# Gates the metrics that the query computes from spans and logs, on top of METRICS_FEATURE_FLAG.
+METRICS_DERIVED_SERIES_FEATURE_FLAG = "metrics-derived-series"
+
+# Names under this prefix are computed from spans and logs at query time, never ingested.
+# Other products must not let users create metrics with this prefix.
+DERIVED_METRIC_PREFIX = "posthog.derived."
+
+# Labels an async MetricsQuery status with each source a derived metric reads, so retrieval can check access.
+# Stable wire identifier shared by query-status producers and readers. Renaming requires
+# a dual-read rollout and a drain of in-flight query statuses.
+DERIVED_SOURCE_QUERY_STATUS_LABEL_PREFIX = "metrics-derived-source:"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DerivedSeriesStatus:
+    """Whether a team can see series derived from its spans and logs."""
+
+    # The team sent spans or logs in the last day.
+    has_sources: bool
+    # Derived series are on for the team, which needs sources.
+    enabled: bool
+
+    def __post_init__(self) -> None:
+        if self.enabled and not self.has_sources:
+            raise ValueError("derived series need spans or logs")
+
+
+@dataclass(frozen=True, slots=True)
+class MetricFilter:
+    """A single label predicate on a clause."""
+
+    key: str
+    op: FilterOp
+    value: str
+    scope: AttributeScope = AttributeScope.AUTO
+
+
+@dataclass(frozen=True, slots=True)
+class MetricGroupBy:
+    """One label to split a clause's result into separate series by."""
+
+    key: str
+    scope: AttributeScope = AttributeScope.AUTO
+
+
+@dataclass(frozen=True, slots=True)
+class MetricQueryClause:
+    """One metric selection: a name, an aggregation, and optional
+    filters / group-by. `name` is the alias a formula refers to (e.g. "a").
+    """
+
+    name: str
+    metric_name: str
+    aggregation: MetricAggregation
+    filters: tuple[MetricFilter, ...] = ()
+    group_by: tuple[MetricGroupBy, ...] = ()
+    # Required for QUANTILE / HISTOGRAM_QUANTILE; ignored otherwise.
+    quantile: float | None = None
+    # Constrains rows to one metric type; None keeps all types (legacy).
+    metric_type: MetricType | None = None
+    # Applied to each series before `aggregation` combines them.
+    range_function: MetricRangeFunction | None = None
+    # Apdex threshold T for the derived apdex metric; None uses its default.
+    apdex_threshold_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.aggregation.is_raw and self.group_by:
+            raise ValueError("group_by needs an aggregation; without one every series stays separate")
+        if self.range_function is not None and self.aggregation.is_counter_function:
+            raise ValueError(f"range_function cannot combine with the {self.aggregation} aggregation")
+        if self.aggregation.needs_quantile:
+            if self.quantile is None:
+                raise ValueError(f"{self.aggregation} requires a quantile")
+            if not 0.0 < self.quantile < 1.0:
+                raise ValueError("quantile must be in (0, 1)")
+        if not self.name:
+            raise ValueError("clause name must be non-empty")
+        if self.apdex_threshold_ms is not None and not self.apdex_threshold_ms > 0:
+            raise ValueError("apdex threshold must be a positive number of milliseconds")
+
+
+@dataclass(frozen=True, slots=True)
+class MetricQueryRequest:
+    """A whole metric query: one or more clauses over a shared time grid,
+    with an optional formula combining them by clause name.
+
+    `interval` is on the request (not per clause) so every series in the
+    response shares one bucket grid — required for a formula like "a / b"
+    to align, and the right default anyway. None means auto-pick from the
+    range.
+    """
+
+    clauses: tuple[MetricQueryClause, ...]
+    date_from: dt.datetime
+    date_to: dt.datetime
+    interval: str | None = None
+    formula: str | None = None
+    # False leaves a bucket without data as a None point (a gap), so a mean over the points skips it.
+    # A formula needs aligned values, so it requires the zero fill.
+    zero_fill: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.clauses:
+            raise ValueError("at least one clause is required")
+        if len(self.clauses) > MAX_CLAUSES_PER_QUERY:
+            raise ValueError(f"at most {MAX_CLAUSES_PER_QUERY} clauses are allowed per query")
+        if self.date_to <= self.date_from:
+            raise ValueError("date_to must be after date_from")
+        if self.formula is not None and not self.zero_fill:
+            raise ValueError("a formula requires zero_fill")
+        names = [c.name for c in self.clauses]
+        if len(names) != len(set(names)):
+            raise ValueError("clause names must be unique")
+
+
+@dataclass(frozen=True, slots=True)
+class MetricInstantWindow:
+    """The range an instant builder query reads: its value is the bucket that ends at `date_to`."""
+
+    date_from: dt.datetime
+    date_to: dt.datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MetricPoint:
+    """One bucketed datapoint. `time` is the bucket start, ISO 8601.
+    `value` is None when the bucket's aggregate isn't representable (e.g.
+    a float overflow to inf) — consumers render a gap."""
+
+    time: str
+    value: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class MetricSeries:
+    """One line on a chart: the label values that identify it plus its
+    points. `labels` is empty for an ungrouped query. `clause` records
+    which clause produced it (the formula result uses `clause="formula"`).
+    """
+
+    labels: dict[str, str]
+    points: tuple[MetricPoint, ...]
+    metric_name: str | None = None
+    clause: str | None = None
+    # UCUM unit of the values in `points` (e.g. "By", "ms", "ms/s"). It differs
+    # from the ingested unit when the clause transforms the values: COUNT has no
+    # unit and RATE is per second. Set by `run_metric_query`, not by callers.
+    unit: str | None = None
+    # Bucket upper edges a histogram quantile was estimated from, merged over every
+    # point. The estimate can be anywhere between two edges. None for other aggregations.
+    histogram_bounds: tuple[float, ...] | None = None
+    # Most explicit bucket layouts merged into one point of a histogram quantile. Above 1, series
+    # with different buckets were combined. None for other aggregations.
+    histogram_layout_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MetricQueryProvenance:
+    """Where a query's buckets came from. `precomputed_until` is the earliest time a precomputed clause switched
+    to raw samples, None when no clause read precomputed metrics. `reasons` says why clauses ran raw."""
+
+    mode: MetricQueryProvenanceMode
+    precomputed_until: dt.datetime | None = None
+    reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MetricQueryShadowCheck:
+    """A precomputed answer compared with the same query run raw. `max_relative_difference` is over the points
+    both answers have, and `mismatched_points` counts the points only one has. Both are None when the raw run
+    failed."""
+
+    max_relative_difference: float | None
+    mismatched_points: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class MetricQueryResult:
+    series: list[MetricSeries]
+    provenance: MetricQueryProvenance
+    shadow: MetricQueryShadowCheck | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MetricAnomalyDimension:
+    """One label value's behavior across the baseline/anomaly windows."""
+
+    key: str
+    label: str
+    baseline_value: float
+    anomaly_value: float
+    # anomaly_value / baseline_value; 0.0 baselines yield the anomaly value
+    # itself (treat as "new" traffic).
+    change_ratio: float
+
+
+@dataclass(frozen=True, slots=True)
+class MetricAnomalyReport:
+    """Everything an investigator needs to characterize 'metric X looks
+    wrong': how the anomaly window compares to the baseline, when it
+    started, and which label values moved the most."""
+
+    metric_name: str
+    aggregation: str
+    interval: str
+    baseline_from: str
+    baseline_to: str
+    anomaly_from: str
+    anomaly_to: str
+    baseline_mean: float
+    baseline_stddev: float
+    anomaly_mean: float
+    anomaly_peak: float
+    # anomaly_mean / baseline_mean; 0.0 baselines yield anomaly_mean.
+    change_ratio: float
+    direction: str  # "up" | "down" | "flat"
+    onset_time: str | None
+    top_movers: tuple[MetricAnomalyDimension, ...]
+    series: MetricSeries
+    # Start of the trailing bucket that was still filling: plotted in `series`, left out of the stats.
+    partial_bucket_time: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MetricEventSample:
+    """A single raw metric emission: one `metrics` row enriched with its
+    `metric_series` labels. Backs the Samples view and the metric->trace pivot.
+    Distinct from `MetricSeries`, which is aggregated at query time.
+    """
+
+    timestamp: str  # ISO 8601
+    metric_name: str
+    metric_type: str  # OTel type: gauge | sum | histogram | summary | exponential_histogram
+    value: float
+    # Observations behind this point: 1 for gauges/counters, the distribution
+    # count for histograms/summaries (value is then the sum; avg = value/count).
+    count: int
+    unit: str
+    aggregation_temporality: str  # "delta" | "cumulative" | "" (gauges)
+    is_monotonic: bool
+    service_name: str
+    trace_id: str
+    span_id: str
+    attributes: dict[str, str]
+    resource_attributes: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class MetricErrorSpike:
+    """An Error Tracking issue spike detected in a time window.
+
+    PoC for the metrics chart's error-spike overlay: team-wide, not yet
+    scoped to a specific metric's service (Error Tracking issues carry no
+    service attribution today; scoping needs a service attribute on spikes
+    or a trace_id join against $exception events).
+
+    Deliberately narrower than error_tracking's own ErrorTrackingSpikeEvent
+    contract (fewer fields, string timestamps instead of datetime) since the
+    chart overlay only needs enough to render and link a marker. Keep it
+    narrow rather than reusing that contract directly, so metrics isn't
+    coupled to error_tracking's internal shape.
+    """
+
+    detected_at: str  # ISO 8601
+    issue_id: str
+    issue_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CompanionMetric:
+    """A metric to check alongside the primary one to confirm or rule out a
+    cause. `role` is a short hint ('traffic', 'saturation', 'processing') shown
+    in the narrative. `aggregation`/`quantile` default by the metric's OTel type.
+    """
+
+    metric_name: str
+    role: str
+    aggregation: str | None = None
+    quantile: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompanionVerdict:
+    """How a companion metric behaved over the same window as the symptom — the
+    basis for 'it wasn't a traffic surge' / 'processing kept up' reasoning.
+    """
+
+    metric_name: str
+    role: str
+    aggregation: str
+    direction: str  # "up" | "down" | "flat"
+    change_ratio: float
+    # True when the companion moved materially in the symptom window (so it
+    # plausibly relates to the cause); False rules it out.
+    moved_with_symptom: bool
+    # Quantile the companion was aggregated at (histogram_quantile only); carried
+    # so a re-runnable chart spec can reproduce the same aggregation.
+    quantile: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InvestigationChartSpec:
+    """A metric query plus the frozen window to render it over. Re-runnable —
+    the report re-runs the same query over the same window for live data —
+    never baked, the opposite of snapshotting datapoints into constants.
+    """
+
+    title: str
+    metric_name: str
+    aggregation: str
+    anomaly_from: str  # ISO 8601
+    anomaly_to: str
+    filters: tuple[MetricFilter, ...] = ()
+    quantile: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TraceExemplar:
+    """A pointer from a metric sample into a concrete trace at the anomaly, for
+    the metric->trace pivot. Trace/span ids are hex, matching the tracing
+    product's contract, so they can be passed straight to a trace URL.
+    """
+
+    trace_id: str
+    span_id: str
+    timestamp: str  # ISO 8601
+    value: float
+
+
+@dataclass(frozen=True, slots=True)
+class InvestigationEvidence:
+    """Cross-signal pointers gathered around onset: trace exemplars to pivot
+    into, and a ready-to-run log filter for the implicated service/window.
+    `log_filter` is None when no service could be implicated.
+    """
+
+    service_name: str | None
+    trace_exemplars: tuple[TraceExemplar, ...] = ()
+    log_filter: dict[str, str] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InvestigationResult:
+    """The structured outcome of investigating a metric symptom. Produced once
+    by `investigate()` and consumed three ways: the agent narrates it, the
+    in-app explorer renders it interactively, and the incident report
+    serializes it. This shared shape is the seam between investigate and
+    display.
+    """
+
+    metric_name: str
+    symptom: MetricAnomalyReport
+    blast_radius: str  # "localized" | "shared" | "unknown"
+    companions: tuple[CompanionVerdict, ...]
+    chart_specs: tuple[InvestigationChartSpec, ...]
+    evidence: InvestigationEvidence
+    confidence: str  # "high" | "medium" | "low"
+    narrative: str
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentContext:
+    """Structured context from a fired alert (or a manual "this looks wrong"),
+    so an investigation never has to parse a timestamp out of prose. `fired_at`
+    must be timezone-aware and is normalized to UTC at construction; the
+    anomaly window is derived as [fired_at - lookback, fired_at + leadout],
+    and `service_name` scopes the investigation to the implicated service.
+    """
+
+    metric_name: str
+    fired_at: dt.datetime
+    lookback: dt.timedelta = dt.timedelta(minutes=15)
+    leadout: dt.timedelta = dt.timedelta(minutes=15)
+    service_name: str | None = None
+    companions: tuple[CompanionMetric, ...] = ()
+
+    def __post_init__(self) -> None:
+        # A naive datetime would be taken as UTC by the window math and
+        # silently mis-bucket a local-time fire; fail fast at construction.
+        # Aware non-UTC instants are fine — normalize them so downstream
+        # window math always operates on UTC.
+        if self.fired_at.tzinfo is None:
+            raise ValueError("fired_at must be timezone-aware")
+        object.__setattr__(self, "fired_at", self.fired_at.astimezone(dt.UTC))
+
+
+@dataclass(frozen=True, slots=True)
+class MetricsServiceOverview:
+    """One service's ingestion rollup inside the overview window."""
+
+    service_name: str
+    metric_names: int
+    series: int
+    last_seen: str  # ISO 8601
+
+
+@dataclass(frozen=True, slots=True)
+class MetricsOverview:
+    """The landing-page answer to "is anything ingesting": how fresh the
+    newest datapoint is, plus window-scoped inventory counts per service.
+
+    `last_seen` deliberately ignores the window — when ingestion stops, the
+    window-scoped numbers go to zero but the status strip still needs to say
+    how long ago the last datapoint arrived. None means never ingested (or
+    everything aged past the series table's retention).
+    """
+
+    last_seen: str | None  # ISO 8601
+    metric_names: int
+    series: int
+    lookback_seconds: int
+    services: tuple[MetricsServiceOverview, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MetricQueryCount:
+    """How often queries read one metric of a team inside a window of days.
+
+    A query counts once for each metric that it selects, whatever the number of clauses or selectors that name it.
+    Builder, heatmap and PromQL queries count, from the app, alerts and the Prometheus API.
+    SQL mode queries do not count.
+    A PromQL selector that names no metric, such as `{__name__=~"http_.*"}`, counts nothing.
+    """
+
+    metric_name: str
+    query_count: int
+    last_queried_at: dt.datetime
+
+
+class DashboardImportError(ValueError):
+    """A dashboard import cannot start or continue. The message is safe to show to the user."""
+
+
+class DashboardImportInProgress(DashboardImportError):
+    """The user already has a dashboard import that has not finished."""
+
+
+class DashboardImportNotAllowed(DashboardImportError):
+    """The organization does not allow the import: AI data processing is off, or the AI credits ran out."""
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardImportRequest:
+    source: DashboardImportSource
+    name: str | None = None
+    grafana_json: str | None = None
+    image: bytes | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardImportPanel:
+    key: str
+    title: str
+    outcome: PanelImportOutcome
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardImportPanelProgress:
+    key: str
+    title: str
+    state: PanelProgressState
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardImportSummary:
+    total: int
+    imported: int
+    approximated: int
+    failed: int
+    skipped: int
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardImportStatus:
+    """Where an import is. `id` is None for an import that needed no agent and finished in the request."""
+
+    id: str | None
+    source: DashboardImportSource
+    status: DashboardImportState
+    dashboard_name: str
+    phase: DashboardImportPhase | None = None
+    panel_progress: tuple[DashboardImportPanelProgress, ...] = ()
+    # The import compares at most `layout_rounds` pictures of the dashboard with the screenshot. None when it does not.
+    layout_rounds: int | None = None
+    layout_round: int | None = None
+    dashboard_id: int | None = None
+    error: str | None = None
+    summary: DashboardImportSummary | None = None
+    panels: tuple[DashboardImportPanel, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PanelQueryCheckRequest:
+    """One panel query for the import agent to check. `builder` holds the builder query as JSON."""
+
+    key: str
+    language: PanelQueryLanguage
+    title: str = ""
+    promql: str | None = None
+    builder: dict[str, Any] | None = None
+    histogram_metric: str | None = None
+    hogql: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PanelQueryCheckResult:
+    key: str
+    valid: bool
+    error: str | None = None
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SuggestedDashboard:
+    """A dashboard from the bank that suits the metrics of a team."""
+
+    id: str
+    template_id: str
+    name: str
+    description: str
+    reason: str
+    panel_count: int
+    matched_metric_count: int
+    coverage: float
+    dashboard_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardTemplateRound:
+    """One check round of a generation: a picture of the preview dashboard, and what the model said about it."""
+
+    round: int
+    has_picture: bool
+    looks_good: bool | None = None
+    problems: tuple[str, ...] = ()
+    revised: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardTemplateSummary:
+    id: str
+    key: str
+    name: str
+    description: str
+    source: DashboardTemplateSource
+    status: DashboardTemplateStatus
+    metric_names: tuple[str, ...]
+    panel_titles: tuple[str, ...]
+    created_at: dt.datetime
+    suggestion_count: int = 0
+    source_team_id: int | None = None
+    preview_team_id: int | None = None
+    preview_dashboard_id: int | None = None
+    rounds: tuple[DashboardTemplateRound, ...] = ()
+    dropped_panels: tuple[str, ...] = ()
+    error: str | None = None
+    reviewed_by: str | None = None
+    reviewed_at: dt.datetime | None = None
+
+
+class SuggestedDashboardError(Exception):
+    """An action on a suggestion or a template failed. The message is safe to show."""
+
+
+class SuggestedDashboardNotFound(SuggestedDashboardError):
+    pass
+
+
+class PromQLQueryError(ValueError):
+    """A PromQL query that Snuffle rejected or could not run. The message is safe to show.
+
+    `transient` says the backend failed rather than the query, so the same query can succeed later.
+    """
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+@dataclass(frozen=True, slots=True)
+class RecordingRule:
+    """A PromQL query that is evaluated every minute and written back into the team's metrics as `metric_name`."""
+
+    id: str
+    metric_name: str
+    query: str
+    description: str
+    enabled: bool
+    created_at: dt.datetime
+    updated_at: dt.datetime
+    # The minute the rule last wrote. None until the first write.
+    last_evaluated_at: dt.datetime | None = None
+    last_series_count: int | None = None
+    # Why the last evaluation wrote nothing. Cleared by the next write.
+    last_error: str | None = None
+
+
+class RecordingRuleError(ValueError):
+    """A recording rule edit that cannot be saved. The message is safe to show."""
+
+
+class RecordingRuleNotFound(RecordingRuleError):
+    pass

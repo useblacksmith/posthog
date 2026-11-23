@@ -1,0 +1,1546 @@
+import { MakeLogicType, actions, connect, events, kea, listeners, path, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import { actionToUrl, router, urlToAction } from 'kea-router'
+import { subscriptions } from 'kea-subscriptions'
+import type { CaptureOptions } from 'posthog-js'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import api, { ApiConfig } from 'lib/api'
+import { ApiError } from 'lib/api-error'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import type { FeatureFlagsSet } from 'lib/logic/featureFlagLogic'
+import { getCurrentTeamIdOrNone } from 'lib/utils/getAppContext'
+import { removeProjectIdIfPresent } from 'lib/utils/kea-router'
+import { objectsEqual, reconcileById } from 'lib/utils/objects'
+import { sceneConfigurations } from 'scenes/scenes'
+import { Scene } from 'scenes/sceneTypes'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { Breadcrumb } from '~/types'
+import type { UserType } from '~/types'
+
+import { OriginProduct, Task, TaskRunStatus } from 'products/posthog_ai/frontend/types/taskTypes'
+import {
+    signalsReportsRefreshMetricsCreate,
+    signalsReportsViewedCreate,
+    signalsScoutRunsList,
+} from 'products/signals/frontend/generated/api'
+import type { SignalReportMetricSnapshotsApi } from 'products/signals/frontend/generated/api.schemas'
+
+import {
+    captureInboxReportClosed,
+    captureInboxReportOpened,
+    captureInboxReportRead,
+    setInboxServedRanker,
+    captureInboxReportScrolled,
+    InboxReportCloseMethod,
+    InboxReportLinkSource,
+    InboxReportOpenMethod,
+    parseInboxReportLinkSource,
+} from './inboxAnalytics'
+import { inboxBulkActionsLogic } from './logics/inboxBulkActionsLogic'
+import { inboxFiltersLogic } from './logics/inboxFiltersLogic'
+import { INBOX_REPORT_SECTION_LIST_PARAMS, reportListLogic } from './logics/reportListLogic'
+import type { ScoutCreateInitialValues } from './logics/scoutCreateModalLogic'
+import { scratchpadLogic } from './logics/scratchpadLogic'
+import { signalSourcesLogic } from './signalSourcesLogic'
+import {
+    INBOX_REPORT_SECTION_KEYS,
+    INBOX_TAB_KEYS,
+    InboxReportSectionKey,
+    InboxTabKey,
+    SignalReport,
+    SignalRun,
+    SignalScoutRunStatus,
+    SignalScoutRunSummary,
+} from './types'
+import { mergeReportRows, selectedFlatListSections } from './utils/flatReportList'
+import { inboxTabRedirectPath } from './utils/inboxReportUrls'
+import { keepFieldsWrittenDuringFetch } from './utils/reportFreshness'
+import { isReportMetricsEnabled, mergeReportMetricSnapshots, reportNeedsMetricRefresh } from './utils/reportMetrics'
+import { decodeScoutCreateTemplate } from './utils/scoutTemplateDeepLink'
+
+// Newest-first scout runs to pull for the Runs panel. The scout-runs endpoint caps at 100 server-side.
+const SCOUT_RUNS_LIMIT = 100
+
+// Signal-pipeline tasks to pull. Bounded symmetrically with the scout side (the tasks endpoint caps
+// at 100); passed explicitly so the cap is visible rather than relying on the server default.
+const SIGNAL_TASKS_LIMIT = 100
+
+/** Strips `#createScout=` from the URL so a refresh can't re-trigger it, then opens the modal. */
+function consumeScoutTemplateHash(
+    actions: { setScoutTemplateDraft: (draft: ScoutCreateInitialValues | null) => void },
+    hashParams: Record<string, any> | undefined
+): void {
+    const raw = hashParams?.['createScout']
+    if (raw === undefined) {
+        return
+    }
+    const { createScout: _consumed, ...remainingHashParams } = hashParams ?? {}
+    router.actions.replace(router.values.location.pathname, router.values.searchParams, remainingHashParams)
+    const draft = decodeScoutCreateTemplate(raw)
+    if (draft) {
+        actions.setScoutTemplateDraft(draft)
+    } else {
+        lemonToast.error("Couldn't read the scout template from this link")
+    }
+}
+
+// How often the Runs panel refetches while it's open, so live runs update in place.
+const RUNS_POLL_INTERVAL_MS = 5000
+
+// `TaskRunStatus` and `SignalScoutRunStatus` enumerate the same run states. This `Record` keyed on the
+// enum makes the relationship exhaustive: a new `TaskRunStatus` value breaks the build here instead of
+// silently rendering as 'queued', so the two type vocabularies can't drift unnoticed.
+const TASK_RUN_STATUS_TO_SCOUT_STATUS: Record<TaskRunStatus, SignalScoutRunStatus> = {
+    [TaskRunStatus.NOT_STARTED]: 'not_started',
+    [TaskRunStatus.QUEUED]: 'queued',
+    [TaskRunStatus.IN_PROGRESS]: 'in_progress',
+    [TaskRunStatus.COMPLETED]: 'completed',
+    [TaskRunStatus.FAILED]: 'failed',
+    [TaskRunStatus.CANCELLED]: 'cancelled',
+}
+
+/**
+ * Merge the Runs panel's two sources — scout runs and signal-pipeline tasks — into one newest-first
+ * `SignalRun[]`. Pure (no I/O) so the merge/sort/normalize contract is unit-testable directly.
+ * Scout runs without a backing `task_id` are dropped (they can't deep-link to a task); signal rows
+ * fall back to the task's own timestamp / a null status when no run exists yet.
+ *
+ * A signal task only counts as a run once it's linked to a report. `origin_product=signal_report`
+ * alone is too broad: the scout-authoring CTAs create chat threads under the same origin, and those
+ * are a "let's write a scout" conversation, not a pipeline run — listing them here drops the user
+ * into a thread with no report to go back to.
+ */
+export function mergeSignalRuns(scoutRuns: SignalScoutRunSummary[], signalTasks: Task[]): SignalRun[] {
+    const scoutRows = scoutRuns
+        .filter((run): run is SignalScoutRunSummary & { task_id: string } => !!run.task_id)
+        .map(
+            (run): SignalRun => ({
+                task_id: run.task_id,
+                kind: 'scout',
+                total_spend: run.total_spend,
+                title: run.skill_name,
+                status: run.status,
+                report_id: null,
+                created_at: run.created_at,
+            })
+        )
+    const signalRows = signalTasks
+        .filter((task): task is Task & { signal_report: string } => !!task.signal_report)
+        .map((task): SignalRun => {
+            const latestStatus = task.latest_run?.status
+            return {
+                task_id: task.id,
+                kind: 'signal',
+                title: task.title,
+                status: latestStatus ? TASK_RUN_STATUS_TO_SCOUT_STATUS[latestStatus] : null,
+                report_id: task.signal_report,
+                created_at: task.latest_run?.created_at ?? task.created_at,
+            }
+        })
+    return [...scoutRows, ...signalRows].sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    )
+}
+
+/**
+ * Which pane of the scout detail page is open. One tab bar holds every pane, so one pane shows at a time.
+ *
+ * `null` means nobody has chosen: the page picks Reports when the scout has any, else Runs.
+ */
+export const SCOUT_DETAIL_TABS = ['reports', 'runs', 'trials', 'signals', 'told', 'learned'] as const
+export type ScoutDetailTab = (typeof SCOUT_DETAIL_TABS)[number]
+
+function asScoutDetailTab(value: string | undefined): ScoutDetailTab | null {
+    return value !== undefined && (SCOUT_DETAIL_TABS as readonly string[]).includes(value)
+        ? (value as ScoutDetailTab)
+        : null
+}
+
+/** The pane a scout URL's path states on its own: a finding is addressed within Signals. */
+function panePathImplies(findingId: string | null): ScoutDetailTab | null {
+    return findingId ? 'signals' : null
+}
+
+/** The pane a scout URL opens: the one its `tab` names, or the one its path implies. */
+function scoutUrlPane(tab: ScoutDetailTab | null, findingId: string | null): ScoutDetailTab | null {
+    return tab ?? panePathImplies(findingId)
+}
+
+/**
+ * The search params a scout-page navigation should carry: whatever is on the URL now, with `tab`
+ * set to the open pane, or dropped when the path already states that pane. A bare scout URL states
+ * the default pane and a finding URL states Signals, so both stay clean, and every other pane is
+ * named in the URL so it survives a reload.
+ */
+function scoutTabSearchParams(pane: ScoutDetailTab | null, findingId: string | null): Record<string, any> {
+    const { tab: _ignored, ...rest } = router.values.searchParams
+    return pane && pane !== panePathImplies(findingId) ? { ...rest, tab: pane } : rest
+}
+
+/** Whether a URL segment is one of the inbox's page tabs. */
+function isInboxTabKey(value: string | undefined): value is InboxTabKey {
+    return value !== undefined && (INBOX_TAB_KEYS as string[]).includes(value)
+}
+
+/**
+ * Find a report already loaded in one of the mounted per-view lists, so opening it can render the
+ * detail instantly from the list row instead of waiting on a fresh
+ * `GET`. The background fetch still runs to converge on the authoritative record.
+ */
+// A search typed into the scratchpad is transient: reopening the panel later should show the whole
+// window again, not the last query. Clear it whenever the scratchpad closes — by any path (close
+// button, report/scout open, Back nav).
+function clearScratchpadSearch(): void {
+    const mounted = scratchpadLogic.findMounted()
+    if (mounted?.values.searchText) {
+        mounted.actions.setSearchText('')
+    }
+}
+
+// `open_method` reads `deeplink` only when this visit never saw an inbox list URL. Session storage
+// is the right scope: it survives a reload and is copied into a tab opened from a link.
+const INBOX_LIST_VISITED_STORAGE_KEY_PREFIX = 'posthog.inbox.listVisited'
+
+/**
+ * Per project, because switching project is a same-tab page load that keeps session storage, and a
+ * list seen in one project says nothing about a report link in another. The project comes from the
+ * server-rendered app context rather than `teamLogic`, because the marker is read from a route
+ * handler on a cold load, before the team request answers.
+ */
+function inboxListVisitedStorageKey(): string {
+    return `${INBOX_LIST_VISITED_STORAGE_KEY_PREFIX}.${getCurrentTeamIdOrNone() ?? 'none'}`
+}
+
+function markInboxListVisited(): void {
+    try {
+        window.sessionStorage.setItem(inboxListVisitedStorageKey(), '1')
+    } catch {
+        return
+    }
+}
+
+function hasVisitedInboxList(): boolean {
+    try {
+        return window.sessionStorage.getItem(inboxListVisitedStorageKey()) === '1'
+    } catch {
+        return false
+    }
+}
+
+// Not `source`: the inbox filters own that param for the product filter.
+function hasLinkParams(searchParams: Record<string, any>): boolean {
+    return searchParams.link_source !== undefined || searchParams.link_action !== undefined
+}
+
+function withoutLinkParams(searchParams: Record<string, any>): Record<string, any> {
+    const { link_source: _linkSource, link_action: _linkAction, ...rest } = searchParams
+    return rest
+}
+
+function mountedReportLists(): ReturnType<typeof reportListLogic.build>[] {
+    return (Object.keys(INBOX_REPORT_SECTION_LIST_PARAMS) as InboxReportSectionKey[]).flatMap((sectionKey) => {
+        const mounted = reportListLogic.findMounted({
+            sectionKey,
+            listParams: INBOX_REPORT_SECTION_LIST_PARAMS[sectionKey],
+        })
+        return mounted ? [mounted] : []
+    })
+}
+
+function findLoadedReport(id: string): SignalReport | null {
+    for (const mounted of mountedReportLists()) {
+        const found = mounted.values.reports.find((r: SignalReport) => r.id === id)
+        if (found) {
+            return found
+        }
+    }
+    return null
+}
+
+/**
+ * Position (1-based) and size of the report's list, for `Inbox report opened` and `Inbox report
+ * scrolled`. The rank is rebuilt with the same selection, dedupe, and ordering the flat Reports list
+ * rendered with, so these outcome events join to the impressions recorded at the same rank. Null
+ * when the report isn't in a rendered list (e.g. a cold deep-link).
+ */
+function findReportRank(id: string): {
+    rank: number | null
+    listSize: number | null
+    section: InboxReportSectionKey | null
+    rankerId: string | null
+    personalTier: string | null
+    personalReasonShown: boolean
+} {
+    const notFound = {
+        rank: null,
+        listSize: null,
+        section: null,
+        rankerId: null,
+        personalTier: null,
+        personalReasonShown: false,
+    }
+    const filterValues = inboxFiltersLogic.findMounted()?.values
+    if (!filterValues) {
+        return notFound
+    }
+    const isStaff = userLogic.findMounted()?.values.user?.is_staff ?? false
+    const reportsBySection = Object.fromEntries(
+        INBOX_REPORT_SECTION_KEYS.map((sectionKey) => [
+            sectionKey,
+            reportListLogic.findMounted({
+                sectionKey,
+                listParams: INBOX_REPORT_SECTION_LIST_PARAMS[sectionKey],
+            })?.values.reports ?? [],
+        ])
+    ) as Record<InboxReportSectionKey, SignalReport[]>
+    const rows = mergeReportRows(
+        reportsBySection,
+        selectedFlatListSections(filterValues.visibleStateFilter, isStaff),
+        filterValues.activeSortField,
+        filterValues.activeSortDirection,
+        {
+            collapsePlans:
+                !!featureFlagLogic.findMounted()?.values.featureFlags[FEATURE_FLAGS.INBOX_CARDS_LINK_RELATED_REPORTS],
+            selectedReportIds: inboxBulkActionsLogic.findMounted()?.values.selectedReportIds,
+        }
+    )
+    const idx = rows.findIndex((row) => row.report.id === id)
+    if (idx >= 0) {
+        const sectionKey = rows[idx].sectionKey
+        const sectionValues = reportListLogic.findMounted({
+            sectionKey,
+            listParams: INBOX_REPORT_SECTION_LIST_PARAMS[sectionKey],
+        })?.values
+        // The opened report can come from the detail endpoint, which has no personal fields, so they
+        // come from the list row the person saw.
+        const personalSort = sectionValues?.loadedRanker === 'personal'
+        return {
+            rank: idx + 1,
+            listSize: rows.length,
+            section: sectionKey,
+            rankerId: sectionValues?.loadedRanker ?? null,
+            personalTier: personalSort ? (rows[idx].report.personal_tier ?? null) : null,
+            personalReasonShown: personalSort && !!rows[idx].report.personal_reason,
+        }
+    }
+    return notFound
+}
+
+// One list answered, with rows or with a failure, and none is still fetching. Until then, a missing
+// rank means "not loaded yet". This mirrors the rule the impression side settles on, so an open and
+// the impression it joins to describe the same list.
+function reportListsSettled(): boolean {
+    const mounted = INBOX_REPORT_SECTION_KEYS.map((sectionKey) =>
+        reportListLogic.findMounted({ sectionKey, listParams: INBOX_REPORT_SECTION_LIST_PARAMS[sectionKey] })
+    ).filter((logic) => !!logic)
+    return (
+        mounted.some((logic) => logic.values.isLoaded || logic.values.reportsLoadFailed) &&
+        mounted.every((logic) => !logic.values.reportsResponseLoading)
+    )
+}
+
+const OPEN_RANK_WAIT_MS = 5000
+const OPEN_RANK_POLL_MS = 250
+/** Visible time an open report needs, after a scroll, to count as read for `Inbox report read`. */
+export const REPORT_READ_ACTIVE_MS = 8000
+
+// A cold load answers the report fetch long before the lists, so a rank read at open time is null
+// and the row joins to no impression. Wait for the lists, then send whatever the lookup gives.
+function captureOpenWhenRanked(
+    cache: Record<string, any>,
+    tracking: InboxOpenTracking,
+    openMethod: InboxReportOpenMethod,
+    linkSource: InboxReportLinkSource | null
+): void {
+    const previousReportId = cache.previousReportId ?? null
+    const deadline = Date.now() + OPEN_RANK_WAIT_MS
+    let sent = false
+
+    const fire = (resolved: ReturnType<typeof findReportRank>, options?: CaptureOptions): void => {
+        if (sent) {
+            return
+        }
+        sent = true
+        cache.pendingOpenCapture = undefined
+        cache.disposables.dispose('openRank')
+        captureInboxReportOpened(
+            {
+                report: tracking.report,
+                openMethod,
+                linkSource,
+                previousReportId,
+                rank: resolved.rank,
+                listSize: resolved.listSize,
+                section: resolved.section,
+                rankerId: resolved.rankerId,
+                personalTier: resolved.personalTier,
+                personalReasonShown: resolved.personalReasonShown,
+            },
+            // The wait puts the capture up to `OPEN_RANK_WAIT_MS` after the report opened, and
+            // posthog-js stamps an event at the capture moment. Without the override, a scroll or an
+            // action taken in the detail pane during the wait reads earlier than the open that
+            // started it. The caller's options win, so the unload flush keeps `send_instantly`.
+            { timestamp: new Date(tracking.openedAt), ...options }
+        )
+    }
+    // The first read sees the list as the person left it, so a rank found there is the rank they
+    // acted on, even while a filter refetch is in flight. Every later read waits for the lists to
+    // settle: the flat list merges the selected states, and a state that answers late adds rows that
+    // can sort above the report, which makes a rank read from the states that answered first too
+    // small.
+    const fireWhenReady = (firstRead: boolean): void => {
+        const resolved = findReportRank(tracking.report.id)
+        if ((firstRead && resolved.rank !== null) || reportListsSettled() || Date.now() >= deadline) {
+            fire(resolved)
+        }
+    }
+
+    cache.pendingOpenCapture = (options?: CaptureOptions) => fire(findReportRank(tracking.report.id), options)
+    fireWhenReady(true)
+    if (sent) {
+        return
+    }
+    // kea-disposables runs this setup again on each resume. A resume without a pause replaces the
+    // stored cleanup and leaves the earlier interval running, so each tick checks `sent` and stops
+    // itself rather than rely on `dispose` alone.
+    cache.disposables.add(() => {
+        const interval = setInterval(() => {
+            if (sent) {
+                clearInterval(interval)
+                return
+            }
+            fireWhenReady(false)
+        }, OPEN_RANK_POLL_MS)
+        return () => clearInterval(interval)
+    }, 'openRank')
+}
+
+/**
+ * Send a still-waiting open now, so no close can precede it. The unload flush must pass its
+ * `options` on: posthog-js batches a capture that carries none, and it drains that queue from its
+ * own `pagehide` handler, which is registered at `init()` and therefore runs before this one. An
+ * open enqueued after the drain never leaves the page.
+ */
+function flushPendingOpen(cache: Record<string, any>, options?: CaptureOptions): void {
+    const capture = cache.pendingOpenCapture as ((options?: CaptureOptions) => void) | undefined
+    capture?.(options)
+}
+
+/**
+ * The URL for whichever full-width inbox surface is open, or the list otherwise. The surfaces
+ * (report, scout detail, scratchpad, findings, runs, triage) are mutually exclusive, so a fixed
+ * priority order resolves them.
+ */
+function inboxSurfaceUrl(values: {
+    selectedReportId: string | null
+    activeTab: InboxTabKey
+    selectedScoutSkillName: string | null
+    selectedScoutFindingId: string | null
+    isScratchpadOpen: boolean
+    isFindingsOpen: boolean
+    isRunsOpen: boolean
+    isTriageOpen: boolean
+}): string {
+    if (values.selectedReportId) {
+        // Every report lives in the one Reports list.
+        return urls.inboxReport('reports', values.selectedReportId)
+    }
+    if (values.selectedScoutSkillName) {
+        return urls.inboxScout(values.selectedScoutSkillName, values.selectedScoutFindingId ?? undefined)
+    }
+    if (values.isScratchpadOpen) {
+        return urls.inboxScratchpad()
+    }
+    if (values.isFindingsOpen) {
+        return urls.inboxFindings()
+    }
+    if (values.isRunsOpen) {
+        return urls.inboxRuns()
+    }
+    if (values.isTriageOpen) {
+        return urls.inboxTriage()
+    }
+    return urls.inbox(values.activeTab)
+}
+
+/** Open-report engagement tracking state, kept on the logic's `cache` (not reactive). */
+interface InboxOpenTracking {
+    report: SignalReport
+    openedAt: number
+    /** Set once the first detail-pane scroll has fired `Inbox report scrolled` for this open. */
+    scrolled: boolean
+    /** Visible time banked before `visibleSince`. */
+    activeMs: number
+    /** When the tab last became visible during this open, or null while the tab is hidden. */
+    visibleSince: number | null
+    /** Set once `Inbox report read` has fired for this open. */
+    read: boolean
+}
+
+function openActiveMs(open: InboxOpenTracking): number {
+    return open.activeMs + (open.visibleSince === null ? 0 : Date.now() - open.visibleSince)
+}
+
+function clearReportReadTimer(cache: Record<string, any>): void {
+    clearTimeout(cache.reportReadTimer)
+    cache.reportReadTimer = undefined
+}
+
+/**
+ * Fire `Inbox report read` once the open report has a scroll and enough visible time. Before that,
+ * check again at the moment the visible time can reach the threshold. A hidden tab schedules
+ * nothing, because the visibility listener calls this again when the tab comes back.
+ */
+function captureReadWhenDue(cache: Record<string, any>): void {
+    clearReportReadTimer(cache)
+    const open: InboxOpenTracking | undefined = cache.openTracking
+    if (!open || open.read || !open.scrolled || open.visibleSince === null) {
+        return
+    }
+    const activeMs = openActiveMs(open)
+    if (activeMs < REPORT_READ_ACTIVE_MS) {
+        cache.reportReadTimer = setTimeout(() => captureReadWhenDue(cache), REPORT_READ_ACTIVE_MS - activeMs)
+        return
+    }
+    open.read = true
+    const { rank, listSize } = findReportRank(open.report.id)
+    captureInboxReportRead({
+        report: open.report,
+        rank,
+        listSize,
+        activeTimeMs: activeMs,
+        timeSinceOpenMs: Date.now() - open.openedAt,
+    })
+}
+
+/**
+ * Emit the dwell-time close for a report still open when the view goes away, then clear the tracking
+ * so it can't fire twice. Shared by the scene unmount (`unmount`) and the tab-close flush
+ * (`page_unload`); a no-op when no report is open.
+ */
+function flushOpenReport(
+    cache: Record<string, any>,
+    closeMethod: InboxReportCloseMethod,
+    options?: CaptureOptions
+): void {
+    const open: InboxOpenTracking | undefined = cache.openTracking
+    if (!open) {
+        return
+    }
+    flushPendingOpen(cache, options)
+    clearReportReadTimer(cache)
+    captureInboxReportClosed(
+        {
+            report: open.report,
+            timeSpentMs: Date.now() - open.openedAt,
+            activeTimeMs: openActiveMs(open),
+            closeMethod,
+        },
+        options
+    )
+    cache.openTracking = undefined
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface inboxSceneLogicValues {
+    featureFlags: FeatureFlagsSet // featureFlagLogic
+    user: UserType | null // userLogic
+    activeTab: InboxTabKey
+    activeTabState: InboxTabKey | null
+    breadcrumbs: Breadcrumb[]
+    isFindingsOpen: boolean
+    isRunsOpen: boolean
+    isScratchpadOpen: boolean
+    isStaff: boolean
+    isTriageOpen: boolean
+    linkImplementReportId: string | null
+    scoutDetailTab: ScoutDetailTab | null
+    scoutTemplateDraft: ScoutCreateInitialValues | null
+    selectedReport: SignalReport | null
+    selectedReportId: string | null
+    selectedReportLoading: boolean
+    selectedReportResponse: SignalReport | null
+    selectedReportResponseLoading: boolean
+    selectedScoutFindingId: string | null
+    selectedScoutSkillName: string | null
+    signalRuns: SignalRun[]
+    signalRunsLoading: boolean
+    signalRunsResponse: SignalRun[] | null
+    signalRunsResponseLoading: boolean
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface inboxSceneLogicActions {
+    loadSourceConfigs: () => any // signalSourcesLogic
+    applySelectedReportMetricSnapshots: (snapshots: SignalReportMetricSnapshotsApi[]) => {
+        snapshots: SignalReportMetricSnapshotsApi[]
+    }
+    loadRuns: (_payload: void) => void
+    loadRunsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadRunsSuccess: (
+        signalRunsResponse: SignalRun[],
+        payload?: void
+    ) => {
+        signalRunsResponse: SignalRun[]
+        payload?: void
+    }
+    loadSelectedReport: ({ id }: { id: string }) => {
+        id: string
+    }
+    loadSelectedReportFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadSelectedReportSuccess: (
+        selectedReportResponse: SignalReport | null,
+        payload?: {
+            id: string
+        }
+    ) => {
+        selectedReportResponse: SignalReport | null
+        payload?: {
+            id: string
+        }
+    }
+    refreshSelectedReportMetrics: (id: string) => {
+        id: string
+    }
+    reportDetailScrolled: () => {
+        value: true
+    }
+    seedSelectedReport: (report: SignalReport | null) => {
+        report: SignalReport | null
+    }
+    setActiveTab: (tab: InboxTabKey) => {
+        tab: InboxTabKey
+    }
+    setFindingsOpen: (open: boolean) => {
+        open: boolean
+    }
+    setLinkImplementReportId: (id: string | null) => {
+        id: string | null
+    }
+    setRunsOpen: (open: boolean) => {
+        open: boolean
+    }
+    setScoutDetailTab: (tab: ScoutDetailTab | null) => {
+        tab: 'learned' | 'reports' | 'runs' | 'signals' | 'told' | 'trials' | null
+    }
+    setScoutTemplateDraft: (draft: ScoutCreateInitialValues | null) => {
+        draft: ScoutCreateInitialValues | null
+    }
+    setScratchpadOpen: (open: boolean) => {
+        open: boolean
+    }
+    setSelectedReportId: (
+        id: string | null,
+        openMethod?: InboxReportOpenMethod,
+        linkSource?: InboxReportLinkSource | null
+    ) => {
+        id: string | null
+        linkSource: InboxReportLinkSource | null
+        openMethod: InboxReportOpenMethod
+    }
+    setSelectedScoutSkillName: (
+        skillName: string | null,
+        findingId?: string | null,
+        tab?: ScoutDetailTab | null
+    ) => {
+        findingId: string | null
+        skillName: string | null
+        tab: 'learned' | 'reports' | 'runs' | 'signals' | 'told' | 'trials' | null
+    }
+    setTriageOpen: (open: boolean) => {
+        open: boolean
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface inboxSceneLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        activeTab: (activeTabState: InboxTabKey | null) => InboxTabKey
+        breadcrumbs: (selectedReport: SignalReport | null, selectedReportId: string | null) => Breadcrumb[]
+        isStaff: (user: UserType | null) => boolean
+        signalRuns: (signalRunsResponse: SignalRun[] | null) => SignalRun[]
+        signalRunsLoading: (signalRunsResponse: SignalRun[] | null, signalRunsResponseLoading: boolean) => boolean
+        selectedReport: (selectedReportResponse: SignalReport | null) => SignalReport | null
+        selectedReportLoading: (selectedReportResponseLoading: boolean) => boolean
+    }
+}
+
+export type inboxSceneLogicType = MakeLogicType<
+    inboxSceneLogicValues,
+    inboxSceneLogicActions,
+    Record<string, any>,
+    inboxSceneLogicMeta
+>
+
+/**
+ * Inbox scene orchestrator. Owns the active page tab (Reports / Scouts / Settings), the active
+ * Reports view, the selected report (loaded by id), the full-width surfaces that replace the list
+ * (scout detail, scratchpad, findings, runs, triage mode), and the project-wide runs list. The
+ * per-view report lists + their counts live in the keyed `reportListLogic` (one instance per view).
+ */
+export const inboxSceneLogic = kea<inboxSceneLogicType>([
+    path(['scenes', 'inbox', 'inboxSceneLogic']),
+
+    connect(() => ({
+        // Mount inboxFiltersLogic with the scene so its URL sync (shareable filter params) applies on
+        // deep-link load, before the filter bar / list have rendered. inboxBulkActionsLogic owns the
+        // `reportStateChanged` broadcast the report refresh below sends, and kea throws when an action
+        // is dispatched through an unmounted logic, so the scene keeps it alive instead of relying on
+        // a component (the list toolbar, the detail actions) having rendered first.
+        logic: [inboxFiltersLogic, inboxBulkActionsLogic],
+        values: [userLogic, ['user'], featureFlagLogic, ['featureFlags']],
+        actions: [signalSourcesLogic, ['loadSourceConfigs']],
+    })),
+
+    actions({
+        setSelectedReportId: (
+            id: string | null,
+            openMethod: InboxReportOpenMethod = 'unknown',
+            linkSource: InboxReportLinkSource | null = null
+        ) => ({
+            id,
+            openMethod,
+            linkSource,
+        }),
+        // A link with `link_action=implement`, such as the Implement button in Slack, asks the
+        // report detail to open its implementation choices. The detail clears it once it opens them.
+        setLinkImplementReportId: (id: string | null) => ({ id }),
+        // Seed (or clear) the selected report synchronously from an already-loaded list row, so the
+        // detail renders without a spinner while the authoritative fetch runs in the background.
+        seedSelectedReport: (report: SignalReport | null) => ({ report }),
+        // Ask the server for the newest snapshot of the open report's metrics. Best effort: a failure
+        // leaves the saved snapshot in place, and the detail shows the live query result anyway.
+        refreshSelectedReportMetrics: (id: string) => ({ id }),
+        applySelectedReportMetricSnapshots: (snapshots: SignalReportMetricSnapshotsApi[]) => ({ snapshots }),
+        setActiveTab: (tab: InboxTabKey) => ({ tab }),
+        // Scout detail surface: selecting a scout opens its full-width detail over the list. An
+        // optional finding id deep-links to one emitted finding within that scout (highlighted +
+        // scrolled into view if it's still in the recent window). The pane travels with the
+        // selection so a route can name the tab its URL asked for in the same action: a second
+        // action for the tab would first write a URL without it, and that write is a history entry.
+        setSelectedScoutSkillName: (
+            skillName: string | null,
+            findingId: string | null = null,
+            tab: ScoutDetailTab | null = null
+        ) => ({
+            skillName,
+            findingId,
+            tab,
+        }),
+        // Which pane of the open scout's page is showing. Carried in the URL so a link to a scout's
+        // runs survives a reload.
+        setScoutDetailTab: (tab: ScoutDetailTab | null) => ({ tab }),
+        // Scout fleet-memory (scratchpad) surface: a full-width browse/search view over the list,
+        // mutually exclusive with the report and scout-detail views. Reached from the fleet-memory callout.
+        setScratchpadOpen: (open: boolean) => ({ open }),
+        // Cross-fleet findings surface: full-width browse/search/filter of every finding the troop
+        // emitted recently, mutually exclusive with the other full-width views.
+        setFindingsOpen: (open: boolean) => ({ open }),
+        // Runs surface: the project-wide scout + signal-pipeline runs list, reached from the roster.
+        setRunsOpen: (open: boolean) => ({ open }),
+        // Triage mode: the Needs-a-decision queue one report at a time, driven from the keyboard.
+        setTriageOpen: (open: boolean) => ({ open }),
+        // The detail pane was scrolled. The logic fires `Inbox report scrolled` once per open; the
+        // component reports the raw scroll.
+        reportDetailScrolled: true,
+        // A decoded `#createScout=` payload, prefilling the create modal. The user still submits it.
+        setScoutTemplateDraft: (draft: ScoutCreateInitialValues | null) => ({ draft }),
+    }),
+
+    loaders(({ values }) => ({
+        // Runs panel: a newest-first list of scout + signals-pipeline runs, composed from two existing
+        // endpoints, scout runs (clean `skill_name`) and signal-pipeline tasks (whose title is the
+        // originating report's title). Merged client-side; there is no unified backend "runs" resource
+        // by design. Both endpoints are team-scoped and readable by any member, so the panel is public.
+        signalRunsResponse: [
+            null as SignalRun[] | null,
+            {
+                loadRuns: async (_payload: void, breakpoint) => {
+                    const [scoutResult, signalResult] = await Promise.allSettled([
+                        signalsScoutRunsList(String(ApiConfig.getCurrentProjectId()), { limit: SCOUT_RUNS_LIMIT }),
+                        // `internal: 'all'` so the pipeline's runs (research and implementation, both
+                        // created internal) are included. They're hidden from the default task list.
+                        api.tasks.list({
+                            origin_product: OriginProduct.SIGNAL_REPORT,
+                            internal: 'all',
+                            limit: SIGNAL_TASKS_LIMIT,
+                        }),
+                    ])
+                    breakpoint()
+                    // Degrade gracefully: surface whichever source resolved, matching the inbox's other
+                    // fan-out loaders (scoutDetailLogic) so one source's outage doesn't blank the panel.
+                    // Only fail the load if both sources rejected.
+                    if (scoutResult.status === 'rejected' && signalResult.status === 'rejected') {
+                        throw scoutResult.reason
+                    }
+                    const scoutRuns = scoutResult.status === 'fulfilled' ? scoutResult.value : []
+                    const signalTasks = signalResult.status === 'fulfilled' ? signalResult.value.results : []
+                    // The tab polls every 5s and both endpoints return freshly parsed objects each
+                    // time. Reconcile the merged list so a no-change poll keeps every reference —
+                    // otherwise all ~100 run cards re-render every 5s on an idle tab. (No
+                    // wall-clock exception needed: a run whose status flips deep-compares
+                    // different and swaps identity on its own; timestamps self-update in TZLabel.)
+                    return reconcileById(
+                        values.signalRunsResponse ?? [],
+                        mergeSignalRuns(scoutRuns, signalTasks),
+                        (run) => run.task_id
+                    )
+                },
+            },
+        ],
+        // The selected report's base record, loaded by id so detail works regardless of which
+        // view/list it came from (and on direct deep-link).
+        selectedReportResponse: [
+            null as SignalReport | null,
+            {
+                loadSelectedReport: async ({ id }: { id: string }, breakpoint) => {
+                    const before = values.selectedReportResponse
+                    try {
+                        const report = await api.signalReports.get(id)
+                        breakpoint()
+                        return keepFieldsWrittenDuringFetch(report, before, values.selectedReportResponse)
+                    } catch (error) {
+                        // Discard a superseded load so a slow response for a report the user already
+                        // navigated away from can't overwrite the current one (e.g. a stale 404
+                        // blanking a valid report that resolved first).
+                        breakpoint()
+                        // An unresolvable id (a stale deep link, or the onboarding sample card) 404s.
+                        // Return null so the scene shows a "not found" empty state instead of the
+                        // global raw error toast. Let every other failure surface as before.
+                        if (error instanceof ApiError && error.status === 404) {
+                            return null
+                        }
+                        throw error
+                    }
+                },
+            },
+        ],
+    })),
+
+    reducers({
+        selectedReportResponse: {
+            // Navigation seeds this directly: the listener resolves the list row (or null) and
+            // dispatches `seedSelectedReport` in the same tick, so we never flash through a stale
+            // report or a spinner when the row is already loaded. The loader repopulates it on fetch.
+            seedSelectedReport: (_, { report }) => report,
+            // Only the numbers change: the report keeps its prose and queries as loaded.
+            applySelectedReportMetricSnapshots: (state, { snapshots }) =>
+                state ? mergeReportMetricSnapshots(state, snapshots) : state,
+        },
+        selectedReportId: [
+            null as string | null,
+            {
+                setSelectedReportId: (_, { id }) => id,
+            },
+        ],
+        linkImplementReportId: [
+            null as string | null,
+            {
+                setLinkImplementReportId: (_, { id }) => id,
+                setSelectedReportId: (state, { id }) => (state === id ? state : null),
+            },
+        ],
+        // Null until a route sets a tab; `activeTab` fills in the landing tab.
+        activeTabState: [
+            null as InboxTabKey | null,
+            {
+                setActiveTab: (_, { tab }) => tab,
+            },
+        ],
+        selectedScoutSkillName: [
+            null as string | null,
+            {
+                setSelectedScoutSkillName: (_, { skillName }) => skillName,
+            },
+        ],
+        isScratchpadOpen: [
+            false,
+            {
+                setScratchpadOpen: (_, { open }) => open,
+                // Opening any other full-width surface closes the memory view.
+                setSelectedReportId: (state, { id }) => (id ? false : state),
+                setSelectedScoutSkillName: (state, { skillName }) => (skillName ? false : state),
+                setFindingsOpen: (state, { open }) => (open ? false : state),
+                setRunsOpen: (state, { open }) => (open ? false : state),
+                setTriageOpen: (state, { open }) => (open ? false : state),
+            },
+        ],
+        isFindingsOpen: [
+            false,
+            {
+                setFindingsOpen: (_, { open }) => open,
+                setSelectedReportId: (state, { id }) => (id ? false : state),
+                setSelectedScoutSkillName: (state, { skillName }) => (skillName ? false : state),
+                setScratchpadOpen: (state, { open }) => (open ? false : state),
+                setRunsOpen: (state, { open }) => (open ? false : state),
+                setTriageOpen: (state, { open }) => (open ? false : state),
+            },
+        ],
+        isRunsOpen: [
+            false,
+            {
+                setRunsOpen: (_, { open }) => open,
+                setSelectedReportId: (state, { id }) => (id ? false : state),
+                setSelectedScoutSkillName: (state, { skillName }) => (skillName ? false : state),
+                setScratchpadOpen: (state, { open }) => (open ? false : state),
+                setFindingsOpen: (state, { open }) => (open ? false : state),
+                setTriageOpen: (state, { open }) => (open ? false : state),
+            },
+        ],
+        isTriageOpen: [
+            false,
+            {
+                setTriageOpen: (_, { open }) => open,
+                setSelectedReportId: (state, { id }) => (id ? false : state),
+                setSelectedScoutSkillName: (state, { skillName }) => (skillName ? false : state),
+                setScratchpadOpen: (state, { open }) => (open ? false : state),
+                setFindingsOpen: (state, { open }) => (open ? false : state),
+                setRunsOpen: (state, { open }) => (open ? false : state),
+            },
+        ],
+        scoutTemplateDraft: [
+            null as ScoutCreateInitialValues | null,
+            {
+                setScoutTemplateDraft: (_, { draft }) => draft,
+            },
+        ],
+        // The finding deep-linked within the selected scout, if any. Cleared whenever a scout is
+        // (re)selected without a finding — navigating to a scout from the fleet drops any prior finding.
+        selectedScoutFindingId: [
+            null as string | null,
+            {
+                setSelectedScoutSkillName: (_, { findingId }) => findingId,
+            },
+        ],
+        scoutDetailTab: [
+            null as ScoutDetailTab | null,
+            {
+                setScoutDetailTab: (_, { tab }) => tab,
+                // The pane the navigation named wins: a route passes the tab its URL carries, so a
+                // finding link that names another pane opens that one. A roster click passes
+                // nothing, which leaves the page on the pane its path implies.
+                setSelectedScoutSkillName: (_, { findingId, tab }) => scoutUrlPane(tab, findingId),
+            },
+        ],
+    }),
+
+    selectors({
+        // A bare `/inbox` keeps whichever tab was already active, and lands on Reports before any
+        // route sets one.
+        activeTab: [
+            (s) => [s.activeTabState],
+            (activeTabState: InboxTabKey | null): InboxTabKey =>
+                activeTabState && isInboxTabKey(activeTabState) ? activeTabState : 'reports',
+        ],
+        breadcrumbs: [
+            (s) => [s.selectedReport, s.selectedReportId],
+            (selectedReport: SignalReport | null, selectedReportId: string | null): Breadcrumb[] => [
+                {
+                    key: 'inbox',
+                    name: sceneConfigurations[Scene.Inbox].name,
+                    iconType: 'inbox',
+                    path: urls.inbox('reports'),
+                },
+                ...(selectedReport && selectedReport.id === selectedReportId
+                    ? [{ key: selectedReport.id, name: selectedReport.title }]
+                    : []),
+            ],
+        ],
+        isStaff: [
+            () => [userLogic.selectors.user],
+            (user: null | import('~/types').UserType): boolean => user?.is_staff ?? false,
+        ],
+        signalRuns: [
+            (s) => [s.signalRunsResponse],
+            (signalRunsResponse: SignalRun[] | null): SignalRun[] => signalRunsResponse ?? [],
+        ],
+        // True only while the first load is in flight (response still null), so the Runs panel shows a
+        // skeleton instead of the empty state before any data lands. A refetch on re-open keeps the
+        // already-loaded list visible rather than flashing the skeleton.
+        signalRunsLoading: [
+            (s) => [s.signalRunsResponse, s.signalRunsResponseLoading],
+            (signalRunsResponse: SignalRun[] | null, signalRunsResponseLoading: boolean): boolean =>
+                signalRunsResponse === null && signalRunsResponseLoading,
+        ],
+        selectedReport: [
+            (s) => [s.selectedReportResponse],
+            (selectedReportResponse: SignalReport | null): SignalReport | null => selectedReportResponse,
+        ],
+        selectedReportLoading: [
+            (s) => [s.selectedReportResponseLoading],
+            (selectedReportResponseLoading: boolean): boolean => selectedReportResponseLoading,
+        ],
+    }),
+
+    listeners(({ actions, values, cache, selectors }) => ({
+        [inboxBulkActionsLogic.actionTypes.reportWriteFailed]: ({ reportIds }: { reportIds: string[] }) => {
+            const id = values.selectedReportId
+            if (id && reportIds.includes(id)) {
+                actions.loadSelectedReport({ id })
+            }
+        },
+        // A claim from a list row can change the open report. Patch it the way the detail pane's own claim
+        // does, which also skips the copy that pane already patched.
+        [inboxBulkActionsLogic.actionTypes.reportClaimChanged]: ({
+            reportId,
+            assignee,
+        }: {
+            reportId: string
+            assignee: SignalReport['assignee']
+        }) => {
+            const report = values.selectedReport
+            if (report?.id === reportId && !objectsEqual(report.assignee ?? null, assignee ?? null)) {
+                actions.seedSelectedReport({ ...report, assignee })
+            }
+        },
+        setRunsOpen: ({ open }) => {
+            // While the Runs panel is open, refetch on a slow poll so live runs update in place. The
+            // keyed disposable replaces any prior poll and is torn down on close / unmount, and
+            // kea-disposables pauses it while the browser tab is hidden. The refetch is silent (the
+            // skeleton only shows before the first load), so it swaps the list without flicker.
+            if (!open) {
+                // The `isRunsOpen` subscription owns poll teardown, so it also catches the closes that
+                // flip the panel shut through a mutual-exclusion reducer without dispatching
+                // `setRunsOpen(false)` (a report, scout, triage, scratchpad, or findings opening).
+                return
+            }
+            actions.loadRuns()
+            cache.disposables.add(() => {
+                const interval = setInterval(() => actions.loadRuns(), RUNS_POLL_INTERVAL_MS)
+                return () => clearInterval(interval)
+            }, 'runsPoll')
+            // Close the open report/scout through their own actions so report dwell-time
+            // bookkeeping runs (clearing the id in a reducer would skip the close tracking).
+            clearScratchpadSearch()
+            if (values.selectedReportId !== null) {
+                actions.setSelectedReportId(null)
+            }
+            if (values.selectedScoutSkillName !== null) {
+                actions.setSelectedScoutSkillName(null)
+            }
+            // The runs list is reached from the roster, so its Back control returns to the Scouts tab.
+            if (values.activeTab !== 'scouts') {
+                actions.setActiveTab('scouts')
+            }
+        },
+        setTriageOpen: ({ open }) => {
+            if (!open) {
+                return
+            }
+            clearScratchpadSearch()
+            if (values.selectedReportId !== null) {
+                actions.setSelectedReportId(null)
+            }
+            if (values.selectedScoutSkillName !== null) {
+                actions.setSelectedScoutSkillName(null)
+            }
+            // Triage mode triages the Reports tab's queue, so leaving it lands back on Reports.
+            if (values.activeTab !== 'reports') {
+                actions.setActiveTab('reports')
+            }
+        },
+        setSelectedReportId: ({ id, openMethod, linkSource }) => {
+            // Close the previously open report (if any) before opening/clearing. `next_report` when
+            // switching straight to another report, `deselected` when returning to the list.
+            const open: InboxOpenTracking | undefined = cache.openTracking
+            if (open) {
+                flushPendingOpen(cache)
+                clearReportReadTimer(cache)
+                const closeMethod: InboxReportCloseMethod = id ? 'next_report' : 'deselected'
+                captureInboxReportClosed({
+                    report: open.report,
+                    timeSpentMs: Date.now() - open.openedAt,
+                    activeTimeMs: openActiveMs(open),
+                    closeMethod,
+                })
+                cache.previousReportId = open.report.id
+                cache.openTracking = undefined
+            }
+            if (!id) {
+                actions.seedSelectedReport(null)
+                return
+            }
+            // Opening a report closes the scratchpad (reducer) — clear its transient search so the
+            // callout doesn't stay hidden behind a stale no-match filter on the way back.
+            clearScratchpadSearch()
+            // The open method is resolved once the authoritative record lands in loadSelectedReportSuccess.
+            cache.pendingOpenMethod = openMethod
+            cache.pendingLinkSource = linkSource
+            // A report and a scout detail are mutually exclusive full-width views.
+            if (values.selectedScoutSkillName !== null) {
+                actions.setSelectedScoutSkillName(null)
+            }
+            // A report page is a Reports-tab surface even when reached from a scout page, so its
+            // back button returns to the report list.
+            if (values.activeTab !== 'reports') {
+                actions.setActiveTab('reports')
+            }
+            // Reuse the list row if we already have it (instant render), then refresh from the server.
+            actions.seedSelectedReport(findLoadedReport(id))
+            actions.loadSelectedReport({ id })
+        },
+        // Fire `Inbox report opened` once the authoritative record lands (skip background refreshes
+        // of the already-open report). Rank/list_size come from whichever loaded list holds it.
+        loadSelectedReportSuccess: ({ selectedReportResponse }, _, __, previousState) => {
+            const report = selectedReportResponse
+            // The report lists stay mounted behind the detail pane and reconcile only on this
+            // broadcast, so a status the server moved behind us (a webhook suppressing the report)
+            // would leave their row and count showing the old state. Compare against the record we
+            // held for the same report, so navigating between two reports never counts as a change.
+            const previous = selectors.selectedReport(previousState)
+            if (report && previous?.id === report.id && previous.status !== report.status) {
+                inboxBulkActionsLogic.actions.reportStateChanged()
+            }
+            // Skip already-open refreshes, and stale loads for a report the user already navigated away
+            // from before the fetch returned (else we'd log a phantom open + a later bogus dwell close).
+            if (!report || values.selectedReportId !== report.id || cache.openTracking?.report.id === report.id) {
+                return
+            }
+            const openedAt = Date.now()
+            const tracking: InboxOpenTracking = {
+                report,
+                openedAt,
+                scrolled: false,
+                activeMs: 0,
+                visibleSince: document.visibilityState === 'hidden' ? null : openedAt,
+                read: false,
+            }
+            cache.openTracking = tracking
+            captureOpenWhenRanked(
+                cache,
+                tracking,
+                (cache.pendingOpenMethod as InboxReportOpenMethod | undefined) ?? 'unknown',
+                (cache.pendingLinkSource as InboxReportLinkSource | null | undefined) ?? null
+            )
+            cache.pendingOpenMethod = undefined
+            cache.pendingLinkSource = undefined
+            // Best-effort server-side view record: consumption evidence that keeps the authoring
+            // scout from being auto-paused as ignored. The analytics event above stays the rich
+            // record (rank, open method, dwell), so a failure here is swallowed.
+            void signalsReportsViewedCreate(String(teamLogic.values.currentTeamId), report.id).catch(() => {})
+            if (reportNeedsMetricRefresh(report, Date.now())) {
+                actions.refreshSelectedReportMetrics(report.id)
+            }
+        },
+        refreshSelectedReportMetrics: async ({ id }, breakpoint) => {
+            if (!isReportMetricsEnabled(values.featureFlags)) {
+                return
+            }
+            let response: Awaited<ReturnType<typeof signalsReportsRefreshMetricsCreate>>
+            try {
+                response = await signalsReportsRefreshMetricsCreate(String(teamLogic.values.currentTeamId), {
+                    report_ids: [id],
+                })
+            } catch {
+                return
+            }
+            breakpoint()
+            if (values.selectedReportId !== id) {
+                return
+            }
+            const snapshots = [...response.reports]
+            actions.applySelectedReportMetricSnapshots(snapshots)
+            // The row for this report in every loaded list shows the same number.
+            for (const mounted of mountedReportLists()) {
+                mounted.actions.applyReportMetricSnapshots(snapshots)
+            }
+        },
+        reportDetailScrolled: () => {
+            // Fire the dwell signal once per open, on the first scroll. The metric's dwell branch
+            // filters `time_since_open_ms >= 5000`, so an immediate scroll is carried but won't qualify.
+            const open: InboxOpenTracking | undefined = cache.openTracking
+            if (!open || open.scrolled) {
+                return
+            }
+            open.scrolled = true
+            const { rank, listSize } = findReportRank(open.report.id)
+            captureInboxReportScrolled({
+                report: open.report,
+                rank,
+                listSize,
+                timeSinceOpenMs: Date.now() - open.openedAt,
+            })
+            captureReadWhenDue(cache)
+        },
+        setSelectedScoutSkillName: ({ skillName }) => {
+            if (skillName !== null) {
+                // Opening a scout detail closes the scratchpad (reducer) — clear its transient search.
+                clearScratchpadSearch()
+                if (values.selectedReportId !== null) {
+                    actions.setSelectedReportId(null)
+                }
+                // A scout page is a Scouts-tab surface even when reached from a report or a cold
+                // deep link, so anything that closes back to "the tab" returns to the roster. After
+                // the report clear, so the tab change resolves to this scout's URL, not the report's.
+                if (values.activeTab !== 'scouts') {
+                    actions.setActiveTab('scouts')
+                }
+            }
+        },
+        setScratchpadOpen: ({ open }) => {
+            if (open) {
+                // Close the open report/scout through their own actions so report dwell-time
+                // bookkeeping runs (clearing the id in a reducer would skip the close tracking).
+                if (values.selectedReportId !== null) {
+                    actions.setSelectedReportId(null)
+                }
+                if (values.selectedScoutSkillName !== null) {
+                    actions.setSelectedScoutSkillName(null)
+                }
+                // Same as opening a scout: the panel's Back control returns to the Scouts tab.
+                if (values.activeTab !== 'scouts') {
+                    actions.setActiveTab('scouts')
+                }
+            } else {
+                clearScratchpadSearch()
+            }
+        },
+        setFindingsOpen: ({ open }) => {
+            if (open) {
+                // Same dwell-tracking-preserving close as the scratchpad path; clear its transient
+                // search so the panel doesn't reopen behind a stale filter on the way back.
+                clearScratchpadSearch()
+                if (values.selectedReportId !== null) {
+                    actions.setSelectedReportId(null)
+                }
+                if (values.selectedScoutSkillName !== null) {
+                    actions.setSelectedScoutSkillName(null)
+                }
+                if (values.activeTab !== 'scouts') {
+                    actions.setActiveTab('scouts')
+                }
+            }
+        },
+    })),
+
+    events(({ actions, cache, values }) => ({
+        afterMount: () => {
+            // `beforeUnmount` flushes dwell time on in-app navigation, but a tab close or hard page
+            // unload never unmounts the scene, so half the closes were dropped. Flush on `pagehide`
+            // too. `pauseOnPageHidden: false` keeps the listener alive while the tab is hidden —
+            // `pagehide` fires as the tab goes away, exactly when a paused listener would be gone.
+            cache.disposables.add(
+                () => {
+                    const onPageHide = (): void => flushOpenReport(cache, 'page_unload', { send_instantly: true })
+                    window.addEventListener('pagehide', onPageHide)
+                    return () => window.removeEventListener('pagehide', onPageHide)
+                },
+                'reportUnloadFlush',
+                { pauseOnPageHidden: false }
+            )
+            // The open report is fetched once and then lags the server (closing its PR on GitHub
+            // suppresses it through the webhook), so re-fetch when the tab comes back into view.
+            // Same opt-out as above: the listener must be alive while hidden to see the return.
+            cache.disposables.add(
+                () => {
+                    const disposables = cache.disposables
+                    const onVisibilityChange = (): void => {
+                        if (document.visibilityState !== 'visible' || disposables.isDisposed) {
+                            return
+                        }
+                        const id = values.selectedReportId
+                        if (id) {
+                            actions.loadSelectedReport({ id })
+                        }
+                    }
+                    document.addEventListener('visibilitychange', onVisibilityChange)
+                    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+                },
+                'selectedReportRefreshOnVisible',
+                { pauseOnPageHidden: false }
+            )
+            // Bank the open report's visible time, so a report left open in a background tab does not
+            // count as read. Same opt-out as above, because the hide and the return are what count.
+            cache.disposables.add(
+                () => {
+                    const onVisibilityChange = (): void => {
+                        const open: InboxOpenTracking | undefined = cache.openTracking
+                        if (!open) {
+                            return
+                        }
+                        if (document.visibilityState === 'hidden') {
+                            if (open.visibleSince !== null) {
+                                open.activeMs += Date.now() - open.visibleSince
+                                open.visibleSince = null
+                            }
+                            clearReportReadTimer(cache)
+                        } else {
+                            open.visibleSince ??= Date.now()
+                            captureReadWhenDue(cache)
+                        }
+                    }
+                    document.addEventListener('visibilitychange', onVisibilityChange)
+                    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+                },
+                'reportActiveTime',
+                { pauseOnPageHidden: false }
+            )
+        },
+        // The Runs list loads lazily when its panel opens (via the `setRunsOpen` listener). There is no
+        // mount pre-fetch, so an inbox visit that never opens Runs doesn't pay for its two requests.
+        beforeUnmount: () => {
+            // Flush dwell time for a report still open when the scene unmounts (navigated away).
+            flushOpenReport(cache, 'unmount')
+            setInboxServedRanker(null)
+        },
+    })),
+
+    // The Runs poll (added in the `setRunsOpen` listener) has to stop the moment the panel closes,
+    // however it closes. Opening any other full-width surface flips `isRunsOpen` false through a
+    // mutual-exclusion reducer rather than dispatching `setRunsOpen(false)`, so this one subscription
+    // is the single teardown path that runs for every close — otherwise the poll leaks two requests
+    // every 5s for the rest of the visit.
+    subscriptions(({ cache }) => ({
+        isRunsOpen: (open: boolean) => {
+            if (!open) {
+                cache.disposables.dispose('runsPoll')
+            }
+        },
+    })),
+
+    actionToUrl(({ values }) => ({
+        // Each action resolves to whichever full-width view is left open (or the list), so clearing one
+        // because another opened honors that surface's URL rather than bouncing to the list — and a
+        // tab change made while a scout surface is open leaves that surface's URL alone.
+        setActiveTab: () => [
+            inboxSurfaceUrl(values),
+            router.values.searchParams,
+            router.values.hashParams,
+            { replace: false },
+        ],
+        setSelectedReportId: ({ openMethod }) => [
+            inboxSurfaceUrl(values),
+            // Opened from triage mode: the report page's back control returns to the spot in the
+            // queue, which the triage URL carries at this moment.
+            openMethod === 'triage'
+                ? { back: removeProjectIdIfPresent(router.values.location.pathname) + router.values.location.search }
+                : withoutLinkParams(router.values.searchParams),
+            router.values.hashParams,
+            // Replace, so Back does not return to the link URL and its `link_source`.
+            { replace: hasLinkParams(router.values.searchParams) },
+        ],
+        setSelectedScoutSkillName: ({ findingId }) => [
+            inboxSurfaceUrl(values),
+            scoutTabSearchParams(values.scoutDetailTab, findingId),
+            router.values.hashParams,
+            { replace: false },
+        ],
+        setScoutDetailTab: () => [
+            inboxSurfaceUrl(values),
+            scoutTabSearchParams(values.scoutDetailTab, values.selectedScoutFindingId),
+            router.values.hashParams,
+            // A tab switch is not a navigation step — Back should leave the scout, not walk its tabs.
+            { replace: true },
+        ],
+        setScratchpadOpen: () => [
+            inboxSurfaceUrl(values),
+            router.values.searchParams,
+            router.values.hashParams,
+            { replace: false },
+        ],
+        setFindingsOpen: () => [
+            inboxSurfaceUrl(values),
+            router.values.searchParams,
+            router.values.hashParams,
+            { replace: false },
+        ],
+        setRunsOpen: () => [
+            inboxSurfaceUrl(values),
+            router.values.searchParams,
+            router.values.hashParams,
+            { replace: false },
+        ],
+        setTriageOpen: () => [
+            inboxSurfaceUrl(values),
+            router.values.searchParams,
+            router.values.hashParams,
+            { replace: false },
+        ],
+    })),
+
+    urlToAction(({ actions, values }) => {
+        const closeAllSurfaces = (): void => {
+            if (values.selectedReportId !== null) {
+                actions.setSelectedReportId(null)
+            }
+            if (values.selectedScoutSkillName !== null) {
+                actions.setSelectedScoutSkillName(null)
+            }
+            if (values.isScratchpadOpen) {
+                actions.setScratchpadOpen(false)
+            }
+            if (values.isFindingsOpen) {
+                actions.setFindingsOpen(false)
+            }
+            if (values.isRunsOpen) {
+                actions.setRunsOpen(false)
+            }
+            if (values.isTriageOpen) {
+                actions.setTriageOpen(false)
+            }
+        }
+        return {
+            [urls.inboxScratchpad()]: () => {
+                if (!values.isScratchpadOpen) {
+                    actions.setScratchpadOpen(true)
+                }
+            },
+            [urls.inboxFindings()]: () => {
+                if (!values.isFindingsOpen) {
+                    actions.setFindingsOpen(true)
+                }
+            },
+            [urls.inboxRuns()]: () => {
+                if (!values.isRunsOpen) {
+                    actions.setRunsOpen(true)
+                }
+            },
+            [urls.inboxTriage()]: () => {
+                markInboxListVisited()
+                if (!values.isTriageOpen) {
+                    actions.setTriageOpen(true)
+                }
+            },
+            [urls.inbox()]: (_, searchParams, hashParams) => {
+                const redirectPath = inboxTabRedirectPath(undefined, searchParams)
+                if (redirectPath) {
+                    router.actions.replace(redirectPath, searchParams, hashParams)
+                    return
+                }
+                markInboxListVisited()
+                consumeScoutTemplateHash(actions, hashParams)
+                closeAllSurfaces()
+            },
+            [urls.inbox(':tab')]: ({ tab }: { tab?: string }, searchParams, hashParams) => {
+                if (tab === 'scout-trials') {
+                    return
+                }
+                // Tab segments from the old inbox layout still arrive from Slack messages and
+                // bookmarks: send them to the surface that replaced them.
+                const redirectPath = inboxTabRedirectPath(tab, searchParams)
+                if (redirectPath) {
+                    router.actions.replace(redirectPath, searchParams, hashParams)
+                    return
+                }
+                if (tab === 'monitoring' && !values.featureFlags[FEATURE_FLAGS.SIGNALS_REPORT_MONITORING]) {
+                    router.actions.replace(urls.inbox('reports'), searchParams, hashParams)
+                    return
+                }
+                // A bare report deep-link `/inbox/<reportId>` is redirected to report form. Mark the list
+                // as visited only when we're actually staying on a list view — otherwise the redirected
+                // report would be misclassified as an in-app click instead of a deep-link.
+                if (tab && !isInboxTabKey(tab)) {
+                    router.actions.replace(urls.inboxReport('reports', tab), searchParams, hashParams)
+                    return
+                }
+                markInboxListVisited()
+                consumeScoutTemplateHash(actions, hashParams)
+                // A selected report takes precedence in actionToUrl, so clear it before changing tabs.
+                closeAllSurfaces()
+                if (isInboxTabKey(tab) && values.activeTab !== tab) {
+                    actions.setActiveTab(tab)
+                }
+            },
+            [urls.inboxScout(':skillName')]: (
+                { skillName }: { skillName?: string },
+                searchParams: Record<string, string | undefined>
+            ) => {
+                // Static scout pages also match this pattern and must not select a scout.
+                if (skillName === 'scratchpad' || skillName === 'findings' || skillName === 'runs') {
+                    return
+                }
+                const name = skillName ?? null
+                const tab = asScoutDetailTab(searchParams.tab)
+                // Also reset the finding when landing on the bare scout URL after a finding deep-link.
+                if (values.selectedScoutSkillName !== name || values.selectedScoutFindingId !== null) {
+                    actions.setSelectedScoutSkillName(name, null, tab)
+                }
+                // Only a tab move within the scout already open reaches this, because the selection
+                // above carries the tab. Sending both would push a URL without the tab first.
+                if (values.scoutDetailTab !== tab) {
+                    actions.setScoutDetailTab(tab)
+                }
+            },
+            [urls.inboxScout(':skillName', ':findingId')]: (
+                { skillName, findingId }: { skillName?: string; findingId?: string },
+                searchParams: Record<string, string | undefined>
+            ) => {
+                const name = skillName ?? null
+                const finding = findingId ?? null
+                // A finding opens on Signals, where it is highlighted, but the reader can move to
+                // another pane without leaving the finding behind. The URL records that move, so it
+                // has to be read back here rather than reset to Signals.
+                const tab = asScoutDetailTab(searchParams.tab)
+                if (values.selectedScoutSkillName !== name || values.selectedScoutFindingId !== finding) {
+                    actions.setSelectedScoutSkillName(name, finding, tab)
+                }
+                const pane = scoutUrlPane(tab, finding)
+                if (values.scoutDetailTab !== pane) {
+                    actions.setScoutDetailTab(pane)
+                }
+            },
+            [urls.inboxReport(':tab', ':reportId')]: (
+                { tab, reportId }: { tab?: string; reportId?: string },
+                searchParams,
+                hashParams
+            ) => {
+                // This pattern also matches `/inbox/scouts/<skillName>` and `/inbox/reports/triage`;
+                // their own handlers own those paths.
+                if (tab === 'scouts' || (tab === 'reports' && reportId === 'triage')) {
+                    return
+                }
+                if (!reportId) {
+                    return
+                }
+                // `/inbox/pulls/<id>` and friends: the same report, now addressed through the one
+                // Reports list that replaced those tabs.
+                if (tab !== 'reports') {
+                    router.actions.replace(urls.inboxReport('reports', reportId), searchParams, hashParams)
+                    return
+                }
+                if (values.activeTab !== 'reports') {
+                    actions.setActiveTab('reports')
+                }
+                if (values.selectedReportId !== reportId) {
+                    // A `back` pointing at triage means the open came from the triage card's "Full
+                    // report" link, which navigates by URL rather than through `openCurrent`; attribute
+                    // it to triage so the metric isn't split with plain list clicks. Otherwise: a link
+                    // PostHog wrote, or a first route before any list URL was seen, is a deep-link,
+                    // else an in-app click. A tab that already saw the list can still open a link.
+                    const fromTriage =
+                        typeof searchParams.back === 'string' && searchParams.back.startsWith(urls.inboxTriage())
+                    const linkSource = fromTriage ? null : parseInboxReportLinkSource(searchParams.link_source)
+                    actions.setSelectedReportId(
+                        reportId,
+                        fromTriage ? 'triage' : linkSource !== null || !hasVisitedInboxList() ? 'deeplink' : 'click',
+                        linkSource
+                    )
+                } else if (hasLinkParams(searchParams)) {
+                    // A copied address bar must not pass the original `link_source` on to the next reader.
+                    router.actions.replace(router.values.location.pathname, withoutLinkParams(searchParams), hashParams)
+                }
+                if (searchParams.link_action === 'implement') {
+                    actions.setLinkImplementReportId(reportId)
+                }
+            },
+        }
+    }),
+])

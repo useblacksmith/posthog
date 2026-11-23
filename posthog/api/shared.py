@@ -1,0 +1,427 @@
+"""
+This module contains serializers that are used across other serializers for nested representations.
+"""
+
+import copy
+from functools import cached_property
+from typing import Any, Optional
+from uuid import UUID
+
+from drf_spectacular.utils import extend_schema_field
+from opentelemetry import trace
+from rest_framework import serializers
+from rest_framework.fields import SkipField
+from rest_framework.relations import PKOnlyObject
+from rest_framework.utils import model_meta
+
+from posthog.helpers.trigram_search import search_match_type_from_instance
+from posthog.ip_restrictions import get_ip_blocked_organization_ids
+from posthog.models import Organization, Team, User
+from posthog.models.organization import OrganizationMembership
+from posthog.models.organization_notification_lock import LOCKABLE_NOTIFICATION_SETTINGS
+from posthog.models.project import Project
+
+tracer = trace.get_tracer(__name__)
+
+
+class ImageSizeSerializer(serializers.Serializer):
+    width = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=320,
+        max_value=4000,
+        help_text="Output width in pixels, from 320 to 4000. Omit or use null for automatic width.",
+    )
+    height = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=200,
+        max_value=5000,
+        help_text="Output height in pixels, from 200 to 5000. Omit or use null for automatic height. "
+        "Content fits inside the requested size without stretching or cropping.",
+    )
+
+
+# Adds the read-only `search_match_type` field to a saved-list serializer whose viewset runs
+# `apply_trigram_search`. The helper annotates each matched row with `_is_exact`; this surfaces it
+# as `exact` / `similar`, and strips the field entirely when the list was not filtered by `search`
+# (no annotation present) so it never appears on retrieve or unfiltered lists. Mix it in before
+# `ModelSerializer` in the bases so its `to_representation` runs in the super() chain — the
+# `test_search_match_type_mixin` tests pin that ordering. Deliberately undocumented (no docstring):
+# `inspect.getdoc` walks the MRO, so a docstring here would leak into every mixed-in serializer's
+# public OpenAPI/MCP component description.
+class SearchMatchTypeSerializerMixin(serializers.Serializer):
+    search_match_type = serializers.SerializerMethodField(
+        read_only=True,
+        help_text=(
+            "How this row matched the `search` query parameter: `exact` (the term is a "
+            "case-insensitive substring of a searched field) or `similar` (a fuzzy trigram match, "
+            "returned only when no exact match exists). Null when the list is not filtered by `search`."
+        ),
+    )
+
+    @extend_schema_field(serializers.ChoiceField(choices=["exact", "similar"], allow_null=True))
+    def get_search_match_type(self, instance: Any) -> Optional[str]:
+        return search_match_type_from_instance(instance)
+
+    def to_representation(self, instance: Any) -> Any:
+        data = super().to_representation(instance)
+        if getattr(instance, "_is_exact", None) is None:
+            data.pop("search_match_type", None)
+        return data
+
+
+class UserBasicSerializer(serializers.ModelSerializer):
+    hedgehog_config = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "uuid",
+            "distinct_id",
+            "first_name",
+            "last_name",
+            "email",
+            "is_email_verified",
+            "hedgehog_config",
+            "role_at_organization",
+        ]
+
+    def get_hedgehog_config(self, user: User) -> Optional[dict]:
+        if user.hedgehog_config:
+            if user.hedgehog_config.get("version") == 2:
+                actor_options = user.hedgehog_config.get("actor_options", {})
+                return {
+                    "use_as_profile": user.hedgehog_config.get("use_as_profile"),
+                    "color": actor_options.get("color"),
+                    "accessories": actor_options.get("accessories"),
+                    "skin": actor_options.get("skin"),
+                }
+            else:
+                return {
+                    "use_as_profile": user.hedgehog_config.get("use_as_profile"),
+                    "color": user.hedgehog_config.get("color"),
+                    "accessories": user.hedgehog_config.get("accessories"),
+                    "skin": user.hedgehog_config.get("skin"),
+                }
+        return None
+
+
+class ProjectBasicSerializer(serializers.ModelSerializer):
+    """
+    Serializer for `Project` model with minimal attributes to speeed up loading and transfer times.
+    Also used for nested serializers.
+    """
+
+    logo_media_id = serializers.UUIDField(
+        read_only=True,
+        allow_null=True,
+        help_text="ID of the uploaded image shown as this project's logo. Null when the project has no logo.",
+    )
+
+    class Meta:
+        model = Project
+        fields = (
+            "id",
+            "organization_id",
+            "name",
+            "logo_media_id",
+        )
+        read_only_fields = fields
+
+
+class ProjectBackwardCompatBasicSerializer(serializers.ModelSerializer):
+    """
+    Like `ProjectBasicSerializer`, but also works as a drop-in replacement for `TeamBasicSerializer` by way of
+    passthrough fields. This allows the meaning of `Team` to change from "project" to "environment" without breaking
+    backward compatibility of the REST API.
+    Do not use this in greenfield endpoints!
+    """
+
+    instance: Optional[Project]
+
+    # Declared explicitly (not a passthrough): Team.project_id is an FK attname the model-field merge can't
+    # resolve, and a Project's own id equals its primary Team's project_id (Project ↔ Team is 1:1).
+    project_id = serializers.IntegerField(
+        source="id", read_only=True, help_text="ID of the project this environment belongs to."
+    )
+    # Project-only: tags label a Project, which environments do not have, so this is not mirrored
+    # onto TeamBasicSerializer.
+    tags = serializers.ListField(
+        child=serializers.CharField(max_length=255),
+        read_only=True,
+        help_text="Labels applied to this project.",
+    )
+
+    class Meta:
+        model = Project
+        fields = (
+            "id",
+            "uuid",  # Compat with TeamSerializer
+            "organization",
+            "project_id",  # Compat with TeamSerializer
+            "api_token",  # Compat with TeamSerializer
+            "name",
+            "completed_snippet_onboarding",  # Compat with TeamSerializer
+            "has_completed_onboarding_for",  # Compat with TeamSerializer
+            "ingested_event",  # Compat with TeamSerializer
+            "is_demo",  # Compat with TeamSerializer
+            "timezone",  # Compat with TeamSerializer
+            "access_control",  # Compat with TeamSerializer
+            "tags",
+        )
+        read_only_fields = tuple(field for field in fields if field != "tags")
+        team_passthrough_fields = {
+            "uuid",
+            "api_token",
+            "completed_snippet_onboarding",
+            "has_completed_onboarding_for",
+            "ingested_event",
+            "is_demo",
+            "timezone",
+            "access_control",
+        }
+
+    def get_fields(self):
+        declared_fields = copy.deepcopy(self._declared_fields)
+
+        info = model_meta.get_field_info(Project)
+        team_info = model_meta.get_field_info(Team)
+        for field_name, field in team_info.fields.items():
+            if field_name in info.fields:
+                continue
+            info.fields[field_name] = field
+            info.fields_and_pk[field_name] = field
+        for field_name, relation in team_info.forward_relations.items():
+            if field_name in info.forward_relations:
+                continue
+            info.forward_relations[field_name] = relation
+            info.relations[field_name] = relation
+        for accessor_name, relation in team_info.reverse_relations.items():
+            if accessor_name in info.reverse_relations:
+                continue
+            info.reverse_relations[accessor_name] = relation
+            info.relations[accessor_name] = relation
+
+        field_names = self.get_field_names(declared_fields, info)
+
+        extra_kwargs = self.get_extra_kwargs()
+        extra_kwargs, hidden_fields = self.get_uniqueness_extra_kwargs(field_names, declared_fields, extra_kwargs)
+
+        fields = {}
+        for field_name in field_names:
+            if field_name in declared_fields:
+                fields[field_name] = declared_fields[field_name]
+                continue
+            extra_field_kwargs = extra_kwargs.get(field_name, {})
+            source = extra_field_kwargs.get("source", "*")
+            if source == "*":
+                source = field_name
+            field_class, field_kwargs = self.build_field(source, info, model_class=Project, nested_depth=0)
+            field_kwargs = self.include_extra_kwargs(field_kwargs, extra_field_kwargs)
+            fields[field_name] = field_class(**field_kwargs)
+        fields.update(hidden_fields)
+        return fields
+
+    def build_field(self, field_name, info, model_class, nested_depth):
+        if field_name in self.Meta.team_passthrough_fields:
+            model_class = Team
+        return super().build_field(field_name, info, model_class, nested_depth)
+
+    def to_representation(self, instance):
+        """
+        Object instance -> Dict of primitive datatypes. Basically copied from Serializer.to_representation
+        """
+        ret: dict[str, Any] = {}
+        fields = self._readable_fields
+
+        for field in fields:
+            assert field.field_name is not None
+            try:
+                attribute_source = instance
+                if field.field_name in self.Meta.team_passthrough_fields:
+                    # This branch is the only material change from the original method
+                    attribute_source = instance.passthrough_team
+                attribute = field.get_attribute(attribute_source)
+            except SkipField:
+                continue
+
+            check_for_none = attribute.pk if isinstance(attribute, PKOnlyObject) else attribute
+            if check_for_none is None:
+                ret[field.field_name] = None
+            else:
+                ret[field.field_name] = field.to_representation(attribute)
+
+        # Tags live in a join table rather than on the model, so the loop above skips them.
+        # This method does not delegate to Serializer.to_representation, so nothing else can add them.
+        if instance.pk:
+            ret["tags"] = (
+                [tagged_item.tag.name for tagged_item in instance.prefetched_tags]
+                if hasattr(instance, "prefetched_tags")
+                else list(instance.tagged_items.values_list("tag__name", flat=True))
+            )
+        else:
+            ret["tags"] = []
+
+        return ret
+
+
+class TeamBasicSerializer(serializers.ModelSerializer):
+    """
+    Serializer for `Team` model with minimal attributes to speeed up loading and transfer times.
+    Also used for nested serializers.
+    """
+
+    class Meta:
+        model = Team
+        fields = (
+            "id",
+            "uuid",
+            "organization",
+            "project_id",
+            "api_token",
+            "name",
+            "completed_snippet_onboarding",
+            "has_completed_onboarding_for",
+            "ingested_event",
+            "is_demo",
+            "timezone",
+            "access_control",
+        )
+        read_only_fields = fields
+
+    @tracer.start_as_current_span("team_basic_serializer.to_representation")
+    def to_representation(self, instance):
+        return super().to_representation(instance)
+
+
+class TeamPublicSerializer(serializers.ModelSerializer):
+    """
+    Serializer for `Team` model with attributes suitable for completely public sharing (primarily shared dashboards).
+    """
+
+    class Meta:
+        model = Team
+        fields = ("id", "project_id", "uuid", "name", "timezone", "default_data_theme")
+        read_only_fields = fields
+
+
+class OrganizationBasicSerializer(serializers.ModelSerializer):
+    """
+    Serializer for `Organization` model with minimal attributes to speeed up loading and transfer times.
+    Also used for nested serializers.
+    """
+
+    membership_level = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Organization
+        fields = [
+            "id",
+            "name",
+            "slug",
+            "logo_media_id",
+            "membership_level",
+            "members_can_use_personal_api_keys",
+            "is_active",
+            "is_not_active_reason",
+            "is_pending_deletion",
+        ]
+
+    def get_membership_level(self, organization: Organization) -> Optional[OrganizationMembership.Level]:
+        level = self._membership_levels_by_org.get(organization.id)
+        return OrganizationMembership.Level(level) if level is not None else None
+
+    @cached_property
+    def _membership_levels_by_org(self) -> dict[UUID, int]:
+        return dict(
+            OrganizationMembership.objects.with_effective_level()
+            .filter(user=self.context["request"].user)
+            .values_list("organization_id", "resolved_level")
+        )
+
+    @tracer.start_as_current_span("organization_basic_serializer.to_representation")
+    def to_representation(self, instance):
+        request = self.context.get("request")
+        if request is not None and str(instance.id) in get_ip_blocked_organization_ids(request):
+            return {
+                "id": str(instance.id),
+                "name": instance.name,
+                "slug": instance.slug,
+                "membership_level": self.get_membership_level(instance),
+            }
+        return super().to_representation(instance)
+
+
+# These mirror the TypedDicts in posthog/hogql_queries/serialized_actors.py, so a field added
+# there needs adding here. Only the Optional[...] ones are nullable; the rest are always-set keys.
+#
+# `type` is a const string rather than a single-value ChoiceField, because a ChoiceField emits an
+# enum component and `type` collides as a component name under --fail-on-warn. The decorator must
+# annotate a field class, not a field instance: DRF rebuilds each field from its stored kwargs when
+# the serializer binds, which drops an instance-level annotation and the discriminator with it.
+@extend_schema_field({"type": "string", "const": "person"})
+class _PersonActorTypeField(serializers.CharField):
+    pass
+
+
+@extend_schema_field({"type": "string", "const": "group"})
+class _GroupActorTypeField(serializers.CharField):
+    pass
+
+
+class SerializedMatchedRecordingEventSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(help_text="UUID of the matched event.")
+    timestamp = serializers.DateTimeField(help_text="When the matched event happened.")
+    window_id = serializers.CharField(help_text="ID of the browser window the event was captured in.")
+
+
+class SerializedMatchedRecordingSerializer(serializers.Serializer):
+    session_id = serializers.CharField(help_text="ID of the session recording.")
+    events = SerializedMatchedRecordingEventSerializer(
+        many=True, help_text="Events of the recording that matched the query."
+    )
+
+
+class SerializedActorSerializer(serializers.Serializer):
+    id = serializers.CharField(help_text="The person's UUID, or the group's key.")
+    properties = serializers.DictField(child=serializers.JSONField(), help_text="The actor's properties.")
+    created_at = serializers.DateTimeField(allow_null=True, help_text="When the actor was first seen.")
+    matched_recordings = SerializedMatchedRecordingSerializer(
+        many=True,
+        help_text="Recordings that matched the query. Empty unless the endpoint asks for them.",
+    )
+    value_at_data_point = serializers.FloatField(
+        allow_null=True,
+        help_text="The actor's value at the data point it was queried for. Null unless the query computes one.",
+    )
+
+
+class SerializedPersonActorSerializer(SerializedActorSerializer):
+    type = _PersonActorTypeField(help_text="Marks this actor as a person.")
+    uuid = serializers.UUIDField(help_text="The person's UUID. Same value as `id`.")
+    name = serializers.CharField(help_text="Display name, resolved from the person's properties or distinct IDs.")
+    distinct_ids = serializers.ListField(
+        child=serializers.CharField(), help_text="The person's distinct IDs, newest first."
+    )
+    last_seen_at = serializers.DateTimeField(allow_null=True, help_text="When the person was last seen.")
+    is_identified = serializers.BooleanField(help_text="Whether the person has been identified.")
+
+
+class SerializedGroupActorSerializer(SerializedActorSerializer):
+    type = _GroupActorTypeField(help_text="Marks this actor as a group.")
+    group_key = serializers.CharField(help_text="Key identifying the group within its group type.")
+    group_type_index = serializers.IntegerField(help_text="Index of the group type this group belongs to.")
+
+
+class OrganizationNotificationLockSerializer(serializers.Serializer):
+    setting = serializers.ChoiceField(
+        choices=sorted(LOCKABLE_NOTIFICATION_SETTINGS),
+        help_text="Notification setting this rule enforces.",
+    )
+    scope_id = serializers.CharField(
+        allow_blank=True,
+        help_text="What the setting applies to: a project ID or an organization ID. Empty for a setting that is a single switch.",
+    )
+    locked_value = serializers.BooleanField(help_text="The value the organization enforces.")

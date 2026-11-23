@@ -1,0 +1,100 @@
+import {
+    ActivityLogItem,
+    ActivityLogUserName,
+    Describer,
+    HumanizedChange,
+    activityLogSummary,
+    defaultDescriber,
+} from 'lib/components/ActivityLog/humanizeActivity'
+
+const projectNameForLog = (logItem: ActivityLogItem): string => {
+    const context = logItem.detail?.context
+    return context?.project_name || 'this project'
+}
+
+const keyLabel = (logItem: ActivityLogItem): string => {
+    return logItem.detail?.name || 'Unknown key'
+}
+
+export const projectSecretAPIKeyActivityDescriber: Describer = (logItem: ActivityLogItem): HumanizedChange => {
+    if (logItem.scope !== 'ProjectSecretAPIKey') {
+        console.error('projectSecretAPIKeyActivityDescriber received a non-ProjectSecretAPIKey activity')
+        return { description: null }
+    }
+
+    const actor = <ActivityLogUserName logItem={logItem} />
+    const keyName = <strong>{keyLabel(logItem)}</strong>
+    const scopeName = <strong>{projectNameForLog(logItem)}</strong>
+
+    if (logItem.activity === 'created') {
+        return {
+            summary: activityLogSummary(
+                logItem,
+                'Created the project secret API key',
+                <>
+                    {keyName} for {scopeName}
+                </>
+            ),
+            description: (
+                <>
+                    {actor} created project secret API key {keyName} for {scopeName}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity === 'updated') {
+        const rolled = logItem.detail?.changes?.some((change) => change.field === 'mask_value')
+
+        if (rolled) {
+            return {
+                summary: activityLogSummary(
+                    logItem,
+                    'Rolled the project secret API key',
+                    <>
+                        {keyName} for {scopeName}
+                    </>
+                ),
+                description: (
+                    <>
+                        {actor} rolled project secret API key {keyName} for {scopeName}
+                    </>
+                ),
+            }
+        }
+
+        return {
+            summary: activityLogSummary(
+                logItem,
+                'Updated the project secret API key',
+                <>
+                    {keyName} for {scopeName}
+                </>
+            ),
+            description: (
+                <>
+                    {actor} updated project secret API key {keyName} for {scopeName}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity === 'deleted') {
+        return {
+            summary: activityLogSummary(
+                logItem,
+                'Deleted the project secret API key',
+                <>
+                    {keyName} for {scopeName}
+                </>
+            ),
+            description: (
+                <>
+                    {actor} deleted project secret API key {keyName} for {scopeName}
+                </>
+            ),
+        }
+    }
+
+    return defaultDescriber(logItem)
+}

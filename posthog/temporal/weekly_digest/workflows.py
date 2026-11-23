@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import os
+import asyncio
+import itertools
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
+
+from django.conf import settings
+
+from temporalio import common, workflow
+from temporalio.exceptions import ApplicationError
+
+from posthog.temporal.common.base import PostHogWorkflow
+from posthog.temporal.weekly_digest.activities import (
+    generate_dashboard_lookup,
+    generate_error_issue_lookup,
+    generate_event_definition_lookup,
+    generate_experiment_completed_lookup,
+    generate_experiment_launched_lookup,
+    generate_external_data_source_lookup,
+    generate_feature_flag_lookup,
+    generate_filter_lookup,
+    generate_organization_digest_batch,
+    generate_product_suggestion_lookup,
+    generate_recording_lookup,
+    generate_survey_lookup,
+    generate_usage_trends_lookup,
+    generate_user_notification_lookup,
+    list_organization_id_ranges,
+    list_team_id_ranges,
+    send_weekly_digest_batch,
+)
+from posthog.temporal.weekly_digest.types import (
+    Digest,
+    GenerateDigestDataBatchInput,
+    GenerateDigestDataInput,
+    GenerateOrganizationDigestInput,
+    SendWeeklyDigestBatchInput,
+    SendWeeklyDigestInput,
+    TeamIdRange,
+    WeeklyDigestInput,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+
+MAX_CONCURRENT_GENERATION_ACTIVITIES = 100
+_PATCH_BOUNDED_GENERATION_ACTIVITIES = "weekly-digest-bounded-generation-activities"
+
+
+def resolve_redis_host() -> str:
+    # redis-py connects to localhost when the URL host is empty, so an empty value counts as missing.
+    host = os.getenv("WEEKLY_DIGEST_REDIS_HOST")
+    if host:
+        return host
+    if settings.DEBUG or settings.TEST:
+        return "localhost"
+    raise ApplicationError(
+        "WEEKLY_DIGEST_REDIS_HOST is not set. Set it on the weekly digest worker to the digest Redis host.",
+        non_retryable=True,
+    )
+
+
+@workflow.defn(name="weekly-digest")
+class WeeklyDigestWorkflow(PostHogWorkflow):
+    @staticmethod
+    def parse_inputs(input: list[str]) -> WeeklyDigestInput:
+        """Parse input from the management command CLI."""
+        return WeeklyDigestInput.model_validate_json(input[0]) if input else WeeklyDigestInput()
+
+    @workflow.run
+    async def run(self, input: WeeklyDigestInput) -> None:
+        if input.common.redis_host is None:
+            input.common.redis_host = resolve_redis_host()
+
+        if input.common.redis_port is None:
+            input.common.redis_port = int(os.getenv("WEEKLY_DIGEST_REDIS_PORT", "6379"))
+
+        if input.common.django_redis_url is None:
+            input.common.django_redis_url = settings.REDIS_URL
+
+        year, week, _ = datetime.now().isocalendar()
+        period_end = input.period_end_override or datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        period_start = period_end - timedelta(days=7)
+
+        digest = Digest(
+            key=input.digest_key_override or f"weekly-digest-{year}-{week}",
+            period_start=period_start,
+            period_end=period_end,
+        )
+
+        if not input.skip_generate:
+            await workflow.execute_child_workflow(
+                GenerateDigestDataWorkflow.run,
+                GenerateDigestDataInput(
+                    digest=digest,
+                    common=input.common,
+                ),
+                parent_close_policy=workflow.ParentClosePolicy.REQUEST_CANCEL,
+                execution_timeout=timedelta(hours=15),
+                run_timeout=timedelta(hours=15),
+                retry_policy=common.RetryPolicy(
+                    maximum_attempts=2,
+                    initial_interval=timedelta(minutes=10),
+                ),
+            )
+
+        await workflow.execute_child_workflow(
+            SendWeeklyDigestWorkflow.run,
+            SendWeeklyDigestInput(
+                dry_run=input.dry_run,
+                allow_already_sent=input.allow_already_sent,
+                digest=digest,
+                common=input.common,
+                organization_ids=input.organization_ids,
+            ),
+            parent_close_policy=workflow.ParentClosePolicy.REQUEST_CANCEL,
+            execution_timeout=timedelta(hours=15),
+            run_timeout=timedelta(hours=6),
+            retry_policy=common.RetryPolicy(
+                maximum_attempts=2,
+                initial_interval=timedelta(minutes=10),
+            ),
+        )
+
+
+@workflow.defn(name="generate-digest-data")
+class GenerateDigestDataWorkflow(PostHogWorkflow):
+    @staticmethod
+    def parse_inputs(input: list[str]) -> GenerateDigestDataInput:
+        """Parse input from the management command CLI."""
+        return GenerateDigestDataInput.model_validate_json(input[0])
+
+    @workflow.run
+    async def run(self, input: GenerateDigestDataInput) -> None:
+        team_id_ranges = await workflow.execute_activity(
+            list_team_id_ranges,
+            input.common,
+            start_to_close_timeout=timedelta(minutes=5),
+            retry_policy=common.RetryPolicy(
+                maximum_attempts=2,
+                initial_interval=timedelta(minutes=1),
+            ),
+            heartbeat_timeout=timedelta(minutes=1),
+        )
+
+        generators = [
+            generate_dashboard_lookup,
+            generate_event_definition_lookup,
+            generate_experiment_completed_lookup,
+            generate_experiment_launched_lookup,
+            generate_external_data_source_lookup,
+            generate_survey_lookup,
+            generate_feature_flag_lookup,
+            generate_user_notification_lookup,
+            generate_filter_lookup,
+            generate_recording_lookup,
+            generate_product_suggestion_lookup,
+            generate_error_issue_lookup,
+            generate_usage_trends_lookup,
+        ]
+
+        # Keep activity dispatch compatible with histories recorded before the concurrency bound.
+        concurrency = len(team_id_ranges) * len(generators)
+        if workflow.patched(_PATCH_BOUNDED_GENERATION_ACTIVITIES):
+            concurrency = MAX_CONCURRENT_GENERATION_ACTIVITIES
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def generate_batch(
+            team_id_range: TeamIdRange, generator: Callable[[GenerateDigestDataBatchInput], Awaitable[None]]
+        ) -> None:
+            async with semaphore:
+                await workflow.execute_activity(
+                    generator,
+                    GenerateDigestDataBatchInput(
+                        team_id_range=team_id_range,
+                        digest=input.digest,
+                        common=input.common,
+                    ),
+                    start_to_close_timeout=timedelta(hours=1),
+                    retry_policy=common.RetryPolicy(
+                        maximum_attempts=2,
+                        initial_interval=timedelta(minutes=1),
+                    ),
+                    heartbeat_timeout=timedelta(minutes=2),
+                )
+
+        await asyncio.gather(
+            *(
+                generate_batch(team_id_range, generator)
+                for team_id_range, generator in itertools.product(team_id_ranges, generators)
+            )
+        )
+
+        organization_id_ranges = await workflow.execute_activity(
+            list_organization_id_ranges,
+            args=[input.common, None],
+            start_to_close_timeout=timedelta(minutes=5),
+            retry_policy=common.RetryPolicy(
+                maximum_attempts=2,
+                initial_interval=timedelta(minutes=1),
+            ),
+            heartbeat_timeout=timedelta(minutes=1),
+        )
+
+        await asyncio.gather(
+            *[
+                workflow.execute_activity(
+                    generate_organization_digest_batch,
+                    GenerateOrganizationDigestInput(
+                        organization_id_range=organization_id_range,
+                        digest=input.digest,
+                        common=input.common,
+                    ),
+                    start_to_close_timeout=timedelta(minutes=30),
+                    retry_policy=common.RetryPolicy(
+                        maximum_attempts=2,
+                        initial_interval=timedelta(minutes=1),
+                    ),
+                    heartbeat_timeout=timedelta(minutes=2),
+                )
+                for organization_id_range in organization_id_ranges
+            ]
+        )
+
+
+@workflow.defn(name="send-weekly-digest")
+class SendWeeklyDigestWorkflow(PostHogWorkflow):
+    @staticmethod
+    def parse_inputs(input: list[str]) -> SendWeeklyDigestInput:
+        """Parse input from the management command CLI."""
+        return SendWeeklyDigestInput.model_validate_json(input[0])
+
+    @workflow.run
+    async def run(self, input: SendWeeklyDigestInput) -> None:
+        organization_id_ranges = await workflow.execute_activity(
+            list_organization_id_ranges,
+            args=[input.common, input.organization_ids],
+            start_to_close_timeout=timedelta(minutes=5),
+            retry_policy=common.RetryPolicy(
+                maximum_attempts=2,
+                initial_interval=timedelta(minutes=1),
+            ),
+            heartbeat_timeout=timedelta(minutes=1),
+        )
+
+        await asyncio.gather(
+            *[
+                workflow.execute_activity(
+                    send_weekly_digest_batch,
+                    SendWeeklyDigestBatchInput(
+                        organization_id_range=organization_id_range,
+                        dry_run=input.dry_run,
+                        allow_already_sent=input.allow_already_sent,
+                        digest=input.digest,
+                        common=input.common,
+                        organization_ids=input.organization_ids,
+                    ),
+                    # Batches share the pace of the captures for Workflows, so a batch can wait well past 30 minutes.
+                    start_to_close_timeout=timedelta(hours=2),
+                    retry_policy=common.RetryPolicy(
+                        maximum_attempts=2,
+                        initial_interval=timedelta(minutes=1),
+                    ),
+                    heartbeat_timeout=timedelta(minutes=2),
+                )
+                for organization_id_range in organization_id_ranges
+            ]
+        )

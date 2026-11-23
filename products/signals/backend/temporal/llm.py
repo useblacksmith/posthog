@@ -1,0 +1,284 @@
+import os
+from collections.abc import Callable, Mapping
+from typing import Final, Literal, Optional, TypedDict, TypeVar
+
+from django.conf import settings
+
+import structlog
+from anthropic.types import Message, MessageParam, OutputConfigParam, TextBlockParam
+
+from posthog.dataclasses import frozen
+from posthog.helpers.tiktoken_encoding import TEXT_EMBEDDING_3_TOKEN_COUNT_PROXY_MODEL, get_tiktoken_encoding_for_model
+from posthog.llm.gateway_client import build_async_anthropic_client, resolve_ai_gateway_config
+
+from products.signals.backend.llm_spend import accounted_message, generate_with_spend
+from products.signals.backend.temporal import metrics
+
+logger = structlog.get_logger(__name__)
+
+MATCHING_MODEL = os.getenv("SIGNAL_MATCHING_LLM_MODEL", "claude-sonnet-5-5")
+
+# Both safety stages resolve their model from here. The default is a literal rather than
+# MATCHING_MODEL, so a matching-model swap leaves the gate on the model its prompt was measured
+# against, and moving the gate takes a deliberate change to this setting.
+SAFETY_MODEL = os.getenv("SIGNAL_SAFETY_LLM_MODEL") or "claude-sonnet-5-5"
+
+
+@frozen
+class ModelCapabilities:
+    """Which request features a model accepts, so swapping models stays a config change.
+
+    The three fields are the ones the Claude 5 generation dropped: assistant prefill,
+    per-request temperature, and budget-based extended thinking. Sending any of them to a
+    model that no longer takes it is a 400 on every call, not a degraded response.
+    """
+
+    prefill: bool
+    temperature: bool
+    thinking: Literal["budget", "adaptive", "none"]
+
+
+_LEGACY = ModelCapabilities(prefill=True, temperature=True, thinking="budget")
+_MODERN = ModelCapabilities(prefill=False, temperature=False, thinking="adaptive")
+
+# Verified against the Messages API rather than inferred from version numbers, because 4-6 sits
+# between the two generations: it takes temperature but refuses prefill. An unlisted model gets the
+# modern contract, on the assumption that a new id is newer than this table.
+MODEL_CAPABILITIES: dict[str, ModelCapabilities] = {
+    "claude-3-7-sonnet-latest": _LEGACY,
+    "claude-haiku-4-5": _LEGACY,
+    "claude-sonnet-4-0": _LEGACY,
+    "claude-sonnet-4-5": _LEGACY,
+    "claude-opus-4-0": _LEGACY,
+    "claude-opus-4-1": _LEGACY,
+    "claude-opus-4-5": _LEGACY,
+    "claude-sonnet-4-6": ModelCapabilities(prefill=False, temperature=True, thinking="adaptive"),
+    "claude-opus-4-8": _MODERN,
+    "claude-sonnet-5": _MODERN,
+    "claude-sonnet-5-5": _MODERN,
+    "claude-opus-5": _MODERN,
+}
+
+# Adaptive-thinking models take an effort level instead of a token budget, and they apply it to every
+# call, not only the ones that enable thinking. Medium keeps eval quality level with high while
+# cutting output tokens by a quarter (see products/signals/eval/reports/2026-09-03.md).
+ADAPTIVE_MODEL_EFFORT: Final = "medium"
+
+
+class EffortKwargs(TypedDict, total=False):
+    output_config: OutputConfigParam
+
+
+def get_model_capabilities(model: str) -> ModelCapabilities:
+    return MODEL_CAPABILITIES.get(model, _MODERN)
+
+
+def effort_kwargs(model: str) -> EffortKwargs:
+    """Request fields that pin the effort level on a model that resolves it adaptively; empty otherwise."""
+    if get_model_capabilities(model).thinking != "adaptive":
+        return {}
+    return {"output_config": {"effort": ADAPTIVE_MODEL_EFFORT}}
+
+
+MAX_RETRIES = 3
+MAX_RESPONSE_TOKENS = 4096
+MAX_QUERY_TOKENS = 2048
+TIMEOUT = 100.0
+
+
+def truncate_query_to_token_limit(query: str, max_tokens: int = MAX_QUERY_TOKENS) -> str:
+    """Truncate a query string to fit within token limit for embedding."""
+    try:
+        enc = get_tiktoken_encoding_for_model(TEXT_EMBEDDING_3_TOKEN_COUNT_PROXY_MODEL)
+        tokens = enc.encode(query)
+        if len(tokens) <= max_tokens:
+            return query
+        truncated_tokens = tokens[:max_tokens]
+        return enc.decode(truncated_tokens)
+    except Exception as e:
+        logger.warning(f"Failed to truncate with tiktoken, falling back to char limit: {e}")
+        char_limit = max_tokens * 4
+        return query[:char_limit]
+
+
+class EmptyLLMResponseError(Exception):
+    """Raised when the LLM returns no text content."""
+
+    pass
+
+
+class LLMRefusalError(EmptyLLMResponseError):
+    pass
+
+
+def _extract_text_content(response: Message) -> str:
+    """Extract text content from Anthropic response."""
+    if not isinstance(response, Message):
+        raise TypeError(f"Expected Anthropic Message response, got {type(response).__name__}")
+
+    if response.stop_reason == "refusal":
+        raise LLMRefusalError("Model refused the request")
+
+    for block in reversed(response.content):
+        if block.type == "text":
+            return block.text
+    raise EmptyLLMResponseError(f"No text content in response (stop_reason={response.stop_reason})")
+
+
+# I could not for the life of me get thinking claude to stop outputting markdown.
+def _strip_markdown_json_fences(text: str) -> str:
+    """Strip ```json ... ``` markdown fences that Claude sometimes wraps around JSON output."""
+    stripped = text.strip()
+    if stripped.startswith("```json") and stripped.endswith("```"):
+        return stripped[len("```json") : -len("```")].strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        return stripped[len("```") : -len("```")].strip()
+    return text
+
+
+T = TypeVar("T")
+
+
+# I reached doing ~the same thing in 3 or 4 places and decided to abstract it.
+async def call_llm(
+    *,
+    team_id: int | None,
+    system_prompt: str,
+    user_prompt: str,
+    validate: Callable[[str], T],
+    thinking: bool = False,
+    temperature: Optional[float] = 0.2,
+    retries: int = MAX_RETRIES,
+    stage: Optional[str] = None,
+    ai_product: str,
+    model: Optional[str] = None,
+    cache_system_prompt: bool = False,
+    trace_id: str | None = None,
+    properties: Mapping[str, str] | None = None,
+    signal_id: str | None = None,
+) -> T:
+    from posthog.sync import database_sync_to_async_pool
+
+    from products.signals.backend.trial.reports import requires_trial_accounting
+
+    trial = team_id is not None and await database_sync_to_async_pool(requires_trial_accounting)(team_id, signal_id)
+    if trial:
+        ai_product = "signals"
+    model = model or MATCHING_MODEL
+    # Native Anthropic Messages endpoint so prefilling and extended thinking carry over unchanged.
+    capabilities = get_model_capabilities(model)
+    thinking = thinking and capabilities.thinking != "none"
+    # Prefill is what keeps non-thinking responses free of markdown fences; without it we lean on
+    # the fence stripper the thinking path already uses.
+    prefill = capabilities.prefill and not thinking
+    client = build_async_anthropic_client(
+        product="signals",
+        ai_product=ai_product,
+        ai_stage=stage,
+        team_id=team_id,
+        use_bedrock_fallback=True,
+        trace_id=trace_id,
+        properties=properties,
+    )
+    if trial:
+        client = client.with_options(max_retries=0)
+
+    messages: list[MessageParam] = [
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # For non-thinking calls, pre-fill the assistant response with `{` to prevent markdown fences. Pre-filling seems to work
+    # well, but isn't supported for thinking modes.
+    if prefill:
+        messages.append({"role": "assistant", "content": "{"})
+
+    # A cached system prompt is billed at about a tenth of the input price on every call after the
+    # first. Only a prompt above the model's cache minimum (512 tokens on Sonnet 5.5, 1,024 on
+    # Sonnet 5) and on a hot path pays for the cache write, so a call site opts in rather than
+    # every stage paying it.
+    system: str | list[TextBlockParam] = system_prompt
+    if cache_system_prompt:
+        system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+
+    create_kwargs: dict = {
+        "model": model,
+        "system": system,
+        "messages": messages,
+        "max_tokens": MAX_RESPONSE_TOKENS,
+        "timeout": TIMEOUT,
+        **effort_kwargs(model),
+    }
+    if capabilities.temperature:
+        create_kwargs["temperature"] = temperature
+    if team_id is not None:
+        create_kwargs["metadata"] = {"user_id": f"team-{team_id}"}
+    # The per-key ai_stage header is what the Python gateway reads. Send it whenever the request
+    # lands there: an un-opted call site, or an opted one before the gateway env is set. Skip it
+    # only when an opted call site actually reaches the Go gateway, which reads ai_stage from the
+    # X-PostHog-Properties blob instead.
+    gateway = resolve_ai_gateway_config() if ai_product is not None else None
+    if stage and gateway is None:
+        create_kwargs["extra_headers"] = {"x-posthog-property-ai_stage": stage}
+
+    # Later, we'll want to tune how many tokens we give over to thinking vs. producing output. Hard-coded for now.
+    if thinking:
+        create_kwargs["max_tokens"] = MAX_RESPONSE_TOKENS * 3
+        if capabilities.thinking == "budget":
+            create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": MAX_RESPONSE_TOKENS * 2}
+            create_kwargs["temperature"] = 1  # Required for thinking
+        else:
+            create_kwargs["thinking"] = {"type": "adaptive"}
+            create_kwargs.pop("temperature", None)
+
+    last_exception: Exception | None = None
+    stage_label = stage or "unknown"
+    for attempt in range(retries):
+        # NOTE - we explicitly don't want to retry if we fail to call the llm, or fail to extract text content,
+        # only if we fail to validate the response. A transport/extraction failure is a hot-path LLM error.
+        try:
+            generation = accounted_message(client, **create_kwargs)
+            priced = await generate_with_spend(
+                generation, gateway=gateway, team_id=team_id, signal_id=signal_id, stage=stage_label
+            )
+            response = priced.response
+            text_content = _extract_text_content(response)
+        except Exception:
+            metrics.increment_llm_call(stage_label, metrics.LLM_STATUS_ERROR)
+            raise
+        text_content = _strip_markdown_json_fences(text_content)
+        if prefill:
+            # Prepend the `{` we pre-filled
+            text_content = "{" + text_content
+        try:
+            result = validate(text_content)
+        except Exception as e:
+            logger.warning(
+                f"LLM call failed (attempt {attempt + 1}/{retries}): {e}",
+                attempt=attempt + 1,
+                retries=retries,
+            )
+            # This is expected to contain pretty sensitive and/or large amounts of data, so for real only
+            # log it in local dev
+            if settings.DEBUG:
+                logger.warning(
+                    f"LLM response that failed validation:\n{text_content}",
+                )
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"Your previous response failed validation. Error: {e}\n\nPlease try again with a valid JSON response.",
+                }
+            )
+            # Re-add assistant pre-fill for non-thinking calls so the LLM
+            # continues from `{` on the next attempt (matching the prepend above).
+            if prefill:
+                messages.append({"role": "assistant", "content": "{"})
+            last_exception = e
+            continue
+
+        metrics.increment_llm_call(stage_label, metrics.LLM_STATUS_OK)
+        return result
+
+    metrics.increment_llm_call(stage_label, metrics.LLM_STATUS_ERROR)
+    raise last_exception or ValueError(f"LLM call failed after {retries} attempts")

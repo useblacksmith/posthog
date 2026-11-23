@@ -1,0 +1,80 @@
+from typing import Literal, Optional, cast
+
+from posthog.hogql import ast
+from posthog.hogql.context import HogQLContext
+from posthog.hogql.database.database import Database
+from posthog.hogql.errors import NotImplementedError, QueryError, SyntaxError
+from posthog.hogql.modifiers import alias_poe_mode_for_legacy
+from posthog.hogql.parser import parse_expr
+from posthog.hogql.printer import prepare_ast_for_printing, print_prepared_ast
+
+
+# This is called only from "non-hogql-based" insights to translate HogQL expressions into ClickHouse SQL
+# All the constant string values will be collected into context.values
+def translate_hogql(
+    query: str,
+    context: HogQLContext,
+    dialect: Literal["hogql", "clickhouse"] = "clickhouse",
+    *,
+    events_table_alias: Optional[str] = None,
+    events_table_use_new_schema: Optional[bool] = None,
+    placeholders: Optional[dict[str, ast.Expr]] = None,
+    table_name: str = "events",
+    forbid_joins: bool = False,
+) -> str:
+    """Translate a HogQL expression into a ClickHouse expression.
+
+    ``table_name`` is the HogQL table the expression's fields resolve against, such as
+    ``posthog.flag_evaluations``. The result holds only the expression, so a join it needs is lost.
+    With ``forbid_joins`` such an expression raises QueryError instead of printing a reference to a
+    table alias that does not exist.
+    """
+    if query == "":
+        raise QueryError("Empty query")
+
+    # TRICKY: As `translate_hogql` is only used in legacy queries (not the all-HogQL ones), we must guard against
+    # the PersonsOnEventsMode.PERSON_ID_OVERRIDE_PROPERTIES_JOINED being used here, as that is not supported in legacy
+    actual_poe_mode = context.modifiers.personsOnEventsMode
+    actual_use_new_events_schema = context.use_new_events_schema
+    try:
+        context.modifiers.personsOnEventsMode = alias_poe_mode_for_legacy(actual_poe_mode)
+        if events_table_use_new_schema is not None:
+            context.use_new_events_schema = events_table_use_new_schema
+        # Create a fake query that selects from the table to have fields to select from.
+        if context.database is None:
+            if context.team_id is None:
+                raise ValueError("Cannot translate HogQL for a filter with no team specified")
+            context.database = Database.create_for(
+                team_id=context.team_id,
+                modifiers=context.modifiers,
+                timings=context.timings,
+            )
+
+        node = parse_expr(query, placeholders=placeholders)
+        chain: list[str | int] = [*table_name.split(".")]
+        select_query = ast.SelectQuery(select=[node], select_from=ast.JoinExpr(table=ast.Field(chain=chain)))
+
+        if events_table_alias is not None and isinstance(select_query.select_from, ast.JoinExpr):
+            select_query.select_from.alias = events_table_alias
+
+        prepared_select_query: ast.SelectQuery = cast(
+            ast.SelectQuery,
+            prepare_ast_for_printing(select_query, context=context, dialect=dialect, stack=[select_query]),
+        )
+        if (
+            forbid_joins
+            and prepared_select_query.select_from is not None
+            and prepared_select_query.select_from.next_join is not None
+        ):
+            raise QueryError("The expression needs a join to another table, which is not supported here")
+        return print_prepared_ast(
+            prepared_select_query.select[0],
+            context=context,
+            dialect=dialect,
+            stack=[prepared_select_query],
+        )
+    except (NotImplementedError, SyntaxError):
+        raise
+    finally:
+        context.modifiers.personsOnEventsMode = actual_poe_mode  # Restore the original value
+        context.use_new_events_schema = actual_use_new_events_schema

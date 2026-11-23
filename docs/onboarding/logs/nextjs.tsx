@@ -1,0 +1,186 @@
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
+
+import { StepDefinition } from '../steps'
+
+export const getNextJSSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+    const { CodeBlock, Markdown, dedent } = ctx
+
+    return [
+        {
+            title: 'Install dependencies',
+            badge: 'required',
+            content: (
+                <>
+                    <Markdown>
+                        PostHog logs uses the standard OpenTelemetry SDK. No PostHog-specific packages required. Install
+                        the OTel SDK and the logs signal package:
+                    </Markdown>
+                    <CodeBlock
+                        blocks={[
+                            {
+                                language: 'bash',
+                                file: 'npm',
+                                code: dedent`
+                                    npm install @opentelemetry/sdk-logs@latest @opentelemetry/exporter-logs-otlp-http@latest @opentelemetry/api@latest @opentelemetry/api-logs@latest @opentelemetry/resources@latest
+                                `,
+                            },
+                            {
+                                language: 'bash',
+                                file: 'yarn',
+                                code: dedent`
+                                    yarn add @opentelemetry/sdk-logs@latest @opentelemetry/exporter-logs-otlp-http@latest @opentelemetry/api@latest @opentelemetry/api-logs@latest @opentelemetry/resources@latest
+                                `,
+                            },
+                            {
+                                language: 'bash',
+                                file: 'pnpm',
+                                code: dedent`
+                                    pnpm add @opentelemetry/sdk-logs@latest @opentelemetry/exporter-logs-otlp-http@latest @opentelemetry/api@latest @opentelemetry/api-logs@latest @opentelemetry/resources@latest
+                                `,
+                            },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                    bun add @opentelemetry/sdk-logs@latest @opentelemetry/exporter-logs-otlp-http@latest @opentelemetry/api@latest @opentelemetry/api-logs@latest @opentelemetry/resources@latest
+                                `,
+                            },
+                        ]}
+                    />
+                    <Markdown>
+                        These steps need `@opentelemetry/sdk-logs` 0.220.0 or later. The `@latest` tags upgrade any
+                        older version already in your project. OpenTelemetry lists Node.js 18 (18.19 or later) and
+                        Node.js 20.6 or later as supported for versions 0.220.0 through 0.222.0. Later releases may
+                        change this.
+                    </Markdown>
+                </>
+            ),
+        },
+        {
+            title: 'Create an instrumentation file',
+            badge: 'required',
+            content: (
+                <>
+                    <Markdown>
+                        {dedent`
+                            Next.js loads \`instrumentation.ts\` (or \`instrumentation.js\`) at startup.
+                            Add the log exporter configuration there:
+                        `}
+                    </Markdown>
+                    <CodeBlock
+                        blocks={[
+                            {
+                                language: 'typescript',
+                                file: 'instrumentation.ts',
+                                code: dedent`
+                                    import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-http'
+                                    import { resourceFromAttributes } from '@opentelemetry/resources'
+                                    import { LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs'
+
+                                    export function register() {
+                                      if (process.env.NEXT_RUNTIME === 'nodejs') {
+                                        const exporter = new OTLPLogExporter({
+                                          url: '<ph_client_api_host>/i/v1/logs',
+                                          headers: {
+                                            Authorization: 'Bearer <ph_project_token>',
+                                          },
+                                        })
+
+                                        const loggerProvider = new LoggerProvider({
+                                          resource: resourceFromAttributes({
+                                            'service.name': 'my-nextjs-app',
+                                          }),
+                                          processors: [new SimpleLogRecordProcessor({ exporter })],
+                                        })
+
+                                        // make the logger available globally
+                                        ;(globalThis as any).__posthogLogger = loggerProvider.getLogger('my-nextjs-app')
+                                      }
+                                    }
+                                `,
+                            },
+                        ]}
+                    />
+                    <Markdown>
+                        {dedent`
+                            On Next.js 13.2–14.x only, enable the instrumentation hook in your Next.js config. Skip this on Next.js 15 and later: \`instrumentation.ts\` is loaded by default, and \`experimental.instrumentationHook\` is no longer needed.
+
+                            If you already have a config file, add \`instrumentationHook: true\` under \`experimental\` and keep your other settings. Use \`export default\` in \`next.config.mjs\`, or in \`next.config.js\` when your \`package.json\` has \`"type": "module"\`. Otherwise, use \`module.exports\`.
+                        `}
+                    </Markdown>
+                    <CodeBlock
+                        blocks={[
+                            {
+                                language: 'javascript',
+                                file: 'next.config.js',
+                                code: dedent`
+                                    /** @type {import('next').NextConfig} */
+                                    const nextConfig = {
+                                      experimental: {
+                                        instrumentationHook: true,
+                                      },
+                                    }
+
+                                    module.exports = nextConfig
+                                `,
+                            },
+                            {
+                                language: 'javascript',
+                                file: 'next.config.mjs',
+                                code: dedent`
+                                    /** @type {import('next').NextConfig} */
+                                    const nextConfig = {
+                                      experimental: {
+                                        instrumentationHook: true,
+                                      },
+                                    }
+
+                                    export default nextConfig
+                                `,
+                            },
+                        ]}
+                    />
+                </>
+            ),
+        },
+        {
+            title: 'Send a log',
+            badge: 'required',
+            content: (
+                <>
+                    <Markdown>Use the global logger in your API routes or server components:</Markdown>
+                    <CodeBlock
+                        blocks={[
+                            {
+                                language: 'typescript',
+                                file: 'app/api/route.ts',
+                                code: dedent`
+                                    import { SeverityNumber } from '@opentelemetry/api-logs'
+
+                                    export const dynamic = 'force-dynamic'
+
+                                    export async function GET() {
+                                      const logger = (globalThis as any).__posthogLogger
+                                      logger?.emit({
+                                        severityNumber: SeverityNumber.INFO,
+                                        severityText: 'INFO',
+                                        body: 'API route called',
+                                        attributes: { route: '/api' },
+                                      })
+                                      return Response.json({ ok: true })
+                                    }
+                                `,
+                            },
+                        ]}
+                    />
+                    <Markdown>
+                        Logs appear in PostHog within a few seconds. Use the [Logs page](https://app.posthog.com/logs)
+                        to search and filter by service name, severity, or any attribute you attach.
+                    </Markdown>
+                </>
+            ),
+        },
+    ]
+}
+
+export const NextJSInstallation = createInstallation(getNextJSSteps)

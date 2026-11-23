@@ -1,0 +1,341 @@
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime
+from functools import cached_property
+from typing import TYPE_CHECKING, Any, Literal, Optional
+
+from posthog.hogql.constants import LimitContext
+from posthog.hogql.property_access_types import RestrictedProperty
+from posthog.hogql.timings import HogQLTimings
+
+from posthog.clickhouse.workload import Workload
+from posthog.week_start_day import WeekStartDay
+
+if TYPE_CHECKING:
+    from posthog.schema import DataWarehouseSyncWarning, HogQLNotice, HogQLQueryModifiers
+
+    from posthog.hogql.database.database import Database
+    from posthog.hogql.database.models import Table
+    from posthog.hogql.observability import HogQLTypeObservability
+    from posthog.hogql.property_metadata import PropertyMetadata
+    from posthog.hogql.transforms.flag_calls_from_flag_evaluations import FlagCallPropertyMetadata
+    from posthog.hogql.transforms.property_types import PropertySwapper
+
+    from posthog.clickhouse.client.execute import ClickHouseExternalTable
+    from posthog.clickhouse.query_tagging import FlagCallsRead
+    from posthog.models import Team, User
+    from posthog.scopes.catalog import APIScopeObject
+
+    from products.access_control.backend.facade.user_access_control import UserAccessControl
+
+
+def _default_modifiers() -> "HogQLQueryModifiers":
+    # Deferred: posthog.schema (the pydantic models) stays off django.setup(); this module
+    # loads there via the legacy filter classes and the warehouse models.
+    from posthog.schema import HogQLQueryModifiers  # noqa: PLC0415
+
+    return HogQLQueryModifiers()
+
+
+@dataclass(frozen=False)
+class HogQLFieldAccess:
+    input: list[str]
+    type: Optional[Literal["event", "event.properties", "person", "person.properties"]]
+    field: Optional[str]
+    sql: str
+
+
+# Mutable by design, because the resolver and the printers accumulate into it as they walk a query:
+# bound values, notices, warnings, and the lazily-resolved retention floors below.
+@dataclass(frozen=False)
+class HogQLContext:
+    """Context given to a HogQL expression printer"""
+
+    # Team making the queries
+    team_id: Optional[int] = None
+    # Team making the queries - if team is passed in, then the team isn't queried when creating the database
+    team: Optional["Team"] = None
+
+    # User making the queries - used for access control on system tables
+    user: Optional["User"] = None
+    # Preloaded access-control snapshot for `user`, shared so schema filtering and the query
+    # cache fingerprint resolve access from the same rows (one bulk preload per run).
+    user_access_control: Optional["UserAccessControl"] = None
+
+    # SECURITY-SENSITIVE: bypass for HogQL access control on warehouse tables.
+    # Set ONLY when running in a context without a user (e.g., internal data imports, schema introspection).
+    # Every call site that sets this MUST include an inline comment explaining why.
+    bypass_warehouse_access_control: bool = False
+
+    # Lets the lazy database build reuse recently fetched per-team sources (TTL-bounded staleness).
+    # Set ONLY by editor-assist paths (autocomplete, metadata); query execution must build fresh.
+    use_cached_sources: bool = False
+
+    # Virtual database we're querying, will be populated from team_id if not present
+    database: Optional["Database"] = None
+    # Metadata discovered for a direct Postgres connection, if one is selected
+    direct_postgres_connection_metadata: dict[str, Any] | None = None
+    # Query-scoped mappings preserve resolved logical tables through Trino lowering.
+    trino_table_locators: Mapping[str, tuple[str, str, str]] = field(default_factory=dict)
+    # Detached printer stages snapshot these values so they do not retain the schema database.
+    timezone: Optional[str] = None
+    week_start_day: Optional[WeekStartDay] = None
+    # Set when the query executes against an external direct-SQL connection instead of PostHog's own cluster
+    is_direct_query: bool = False
+    # If set, will save string constants to this dict. Inlines strings into the query if None.
+    values: dict = field(default_factory=dict)
+    # Query-scoped ClickHouse external data tables accumulated during printing (keyed by table name).
+    # Lets `system.information_schema` ship its rows out-of-band instead of inlining them; read by the
+    # executor and passed to `sync_execute`.
+    external_tables: dict[str, "ClickHouseExternalTable"] = field(default_factory=dict, compare=False, repr=False)
+    # Are we small part of a non-HogQL query? If so, use custom syntax for accessed person properties.
+    within_non_hogql_query: bool = False
+    use_new_events_schema: Optional[bool] = None
+    # Enable full SELECT queries and subqueries in ClickHouse
+    enable_select_queries: bool = False
+    # Do we apply a limit of MAX_SELECT_RETURNED_ROWS=10000 to the topmost select query?
+    limit_top_select: bool = True
+    # Context for determining the appropriate limit to apply
+    limit_context: Optional[LimitContext] = None
+    # Apply a FORMAT clause to output data in given format.
+    output_format: str | None = None
+    emit_top_level_settings: bool = True
+    top_level_settings: dict[str, object] = field(default_factory=dict)
+    # Globals that will be resolved in the context of the query
+    globals: Optional[dict] = None
+    # Standard-library names the bytecode compiler accepts for a direct call. The Python and Node
+    # standard libraries differ, so a caller whose bytecode runs elsewhere names what it can execute.
+    allowed_functions: Optional[dict[str, tuple[int, Optional[int]]]] = None
+    property_type_overrides: Optional[dict[str, str]] = None
+    # Per-query data that query runners want to ingest into the HogQL resolution (e.g. pending updates
+    # merged into a table via UNION ALL in error tracking).
+    data_to_ingest: dict[str, Any] = field(default_factory=dict)
+
+    # Warnings returned with the metadata query
+    warnings: list["HogQLNotice"] = field(default_factory=list)
+    # Notices returned with the metadata query
+    notices: list["HogQLNotice"] = field(default_factory=list)
+    # Errors returned with the metadata query
+    errors: list["HogQLNotice"] = field(default_factory=list)
+
+    # Data warehouse sync warnings collected while resolving warehouse tables referenced by the query.
+    # Keyed by (table_id, schema_name) to dedupe when a table is referenced multiple times.
+    data_warehouse_sync_warnings: dict[tuple[str, str], "DataWarehouseSyncWarning"] = field(default_factory=dict)
+    referenced_saved_query_ids: set[str] = field(default_factory=set)
+    materialized_saved_query_ids: set[str] = field(default_factory=set)
+    referenced_warehouse_table_ids: set[str] = field(default_factory=set)
+    directly_read_ids: set[str] = field(default_factory=set)
+    view_body_depth: int = 0
+
+    # Resources with object-level access restrictions referenced by the query, collected while printing
+    # system tables. A set dedupes when several system tables share an access scope (e.g. system.dashboards
+    # and system.dashboard_tiles both scope "dashboard"). Turned into a single AccessControlFilterWarning
+    # on the response by build_access_control_warning.
+    access_control_restricted_resources: set["APIScopeObject"] = field(default_factory=set)
+
+    # Timings in seconds for different parts of the HogQL query
+    timings: HogQLTimings = field(default_factory=HogQLTimings)
+    # Modifications requested by the HogQL client
+    modifiers: "HogQLQueryModifiers" = field(default_factory=_default_modifiers)
+    # Enables more verbose output for debugging
+    debug: bool = False
+    # Internal optimizer flag. Keep disabled until typed rewrites have broader compatibility coverage.
+    enable_type_aware_cast_simplification: bool = False
+
+    # Optional per-query HogQL type-system observability accumulator.
+    type_observability: Optional["HogQLTypeObservability"] = None
+    # Bounded source/surface label for type-system observability metrics.
+    observability_source: str = "unknown"
+
+    # Property-definition metadata for the properties this query touches, loaded from Postgres by
+    # load_property_metadata during property-type resolution (None until build_property_swapper runs).
+    property_metadata: Optional["PropertyMetadata"] = None
+    property_swapper: Optional["PropertySwapper"] = None
+    # Workload detected during AST resolution (set by prepare_ast_for_printing)
+    workload: Optional[Workload] = None
+    # Per-query cache of the `system.information_schema` introspection result (populated lazily in
+    # posthog/hogql/database/schema/information_schema.py). A dict keyed by the pushed-down table
+    # filter and holding lazy introspection objects, so tables resolving to the same bound walk the
+    # database only once while surface-specific catalog metadata is fetched only when requested.
+    information_schema_introspection: Optional[Any] = field(default=None, compare=False, repr=False)
+    # Per-query cache of the team's rows for `system.integrations`, so a query that references the
+    # table more than once calls the integrations SDK once. None until the first reference resolves.
+    system_integrations_rows: Optional[list[list[Any]]] = field(default=None, compare=False, repr=False)
+    # Property-level access control: (property_name, PropertyDefinition.Type, group_type_index) tuples
+    # that the current user is denied access to. Populated before type resolution so that
+    # FieldType.get_child() can raise QueryError for restricted properties.
+    restricted_properties: Optional[set[RestrictedProperty]] = None
+
+    # Per-query cache of CTE synthetic tables, keyed by id() of the CTE's SelectQueryType. Value pins a
+    # strong ref to the keyed type so its id can't be reused while cached; lookups verify identity.
+    cte_database_table_cache: dict[int, tuple[Any, "Table"]] = field(default_factory=dict, compare=False, repr=False)
+
+    # Cohort-gated events data retention: when set, the ClickHouse printer floors every events-table scan to
+    # now() - toIntervalMonth(this). Computed once per query in prepare_ast_for_printing; None means not enforced.
+    events_retention_months: Optional[int] = None
+    # Backend-only switch for the events-retention floor. Defaults on; server-side paths that must act on all rows
+    # regardless of retention — notably the GDPR data-deletion mutation path — set this False. Deliberately NOT a
+    # HogQLQueryModifier, so a query can't disable enforcement.
+    apply_events_retention_floor: bool = True
+    # Backend-only switch for transforms/flag_calls_from_flag_evaluations.py. The data-deletion path sets it False, so a
+    # flag-call subquery in a deletion predicate keeps reading `events` whatever the organization's mode.
+    rewrite_flag_calls_to_flag_evaluations: bool = True
+    # Per-query event property definitions that transform loads. The transform runs once for the query and once for
+    # each saved view the query inlines, so this loads each property's definition once per query.
+    flag_call_property_metadata: Optional["FlagCallPropertyMetadata"] = field(default=None, compare=False, repr=False)
+    # The (start, end) of each `$feature_flag_called` literal in the query text that the flag-call union reads.
+    # `_resolve_with_swaps` in transforms/flag_calls_from_flag_evaluations.py fills it when the swap succeeds, and the
+    # SQL editor's notices read it.
+    flag_called_union_spans: set[tuple[int, int]] = field(default_factory=set)
+    # The flag-call rewrites that this query applied. `read_tags` reports them to ClickHouse.
+    flag_calls_read: set["FlagCallsRead"] = field(default_factory=set)
+
+    # Backend-only opt-in for transforms/events_read_in_order.py. The prefix is slower when the range is short or
+    # the filter is selective, so set it only for a query shape that was measured to be faster with it.
+    order_events_reads_by_sort_key: bool = False
+
+    # Entitlement-derived floors for federated tables that declare a `retention_field`, keyed by
+    # Postgres table name so two such tables can never share one window. Resolved lazily by the
+    # ClickHouse printer the first time each table is printed, so a query that reads none of them
+    # never pays the organization load. A stored None means "resolved, no restriction", which is why
+    # membership rather than truthiness decides whether the lookup already ran.
+    postgres_retention_starts: dict[str, Optional[datetime]] = field(default_factory=dict, compare=False, repr=False)
+
+    def __post_init__(self):
+        if self.team:
+            self.team_id = self.team.id
+
+    def uses_new_events_schema(self) -> bool:
+        if self.use_new_events_schema is None:
+            # Deferred: keeps posthog.models off this module's import path (see _default_modifiers).
+            from posthog.models.event.new_events_schema import use_new_events_schema  # noqa: PLC0415
+
+            # Pin per context so an instance-setting flip can't mix schemas within one query.
+            self.use_new_events_schema = use_new_events_schema(self.team_id, self.modifiers)
+        return self.use_new_events_schema
+
+    def reads_flag_calls_from_flag_evaluations(self) -> bool:
+        """Whether this query's flag-call reads may come from `posthog.flag_evaluations`.
+
+        The native JSON events table holds no `$feature_flag_called` events. A query that reads it therefore reads flag
+        calls from flag_evaluations whatever the organization's mode, and FLAG_EVALUATIONS_READS_FORCE_EVENTS does not
+        move it back to events. A catalog without the flag_evaluations table never reads it.
+        """
+        database = self.database
+        return database is not None and (
+            database.organization_reads_flag_calls_from_flag_evaluations
+            or self._reads_native_events_with_flag_evaluations()
+        )
+
+    def flag_calls_only_in_flag_evaluations(self) -> bool:
+        """Whether this query reads flag calls only from `posthog.flag_evaluations`, as mode 2 does. The events table
+        that the query reads holds no new flag calls then, so a read that flag_evaluations cannot answer fails."""
+        database = self.database
+        return database is not None and (
+            database.organization_flag_calls_only_in_flag_evaluations
+            or self._reads_native_events_with_flag_evaluations()
+        )
+
+    def reads_flag_calls_with_union(self) -> bool:
+        """Whether flag calls that a mixed query reads come from events and flag_evaluations together.
+
+        A query whose flag calls are only in flag_evaluations reads the union, unless FLAG_EVALUATIONS_UNION_DISABLED
+        is on. On READ_FLAG_EVALUATIONS, a query reads the union only when the organization's hogql-flag-calls-union
+        flag is on.
+        """
+        database = self.database
+        if database is None or not database.flag_calls_union_enabled:
+            return False
+        return database.flag_calls_union_opted_in or self.flag_calls_only_in_flag_evaluations()
+
+    def _reads_native_events_with_flag_evaluations(self) -> bool:
+        database = self.database
+        return (
+            self.uses_new_events_schema()
+            and database is not None
+            and database.has_table(["posthog", "flag_evaluations"])
+        )
+
+    def add_value(self, value: Any) -> str:
+        key = f"hogql_val_{len(self.values)}"
+        self.values[key] = value
+        return f"%({key})s"
+
+    def add_sensitive_value(self, value: Any) -> str:
+        key = f"hogql_val_{len(self.values)}_sensitive"
+        self.values[key] = value
+        return f"%({key})s"
+
+    def add_notice(
+        self,
+        message: str,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        fix: Optional[str] = None,
+    ):
+        if not any(n.start == start and n.end == end and n.message == message and n.fix == fix for n in self.notices):
+            from posthog.schema import HogQLNotice  # noqa: PLC0415
+
+            self.notices.append(HogQLNotice(start=start, end=end, message=message, fix=fix))
+
+    def add_warning(
+        self,
+        message: str,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        fix: Optional[str] = None,
+    ):
+        if not any(n.start == start and n.end == end and n.message == message and n.fix == fix for n in self.warnings):
+            from posthog.schema import HogQLNotice  # noqa: PLC0415
+
+            self.warnings.append(HogQLNotice(start=start, end=end, message=message, fix=fix))
+
+    def add_error(
+        self,
+        message: str,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        fix: Optional[str] = None,
+    ):
+        if not any(n.start == start and n.end == end and n.message == message and n.fix == fix for n in self.errors):
+            from posthog.schema import HogQLNotice  # noqa: PLC0415
+
+            self.errors.append(HogQLNotice(start=start, end=end, message=message, fix=fix))
+
+    def clear_reads(self) -> None:
+        self.referenced_saved_query_ids.clear()
+        self.materialized_saved_query_ids.clear()
+        self.referenced_warehouse_table_ids.clear()
+        self.directly_read_ids.clear()
+        self.flag_calls_read.clear()
+
+    def read_tags(self) -> dict[str, list[str] | None]:
+        reads_warehouse_object = bool(self.referenced_saved_query_ids or self.referenced_warehouse_table_ids)
+        return {
+            "saved_query_ids": sorted(self.referenced_saved_query_ids) or None,
+            "warehouse_table_ids": sorted(self.referenced_warehouse_table_ids) or None,
+            "directly_read_ids": (sorted(self.directly_read_ids) or None) if reads_warehouse_object else None,
+            "flag_calls_read": sorted(self.flag_calls_read) or None,
+        }
+
+    @contextmanager
+    def entering_select(self, view_name: str | None) -> Iterator[None]:
+        step = 0 if view_name is None else 1
+        self.view_body_depth += step
+        try:
+            yield
+        finally:
+            self.view_body_depth -= step
+
+    def add_data_warehouse_sync_warning(self, table_id: str, warning: "DataWarehouseSyncWarning") -> None:
+        self.data_warehouse_sync_warnings[(table_id, warning.schema_name)] = warning
+
+    @cached_property
+    def project_id(self) -> int:
+        from posthog.models import Team
+
+        if not self.team and not self.team_id:
+            raise ValueError("Either team or team_id must be set to determine project_id")
+        team = self.team or Team.objects.only("project_id").get(id=self.team_id)
+        return team.project_id

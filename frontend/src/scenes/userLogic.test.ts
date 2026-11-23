@@ -1,0 +1,367 @@
+import { MOCK_DEFAULT_USER } from 'lib/api.mock'
+
+import { expectLogic } from 'kea-test-utils'
+import posthog from 'posthog-js'
+
+import api from 'lib/api'
+
+import { resumeKeaLoadersErrors, silenceKeaLoadersErrors } from '~/initKea'
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+import { UserType } from '~/types'
+
+import { sqlEditorDraftStorage } from 'products/data_warehouse/frontend/sqlEditorDraftStorage'
+
+import { userLogic } from './userLogic'
+
+describe('userLogic', () => {
+    const userWithLightTheme = { ...MOCK_DEFAULT_USER, theme_mode: 'light' as const }
+
+    beforeEach(() => {
+        // Set current_user before initKeaTests so userLogic bootstraps with theme_mode: 'light'
+        window.POSTHOG_APP_CONTEXT = {
+            ...window.POSTHOG_APP_CONTEXT,
+            current_user: userWithLightTheme,
+        } as any
+        useMocks({
+            get: {
+                '/api/users/@me/': () => [200, userWithLightTheme],
+            },
+        })
+        initKeaTests()
+        userLogic.mount()
+    })
+
+    it.each([
+        [503, undefined],
+        [401, false],
+        [403, false],
+    ])('clears the user on status %s with resetOnFailure=%s', async (status, resetOnFailure) => {
+        useMocks({ get: { '/api/users/@me/': () => [status, {}] } })
+        silenceKeaLoadersErrors()
+        try {
+            await expectLogic(userLogic, () => {
+                userLogic.actions.loadUser(resetOnFailure)
+            }).toFinishAllListeners()
+            expect(userLogic.values.user).toBeNull()
+        } finally {
+            resumeKeaLoadersErrors()
+        }
+    })
+
+    describe('SQL draft logout cleanup', () => {
+        beforeEach(() => {
+            localStorage.clear()
+            sessionStorage.clear()
+        })
+
+        afterEach(() => {
+            localStorage.clear()
+            sessionStorage.clear()
+            jest.restoreAllMocks()
+        })
+
+        it.each([undefined, '/api/agentic/authorize?state=example-state'])(
+            'clears drafts without removing preferences when logging out to %s',
+            (nextUrl) => {
+                let submittedNext: string | null = null
+                const submit = jest
+                    .spyOn(HTMLFormElement.prototype, 'submit')
+                    .mockImplementation(function (this: HTMLFormElement) {
+                        submittedNext = this.querySelector<HTMLInputElement>('input[name="next"]')?.value ?? null
+                        this.remove()
+                    })
+                for (const teamId of [1, 2]) {
+                    sqlEditorDraftStorage(MOCK_DEFAULT_USER.uuid, teamId, 'new')?.set({ q: 'SELECT unfinished' })
+                }
+                localStorage.setItem('theme', 'dark')
+                sessionStorage.setItem('other-session-state', 'keep')
+
+                userLogic.actions.logout(false, nextUrl)
+
+                expect(submit).toHaveBeenCalledTimes(1)
+                expect(submittedNext).toEqual(nextUrl ?? null)
+                expect(Object.keys(localStorage)).toEqual(['theme'])
+                expect(Object.keys(sessionStorage)).toEqual(['other-session-state'])
+            }
+        )
+
+        it('clears this tab’s session copy when another tab removes the shared draft', () => {
+            const draft = sqlEditorDraftStorage(MOCK_DEFAULT_USER.uuid, 1, 'new')!
+            draft.set({ q: 'SELECT unfinished' })
+            const key = localStorage.key(0)!
+            window.dispatchEvent(new StorageEvent('storage', { key, newValue: 'null', storageArea: localStorage }))
+            expect(draft.get(true)).toEqual({ q: 'SELECT unfinished' })
+
+            localStorage.removeItem(key)
+
+            window.dispatchEvent(new StorageEvent('storage', { key, newValue: null, storageArea: localStorage }))
+
+            expect(sessionStorage.getItem(key)).toBeNull()
+            expect(draft.get(true)).toBeNull()
+        })
+    })
+
+    describe('optimistic theme mode', () => {
+        afterEach(() => {
+            jest.restoreAllMocks()
+        })
+
+        beforeEach(async () => {
+            await expectLogic(userLogic, () => {
+                userLogic.actions.loadUser()
+            })
+                .toDispatchActions(['loadUserSuccess'])
+                .toMatchValues({ user: userWithLightTheme, themeMode: 'light' })
+        })
+
+        it('themeMode updates immediately when updateUser is called with theme_mode', async () => {
+            jest.spyOn(api, 'update').mockImplementation(async () => await new Promise(() => undefined))
+
+            await expectLogic(userLogic, () => {
+                userLogic.actions.updateUser({ theme_mode: 'dark' })
+            }).toMatchValues({
+                themeMode: 'dark',
+                optimisticThemeMode: 'dark',
+            })
+        })
+
+        it('optimisticThemeMode is cleared and themeMode comes from user when update succeeds', async () => {
+            const updatedUser = { ...userWithLightTheme, theme_mode: 'dark' as const }
+            jest.spyOn(api, 'update').mockImplementation(async () => await new Promise(() => undefined))
+
+            await expectLogic(userLogic, () => {
+                userLogic.actions.updateUser({ theme_mode: 'dark' })
+            }).toMatchValues({ themeMode: 'dark', optimisticThemeMode: 'dark' })
+
+            await expectLogic(userLogic, () => {
+                userLogic.actions.updateUserSuccess(updatedUser)
+            }).toMatchValues({
+                user: updatedUser,
+                themeMode: 'dark',
+                optimisticThemeMode: null,
+            })
+        })
+
+        it('optimisticThemeMode is cleared and themeMode reverts to user when update fails', async () => {
+            jest.spyOn(api, 'update').mockImplementation(async () => await new Promise(() => undefined))
+
+            await expectLogic(userLogic, () => {
+                userLogic.actions.updateUser({ theme_mode: 'dark' })
+            }).toMatchValues({ themeMode: 'dark', optimisticThemeMode: 'dark' })
+
+            await expectLogic(userLogic, () => {
+                userLogic.actions.updateUserFailure('Server error')
+            }).toMatchValues({
+                user: userWithLightTheme,
+                themeMode: 'light',
+                optimisticThemeMode: null,
+            })
+        })
+
+        it('updateUser without theme_mode does not change optimisticThemeMode', async () => {
+            jest.spyOn(api, 'update').mockImplementation(async () => await new Promise(() => undefined))
+
+            userLogic.actions.updateUser({ theme_mode: 'dark' })
+            await expectLogic(userLogic).toMatchValues({ optimisticThemeMode: 'dark' })
+
+            await expectLogic(userLogic, () => {
+                userLogic.actions.updateUser({ first_name: 'Jane' })
+            }).toMatchValues({ optimisticThemeMode: 'dark' })
+        })
+    })
+
+    describe('realtime notification preferences', () => {
+        let updateUserSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            updateUserSpy = jest.spyOn(userLogic.actions, 'updateUser')
+            useMocks({ patch: { '/api/users/@me/': [200, userWithLightTheme] } })
+        })
+
+        afterEach(async () => {
+            await expectLogic(userLogic).toFinishAllListeners()
+            updateUserSpy.mockRestore()
+        })
+
+        it('updateRealtimeNotificationForTeam sends a minimal patch toggling one (type, team) pair to disabled', () => {
+            userLogic.actions.loadUserSuccess({
+                ...MOCK_DEFAULT_USER,
+                notification_settings: {
+                    ...MOCK_DEFAULT_USER.notification_settings,
+                    realtime_notifications_disabled: {},
+                },
+            } as any)
+
+            userLogic.actions.updateRealtimeNotificationForTeam('comment_mention', 42, false)
+
+            expect(updateUserSpy).toHaveBeenCalledWith({
+                notification_settings: expect.objectContaining({
+                    realtime_notifications_disabled: { comment_mention: { '42': true } },
+                }),
+            })
+        })
+
+        it('updateRealtimeNotificationForProject sets every passed type to disabled for that team', () => {
+            userLogic.actions.loadUserSuccess({
+                ...MOCK_DEFAULT_USER,
+                notification_settings: {
+                    ...MOCK_DEFAULT_USER.notification_settings,
+                    realtime_notifications_disabled: {},
+                },
+            } as any)
+
+            userLogic.actions.updateRealtimeNotificationForProject(7, ['comment_mention', 'alert_firing'], false)
+
+            expect(updateUserSpy).toHaveBeenCalledWith({
+                notification_settings: expect.objectContaining({
+                    realtime_notifications_disabled: {
+                        comment_mention: { '7': true },
+                        alert_firing: { '7': true },
+                    },
+                }),
+            })
+        })
+
+        it('updateAllRealtimeNotifications disables every (team, type) pair when enabled=false', () => {
+            userLogic.actions.loadUserSuccess({
+                ...MOCK_DEFAULT_USER,
+                notification_settings: {
+                    ...MOCK_DEFAULT_USER.notification_settings,
+                    realtime_notifications_disabled: {},
+                },
+            } as any)
+
+            userLogic.actions.updateAllRealtimeNotifications([1, 2], ['comment_mention'], false)
+
+            expect(updateUserSpy).toHaveBeenCalledWith({
+                notification_settings: expect.objectContaining({
+                    realtime_notifications_disabled: {
+                        comment_mention: { '1': true, '2': true },
+                    },
+                }),
+            })
+        })
+
+        it('updateAllRealtimeNotifications clears disabled entries when enabled=true', () => {
+            userLogic.actions.loadUserSuccess({
+                ...MOCK_DEFAULT_USER,
+                notification_settings: {
+                    ...MOCK_DEFAULT_USER.notification_settings,
+                    realtime_notifications_disabled: { comment_mention: { '1': true, '2': true } },
+                },
+            } as any)
+
+            userLogic.actions.updateAllRealtimeNotifications([1, 2], ['comment_mention'], true)
+
+            expect(updateUserSpy).toHaveBeenCalledWith({
+                notification_settings: expect.objectContaining({
+                    realtime_notifications_disabled: {
+                        comment_mention: { '1': false, '2': false },
+                    },
+                }),
+            })
+        })
+    })
+
+    describe('updateUser failure handling', () => {
+        beforeEach(silenceKeaLoadersErrors)
+        afterEach(resumeKeaLoadersErrors)
+
+        afterEach(() => {
+            jest.restoreAllMocks()
+        })
+
+        it('dispatches updateUserFailure (not success) when the backend rejects the update', async () => {
+            jest.spyOn(api, 'update').mockRejectedValue({
+                status: 400,
+                detail: 'Update rejected by server.',
+            })
+
+            await expectLogic(userLogic, () => {
+                userLogic.actions.updateUser({ email: 'new@example.com' })
+            })
+                .toDispatchActions(['updateUserFailure'])
+                .toNotHaveDispatchedActions(['updateUserSuccess'])
+        })
+
+        it('keeps the existing user when the update fails — no silent revert via success', async () => {
+            jest.spyOn(api, 'update').mockRejectedValue({ status: 400, detail: 'nope' })
+
+            await expectLogic(userLogic, () => {
+                userLogic.actions.updateUser({ email: 'new@example.com' })
+            })
+                .toDispatchActions(['updateUserFailure'])
+                .toMatchValues({ user: userWithLightTheme })
+        })
+
+        it.each([502, 503, 504])(
+            'does not report transient gateway error %s to error tracking but still fails the update',
+            async (status) => {
+                const captureSpy = jest.spyOn(posthog, 'captureException').mockImplementation(() => undefined as any)
+                jest.spyOn(api, 'update').mockRejectedValue({ status, statusText: 'Bad Gateway' })
+
+                await expectLogic(userLogic, () => {
+                    userLogic.actions.updateUser({ email: 'new@example.com' })
+                })
+                    .toDispatchActions(['updateUserFailure'])
+                    .toNotHaveDispatchedActions(['updateUserSuccess'])
+
+                expect(captureSpy).not.toHaveBeenCalled()
+            }
+        )
+
+        it.each([false, true])('serializes subsequent updates when the first request fails: %s', async (firstFails) => {
+            let releaseFirst: (user: UserType) => void = () => {}
+            let rejectFirst: (error: unknown) => void = () => {}
+            let reportFirstStarted: () => void = () => {}
+            const firstStarted = new Promise<void>((resolve) => {
+                reportFirstStarted = resolve
+            })
+            const firstHeld = new Promise<UserType>((resolve, reject) => {
+                releaseFirst = resolve
+                rejectFirst = reject
+            })
+            const latestUser = { ...userWithLightTheme, first_name: 'Latest' }
+            const update = jest
+                .spyOn(api, 'update')
+                .mockImplementationOnce(async () => {
+                    reportFirstStarted()
+                    return await firstHeld
+                })
+                .mockResolvedValueOnce(latestUser)
+            const firstSuccess = jest.fn()
+            const firstFailure = jest.fn()
+
+            userLogic.actions.updateUser({ first_name: 'First' }, firstSuccess, firstFailure)
+            await firstStarted
+            userLogic.actions.updateUser({ first_name: 'Latest' })
+            const requestsBeforeRelease = update.mock.calls.length
+
+            await expectLogic(userLogic, () => {
+                if (firstFails) {
+                    rejectFirst({ status: 400, detail: 'Update rejected by server.' })
+                } else {
+                    releaseFirst({ ...userWithLightTheme, first_name: 'First' })
+                }
+            }).toFinishAllListeners()
+
+            expect(requestsBeforeRelease).toBe(1)
+            expect(update).toHaveBeenCalledTimes(2)
+            expect(userLogic.values.user?.first_name).toBe('Latest')
+            expect(firstSuccess).toHaveBeenCalledTimes(firstFails ? 0 : 1)
+            expect(firstFailure).toHaveBeenCalledTimes(firstFails ? 1 : 0)
+        })
+
+        it('reports a genuine backend error (500) to error tracking', async () => {
+            const captureSpy = jest.spyOn(posthog, 'captureException').mockImplementation(() => undefined as any)
+            jest.spyOn(api, 'update').mockRejectedValue({ status: 500, statusText: 'Internal Server Error' })
+
+            await expectLogic(userLogic, () => {
+                userLogic.actions.updateUser({ email: 'new@example.com' })
+            }).toDispatchActions(['updateUserFailure'])
+
+            expect(captureSpy).toHaveBeenCalled()
+        })
+    })
+})

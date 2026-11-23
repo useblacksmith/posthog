@@ -1,0 +1,567 @@
+import { deepEqual as equal } from 'fast-equals'
+import { MakeLogicType, actions, connect, events, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import posthog from 'posthog-js'
+
+import { defaultDataWarehousePopoverFields } from 'lib/components/TaxonomicFilter/taxonomicFilterLogic'
+import { DataWarehousePopoverField } from 'lib/components/TaxonomicFilter/types'
+import { uuid } from 'lib/utils/dom'
+import { GraphSeriesAddedSource, eventUsageLogic } from 'lib/utils/eventUsageLogic'
+
+import { AnyEntityNode, EventsNode, GroupNode, NodeKind } from '~/queries/schema/schema-general'
+import { AnyPropertyFilter, EntityType, FilterLogicalOperator, PropertyFilterType, PropertyMathType } from '~/types'
+
+import {
+    SeriesNode,
+    WarehouseSeriesNodeKind,
+    createDefaultSeriesNode,
+    isGroupSeriesNode,
+    isWarehouseSeriesNode,
+    isWarehouseSeriesNodeKind,
+    seriesNodeEntityType,
+    seriesNodeKey,
+    toActionId,
+    withLatestVersion,
+} from './seriesNode'
+
+/** A series node plus the sidecar identity the editor needs for drag keys and row identity. */
+export interface LocalSeries {
+    uuid: string
+    node: SeriesNode
+}
+
+export interface SeriesMathUpdate {
+    math?: string
+    math_property?: string
+    math_property_type?: string
+    math_hogql?: string
+    math_group_type_index?: number
+}
+
+/**
+ * What the picker commits for a row: the node kind, the key that kind is identified by, and
+ * whatever else that kind carries (warehouse popover fields, group operator and nodes).
+ */
+export interface SeriesEntityUpdate {
+    kind: SeriesNode['kind']
+    /** Event name, action id or table name, by kind. */
+    key?: string | number | null
+    name?: string | null
+    custom_name?: string | null
+    [field: string]: any
+}
+
+export interface SelectedSeries {
+    index: number
+    node: SeriesNode
+    /** Row identity, so a rename cannot land on a different series that took this index. */
+    uuid?: string
+}
+
+const PROPERTY_VALUE_MATHS = new Set<string>(Object.values(PropertyMathType))
+
+// Fields that only the data warehouse node kinds define. The events and actions node schemas
+// forbid unknown keys, so a query fails when one of these is left on an event or action series.
+const WAREHOUSE_ONLY_FIELDS = [
+    'table_name',
+    'timestamp_field',
+    'id_field',
+    'distinct_id_field',
+    'aggregation_target_field',
+    'created_at_field',
+    'dw_source_type',
+    'events_join_key',
+    'data_warehouse_join_key',
+] as const
+
+// Fields only an events node defines. The actions and data warehouse node schemas forbid unknown
+// keys, so a query fails when one of these is left on a series that stopped being an event.
+const EVENTS_ONLY_FIELDS = ['event', 'limit', 'orderBy'] as const
+
+// A multiplier and a revenue currency describe one math property, so they cannot carry over to
+// another property. Otherwise the query would scale and currency-convert the wrong value.
+const PROPERTY_MATH_SETTINGS = ['math_multiplier', 'math_property_revenue_currency'] as const
+
+// math_property names a column or property on the entity the series aggregates, so it cannot
+// survive an entity switch. Property-value math (sum, avg, percentiles) is dropped with it —
+// the backend errors out on that math without a math_property.
+function dropStaleMath(node: Record<string, any>): void {
+    if (node.math && PROPERTY_VALUE_MATHS.has(node.math)) {
+        node.math = undefined
+    }
+    node.math_property = undefined
+    node.math_property_type = undefined
+    PROPERTY_MATH_SETTINGS.forEach((field) => {
+        node[field] = undefined
+    })
+}
+
+function toLocalSeries(series: SeriesNode[]): LocalSeries[] {
+    return series.map((node) => ({ uuid: uuid(), node }))
+}
+
+function applySeriesKey(node: Record<string, any>, kind: SeriesNode['kind'], key: string | number | null): void {
+    if (kind === NodeKind.EventsNode) {
+        node.event = key
+    } else if (kind === NodeKind.ActionsNode) {
+        node.id = toActionId(key)
+    } else if (kind !== NodeKind.GroupNode) {
+        node.table_name = key
+        // Warehouse nodes mirror the table name onto `id`.
+        node.id = key
+    }
+}
+
+/** Turns a row into a one-entity group, keeping the row inside it so the split is reversible. */
+export function seriesNodeToGroupNode(node: SeriesNode): GroupNode {
+    return withLatestVersion({
+        kind: NodeKind.GroupNode,
+        name: node.name,
+        operator: FilterLogicalOperator.Or,
+        nodes: [node as AnyEntityNode],
+        ...(node.math && { math: node.math }),
+        ...(node.math_property && { math_property: node.math_property }),
+        ...(node.math_property_type && { math_property_type: node.math_property_type }),
+        ...(node.math_hogql && { math_hogql: node.math_hogql }),
+        ...(node.math_group_type_index !== undefined && { math_group_type_index: node.math_group_type_index }),
+    } as GroupNode)
+}
+
+export interface EntityFilterProps {
+    series?: SeriesNode[]
+    onChange?: (series: SeriesNode[]) => void
+    typeKey: string
+    singleMode?: boolean
+    newSeriesDefaults?: Partial<SeriesNode>
+    dataWarehousePopoverFields?: DataWarehousePopoverField[]
+    dataWarehouseNodeKind?: WarehouseSeriesNodeKind
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface entityFilterLogicValues {
+    entityFilterVisible: boolean[]
+    localSeries: LocalSeries[]
+    modalVisible: boolean
+    selectedSeries: SelectedSeries | null
+    series: SeriesNode[]
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface entityFilterLogicActions {
+    addSeries: () => {
+        value: true
+    }
+    convertToGroup: (index: number) => {
+        index: number
+    }
+    duplicateSeries: (index: number) => {
+        index: number
+    }
+    hideModal: () => {
+        value: true
+    }
+    removeSeries: (index: number) => {
+        index: number
+    }
+    renameSeries: (customName: string) => {
+        customName: string
+    }
+    revealSeriesFilters: () => {
+        value: true
+    }
+    selectSeries: (
+        index: number | null,
+        node?: SeriesNode | null,
+        uuid?: string
+    ) => {
+        index: number | null
+        node: SeriesNode | null | undefined
+        uuid: string | undefined
+    }
+    selectSeriesAt: (index: number | null) => {
+        index: number | null
+    }
+    setEntityFilterVisibility: (
+        index: number,
+        value: boolean
+    ) => {
+        index: number
+        value: boolean
+    }
+    setLocalSeries: (localSeries: LocalSeries[]) => {
+        localSeries: LocalSeries[]
+    }
+    setSeries: (series: SeriesNode[]) => {
+        series: SeriesNode[]
+    }
+    showModal: () => {
+        value: true
+    }
+    splitGroup: (index: number) => {
+        index: number
+    }
+    updateSeriesEntity: (
+        index: number,
+        update: SeriesEntityUpdate
+    ) => {
+        index: number
+        update: SeriesEntityUpdate
+    }
+    updateSeriesMath: (
+        index: number,
+        math: SeriesMathUpdate
+    ) => {
+        index: number
+        math: SeriesMathUpdate
+    }
+    updateSeriesOptional: (
+        index: number,
+        optionalInFunnel: boolean | undefined
+    ) => {
+        index: number
+        optionalInFunnel: boolean | undefined
+    }
+    updateSeriesProperties: (
+        index: number,
+        properties: AnyPropertyFilter[]
+    ) => {
+        index: number
+        properties: AnyPropertyFilter[]
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface entityFilterLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        series: (localSeries: LocalSeries[]) => SeriesNode[]
+    }
+}
+
+export type entityFilterLogicType = MakeLogicType<
+    entityFilterLogicValues,
+    entityFilterLogicActions,
+    EntityFilterProps,
+    entityFilterLogicMeta
+>
+
+const seriesFiltersToReveal = new Set<string>()
+
+export function revealSeriesFilters(typeKey: string): void {
+    const mounted = entityFilterLogic.findMounted({ typeKey })
+    if (mounted) {
+        mounted.actions.revealSeriesFilters()
+    } else {
+        seriesFiltersToReveal.add(typeKey)
+    }
+}
+
+export const entityFilterLogic = kea<entityFilterLogicType>([
+    props({} as EntityFilterProps),
+    key((props) => props.typeKey),
+    path((key) => ['scenes', 'insights', 'ActionFilter', 'entityFilterLogic', key]),
+    connect(() => ({
+        logic: [eventUsageLogic],
+    })),
+    actions({
+        selectSeries: (index: number | null, node?: SeriesNode | null, uuid?: string) => ({ index, node, uuid }),
+        selectSeriesAt: (index: number | null) => ({ index }),
+        updateSeriesEntity: (index: number, update: SeriesEntityUpdate) => ({ index, update }),
+        updateSeriesMath: (index: number, math: SeriesMathUpdate) => ({ index, math }),
+        updateSeriesProperties: (index: number, properties: AnyPropertyFilter[]) => ({ index, properties }),
+        updateSeriesOptional: (index: number, optionalInFunnel: boolean | undefined) => ({ index, optionalInFunnel }),
+        renameSeries: (customName: string) => ({ customName }),
+        removeSeries: (index: number) => ({ index }),
+        splitGroup: (index: number) => ({ index }),
+        addSeries: true,
+        duplicateSeries: (index: number) => ({ index }),
+        convertToGroup: (index: number) => ({ index }),
+        setLocalSeries: (localSeries: LocalSeries[]) => ({ localSeries }),
+        setSeries: (series: SeriesNode[]) => ({ series }),
+        setEntityFilterVisibility: (index: number, value: boolean) => ({ index, value }),
+        revealSeriesFilters: true,
+        showModal: true,
+        hideModal: true,
+    }),
+
+    reducers(({ props }) => ({
+        selectedSeries: [
+            null as SelectedSeries | null,
+            {
+                selectSeries: (_, { index, node, uuid }) => (index == null || !node ? null : { index, node, uuid }),
+            },
+        ],
+        localSeries: [
+            toLocalSeries(props.series ?? []),
+            {
+                setLocalSeries: (_, { localSeries }) => localSeries,
+                setSeries: (current, { series }) => {
+                    if (
+                        equal(
+                            current.map(({ node }) => node),
+                            series
+                        )
+                    ) {
+                        return current
+                    }
+                    // Row identity has to survive a parent re-render, or drag handles and open
+                    // property panels reset under the user. Match a row to the same kind and key,
+                    // preferring the one at the same index so two rows on the same event keep
+                    // their own uuid.
+                    const usedUuids = new Set<string>()
+                    return series.map((node, index) => {
+                        const isSameSeries = (candidate: LocalSeries): boolean =>
+                            candidate.node.kind === node.kind &&
+                            seriesNodeKey(candidate.node) === seriesNodeKey(node) &&
+                            !usedUuids.has(candidate.uuid)
+                        const existing =
+                            (current[index] && isSameSeries(current[index]) ? current[index] : undefined) ??
+                            current.find(isSameSeries)
+                        if (existing) {
+                            usedUuids.add(existing.uuid)
+                            return { uuid: existing.uuid, node }
+                        }
+                        return { uuid: uuid(), node }
+                    })
+                },
+            },
+        ],
+        entityFilterVisible: [
+            [] as boolean[],
+            {
+                setEntityFilterVisibility: (state, { index, value }) => ({
+                    ...state,
+                    [index]: value,
+                }),
+            },
+        ],
+        modalVisible: [
+            false,
+            {
+                showModal: () => true,
+                hideModal: () => false,
+            },
+        ],
+    })),
+
+    selectors({
+        series: [(s) => [s.localSeries], (localSeries: LocalSeries[]): SeriesNode[] => localSeries.map((l) => l.node)],
+    }),
+
+    listeners(({ actions, values, props }) => {
+        const replaceAt = (index: number, update: (node: SeriesNode) => SeriesNode): void => {
+            actions.setLocalSeries(
+                values.localSeries.map((local, i) => (i === index ? { ...local, node: update(local.node) } : local))
+            )
+        }
+
+        return {
+            selectSeriesAt: ({ index }) => {
+                const local = index === null ? undefined : values.localSeries[index]
+                actions.selectSeries(local ? index : null, local?.node, local?.uuid)
+            },
+            renameSeries: ({ customName }) => {
+                const selected = values.selectedSeries
+                if (selected) {
+                    // Resolve by row identity: the selected row may have moved or been removed
+                    // while the modal was open, and renaming by index alone would hit whichever
+                    // series took its place.
+                    const index = selected.uuid
+                        ? values.localSeries.findIndex(({ uuid: rowUuid }) => rowUuid === selected.uuid)
+                        : selected.index
+                    if (index !== -1) {
+                        replaceAt(index, (node) => ({ ...node, custom_name: customName }) as SeriesNode)
+                    }
+                }
+                actions.hideModal()
+            },
+            hideModal: () => {
+                actions.selectSeries(null)
+            },
+            updateSeriesEntity: ({ index, update }) => {
+                const { kind, key, name, custom_name, ...extra } = update
+                const dataWarehousePopoverFields = props.dataWarehousePopoverFields ?? defaultDataWarehousePopoverFields
+
+                replaceAt(index, (current) => {
+                    const previousKind = current.kind
+                    const next: Record<string, any> = { ...current, kind }
+
+                    if (typeof name !== 'undefined') {
+                        next.name = name
+                    }
+                    if (typeof custom_name !== 'undefined') {
+                        next.custom_name = custom_name
+                    }
+
+                    if (isWarehouseSeriesNodeKind(kind)) {
+                        EVENTS_ONLY_FIELDS.forEach((field) => {
+                            delete next[field]
+                        })
+                        applySeriesKey(next, kind, typeof key === 'undefined' ? seriesNodeKey(current) : key)
+                        dataWarehousePopoverFields.forEach(({ key: fieldKey }) => {
+                            const value = extra[fieldKey]
+                            next[fieldKey] = typeof value === 'undefined' ? (current as any)[fieldKey] : value
+                        })
+
+                        // A data warehouse series resolves property filters against its own
+                        // table: there is no person in scope, so person-scoped filters carried
+                        // over from a previous event entity cannot resolve, and column filters
+                        // from a different table cannot either. SQL expression filters are
+                        // user-authored and stay visible in the UI, so they are kept.
+                        if (Array.isArray(current.properties)) {
+                            next.properties = current.properties.filter(
+                                (property: AnyPropertyFilter) =>
+                                    property.type === PropertyFilterType.HogQL ||
+                                    (property.type === PropertyFilterType.DataWarehouse &&
+                                        next.table_name === (current as any).table_name)
+                            )
+                        }
+
+                        if (!isWarehouseSeriesNode(current) || next.table_name !== (current as any).table_name) {
+                            dropStaleMath(next)
+                            // The source type describes the previous table.
+                            delete next.dw_source_type
+                        }
+
+                        return withLatestVersion(next as SeriesNode)
+                    }
+
+                    if (kind === NodeKind.GroupNode) {
+                        return withLatestVersion({ ...next, ...extra } as SeriesNode)
+                    }
+
+                    // Leaving the warehouse: its fields, popover fields and column filters name a
+                    // table an event or action series does not select from, so none can carry over.
+                    WAREHOUSE_ONLY_FIELDS.forEach((field) => {
+                        delete next[field]
+                    })
+                    dataWarehousePopoverFields.forEach(({ key: fieldKey }) => {
+                        delete next[fieldKey]
+                    })
+                    if (Array.isArray(current.properties)) {
+                        next.properties = current.properties.filter(
+                            (property: AnyPropertyFilter) => property.type !== PropertyFilterType.DataWarehouse
+                        )
+                    }
+                    if (isWarehouseSeriesNode(current)) {
+                        dropStaleMath(next)
+                    }
+
+                    if (kind === NodeKind.EventsNode) {
+                        delete next.id
+                    } else {
+                        EVENTS_ONLY_FIELDS.forEach((field) => {
+                            delete next[field]
+                        })
+                    }
+                    if (previousKind === NodeKind.GroupNode) {
+                        delete next.nodes
+                        delete next.operator
+                    }
+                    applySeriesKey(next, kind, typeof key === 'undefined' ? seriesNodeKey(current) : key)
+
+                    return withLatestVersion(next as SeriesNode)
+                })
+
+                !props.singleMode && actions.selectSeries(null)
+            },
+            updateSeriesProperties: ({ index, properties }) => {
+                replaceAt(index, (node) => ({ ...node, properties }) as SeriesNode)
+            },
+            updateSeriesMath: ({ index, math }) => {
+                replaceAt(index, (node) => {
+                    const next: Record<string, any> = { ...node, ...math }
+                    if (next.math_property !== node.math_property) {
+                        PROPERTY_MATH_SETTINGS.forEach((field) => {
+                            next[field] = undefined
+                        })
+                    }
+                    return next as SeriesNode
+                })
+            },
+            updateSeriesOptional: ({ index, optionalInFunnel }) => {
+                replaceAt(index, (node) => ({ ...node, optionalInFunnel }) as SeriesNode)
+            },
+            removeSeries: ({ index }) => {
+                actions.setLocalSeries(values.localSeries.filter((_, i) => i !== index))
+                posthog.capture('local filter removed', { index: index })
+            },
+            splitGroup: ({ index }) => {
+                const node = values.localSeries[index]?.node
+                if (!isGroupSeriesNode(node)) {
+                    return
+                }
+                const nested = node.nodes ?? []
+                actions.setLocalSeries([
+                    ...values.localSeries.slice(0, index),
+                    ...nested.map((nestedNode) => ({ uuid: uuid(), node: nestedNode as SeriesNode })),
+                    ...values.localSeries.slice(index + 1),
+                ])
+            },
+            addSeries: () => {
+                const newLength = values.localSeries.length + 1
+                const node = createDefaultSeriesNode(props.newSeriesDefaults)
+                const newUuid = uuid()
+                actions.setLocalSeries([...values.localSeries, { uuid: newUuid, node }])
+                actions.selectSeries(newLength - 1, node, newUuid)
+                eventUsageLogic.actions.reportInsightFilterAdded(newLength, GraphSeriesAddedSource.Default)
+            },
+            duplicateSeries: ({ index }) => {
+                const local = values.localSeries[index]
+                if (!local) {
+                    return
+                }
+                const newLength = values.localSeries.length + 1
+                const duplicated = { uuid: uuid(), node: withLatestVersion({ ...local.node }) }
+                actions.setLocalSeries([
+                    ...values.localSeries.slice(0, index + 1),
+                    duplicated,
+                    ...values.localSeries.slice(index + 1),
+                ])
+                actions.setEntityFilterVisibility(index + 1, values.entityFilterVisible[index])
+                eventUsageLogic.actions.reportInsightFilterAdded(newLength, GraphSeriesAddedSource.Duplicate)
+            },
+            convertToGroup: ({ index }) => {
+                const node = values.localSeries[index]?.node
+                if (!node) {
+                    return
+                }
+                replaceAt(index, () => seriesNodeToGroupNode(node))
+            },
+            setLocalSeries: ({ localSeries }) => {
+                const series = localSeries.map(({ node }) => node)
+                if (typeof props.onChange === 'function') {
+                    props.onChange(series)
+                }
+                posthog.capture('filters set', {
+                    filters: series.map((node) => ({
+                        id: seriesNodeKey(node),
+                        type: seriesNodeEntityType(node) as EntityType | undefined,
+                    })),
+                })
+            },
+            revealSeriesFilters: () => {
+                values.localSeries.forEach(({ node }, index) => {
+                    if (node.properties?.length && !values.entityFilterVisible[index]) {
+                        actions.setEntityFilterVisibility(index, true)
+                    }
+                })
+            },
+            setEntityFilterVisibility: ({ index, value }) => {
+                const entityName = values.localSeries[index]?.node.name || undefined
+                posthog.capture('entity filter visbility set', { index: index, visible: value, entityName: entityName })
+            },
+        }
+    }),
+    events(({ actions, props }) => ({
+        afterMount: () => {
+            if (seriesFiltersToReveal.delete(props.typeKey)) {
+                actions.revealSeriesFilters()
+            }
+            if (props.singleMode) {
+                const node = withLatestVersion({ kind: NodeKind.EventsNode, event: null } as EventsNode)
+                actions.setSeries([node])
+                actions.selectSeries(0, node)
+            }
+        },
+    })),
+])

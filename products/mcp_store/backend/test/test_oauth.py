@@ -1,0 +1,1360 @@
+from urllib.parse import urlparse
+
+import pytest
+from posthog.test.base import BaseTest
+from unittest.mock import MagicMock, patch
+
+from django.test import SimpleTestCase
+
+import httpx
+from parameterized import parameterized
+
+from posthog.models.instance_setting import override_instance_config
+from posthog.test.anti_ssrf import mock_anti_ssrf_dns_lookup
+
+from products.mcp_store.backend.models import MCPServerInstallation, MCPServerTemplate
+from products.mcp_store.backend.oauth import (
+    TIMEOUT,
+    DcrClientRegistration,
+    DCRRegistrationRejectedError,
+    OAuthTokenExchangeError,
+    TokenRefreshError,
+    TokenRefreshRejectedError,
+    discover_oauth_metadata,
+    exchange_oauth_token,
+    oauth_resource,
+    refresh_installation_token,
+    refresh_oauth_token,
+    register_dcr_client,
+    requested_oauth_grant_types,
+    requested_oauth_scopes,
+    resolve_installation_oauth_context,
+    select_token_endpoint_auth_method,
+)
+
+pytestmark = pytest.mark.usefixtures("pin_oauth_urls")
+
+
+class TestRefreshOauthToken(SimpleTestCase):
+    @parameterized.expand(
+        [
+            (
+                "known_provider_with_secret",
+                {"client_secret": "my-secret"},
+                ("my-client", "my-secret"),
+            ),
+            (
+                "dcr_without_secret",
+                {"client_secret": None},
+                None,
+            ),
+        ]
+    )
+    def test_default_token_auth_method(self, _name, kwargs, expected_auth):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "new-token", "refresh_token": "new-refresh"}
+        mock_resp.raise_for_status = MagicMock()
+
+        with (
+            patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None)),
+            patch("products.mcp_store.backend.oauth.httpx.Client.post", return_value=mock_resp) as mock_post,
+        ):
+            result = refresh_oauth_token(
+                token_url="https://example.com/token",
+                refresh_token="old-refresh",
+                client_id="my-client",
+                **kwargs,
+            )
+
+        call_kwargs = mock_post.call_args.kwargs
+        call_data = call_kwargs["data"]
+        self.assertEqual(call_data["grant_type"], "refresh_token")
+        self.assertEqual(call_data["refresh_token"], "old-refresh")
+        if expected_auth:
+            self.assertNotIn("client_id", call_data)
+            self.assertNotIn("client_secret", call_data)
+        else:
+            self.assertEqual(call_data["client_id"], "my-client")
+            self.assertNotIn("client_secret", call_data)
+        self.assertEqual(call_kwargs["auth"], expected_auth or httpx.USE_CLIENT_DEFAULT)
+        self.assertEqual(result["access_token"], "new-token")
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_refresh_sends_resource_and_disables_redirects(self, mock_post, _allow):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "new-token"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        refresh_oauth_token(
+            token_url="https://example.com/token",
+            refresh_token="old-refresh",
+            client_id="my-client",
+            resource="https://mcp.example.com/",
+        )
+
+        call_kwargs = mock_post.call_args.kwargs
+        assert call_kwargs["follow_redirects"] is False
+        assert call_kwargs["data"]["resource"] == "https://mcp.example.com/"
+
+    @parameterized.expand(
+        [
+            ("invalid_grant", 400, {"error": "invalid_grant"}, True),
+            ("invalid_client", 401, {"error": "invalid_client"}, True),
+            ("request_timeout", 408, {}, False),
+            ("temporarily_unavailable", 400, {"error": "temporarily_unavailable"}, False),
+            ("too_many_requests", 429, {}, False),
+            ("unauthorized_without_oauth_error", 401, {}, False),
+            ("server_error", 500, {}, False),
+        ]
+    )
+    def test_http_error_separates_a_rejected_grant_from_a_transient_failure(
+        self, _name: str, status_code: int, response_data: dict[str, str], expect_rejected: bool
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.json.return_value = response_data
+        mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            str(status_code), request=httpx.Request("POST", "https://example.com"), response=mock_resp
+        )
+
+        with (
+            patch("products.mcp_store.backend.oauth.httpx.Client.post", return_value=mock_resp),
+            mock_anti_ssrf_dns_lookup(),
+        ):
+            with self.assertRaises(TokenRefreshError) as ctx:
+                refresh_oauth_token(
+                    token_url="https://example.com/token",
+                    refresh_token="bad-refresh",
+                    client_id="my-client",
+                )
+
+        assert isinstance(ctx.exception, TokenRefreshRejectedError) is expect_rejected
+
+    def test_missing_access_token_raises_token_refresh_error(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"error": "invalid_grant"}
+        mock_resp.raise_for_status = MagicMock()
+
+        with (
+            patch("products.mcp_store.backend.oauth.httpx.Client.post", return_value=mock_resp),
+            mock_anti_ssrf_dns_lookup(),
+        ):
+            with self.assertRaises(TokenRefreshError) as ctx:
+                refresh_oauth_token(
+                    token_url="https://example.com/token",
+                    refresh_token="expired-refresh",
+                    client_id="my-client",
+                )
+            self.assertIn("missing access_token", str(ctx.exception))
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(False, "Private IP address not allowed"))
+    def test_ssrf_blocked_token_url_raises_token_refresh_error(self, _mock):
+        with self.assertRaises(TokenRefreshError) as ctx:
+            refresh_oauth_token(
+                token_url="http://169.254.169.254/latest/meta-data/",
+                refresh_token="tok",
+                client_id="cid",
+            )
+        self.assertIn("SSRF protection", str(ctx.exception))
+
+
+class TestIssuerValidation(SimpleTestCase):
+    def _make_response(self, *, ok=True, status_code=200, json_data=None):
+        resp = MagicMock()
+        resp.is_success = ok
+        resp.status_code = status_code
+        resp.json.return_value = json_data or {}
+        resp.raise_for_status = MagicMock()
+        if status_code >= 400:
+            resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "Upstream error", request=httpx.Request("GET", "https://example.com"), response=resp
+            )
+        return resp
+
+    def _origin(self, url: str) -> str:
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    def _auth_metadata_url(self, auth_server_url: str) -> str:
+        parsed = urlparse(auth_server_url)
+        if parsed.path and parsed.path != "/":
+            return f"{parsed.scheme}://{parsed.netloc}/.well-known/oauth-authorization-server{parsed.path}"
+        return f"{parsed.scheme}://{parsed.netloc}/.well-known/oauth-authorization-server"
+
+    def _auth_metadata_chain(self, auth_server_url: str) -> list[str]:
+        parsed = urlparse(auth_server_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if parsed.path and parsed.path != "/":
+            path = parsed.path.rstrip("/")
+            return [
+                f"{origin}/.well-known/oauth-authorization-server{path}",
+                f"{origin}/.well-known/openid-configuration{path}",
+                f"{origin}{path}/.well-known/openid-configuration",
+            ]
+        return [
+            f"{origin}/.well-known/oauth-authorization-server",
+            f"{origin}/.well-known/openid-configuration",
+        ]
+
+    @parameterized.expand(
+        [
+            (
+                "matching_issuer_accepted",
+                {
+                    "issuer": "https://evil.com",
+                    "authorization_endpoint": "https://evil.com/authorize",
+                    "token_endpoint": "https://evil.com/token",
+                },
+                "https://evil.com/mcp",
+                False,
+                None,
+            ),
+            (
+                "trailing_slash_accepted",
+                {
+                    "issuer": "https://example.com/",
+                    "authorization_endpoint": "https://example.com/authorize",
+                    "token_endpoint": "https://example.com/token",
+                },
+                "https://example.com/mcp",
+                False,
+                None,
+            ),
+            (
+                "no_issuer_defaults_to_origin",
+                {
+                    "authorization_endpoint": "https://example.com/authorize",
+                    "token_endpoint": "https://example.com/token",
+                },
+                "https://example.com/mcp",
+                False,
+                None,
+            ),
+            (
+                "cross_validation_succeeds",
+                {
+                    "issuer": "https://cf.mcp.atlassian.com",
+                    "authorization_endpoint": "https://cf.mcp.atlassian.com/v1/authorize",
+                    "token_endpoint": "https://cf.mcp.atlassian.com/v1/token",
+                },
+                "https://mcp.atlassian.com/v1/mcp",
+                False,
+                {
+                    "issuer": "https://cf.mcp.atlassian.com",
+                    "authorization_endpoint": "https://cf.mcp.atlassian.com/v1/authorize",
+                    "token_endpoint": "https://cf.mcp.atlassian.com/v1/token",
+                },
+            ),
+            (
+                "cross_validation_fails_issuer_mismatch",
+                {
+                    "issuer": "https://accounts.notion.com",
+                    "authorization_endpoint": "https://evil.com/authorize",
+                    "token_endpoint": "https://evil.com/token",
+                },
+                "https://evil.com/mcp",
+                True,
+                {
+                    "issuer": "https://real-notion-auth.com",
+                    "authorization_endpoint": "https://real-notion-auth.com/authorize",
+                    "token_endpoint": "https://real-notion-auth.com/token",
+                },
+            ),
+            (
+                "cross_validation_fails_declared_issuer_404",
+                {
+                    "issuer": "https://nonexistent.example.com",
+                    "authorization_endpoint": "https://nonexistent.example.com/authorize",
+                    "token_endpoint": "https://nonexistent.example.com/token",
+                },
+                "https://evil.com/mcp",
+                True,
+                None,
+            ),
+        ]
+    )
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.get")
+    def test_step2_fallback_issuer_validation(
+        self, _name, auth_metadata, server_url, should_raise, cross_val_metadata, mock_get, _allow
+    ):
+        not_found = self._make_response(ok=False, status_code=404)
+        auth_resp = self._make_response(json_data=auth_metadata)
+        expected_origin = self._origin(server_url)
+        expected_path = urlparse(server_url).path.rstrip("/")
+
+        declared_issuer = auth_metadata.get("issuer", "").rstrip("/")
+        needs_cross_validation = bool(declared_issuer and declared_issuer != expected_origin.rstrip("/"))
+
+        responses: list = [not_found, not_found, auth_resp]
+        expected_urls = [
+            f"{expected_origin}/.well-known/oauth-protected-resource{expected_path}",
+            f"{expected_origin}/.well-known/oauth-protected-resource",
+            self._auth_metadata_url(expected_origin),
+        ]
+
+        if needs_cross_validation:
+            if cross_val_metadata is not None:
+                responses.append(self._make_response(json_data=cross_val_metadata))
+                expected_urls.append(self._auth_metadata_url(declared_issuer))
+            else:
+                chain = self._auth_metadata_chain(declared_issuer)
+                responses.extend(self._make_response(ok=False, status_code=404) for _ in chain)
+                expected_urls.extend(chain)
+
+        mock_get.side_effect = responses
+
+        if should_raise:
+            with self.assertRaises(Exception):
+                discover_oauth_metadata(server_url)
+        else:
+            metadata = discover_oauth_metadata(server_url)
+            assert metadata["issuer"] == auth_metadata.get("issuer", expected_origin)
+
+        assert mock_get.call_count == len(expected_urls)
+        for index, expected_url in enumerate(expected_urls):
+            assert mock_get.call_args_list[index].args[0] == expected_url
+            assert mock_get.call_args_list[index].kwargs["timeout"] == TIMEOUT
+
+    @parameterized.expand(
+        [
+            (
+                "matching_issuer_accepted",
+                "https://auth.example.com",
+                {
+                    "issuer": "https://auth.example.com",
+                    "authorization_endpoint": "https://auth.example.com/authorize",
+                    "token_endpoint": "https://auth.example.com/token",
+                },
+                False,
+                None,
+            ),
+            (
+                "cross_origin_mcp_with_legitimate_auth_server",
+                "https://accounts.notion.com",
+                {
+                    "issuer": "https://accounts.notion.com",
+                    "authorization_endpoint": "https://accounts.notion.com/authorize",
+                    "token_endpoint": "https://accounts.notion.com/token",
+                },
+                False,
+                None,
+            ),
+            (
+                "auth_server_with_path_accepted",
+                "https://auth.example.com/oauth2/default",
+                {
+                    "issuer": "https://auth.example.com/oauth2/default",
+                    "authorization_endpoint": "https://auth.example.com/oauth2/default/authorize",
+                    "token_endpoint": "https://auth.example.com/oauth2/default/token",
+                },
+                False,
+                None,
+            ),
+            (
+                "cross_validation_succeeds",
+                "https://auth.example.com",
+                {
+                    "issuer": "https://cf.auth.example.com",
+                    "authorization_endpoint": "https://cf.auth.example.com/authorize",
+                    "token_endpoint": "https://cf.auth.example.com/token",
+                },
+                False,
+                {
+                    "issuer": "https://cf.auth.example.com",
+                    "authorization_endpoint": "https://cf.auth.example.com/authorize",
+                    "token_endpoint": "https://cf.auth.example.com/token",
+                },
+            ),
+            (
+                "cross_validation_fails_issuer_mismatch",
+                "https://auth.example.com",
+                {
+                    "issuer": "https://evil.com",
+                    "authorization_endpoint": "https://evil.com/authorize",
+                    "token_endpoint": "https://evil.com/token",
+                },
+                True,
+                {
+                    "issuer": "https://real-evil.com",
+                    "authorization_endpoint": "https://real-evil.com/authorize",
+                    "token_endpoint": "https://real-evil.com/token",
+                },
+            ),
+            (
+                "cross_validation_fails_declared_issuer_404",
+                "https://auth.example.com",
+                {
+                    "issuer": "https://nonexistent.example.com",
+                    "authorization_endpoint": "https://nonexistent.example.com/authorize",
+                    "token_endpoint": "https://nonexistent.example.com/token",
+                },
+                True,
+                None,
+            ),
+        ]
+    )
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.get")
+    def test_step1_protected_resource_issuer_validation(
+        self, _name, auth_server_url, auth_metadata, should_raise, cross_val_metadata, mock_get, _allow
+    ):
+        resource_resp = self._make_response(json_data={"authorization_servers": [auth_server_url]})
+        auth_resp = self._make_response(json_data=auth_metadata)
+        mcp_url = "https://mcp.example.com/mcp"
+
+        declared_issuer = auth_metadata.get("issuer", "").rstrip("/")
+        needs_cross_validation = bool(declared_issuer and declared_issuer != auth_server_url.rstrip("/"))
+
+        responses: list = [resource_resp, auth_resp]
+        expected_urls = [
+            "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+            self._auth_metadata_url(auth_server_url),
+        ]
+
+        if needs_cross_validation:
+            if cross_val_metadata is not None:
+                responses.append(self._make_response(json_data=cross_val_metadata))
+                expected_urls.append(self._auth_metadata_url(declared_issuer))
+            else:
+                chain = self._auth_metadata_chain(declared_issuer)
+                responses.extend(self._make_response(ok=False, status_code=404) for _ in chain)
+                expected_urls.extend(chain)
+
+        mock_get.side_effect = responses
+
+        if should_raise:
+            with self.assertRaises(Exception):
+                discover_oauth_metadata(mcp_url)
+        else:
+            metadata = discover_oauth_metadata(mcp_url)
+            assert metadata["issuer"] == auth_metadata.get("issuer", auth_server_url)
+
+        assert mock_get.call_count == len(expected_urls)
+        for index, expected_url in enumerate(expected_urls):
+            assert mock_get.call_args_list[index].args[0] == expected_url
+            assert mock_get.call_args_list[index].kwargs["timeout"] == TIMEOUT
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.get")
+    def test_step1_preserves_same_origin_resource(self, mock_get, _allow):
+        auth_server_url = "https://auth.example.com"
+        resource_resp = self._make_response(
+            json_data={
+                "resource": "https://mcp.example.com/mcp",
+                "authorization_servers": [auth_server_url],
+            }
+        )
+        auth_resp = self._make_response(
+            json_data={
+                "issuer": auth_server_url,
+                "authorization_endpoint": f"{auth_server_url}/authorize",
+                "token_endpoint": f"{auth_server_url}/token",
+            }
+        )
+        mock_get.side_effect = [resource_resp, auth_resp]
+
+        metadata = discover_oauth_metadata("https://mcp.example.com/mcp")
+
+        assert metadata["resource"] == "https://mcp.example.com/mcp"
+        assert mock_get.call_count == 2
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.get")
+    def test_step1_rejects_resource_on_unrelated_origin(self, mock_get, _allow):
+        resource_resp = self._make_response(
+            json_data={
+                "resource": "https://api.legit.com",
+                "authorization_servers": ["https://auth.legit.com"],
+            }
+        )
+        mock_get.return_value = resource_resp
+
+        with self.assertRaisesMessage(ValueError, "not bound to MCP server"):
+            discover_oauth_metadata("https://mcp.attacker.com/mcp")
+
+        assert mock_get.call_count == 1
+
+    @parameterized.expand(
+        [
+            (
+                "token_endpoint_redirected_to_attacker",
+                {
+                    "issuer": "https://auth.legit.com",
+                    "authorization_endpoint": "https://auth.legit.com/authorize",
+                    "token_endpoint": "https://attacker.com/token",
+                    "registration_endpoint": "https://auth.legit.com/register",
+                },
+            ),
+            (
+                "registration_endpoint_redirected_to_attacker",
+                {
+                    "issuer": "https://auth.legit.com",
+                    "authorization_endpoint": "https://auth.legit.com/authorize",
+                    "token_endpoint": "https://auth.legit.com/token",
+                    "registration_endpoint": "https://attacker.com/register",
+                },
+            ),
+        ]
+    )
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.get")
+    def test_rejects_metadata_with_endpoints_off_issuer_origin(self, _name, auth_metadata, mock_get, _allow):
+        """A malicious MCP server cannot mix a legitimate issuer with an attacker-controlled endpoint.
+
+        Otherwise, after the user authorizes against the real provider, the
+        token exchange would ship the code, PKCE verifier, and any DCR-minted
+        client_secret to the attacker.
+        """
+        resource_resp = self._make_response(json_data={"authorization_servers": ["https://auth.legit.com"]})
+        auth_resp = self._make_response(json_data=auth_metadata)
+        mock_get.side_effect = [resource_resp, auth_resp]
+
+        with self.assertRaises(ValueError):
+            discover_oauth_metadata("https://mcp.legit.com/mcp")
+
+
+class TestRegisterDCRClient(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("public_client", False),
+            ("confidential_client", True),
+        ]
+    )
+    def test_rejects_explicit_unsupported_auth_methods(self, _name, has_client_secret):
+        with self.assertRaisesMessage(ValueError, "private_key_jwt"):
+            select_token_endpoint_auth_method(
+                {"token_endpoint_auth_methods_supported": ["private_key_jwt"]},
+                has_client_secret=has_client_secret,
+            )
+
+    def test_uses_public_auth_when_it_is_the_only_supported_method_with_secret(self):
+        assert (
+            select_token_endpoint_auth_method(
+                {"token_endpoint_auth_methods_supported": ["none"]},
+                has_client_secret=True,
+            )
+            == "none"
+        )
+
+    def test_omitted_supported_methods_default_to_basic_for_confidential_clients(self):
+        assert select_token_endpoint_auth_method({}, has_client_secret=True) == "client_secret_basic"
+
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_rejects_dcr_when_provider_only_lists_unsupported_auth_methods(self, mock_post):
+        with self.assertRaisesMessage(ValueError, "private_key_jwt"):
+            register_dcr_client(
+                {
+                    "registration_endpoint": "https://auth.example.com/register",
+                    "token_endpoint_auth_methods_supported": ["private_key_jwt"],
+                },
+                "https://app.posthog.com/callback",
+            )
+
+        mock_post.assert_not_called()
+
+    @parameterized.expand(
+        [
+            (
+                "drops_secret_when_server_honors_public_client",
+                {"client_id": "abc", "token_endpoint_auth_method": "none"},
+                DcrClientRegistration(client_id="abc", client_secret=None, token_endpoint_auth_method="none"),
+            ),
+            (
+                "drops_secret_when_server_omits_it",
+                {"client_id": "abc", "token_endpoint_auth_method": "none", "client_secret": ""},
+                DcrClientRegistration(client_id="abc", client_secret=None, token_endpoint_auth_method="none"),
+            ),
+            (
+                "keeps_secret_when_server_registered_confidential_client_post",
+                {
+                    "client_id": "abc",
+                    "client_secret": "minted-secret",
+                    "token_endpoint_auth_method": "client_secret_post",
+                },
+                DcrClientRegistration(
+                    client_id="abc", client_secret="minted-secret", token_endpoint_auth_method="client_secret_post"
+                ),
+            ),
+            (
+                "keeps_secret_when_server_registered_confidential_client_basic",
+                {
+                    "client_id": "abc",
+                    "client_secret": "minted-secret",
+                    "token_endpoint_auth_method": "client_secret_basic",
+                },
+                DcrClientRegistration(
+                    client_id="abc", client_secret="minted-secret", token_endpoint_auth_method="client_secret_basic"
+                ),
+            ),
+            (
+                "keeps_secret_with_basic_auth_when_auth_method_unspecified",
+                {"client_id": "abc", "client_secret": "minted-secret"},
+                DcrClientRegistration(
+                    client_id="abc", client_secret="minted-secret", token_endpoint_auth_method="client_secret_basic"
+                ),
+            ),
+        ]
+    )
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, ""))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_returns_client_secret_only_when_server_requires_it(
+        self, _name, response_body, expected, mock_post, _allow
+    ):
+        mock_response = MagicMock()
+        mock_response.is_success = True
+        mock_response.status_code = 201
+        mock_response.json.return_value = response_body
+        mock_post.return_value = mock_response
+
+        result = register_dcr_client(
+            {"registration_endpoint": "https://auth.example.com/register"},
+            "https://app.posthog.com/callback",
+        )
+
+        assert result == expected
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, ""))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_registers_refresh_grant_without_refresh_scope(self, mock_post, _allow):
+        mock_response = MagicMock()
+        mock_response.is_success = True
+        mock_response.status_code = 201
+        mock_response.json.return_value = {
+            "client_id": "abc",
+            "client_secret": "minted-secret",
+            "token_endpoint_auth_method": "client_secret_post",
+        }
+        mock_post.return_value = mock_response
+
+        result = register_dcr_client(
+            {
+                "registration_endpoint": "https://auth.example.com/register",
+                "scopes_supported": ["read", "write"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+            },
+            "https://app.posthog.com/callback",
+            ("read",),
+        )
+
+        assert result == DcrClientRegistration(
+            client_id="abc", client_secret="minted-secret", token_endpoint_auth_method="client_secret_post"
+        )
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["grant_types"] == ["authorization_code", "refresh_token"]
+        assert payload["token_endpoint_auth_method"] == "client_secret_post"
+        assert payload["scope"] == "read"
+        assert "refresh_token" not in payload["scope"]
+        assert mock_post.call_args.kwargs["follow_redirects"] is False
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, ""))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_keeps_requested_basic_auth_when_dcr_response_omits_auth_method(self, mock_post, _allow):
+        mock_response = MagicMock()
+        mock_response.is_success = True
+        mock_response.status_code = 201
+        mock_response.json.return_value = {
+            "client_id": "abc",
+            "client_secret": "minted-secret",
+        }
+        mock_post.return_value = mock_response
+
+        result = register_dcr_client(
+            {
+                "registration_endpoint": "https://auth.example.com/register",
+                "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+            },
+            "https://app.posthog.com/callback",
+        )
+
+        assert result == DcrClientRegistration(
+            client_id="abc", client_secret="minted-secret", token_endpoint_auth_method="client_secret_basic"
+        )
+        assert mock_post.call_args.kwargs["json"]["token_endpoint_auth_method"] == "client_secret_basic"
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, ""))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_client_name_has_no_parentheses(self, mock_post, _allow):
+        mock_response = MagicMock()
+        mock_response.is_success = True
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"client_id": "abc", "token_endpoint_auth_method": "none"}
+        mock_post.return_value = mock_response
+
+        register_dcr_client(
+            {"registration_endpoint": "https://auth.example.com/register"},
+            "https://app.posthog.com/callback",
+        )
+
+        client_name = mock_post.call_args.kwargs["json"]["client_name"]
+        assert "(" not in client_name and ")" not in client_name
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, ""))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_surfaces_provider_rejection_message(self, mock_post, _allow):
+        mock_response = MagicMock()
+        mock_response.is_success = False
+        mock_response.status_code = 400
+        mock_response.json.return_value = {
+            "error": "invalid_client_metadata",
+            "error_description": "client_name contains invalid characters",
+        }
+        mock_response.text = '{"error": "invalid_client_metadata"}'
+        mock_post.return_value = mock_response
+
+        with self.assertRaises(DCRRegistrationRejectedError) as ctx:
+            register_dcr_client(
+                {"registration_endpoint": "https://auth.example.com/register"},
+                "https://app.posthog.com/callback",
+            )
+
+        assert "client_name contains invalid characters" in ctx.exception.provider_message
+
+    def test_scope_selection_prefers_protected_resource_scopes(self):
+        metadata = {
+            "scopes_supported": ["admin", "read"],
+            "resource_scopes_supported": ["read"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "resource": "https://mcp.example.com/",
+        }
+
+        assert requested_oauth_scopes(metadata) == ["read"]
+        assert requested_oauth_scopes(metadata, ("read", "admin", "read")) == ["read"]
+        with self.assertRaisesRegex(ValueError, "does not contain any scopes"):
+            requested_oauth_scopes(metadata, ())
+        with self.assertRaisesRegex(ValueError, "does not match any provider-supported scopes"):
+            requested_oauth_scopes(metadata, ("admin",))
+        assert requested_oauth_grant_types(metadata) == ["authorization_code", "refresh_token"]
+        assert oauth_resource(metadata) == "https://mcp.example.com/"
+
+
+class TestResolveInstallationOauthContext(BaseTest):
+    @parameterized.expand(
+        [
+            ("metadata_without_methods_defaults_to_post", {}, "client_secret_post"),
+            (
+                "metadata_selects_client_secret_basic",
+                {"token_endpoint_auth_methods_supported": ["client_secret_basic"]},
+                "client_secret_basic",
+            ),
+            (
+                "metadata_selects_client_secret_post",
+                {"token_endpoint_auth_methods_supported": ["client_secret_post"]},
+                "client_secret_post",
+            ),
+        ]
+    )
+    def test_template_backed_install_returns_template_creds(
+        self, _name: str, metadata_overrides: dict, expected_auth_method: str
+    ) -> None:
+        template = MCPServerTemplate.objects.create(
+            name="Template",
+            url="https://mcp.template.example.com/mcp",
+            auth_type="oauth",
+            oauth_metadata={
+                "token_endpoint": "https://auth.template.example.com/token",
+                **metadata_overrides,
+            },
+            oauth_credentials={"client_id": "template-client", "client_secret": "template-secret"},
+            created_by=self.user,
+        )
+        installation = MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            template=template,
+            url=template.url,
+            auth_type="oauth",
+            # Installation sensitive_configuration does NOT carry a dcr_client_secret
+            # for template installs — creds live on the template.
+            sensitive_configuration={"access_token": "tok"},
+        )
+
+        ctx = resolve_installation_oauth_context(installation)
+
+        assert ctx.metadata["token_endpoint"] == "https://auth.template.example.com/token"
+        assert ctx.client_id == "template-client"
+        assert ctx.client_secret == "template-secret"
+        assert ctx.token_endpoint_auth_method == expected_auth_method
+
+    def test_template_backed_install_uses_instance_credential_source(self) -> None:
+        template = MCPServerTemplate.objects.create(
+            name="Slack",
+            url="https://mcp.slack.test.example/mcp",
+            auth_type="oauth",
+            oauth_metadata={
+                "issuer": "https://mcp.slack.com",
+                "authorization_endpoint": "https://slack.com/oauth/v2_user/authorize",
+                "token_endpoint": "https://slack.com/api/oauth.v2.user.access",
+                "token_endpoint_auth_methods_supported": ["client_secret_post"],
+            },
+            oauth_credentials_source="slack_app",
+            oauth_credentials={},
+            created_by=self.user,
+        )
+        installation = MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            template=template,
+            url=template.url,
+            auth_type="oauth",
+            sensitive_configuration={"access_token": "tok"},
+        )
+
+        with (
+            override_instance_config("SLACK_APP_CLIENT_ID", "slack-client"),
+            override_instance_config("SLACK_APP_CLIENT_SECRET", "slack-secret"),
+        ):
+            ctx = resolve_installation_oauth_context(installation)
+
+        assert ctx.client_id == "slack-client"
+        assert ctx.client_secret == "slack-secret"
+        assert ctx.token_endpoint_auth_method == "client_secret_post"
+
+    def test_dcr_template_backed_install_returns_per_installation_metadata_and_creds(self):
+        # DCR templates carry no shared client_id AND no trusted metadata —
+        # both were discovered + minted at install time and cached on the
+        # installation (never written back to the template). The resolver
+        # must read both from the installation, matching the custom-install
+        # path.
+        template = MCPServerTemplate.objects.create(
+            name="DCR Template",
+            url="https://mcp.dcr-template.example.com/mcp",
+            auth_type="oauth",
+            oauth_metadata={},
+            oauth_credentials={},
+            created_by=self.user,
+        )
+        installation = MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            template=template,
+            url=template.url,
+            auth_type="oauth",
+            oauth_metadata={"token_endpoint": "https://auth.dcr-template.example.com/token"},
+            sensitive_configuration={
+                "dcr_client_id": "minted-for-user",
+                "access_token": "tok",
+            },
+        )
+
+        ctx = resolve_installation_oauth_context(installation)
+
+        assert ctx.metadata["token_endpoint"] == "https://auth.dcr-template.example.com/token"
+        assert ctx.client_id == "minted-for-user"
+        assert ctx.client_secret is None
+        assert ctx.token_endpoint_auth_method == "none"
+
+    def test_custom_install_returns_per_installation_dcr_creds(self):
+        installation = MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            url="https://mcp.custom.example.com/mcp",
+            auth_type="oauth",
+            oauth_metadata={"token_endpoint": "https://auth.custom.example.com/token"},
+            sensitive_configuration={
+                "dcr_client_id": "per-user-client",
+                "dcr_client_secret": "per-user-secret",
+            },
+        )
+
+        ctx = resolve_installation_oauth_context(installation)
+
+        assert ctx.metadata["token_endpoint"] == "https://auth.custom.example.com/token"
+        assert ctx.client_id == "per-user-client"
+        assert ctx.client_secret == "per-user-secret"
+        assert ctx.token_endpoint_auth_method == "client_secret_basic"
+
+    def test_custom_install_without_secret_returns_none(self):
+        installation = MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            url="https://mcp.custom.example.com/mcp",
+            auth_type="oauth",
+            oauth_metadata={"token_endpoint": "https://auth.custom.example.com/token"},
+            sensitive_configuration={"dcr_client_id": "public-client"},
+        )
+
+        ctx = resolve_installation_oauth_context(installation)
+
+        assert ctx.client_secret is None
+        assert ctx.token_endpoint_auth_method == "none"
+
+
+class TestSourceBackedOauthMetadataBinding(BaseTest):
+    def _installation(
+        self,
+        *,
+        token_endpoint: str = "https://attacker.example.com/token",
+        oauth_credentials_source: str = "slack_app",
+    ) -> MCPServerInstallation:
+        template = MCPServerTemplate.objects.create(
+            name="Slack",
+            url="https://mcp.slack.test.example/mcp",
+            auth_type="oauth",
+            oauth_metadata={
+                "issuer": "https://mcp.slack.com",
+                "authorization_endpoint": "https://slack.com/oauth/v2_user/authorize",
+                "token_endpoint": token_endpoint,
+                "token_endpoint_auth_methods_supported": ["client_secret_post"],
+            },
+            oauth_credentials_source=oauth_credentials_source,
+            created_by=self.user,
+        )
+        return MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            template=template,
+            url=template.url,
+            auth_type="oauth",
+            sensitive_configuration={"refresh_token": "refresh-token"},
+        )
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_exchange_rejects_modified_token_endpoint_before_sending_secret(self, mock_post, _allow):
+        installation = self._installation()
+
+        with (
+            override_instance_config("SLACK_APP_CLIENT_ID", "slack-client"),
+            override_instance_config("SLACK_APP_CLIENT_SECRET", "slack-secret"),
+            self.assertRaises(OAuthTokenExchangeError),
+        ):
+            exchange_oauth_token(
+                installation=installation,
+                code="auth-code",
+                pkce_verifier="pkce-verifier",
+                redirect_uri="https://app.posthog.com/callback",
+                is_https=lambda url: url.startswith("https://"),
+            )
+
+        mock_post.assert_not_called()
+
+    @parameterized.expand(["exchange", "refresh"])
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.record_slack_api_response")
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_slack_token_requests_are_recorded(self, operation, mock_post, record_response, _allow):
+        response = MagicMock()
+        response.status_code = 200
+        response.is_success = True
+        response.headers = {}
+        response.json.return_value = {"access_token": "access-token", "refresh_token": "refresh-token"}
+        mock_post.return_value = response
+        installation = self._installation(
+            token_endpoint="https://slack.com/api/oauth.v2.user.access",
+            oauth_credentials_source="slack_app",
+        )
+
+        with (
+            override_instance_config("SLACK_APP_CLIENT_ID", "slack-client"),
+            override_instance_config("SLACK_APP_CLIENT_SECRET", "slack-secret"),
+        ):
+            if operation == "exchange":
+                exchange_oauth_token(
+                    installation=installation,
+                    code="auth-code",
+                    pkce_verifier="pkce-verifier",
+                    redirect_uri="https://app.posthog.com/callback",
+                    is_https=lambda url: url.startswith("https://"),
+                )
+            else:
+                refresh_installation_token(installation)
+
+        record_response.assert_called_once_with(
+            response,
+            source="mcp_store_oauth",
+            workspace_id=None,
+            app_id="slack_app",
+            method="POST",
+            endpoint="oauth.v2.user.access",
+        )
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_refresh_rejects_modified_token_endpoint_before_sending_secret(self, mock_post, _allow):
+        installation = self._installation()
+
+        with (
+            override_instance_config("SLACK_APP_CLIENT_ID", "slack-client"),
+            override_instance_config("SLACK_APP_CLIENT_SECRET", "slack-secret"),
+            self.assertRaises(TokenRefreshError),
+        ):
+            refresh_installation_token(installation)
+
+        mock_post.assert_not_called()
+
+
+class TestExchangeOauthToken(BaseTest):
+    def _make_installation(self, *, sensitive_configuration: dict) -> MCPServerInstallation:
+        return MCPServerInstallation.objects.create(
+            team=self.team,
+            user=self.user,
+            url="https://mcp.custom.example.com/mcp",
+            auth_type="oauth",
+            oauth_metadata={"token_endpoint": "https://auth.custom.example.com/token"},
+            sensitive_configuration=sensitive_configuration,
+        )
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_confidential_custom_install_defaults_to_http_basic(self, mock_post, _allow):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.is_success = True
+        mock_resp.json.return_value = {"access_token": "abc", "refresh_token": "def"}
+        mock_post.return_value = mock_resp
+
+        installation = self._make_installation(
+            sensitive_configuration={
+                "dcr_client_id": "confidential-client",
+                "dcr_client_secret": "confidential-secret",
+            },
+        )
+
+        result = exchange_oauth_token(
+            installation=installation,
+            code="auth-code",
+            pkce_verifier="pkce-verifier",
+            redirect_uri="https://app.posthog.com/callback",
+            is_https=lambda url: url.startswith("https://"),
+        )
+
+        assert result["access_token"] == "abc"
+        sent_form = mock_post.call_args.kwargs["data"]
+        assert "client_id" not in sent_form
+        assert "client_secret" not in sent_form
+        assert sent_form["grant_type"] == "authorization_code"
+        assert sent_form["code_verifier"] == "pkce-verifier"
+        assert mock_post.call_args.kwargs["auth"] == ("confidential-client", "confidential-secret")
+        assert mock_post.call_args.kwargs["follow_redirects"] is False
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_client_secret_post_custom_install_sends_secret_in_form(self, mock_post, _allow):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.is_success = True
+        mock_resp.json.return_value = {"access_token": "abc", "refresh_token": "def"}
+        mock_post.return_value = mock_resp
+
+        installation = self._make_installation(
+            sensitive_configuration={
+                "dcr_client_id": "confidential-client",
+                "dcr_client_secret": "confidential-secret",
+                "dcr_token_endpoint_auth_method": "client_secret_post",
+            },
+        )
+
+        result = exchange_oauth_token(
+            installation=installation,
+            code="auth-code",
+            pkce_verifier="pkce-verifier",
+            redirect_uri="https://app.posthog.com/callback",
+            is_https=lambda url: url.startswith("https://"),
+        )
+
+        assert result["access_token"] == "abc"
+        sent_form = mock_post.call_args.kwargs["data"]
+        assert sent_form["client_id"] == "confidential-client"
+        assert sent_form["client_secret"] == "confidential-secret"
+        assert sent_form["grant_type"] == "authorization_code"
+        assert sent_form["code_verifier"] == "pkce-verifier"
+        assert mock_post.call_args.kwargs["auth"] is httpx.USE_CLIENT_DEFAULT
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_public_custom_install_omits_client_secret(self, mock_post, _allow):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"access_token": "abc"}
+        mock_post.return_value = mock_resp
+
+        installation = self._make_installation(
+            sensitive_configuration={"dcr_client_id": "public-client"},
+        )
+
+        exchange_oauth_token(
+            installation=installation,
+            code="auth-code",
+            pkce_verifier="pkce-verifier",
+            redirect_uri="https://app.posthog.com/callback",
+            is_https=lambda url: url.startswith("https://"),
+        )
+
+        sent_form = mock_post.call_args[1]["data"]
+        assert "client_secret" not in sent_form
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_client_secret_basic_custom_install_uses_http_basic(self, mock_post, _allow):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.is_success = True
+        mock_resp.json.return_value = {"access_token": "abc"}
+        mock_post.return_value = mock_resp
+
+        installation = self._make_installation(
+            sensitive_configuration={
+                "dcr_client_id": "basic-client",
+                "dcr_client_secret": "basic-secret",
+                "dcr_token_endpoint_auth_method": "client_secret_basic",
+            },
+        )
+
+        exchange_oauth_token(
+            installation=installation,
+            code="auth-code",
+            pkce_verifier="pkce-verifier",
+            redirect_uri="https://app.posthog.com/callback",
+            is_https=lambda url: url.startswith("https://"),
+        )
+
+        sent_form = mock_post.call_args.kwargs["data"]
+        assert "client_id" not in sent_form
+        assert "client_secret" not in sent_form
+        assert mock_post.call_args.kwargs["auth"] == ("basic-client", "basic-secret")
+
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_token_exchange_includes_resource_indicator(self, mock_post, _allow):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.is_success = True
+        mock_resp.json.return_value = {"access_token": "abc"}
+        mock_post.return_value = mock_resp
+
+        installation = self._make_installation(
+            sensitive_configuration={"dcr_client_id": "public-client"},
+        )
+        installation.oauth_metadata = {
+            "token_endpoint": "https://auth.custom.example.com/token",
+            "resource": "https://mcp.custom.example.com/",
+        }
+        installation.save(update_fields=["oauth_metadata"])
+
+        exchange_oauth_token(
+            installation=installation,
+            code="auth-code",
+            pkce_verifier="pkce-verifier",
+            redirect_uri="https://app.posthog.com/callback",
+            is_https=lambda url: url.startswith("https://"),
+        )
+
+        assert mock_post.call_args.kwargs["data"]["resource"] == "https://mcp.custom.example.com/"
+
+    def test_missing_pkce_verifier_raises(self):
+        installation = self._make_installation(
+            sensitive_configuration={"dcr_client_id": "public-client"},
+        )
+
+        with self.assertRaises(OAuthTokenExchangeError):
+            exchange_oauth_token(
+                installation=installation,
+                code="auth-code",
+                pkce_verifier="",
+                redirect_uri="https://app.posthog.com/callback",
+                is_https=lambda url: url.startswith("https://"),
+            )
+
+    @parameterized.expand(
+        [
+            ("ok_200", 200, True, False),
+            ("created_201", 201, True, False),
+            ("accepted_202", 202, True, False),
+            ("bad_request_400", 400, False, True),
+            ("unauthorized_401", 401, False, True),
+            ("unprocessable_422", 422, False, True),
+            ("server_error_500", 500, False, True),
+        ]
+    )
+    @patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+    @patch("products.mcp_store.backend.oauth.httpx.Client.post")
+    def test_accepts_any_2xx_status(self, _name, status_code, ok, should_raise, mock_post, _allow):
+        """Some providers (e.g. Supabase) return 201 on token issue — we must accept it."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.is_success = ok
+        mock_resp.json.return_value = {"access_token": "abc", "refresh_token": "def"}
+        mock_resp.text = "{}"
+        mock_post.return_value = mock_resp
+
+        installation = self._make_installation(
+            sensitive_configuration={"dcr_client_id": "client"},
+        )
+
+        if should_raise:
+            with self.assertRaises(OAuthTokenExchangeError):
+                exchange_oauth_token(
+                    installation=installation,
+                    code="auth-code",
+                    pkce_verifier="pkce-verifier",
+                    redirect_uri="https://app.posthog.com/callback",
+                    is_https=lambda url: url.startswith("https://"),
+                )
+        else:
+            result = exchange_oauth_token(
+                installation=installation,
+                code="auth-code",
+                pkce_verifier="pkce-verifier",
+                redirect_uri="https://app.posthog.com/callback",
+                is_https=lambda url: url.startswith("https://"),
+            )
+            assert result["access_token"] == "abc"
+
+
+class TestRefreshInstallationToken(BaseTest):
+    def _make_installation(self, **kwargs) -> MCPServerInstallation:
+        template = MCPServerTemplate.objects.create(
+            name="Refreshable",
+            url="https://mcp.refreshable.example.com/mcp",
+            auth_type="oauth",
+            oauth_metadata={"token_endpoint": "https://auth.refreshable.example.com/token"},
+            oauth_credentials={"client_id": "client", "client_secret": "secret"},
+            created_by=self.user,
+        )
+        defaults: dict = {
+            "team": self.team,
+            "user": self.user,
+            "template": template,
+            "url": template.url,
+            "auth_type": "oauth",
+            "sensitive_configuration": {"access_token": "tok", "refresh_token": "refresh"},
+        }
+        defaults.update(kwargs)
+        return MCPServerInstallation.objects.create(**defaults)
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The fixture token endpoint is not a resolvable host; the SSRF guard is not
+        # what these tests are about.
+        patcher = patch("products.mcp_store.backend.oauth.is_url_allowed", return_value=(True, None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _post_answering(status_code: int, response_data: dict[str, str] | None = None) -> MagicMock:
+        response = MagicMock()
+        response.status_code = status_code
+        response.json.return_value = response_data or {}
+        response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            str(status_code), request=httpx.Request("POST", "https://example.com"), response=response
+        )
+        return response
+
+    @staticmethod
+    def _post_failing(error: Exception) -> MagicMock:
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status.side_effect = error
+        return response
+
+    @parameterized.expand([("invalid_grant", 400), ("invalid_client", 401)])
+    def test_provider_rejecting_the_grant_flags_reauth(self, oauth_error: str, status_code: int) -> None:
+        installation = self._make_installation()
+
+        with patch(
+            "products.mcp_store.backend.oauth.httpx.Client.post",
+            return_value=self._post_answering(status_code, {"error": oauth_error}),
+        ):
+            with self.assertRaises(TokenRefreshRejectedError):
+                refresh_installation_token(installation)
+
+        installation.refresh_from_db()
+        # EncryptedJSONField stringifies scalars, so every reader of the flag tests truthiness.
+        assert installation.sensitive_configuration["needs_reauth"]
+
+    def test_rejection_of_a_token_a_concurrent_refresh_replaced_leaves_the_connection_alone(self) -> None:
+        # Providers that rotate refresh tokens reject every loser of a concurrent refresh,
+        # because the winner already consumed the token they all sent. Acting on that would
+        # flag a working connection and write the consumed credentials over the fresh ones.
+        installation = self._make_installation()
+
+        def _win_the_race_then_reject(*args, **kwargs):
+            winner = MCPServerInstallation.objects.get(pk=installation.pk)
+            winner.sensitive_configuration = {"access_token": "fresh", "refresh_token": "rotated"}
+            winner.save(update_fields=["sensitive_configuration", "updated_at"])
+            raise TokenRefreshRejectedError("Token refresh rejected by the provider")
+
+        with patch("products.mcp_store.backend.oauth.refresh_oauth_token", side_effect=_win_the_race_then_reject):
+            with self.assertRaises(TokenRefreshRejectedError):
+                refresh_installation_token(installation)
+
+        installation.refresh_from_db()
+        assert "needs_reauth" not in installation.sensitive_configuration
+        assert installation.sensitive_configuration["access_token"] == "fresh"
+        assert installation.sensitive_configuration["refresh_token"] == "rotated"
+
+    @parameterized.expand(
+        [
+            ("request_timeout", 408, {}),
+            ("temporarily_unavailable", 400, {"error": "temporarily_unavailable"}),
+            ("too_many_requests", 429, {}),
+            ("server_error", 500, {}),
+            ("bad_gateway", 502, {}),
+            ("gateway_timeout", 504, {}),
+        ]
+    )
+    def test_provider_outage_leaves_the_connection_alone(
+        self, _name: str, status_code: int, response_data: dict[str, str]
+    ) -> None:
+        installation = self._make_installation()
+
+        with patch(
+            "products.mcp_store.backend.oauth.httpx.Client.post",
+            return_value=self._post_answering(status_code, response_data),
+        ):
+            with self.assertRaises(TokenRefreshError) as ctx:
+                refresh_installation_token(installation)
+
+        assert not isinstance(ctx.exception, TokenRefreshRejectedError)
+        installation.refresh_from_db()
+        assert "needs_reauth" not in installation.sensitive_configuration
+
+    @parameterized.expand(
+        [
+            ("connection_error", httpx.ConnectError("connection reset")),
+            ("timeout", httpx.ReadTimeout("timed out")),
+        ]
+    )
+    def test_network_failure_leaves_the_connection_alone(self, _name: str, error: Exception) -> None:
+        installation = self._make_installation()
+
+        with patch("products.mcp_store.backend.oauth.httpx.Client.post", return_value=self._post_failing(error)):
+            with self.assertRaises(TokenRefreshError) as ctx:
+                refresh_installation_token(installation)
+
+        assert not isinstance(ctx.exception, TokenRefreshRejectedError)
+        installation.refresh_from_db()
+        assert "needs_reauth" not in installation.sensitive_configuration
+
+    def test_missing_refresh_token_flags_reauth(self) -> None:
+        # No refresh token means no refresh will ever succeed; only a new authorization can.
+        installation = self._make_installation(sensitive_configuration={"access_token": "tok"})
+
+        with self.assertRaises(TokenRefreshRejectedError):
+            refresh_installation_token(installation)
+
+        installation.refresh_from_db()
+        assert installation.sensitive_configuration["needs_reauth"]
+
+    def test_successful_refresh_clears_a_stale_reauth_flag(self) -> None:
+        installation = self._make_installation(
+            sensitive_configuration={"access_token": "tok", "refresh_token": "refresh", "needs_reauth": True},
+        )
+        response = MagicMock()
+        response.status_code = 200
+        response.raise_for_status = MagicMock()
+        response.json.return_value = {"access_token": "fresh", "expires_in": 3600}
+
+        with patch("products.mcp_store.backend.oauth.httpx.Client.post", return_value=response):
+            refresh_installation_token(installation)
+
+        installation.refresh_from_db()
+        assert "needs_reauth" not in installation.sensitive_configuration
+        assert installation.sensitive_configuration["access_token"] == "fresh"

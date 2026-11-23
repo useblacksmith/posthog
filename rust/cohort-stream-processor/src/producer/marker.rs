@@ -1,0 +1,169 @@
+//! Producer for the `cohort_reconcile_markers` topic.
+//!
+//! A dedicated producer rather than a second topic on [`crate::producer::KafkaMembershipSink`]: the
+//! membership output has to move to its own cluster, while markers stay alongside the seed topic on
+//! ingestion, and one shared producer would force them to move together.
+//!
+//! Two topic properties the seeder's watcher depends on, recorded here because the topic is
+//! provisioned in another repo and would fail silently. The first is a stable partition count. The
+//! watcher captures a start offset per partition at dispatch and is assigned exactly those, so a
+//! partition added mid-run is never read. Added before that run's observation ends are captured, it
+//! holds the run open until a re-dispatch; added after them, it is not even consulted, and the run
+//! settles short on the markers that landed where nothing was watching.
+//!
+//! The second is the `delete` cleanup policy, never compaction. The key ([`reconcile_marker_key`])
+//! carries the body partition, so a run's 64 certificates are 64 distinct keys rather than one. A
+//! complete and a withheld marker for the same body partition share their key, which puts them on
+//! one topic partition in the order they were produced, and the seeder ignores a withheld marker
+//! that follows its partition's certificate. Compaction would keep only the later of the two, so a
+//! watcher that reads after it would supersede a cohort the partition certified.
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use common_kafka::config::KafkaConfig;
+use common_kafka::kafka_producer::{
+    create_kafka_producer, send_keyed_iter_to_kafka_with_headers, KafkaContext, KafkaProduceError,
+};
+use rdkafka::producer::FutureProducer;
+
+use crate::producer::kafka::AlwaysHealthy;
+use crate::producer::merge::Capture;
+use crate::producer::ReconcileMarker;
+
+#[async_trait]
+pub trait ReconcileMarkerSink: Send + Sync {
+    async fn produce(&self, markers: Vec<ReconcileMarker>) -> Vec<Result<(), KafkaProduceError>>;
+}
+
+pub struct KafkaReconcileMarkerSink {
+    producer: FutureProducer<KafkaContext>,
+    topic: String,
+}
+
+impl KafkaReconcileMarkerSink {
+    pub async fn new(kafka_config: &KafkaConfig, topic: String) -> Result<Self> {
+        let producer = create_kafka_producer(kafka_config, AlwaysHealthy)
+            .await
+            .context("creating cohort_reconcile_markers producer")?;
+        Ok(Self { producer, topic })
+    }
+}
+
+#[async_trait]
+impl ReconcileMarkerSink for KafkaReconcileMarkerSink {
+    async fn produce(&self, markers: Vec<ReconcileMarker>) -> Vec<Result<(), KafkaProduceError>> {
+        send_keyed_iter_to_kafka_with_headers(
+            &self.producer,
+            &self.topic,
+            reconcile_marker_key,
+            |_| None,
+            markers,
+        )
+        .await
+    }
+}
+
+/// Inert sink for when the reconcile gate is off: satisfies the [`ReconcileMarkerSink`] slot without
+/// a Kafka producer. Nothing should reach it — a reconcile job is only ever admitted from a seed tile
+/// and `ReconcileDeps::enabled` gates that admission — so a produce here is a coding error, and it
+/// fails rather than acking. Acking would be the worse half of the trade: the job would complete and
+/// commit its seed offset while the seeder waited for a certificate that was never produced.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopReconcileMarkerSink;
+
+#[async_trait]
+impl ReconcileMarkerSink for NoopReconcileMarkerSink {
+    async fn produce(&self, markers: Vec<ReconcileMarker>) -> Vec<Result<(), KafkaProduceError>> {
+        markers
+            .into_iter()
+            .map(|_| Err(KafkaProduceError::KafkaProduceCanceled))
+            .collect()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct CaptureReconcileMarkerSink(Capture<ReconcileMarker>);
+
+impl CaptureReconcileMarkerSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn failing_first(n: usize) -> Self {
+        Self(Capture::failing_first(n))
+    }
+
+    pub fn markers(&self) -> Vec<ReconcileMarker> {
+        self.0.recorded()
+    }
+
+    pub fn produce_calls(&self) -> usize {
+        self.0.produce_calls()
+    }
+}
+
+#[async_trait]
+impl ReconcileMarkerSink for CaptureReconcileMarkerSink {
+    async fn produce(&self, markers: Vec<ReconcileMarker>) -> Vec<Result<(), KafkaProduceError>> {
+        self.0.produce(markers)
+    }
+}
+
+/// One key per run, cohort and body partition, shared by its complete and withheld markers so both
+/// land on one topic partition in order. Nothing downstream reads the key.
+fn reconcile_marker_key(marker: &ReconcileMarker) -> Option<String> {
+    Some(format!(
+        "{}:{}:{}:{}",
+        marker.team_id().0,
+        marker.cohort_id().0,
+        marker.run_id().0,
+        marker.partition(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filters::{CohortId, TeamId};
+    use crate::producer::ReconcileCompleteMarker;
+    use cohort_core::seed::RunId;
+    use uuid::Uuid;
+
+    const TS: &str = "2026-05-26 12:34:56.789123";
+
+    fn marker(partition: u16) -> ReconcileMarker {
+        ReconcileMarker::Complete(ReconcileCompleteMarker::new(
+            TeamId(42),
+            CohortId(91204),
+            partition,
+            RunId(Uuid::nil()),
+            TS.to_string(),
+        ))
+    }
+
+    #[test]
+    fn reconcile_marker_key_is_unique_per_partition_marker() {
+        assert_eq!(
+            reconcile_marker_key(&marker(63)),
+            Some("42:91204:00000000-0000-0000-0000-000000000000:63".to_string())
+        );
+        assert_ne!(
+            reconcile_marker_key(&marker(63)),
+            reconcile_marker_key(&marker(0)),
+            "a shared key would let a compacting topic erase all but one marker of a run",
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_marker_sink_retries_a_failed_produce_without_recording_the_attempt() {
+        let sink = CaptureReconcileMarkerSink::failing_first(1);
+
+        let first = sink.produce(vec![marker(7)]).await;
+        assert!(first.iter().all(Result::is_err), "first flush fails");
+        assert!(sink.markers().is_empty(), "a failed flush records nothing");
+
+        let second = sink.produce(vec![marker(7)]).await;
+        assert!(second.iter().all(Result::is_ok), "retry succeeds");
+        assert_eq!(sink.markers(), vec![marker(7)]);
+    }
+}

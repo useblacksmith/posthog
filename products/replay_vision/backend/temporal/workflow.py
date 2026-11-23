@@ -1,0 +1,754 @@
+import asyncio
+import datetime as dt
+from typing import Any, cast
+from uuid import UUID
+
+import temporalio.workflow as wf
+from temporalio import common
+from temporalio.common import SearchAttributePair, TypedSearchAttributes, WorkflowIDReusePolicy
+from temporalio.exceptions import (
+    ActivityError,
+    ChildWorkflowError,
+    TimeoutError as TemporalTimeoutError,
+)
+from temporalio.workflow import ParentClosePolicy
+
+from posthog.temporal.common.base import PostHogWorkflow
+from posthog.temporal.common.errors import MAX_ERROR_MESSAGE_CHARS, truncate_for_temporal_payload, unwrap_temporal_cause
+from posthog.temporal.common.search_attributes import POSTHOG_SESSION_RECORDING_ID_KEY, POSTHOG_TEAM_ID_KEY
+from posthog.temporal.session_replay.rasterize_recording.activities.stuck_counter import (
+    BumpStuckCounterInput,
+    bump_stuck_counter_activity,
+)
+from posthog.temporal.session_replay.rasterize_recording.types import (
+    RASTERIZE_WORKFLOW_SINGLE_ATTEMPT_TIMEOUT,
+    RasterizeRecordingInputs,
+)
+
+with wf.unsafe.imports_passed_through():
+    from django.conf import settings
+
+from products.replay_vision.backend.models.replay_scanner import ScannerType
+from products.replay_vision.backend.temporal.activities import (
+    call_scanner_provider_activity,
+    cleanup_gemini_file_activity,
+    create_observation_activity,
+    embed_observation_activity,
+    emit_classifier_tags_activity,
+    emit_observation_event_activity,
+    emit_observation_signal_summaries_activity,
+    ensure_session_asset_activity,
+    fetch_session_events_activity,
+    fetch_session_network_activity,
+    finalize_observation_activity,
+    mark_observation_failed_activity,
+    mark_observation_ineligible_activity,
+    mark_observation_running_activity,
+    mark_observation_succeeded_activity,
+    prepare_observation_activity,
+    resolve_experiment_variant_activity,
+    upload_video_to_gemini_activity,
+)
+from products.replay_vision.backend.temporal.constants import (
+    APPLY_SCANNER_WORKFLOW_NAME,
+    CREATE_OBSERVATION_TIMEOUT,
+    FINALIZE_OBSERVATION_SCHEDULE_TO_CLOSE,
+    FINALIZE_OBSERVATION_TIMEOUT,
+    STATE_ACTIVITY_RETRY,
+    STATE_ACTIVITY_SCHEDULE_TO_CLOSE,
+)
+from products.replay_vision.backend.temporal.errors import (
+    INELIGIBLE_SESSION_ERROR_TYPE,
+    SCANNER_FAILURE_ERROR_TYPE,
+    FailureKind,
+    IneligibleSessionError,
+    IneligibleSessionKind,
+    ScannerFailureError,
+)
+from products.replay_vision.backend.temporal.media_types import (
+    MEDIA_WORKFLOW_EXECUTION_TIMEOUT,
+    MEDIA_WORKFLOW_NAME,
+    ObservationMediaInputs,
+    build_media_workflow_id,
+)
+from products.replay_vision.backend.temporal.scanners.base import has_embeddable_text
+from products.replay_vision.backend.temporal.scanners.classifier import ClassifierOutput
+from products.replay_vision.backend.temporal.types import (
+    OBSERVATION_PHASE_INDEX,
+    OBSERVATION_PHASE_ORDER,
+    ApplyScannerInputs,
+    CallScannerProviderInputs,
+    CleanupGeminiFileInputs,
+    CreateObservationInputs,
+    CreateObservationOutput,
+    EmbedObservationInputs,
+    EmitClassifierTagsInputs,
+    EmitObservationEventInputs,
+    EmitObservationSignalInputs,
+    EmittedSignal,
+    EnsureSessionAssetInputs,
+    EnsureSessionAssetOutput,
+    FetchSessionEventsInputs,
+    FetchSessionNetworkInputs,
+    FinalizeObservationInputs,
+    MarkObservationFailedInputs,
+    MarkObservationIneligibleInputs,
+    MarkObservationRunningInputs,
+    MarkObservationSucceededInputs,
+    ObservationProgress,
+    PrepareObservationInputs,
+    PrepareObservationOutput,
+    ResolveExperimentVariantInputs,
+    ResolveExperimentVariantOutput,
+    ScannerCallOutput,
+    UploadedVideo,
+    UploadVideoToGeminiInputs,
+    scanner_result,
+)
+
+# Create's `ValueError` paths (scanner missing, user not in org) won't recover on retry, and the
+# re-raised `IntegrityError`s (FK / CHECK violations; the unique-violation case is handled inside
+# the activity) are deterministic — retrying them for the full window would only amplify load.
+# Unlimited attempts, bounded by schedule_to_close (3m): a ScannerAdmissionBusy rejection must be
+# able to retry across a whole contention wave, or every admission in the wave becomes a dropped
+# scan — the sweep watermark and backfill cursor advance past a session with no observation row.
+_CREATE_OBSERVATION_RETRY = common.RetryPolicy(
+    initial_interval=dt.timedelta(seconds=1),
+    maximum_interval=dt.timedelta(seconds=15),
+    maximum_attempts=0,
+    non_retryable_error_types=["ValueError", "IntegrityError"],
+)
+
+# Generous because fetch's deterministic errors are non_retryable; this budget only covers transient infra (e.g. ClickHouse at capacity).
+_FETCH_RETRY = common.RetryPolicy(
+    initial_interval=dt.timedelta(seconds=2),
+    maximum_interval=dt.timedelta(seconds=60),
+    maximum_attempts=6,
+)
+
+# A transient shared-DB slowdown can time this out; retry like the other state activities (the get-or-create makes sequential retries dedup-safe).
+_ENSURE_ASSET_RETRY = common.RetryPolicy(
+    initial_interval=dt.timedelta(seconds=1),
+    maximum_interval=dt.timedelta(seconds=10),
+    maximum_attempts=5,
+)
+
+# Deterministic failures opt out via ScannerFailureError's non_retryable flag; only transient kinds re-run.
+# Attempts land at ~0s/15s/75s so the third clears a per-minute provider quota window.
+_UPLOAD_RETRY = common.RetryPolicy(
+    initial_interval=dt.timedelta(seconds=15),
+    backoff_coefficient=4.0,
+    maximum_interval=dt.timedelta(seconds=60),
+    maximum_attempts=3,
+)
+
+# Workflow-level retries only cover transient transport failures; schema/semantic errors are non-retryable.
+# A provider rate limit or 5xx arrives classified (see `classify_gemini_error`), which is what makes these attempts
+# reachable at all. The spacing must outlast a per-minute quota window: attempts land at ~0s/15s/75s/135s, so the
+# last two run in later windows instead of burning out inside the one that rate-limited us. `schedule_to_close`
+# on the call site keeps four long attempts from eating the whole workflow budget.
+_PROVIDER_CALL_RETRY = common.RetryPolicy(
+    initial_interval=dt.timedelta(seconds=15),
+    backoff_coefficient=4.0,
+    maximum_interval=dt.timedelta(seconds=60),
+    maximum_attempts=4,
+)
+
+# Cleanup is best-effort; the cleanup sweep handles persistent failures.
+_CLEANUP_RETRY = common.RetryPolicy(maximum_attempts=2)
+
+# Runs the steps around the model call in two activities instead of up to ten, because Temporal bills each activity.
+APPLY_FOLDED_STEPS_PATCH = "replay-vision-apply-folded-steps-2026-11"
+
+# Side-effects (embeddings, tag emission) — bounded retries on transient transport failures.
+_SIDE_EFFECT_RETRY = common.RetryPolicy(
+    initial_interval=dt.timedelta(seconds=1),
+    maximum_interval=dt.timedelta(seconds=10),
+    maximum_attempts=3,
+)
+
+
+async def _optional(task: Any) -> None:
+    """Await a side-input activity, absorbing its failure.
+
+    The activity handles its own errors, but a timeout or a spent retry chain is enforced by the server
+    and never reaches that handler. Without this the scan would fail over a side input it can run
+    without. `CancelledError` derives from `BaseException`, so workflow cancellation still propagates.
+    """
+    try:
+        await task
+    except Exception:
+        wf.logger.warning("replay_vision.side_input_failed", exc_info=True)
+
+
+# Provider-facing activities whose Temporal timeout means "provider slow", not a PostHog bug.
+_PROVIDER_TIMEOUT_ACTIVITY_TYPES = frozenset(
+    {"replay_vision_upload_video_to_gemini_activity", "call_scanner_provider_activity"}
+)
+
+# The rasterizer sends its own `RasterizationError.code` as the ApplicationError type. This one means the recording
+# holds no renderable snapshots. It is retryable over there while nothing has loaded (blocks can still be landing) and
+# final when snapshots loaded but no window has a full snapshot, so either way the emptiness surfaces here as a property
+# of the recording, not of one attempt.
+_RASTERIZER_NO_SNAPSHOTS_TYPE = "NO_SNAPSHOTS"
+
+# The rasterizer refuses a recording whose snapshot blocks exceed its size cap, to keep an oversized render from
+# walking the pod into its memory limit. That size is a fixed property of the recording, so no retry helps.
+_RASTERIZER_TOO_LARGE_TYPE = "RECORDING_TOO_LARGE"
+
+# Rasterizer codes that mean a PostHog-side dependency the renderer talks to was unreachable or slow — the
+# recording-api it fetches the block listing and data from, or the object storage it uploads the video to — not
+# that the recording itself can't render. They belong in the same transient bucket as an activity timeout against
+# those dependencies (see `_activity_timeout_kind`), so the user gets a retry prompt, not a "known issue" label.
+_RASTERIZER_INFRA_TRANSIENT_TYPES = frozenset(
+    {"BLOCK_LISTING_FAILED", "DATA_LOAD_FAILED", "S3_UPLOAD_FAILED", "S3_UPLOAD_UNDECODABLE_RESPONSE"}
+)
+
+
+def _activity_timeout_kind(e: BaseException) -> str | None:
+    """Map an activity start-to-close/heartbeat timeout onto whichever side ran out of time."""
+    if not isinstance(e, ActivityError) or not isinstance(e.cause, TemporalTimeoutError):
+        return None
+    if e.activity_type in _PROVIDER_TIMEOUT_ACTIVITY_TYPES:
+        return FailureKind.PROVIDER_TRANSIENT.value
+    # Every other activity here talks to our own dependencies (ClickHouse, Postgres, Redis, object storage). A
+    # timeout against those is capacity, so it recovers on a retry; `internal_error` would send the user to support.
+    return FailureKind.INFRA_TRANSIENT.value
+
+
+def _failure_type(e: BaseException) -> str | None:
+    """The `type` off an ApplicationError, surviving Temporal's ActivityError / ChildWorkflowError wrapping."""
+    cause = unwrap_temporal_cause(e) or e
+    return getattr(cause, "type", None)
+
+
+def _failure_non_retryable(e: BaseException) -> bool:
+    """Whether the leaf ApplicationError was flagged non-retryable, surviving the same wrapping."""
+    cause = unwrap_temporal_cause(e) or e
+    return bool(getattr(cause, "non_retryable", False))
+
+
+def _extract_kind_for_type(e: BaseException, expected_type: str) -> str | None:
+    """Pull a kind string off a kinded ApplicationError, surviving Temporal's ActivityError wrap."""
+    if _failure_type(e) != expected_type:
+        return None
+    cause = unwrap_temporal_cause(e) or e
+    details = getattr(cause, "details", None)
+    return details[0] if details else None
+
+
+def _root_cause_message(e: BaseException) -> str:
+    """Bare message from the root cause — no `TypeName:` prefix; the kind label takes that role."""
+    cause = unwrap_temporal_cause(e) or e
+    msg = getattr(cause, "message", None) or str(cause) or type(cause).__name__
+    return truncate_for_temporal_payload(msg, MAX_ERROR_MESSAGE_CHARS)
+
+
+def _normalized_rasterizer_infra_message(code: str) -> str:
+    """A stable message for a transient rasterizer dependency failure, keyed on the code alone.
+
+    The raw text carries the errno, the pod address and the pooler wording, all of which vary per
+    occurrence, so copying it verbatim mints a fresh error-tracking issue for one root cause. Keying
+    the message on the code collapses those variants back into a single issue.
+    """
+    return f"rasterizer could not reach a PostHog dependency ({code})"
+
+
+def _encode_reason(kind: str, message: str) -> str:
+    """`kind:message` — the frontend splits on the first colon to render the kind as a badge."""
+    return f"{kind}:{message}"
+
+
+def _rasterizer_workflow_id(inputs: ApplyScannerInputs) -> str:
+    # Per-scanner child id so concurrent observations of the same session don't collide on WorkflowAlreadyStartedError.
+    return f"replay-vision-rasterize-{inputs.team_id}-{inputs.session_id}-{inputs.scanner_id}"
+
+
+@wf.defn(name=APPLY_SCANNER_WORKFLOW_NAME)
+class ApplyScannerWorkflow(PostHogWorkflow):
+    """Apply one scanner to one session: create row → fetch+rasterize → upload → call provider → mark succeeded → emit event."""
+
+    inputs_cls = ApplyScannerInputs
+
+    def __init__(self) -> None:
+        self._progress: ObservationProgress = {
+            "phase": OBSERVATION_PHASE_ORDER[0],
+            "step": 0,
+            "total_steps": len(OBSERVATION_PHASE_ORDER),
+            "rasterizer_workflow_id": None,
+            "phase_started_at": None,
+        }
+
+    @wf.query
+    def get_progress(self) -> ObservationProgress:
+        # Copy so Temporal serializes a stable snapshot without racing the run() coroutine.
+        return cast(ObservationProgress, dict(self._progress))
+
+    def _advance_phase(self, phase: str, rasterizer_workflow_id: str | None = None) -> None:
+        self._progress["phase"] = phase
+        self._progress["step"] = OBSERVATION_PHASE_INDEX[phase]
+        self._progress["phase_started_at"] = wf.now().timestamp()
+        if rasterizer_workflow_id is not None:
+            self._progress["rasterizer_workflow_id"] = rasterizer_workflow_id
+
+    @wf.run
+    async def run(self, inputs: ApplyScannerInputs) -> None:
+        workflow_id = wf.info().workflow_id
+        self._progress["phase_started_at"] = wf.now().timestamp()
+
+        create_result: CreateObservationOutput = await wf.execute_activity(
+            create_observation_activity,
+            CreateObservationInputs(
+                scanner_id=inputs.scanner_id,
+                team_id=inputs.team_id,
+                session_id=inputs.session_id,
+                triggered_by=inputs.triggered_by,
+                triggered_by_user_id=inputs.triggered_by_user_id,
+                workflow_id=workflow_id,
+                backfill_id=inputs.backfill_id,
+                variant_sampling_rates=inputs.variant_sampling_rates,
+            ),
+            start_to_close_timeout=CREATE_OBSERVATION_TIMEOUT,
+            schedule_to_close_timeout=STATE_ACTIVITY_SCHEDULE_TO_CLOSE,
+            retry_policy=_CREATE_OBSERVATION_RETRY,
+        )
+        if not create_result.was_created or create_result.observation_id is None:
+            return  # Either an existing observation owns this (scanner, session_id), or the org's monthly quota is exhausted.
+
+        observation_id = create_result.observation_id
+        scanner_type = create_result.scanner_type
+        # None means the create activity's recorded output predates this field, so this run started
+        # gated on the scanner type. Keep gating it that way rather than changing a run mid-flight.
+        watches_experiment = (
+            create_result.watches_experiment
+            if create_result.watches_experiment is not None
+            else scanner_type == ScannerType.EXPERIMENT
+        )
+        folded = wf.patched(APPLY_FOLDED_STEPS_PATCH)
+
+        uploaded: UploadedVideo | None = None
+        try:
+            # Inside the try so an exhausted retry still lands the row in FAILED instead of stranding it PENDING.
+            if folded:
+                self._advance_phase("fetching")
+                prepared: PrepareObservationOutput = await wf.execute_activity(
+                    prepare_observation_activity,
+                    PrepareObservationInputs(
+                        observation_id=observation_id,
+                        team_id=inputs.team_id,
+                        session_id=inputs.session_id,
+                        # Deterministic: the create activity recorded this, so a replay reads the
+                        # same answer. Gated on the scope, so a scan whose scanner is narrowed only
+                        # by the `scope` column still gets its variant attributed.
+                        resolve_experiment=watches_experiment,
+                    ),
+                    start_to_close_timeout=dt.timedelta(minutes=2),
+                    schedule_to_close_timeout=dt.timedelta(minutes=5),
+                    retry_policy=_FETCH_RETRY,
+                )
+                asset_result, experiment_resolution = prepared.asset, prepared.experiment_resolution
+            else:
+                asset_result, experiment_resolution = await self._prepare_legacy(
+                    inputs, observation_id, watches_experiment
+                )
+            self._advance_phase("rendering", rasterizer_workflow_id=_rasterizer_workflow_id(inputs))
+            await self._run_rasterize_child(inputs, asset_result.asset_id)
+            self._advance_phase("uploading")
+            uploaded = await wf.execute_activity(
+                upload_video_to_gemini_activity,
+                UploadVideoToGeminiInputs(asset_id=asset_result.asset_id),
+                start_to_close_timeout=dt.timedelta(minutes=10),
+                # Bounds the whole retry chain, so three slow attempts can't consume the phases behind this one.
+                schedule_to_close_timeout=dt.timedelta(minutes=20),
+                heartbeat_timeout=dt.timedelta(minutes=2),
+                retry_policy=_UPLOAD_RETRY,
+            )
+            self._advance_phase("analyzing")
+            call_output: ScannerCallOutput = await wf.execute_activity(
+                call_scanner_provider_activity,
+                CallScannerProviderInputs(
+                    team_id=inputs.team_id,
+                    observation_id=observation_id,
+                    exported_asset_id=asset_result.asset_id,
+                    file_uri=uploaded.file_uri,
+                    mime_type=uploaded.mime_type,
+                    experiment_variant=(
+                        experiment_resolution.experiment_variant if experiment_resolution is not None else None
+                    ),
+                    experiment_context=(
+                        experiment_resolution.experiment_context if experiment_resolution is not None else None
+                    ),
+                ),
+                # Multi-turn tool conversation (video + on-demand event lookups) needs more headroom than a single
+                # call, and must cover both mission passes: a pass that
+                # overruns would surface as a Temporal timeout labeled provider_transient when the real problem is
+                # the scanner's prompt.
+                start_to_close_timeout=dt.timedelta(minutes=20),
+                # Bounds the whole retry chain, so slow attempts can't overrun the workflow's own timeout.
+                schedule_to_close_timeout=dt.timedelta(minutes=25),
+                heartbeat_timeout=dt.timedelta(minutes=2),
+                retry_policy=_PROVIDER_CALL_RETRY,
+            )
+            self._advance_phase("finalizing")
+            if folded:
+                await wf.execute_activity(
+                    finalize_observation_activity,
+                    FinalizeObservationInputs(
+                        team_id=inputs.team_id,
+                        session_id=inputs.session_id,
+                        scanner_id=inputs.scanner_id,
+                        observation_id=observation_id,
+                        scanner_type=scanner_type,
+                        exported_asset_id=asset_result.asset_id,
+                        call_output=call_output,
+                        experiment_resolution=experiment_resolution,
+                        gemini_file_name=uploaded.gemini_file_name,
+                    ),
+                    start_to_close_timeout=FINALIZE_OBSERVATION_TIMEOUT,
+                    schedule_to_close_timeout=FINALIZE_OBSERVATION_SCHEDULE_TO_CLOSE,
+                    retry_policy=STATE_ACTIVITY_RETRY,
+                )
+                # The finalize activity deleted the Gemini file once the result was persisted.
+                uploaded = None
+                await self._render_media(inputs, observation_id, asset_result.asset_id, call_output)
+            else:
+                await self._finalize_legacy(
+                    inputs, observation_id, scanner_type, asset_result.asset_id, experiment_resolution, call_output
+                )
+        except Exception as e:
+            ineligible_kind = _extract_kind_for_type(e, INELIGIBLE_SESSION_ERROR_TYPE)
+            if ineligible_kind is not None:
+                await self._mark_ineligible(observation_id, scanner_type, ineligible_kind, _root_cause_message(e))
+            else:
+                failure_kind = (
+                    _extract_kind_for_type(e, SCANNER_FAILURE_ERROR_TYPE)
+                    or _activity_timeout_kind(e)
+                    or FailureKind.INTERNAL_ERROR.value
+                )
+                await self._mark_failed(observation_id, scanner_type, failure_kind, _root_cause_message(e))
+            raise
+        finally:
+            if uploaded is not None:
+                # Swallow exceptions so cleanup failure can't fail a workflow that already marked-succeeded.
+                try:
+                    await wf.execute_activity(
+                        cleanup_gemini_file_activity,
+                        CleanupGeminiFileInputs(gemini_file_name=uploaded.gemini_file_name),
+                        start_to_close_timeout=dt.timedelta(seconds=30),
+                        retry_policy=_CLEANUP_RETRY,
+                    )
+                except Exception:
+                    pass
+
+    async def _prepare_legacy(
+        self, inputs: ApplyScannerInputs, observation_id: UUID, watches_experiment: bool
+    ) -> tuple[EnsureSessionAssetOutput, ResolveExperimentVariantOutput | None]:
+        """The steps before rendering as runs started before `APPLY_FOLDED_STEPS_PATCH` recorded them."""
+        await wf.execute_activity(
+            mark_observation_running_activity,
+            MarkObservationRunningInputs(observation_id=observation_id),
+            start_to_close_timeout=dt.timedelta(seconds=30),
+            schedule_to_close_timeout=STATE_ACTIVITY_SCHEDULE_TO_CLOSE,
+            retry_policy=STATE_ACTIVITY_RETRY,
+        )
+        self._advance_phase("fetching")
+        return await self._fetch_and_ensure_asset(inputs, observation_id, watches_experiment)
+
+    async def _finalize_legacy(
+        self,
+        inputs: ApplyScannerInputs,
+        observation_id: UUID,
+        scanner_type: ScannerType,
+        asset_id: int,
+        experiment_resolution: ResolveExperimentVariantOutput | None,
+        call_output: ScannerCallOutput,
+    ) -> None:
+        """The steps after the model call as runs started before `APPLY_FOLDED_STEPS_PATCH` recorded them."""
+        signal_summaries: list[EmittedSignal] = []
+        if call_output.signals:
+            emit_inputs = EmitObservationSignalInputs(
+                team_id=inputs.team_id,
+                observation_id=observation_id,
+                exported_asset_id=asset_id,
+                signals=call_output.signals,
+            )
+            # The activity reports every signal it actually emitted, so the count and the problem types
+            # both derive from that list. It fails soft (emits nothing extra on error), so there is
+            # nothing to retry; the local catch covers Temporal-level failures (timeout, worker loss),
+            # because emission is advisory and must never demote an otherwise-successful observation.
+            # 30s once truncated the tail on a slow facade, so give it 2 minutes; retries are safe
+            # because each finding carries a deterministic idempotency key.
+            try:
+                signal_summaries = await wf.execute_activity(
+                    emit_observation_signal_summaries_activity,
+                    emit_inputs,
+                    start_to_close_timeout=dt.timedelta(minutes=2),
+                    heartbeat_timeout=dt.timedelta(seconds=30),
+                    retry_policy=common.RetryPolicy(maximum_attempts=3),
+                )
+            except Exception:
+                wf.logger.exception("Signal emission activity failed for observation %s", observation_id)
+        # Persist the billed result first — everything past this point is fail-soft delivery.
+        await wf.execute_activity(
+            mark_observation_succeeded_activity,
+            MarkObservationSucceededInputs(
+                observation_id=observation_id,
+                scanner_type=scanner_type,
+                scanner_result=scanner_result(call_output.model_output, signal_summaries, experiment_resolution),
+            ),
+            start_to_close_timeout=dt.timedelta(seconds=30),
+            schedule_to_close_timeout=STATE_ACTIVITY_SCHEDULE_TO_CLOSE,
+            retry_policy=STATE_ACTIVITY_RETRY,
+        )
+        try:
+            await wf.execute_activity(
+                emit_observation_event_activity,
+                EmitObservationEventInputs(observation_id=observation_id, model_output=call_output.model_output),
+                start_to_close_timeout=dt.timedelta(seconds=30),
+                schedule_to_close_timeout=STATE_ACTIVITY_SCHEDULE_TO_CLOSE,
+                retry_policy=STATE_ACTIVITY_RETRY,
+            )
+        except Exception:
+            wf.logger.exception("Event emission failed for succeeded observation %s", observation_id)
+        await self._render_media(inputs, observation_id, asset_id, call_output)
+        await self._apply_scanner_side_effects(inputs, observation_id, call_output.model_output)
+
+    async def _fetch_and_ensure_asset(
+        self, inputs: ApplyScannerInputs, observation_id: UUID, watches_experiment: bool
+    ) -> tuple[EnsureSessionAssetOutput, ResolveExperimentVariantOutput | None]:
+        # Deterministic: the create activity recorded this, so a replay reads the same answer.
+        resolve_task = None
+        if watches_experiment:
+            # Rides alongside the fetch, so attribution costs no wall-clock. An unexposed session
+            # raises IneligibleSessionError here, before any model call and at no credit cost.
+            resolve_task = wf.execute_activity(
+                resolve_experiment_variant_activity,
+                ResolveExperimentVariantInputs(
+                    observation_id=observation_id,
+                    team_id=inputs.team_id,
+                    session_id=inputs.session_id,
+                ),
+                # The linkage resolution can run a lazy exposure precomputation on its first touch
+                # of a large experiment, so it gets the fetch's budget rather than a state
+                # activity's 30 seconds.
+                start_to_close_timeout=dt.timedelta(minutes=2),
+                schedule_to_close_timeout=dt.timedelta(minutes=5),
+                retry_policy=_FETCH_RETRY,
+            )
+        fetch_task = wf.execute_activity(
+            fetch_session_events_activity,
+            FetchSessionEventsInputs(
+                observation_id=observation_id,
+                team_id=inputs.team_id,
+                session_id=inputs.session_id,
+            ),
+            start_to_close_timeout=dt.timedelta(minutes=2),
+            # Bounds the whole retry chain: six 2m attempts with backoff would otherwise stretch past 13m.
+            schedule_to_close_timeout=dt.timedelta(minutes=5),
+            retry_policy=_FETCH_RETRY,
+        )
+        asset_task = wf.execute_activity(
+            ensure_session_asset_activity,
+            EnsureSessionAssetInputs(team_id=inputs.team_id, session_id=inputs.session_id),
+            start_to_close_timeout=dt.timedelta(seconds=30),
+            schedule_to_close_timeout=STATE_ACTIVITY_SCHEDULE_TO_CLOSE,
+            retry_policy=_ENSURE_ASSET_RETRY,
+        )
+        # Rides alongside the other two so the extra recording-block read costs no wall-clock.
+        network_task = wf.execute_activity(
+            fetch_session_network_activity,
+            FetchSessionNetworkInputs(
+                observation_id=observation_id,
+                team_id=inputs.team_id,
+                session_id=inputs.session_id,
+            ),
+            start_to_close_timeout=dt.timedelta(minutes=2),
+            schedule_to_close_timeout=dt.timedelta(minutes=5),
+            retry_policy=_FETCH_RETRY,
+        )
+        if resolve_task is not None:
+            _, asset_result, _, experiment_resolution = await asyncio.gather(
+                fetch_task, asset_task, _optional(network_task), resolve_task
+            )
+            return asset_result, experiment_resolution
+        _, asset_result, _ = await asyncio.gather(fetch_task, asset_task, _optional(network_task))
+        return asset_result, None
+
+    async def _run_rasterize_child(self, inputs: ApplyScannerInputs, asset_id: int) -> None:
+        try:
+            await wf.execute_child_workflow(
+                "rasterize-recording",
+                RasterizeRecordingInputs(exported_asset_id=asset_id, product="replay_vision"),
+                id=_rasterizer_workflow_id(inputs),
+                task_queue=settings.SESSION_REPLAY_TASK_QUEUE,
+                retry_policy=common.RetryPolicy(maximum_attempts=int(settings.TEMPORAL_WORKFLOW_MAX_ATTEMPTS)),
+                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+                # Temporal counts the whole retry chain against this. Held below the full two-attempt
+                # envelope on purpose, to stay within the parent's phase budget.
+                execution_timeout=RASTERIZE_WORKFLOW_SINGLE_ATTEMPT_TIMEOUT,
+                search_attributes=TypedSearchAttributes(
+                    search_attributes=[
+                        SearchAttributePair(key=POSTHOG_TEAM_ID_KEY, value=inputs.team_id),
+                        SearchAttributePair(key=POSTHOG_SESSION_RECORDING_ID_KEY, value=inputs.session_id),
+                    ]
+                ),
+            )
+        except Exception as e:
+            if _failure_type(e) == _RASTERIZER_NO_SNAPSHOTS_TYPE:
+                # Replay metadata exists but the snapshot blocks hold nothing to draw. That is the same class of
+                # "nothing to analyze" as a session with no events, which we already gate as ineligible, so calling
+                # it a failure would point the user at support over a recording that can never produce a video.
+                raise IneligibleSessionError(_root_cause_message(e), kind=IneligibleSessionKind.NO_SNAPSHOTS) from e
+            if _failure_type(e) == _RASTERIZER_TOO_LARGE_TYPE:
+                # Gate as ineligible, not failed, so the user reads "too large" instead of a "known issue" retry prompt.
+                raise IneligibleSessionError(_root_cause_message(e), kind=IneligibleSessionKind.TOO_LARGE) from e
+            rasterizer_type = _failure_type(e)
+            # The rasterizer flags a genuine transport blip (5xx, timeout, dropped connection) as retryable
+            # but a permanent 4xx or a malformed listing as non-retryable. Only the retryable ones are the
+            # "dependency was slow" story; a non-retryable leaf keeps the RASTERIZATION_FAILED path below, so
+            # it gets neither a false retry prompt nor a message that merges it into the transient-outage issue.
+            if rasterizer_type in _RASTERIZER_INFRA_TRANSIENT_TYPES and not _failure_non_retryable(e):
+                # A PostHog dependency blip, not a broken recording. Classify transient so the observation
+                # stays retryable, and keep the raw errno and pod address in the worker log only: `from None`
+                # drops the volatile cause so error tracking groups the outage by the stable message alone
+                # instead of minting a fresh issue per errno and pod address.
+                # Interpolate the code and detail into the message text, not `extra={...}`: the worker's
+                # stdlib formatter chain has no `ExtraAdder`, so record attributes never reach the rendered
+                # line, and the promised on-call copy would carry neither field.
+                wf.logger.warning(
+                    "replay_vision.rasterizer_infra_transient code=%s detail=%s",
+                    rasterizer_type,
+                    _root_cause_message(e),
+                )
+                raise ScannerFailureError(
+                    _normalized_rasterizer_infra_message(rasterizer_type), kind=FailureKind.INFRA_TRANSIENT
+                ) from None
+            # Direct cause only: a nested activity timeout inside the child already bumped the
+            # counter there, and matching it here would double-count one run.
+            if isinstance(e, ChildWorkflowError) and isinstance(e.cause, TemporalTimeoutError):
+                # The single-attempt execution_timeout terminates the child before its own final-attempt
+                # bump can run, so a render that rode out the whole budget would never reach the
+                # quarantine threshold. Bump from here instead; the child's own bump covers every
+                # failure that surfaces as an exception.
+                try:
+                    await wf.execute_activity(
+                        bump_stuck_counter_activity,
+                        BumpStuckCounterInput(team_id=inputs.team_id, session_id=inputs.session_id),
+                        start_to_close_timeout=dt.timedelta(seconds=10),
+                        retry_policy=common.RetryPolicy(maximum_attempts=2),
+                    )
+                except Exception as exc:
+                    wf.logger.warning("replay_vision.stuck_counter_bump_failed", extra={"error": str(exc)})
+            # Re-classify the rasterizer's failure so the user sees a rasterizer label, not a generic "internal error".
+            raise ScannerFailureError(_root_cause_message(e), kind=FailureKind.RASTERIZATION_FAILED) from e
+
+    async def _render_media(
+        self,
+        inputs: ApplyScannerInputs,
+        observation_id: UUID,
+        analysis_asset_id: int,
+        call_output: ScannerCallOutput,
+    ) -> None:
+        """Render the observation's thumbnail. Fail-soft: a missing poster must never fail a paid-for scan."""
+        try:
+            # Started, not awaited: the poster is delivery, and the scan has no reason to hold a workflow
+            # slot open while one frame is cut. ABANDON keeps the child alive past the parent's close.
+            await wf.start_child_workflow(
+                MEDIA_WORKFLOW_NAME,
+                ObservationMediaInputs(
+                    team_id=inputs.team_id,
+                    observation_id=observation_id,
+                    session_id=inputs.session_id,
+                    analysis_asset_id=analysis_asset_id,
+                    signal_video_times=call_output.signal_video_spans,
+                    thumbnail_video_s=call_output.thumbnail_video_s,
+                ),
+                id=build_media_workflow_id(observation_id),
+                task_queue=settings.REPLAY_VISION_TASK_QUEUE,
+                # A retried observation reuses its id, so the render it supersedes must not block this one once
+                # it has closed, whatever it closed as. A run still open keeps the id and this start fails, which
+                # is what we want: that run is already rendering this observation.
+                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+                parent_close_policy=ParentClosePolicy.ABANDON,
+                # The execution timeout spans every attempt and the thumbnail's own retries fill it, so a second run has no time left.
+                retry_policy=common.RetryPolicy(maximum_attempts=1),
+                execution_timeout=MEDIA_WORKFLOW_EXECUTION_TIMEOUT,
+            )
+        except Exception:
+            wf.logger.exception("Media rendering could not be started for observation %s", observation_id)
+
+    async def _mark_failed(self, observation_id: UUID, scanner_type: ScannerType, kind: str, message: str) -> None:
+        await wf.execute_activity(
+            mark_observation_failed_activity,
+            MarkObservationFailedInputs(
+                observation_id=observation_id,
+                scanner_type=scanner_type,
+                error_reason=_encode_reason(kind, message),
+            ),
+            start_to_close_timeout=dt.timedelta(seconds=30),
+            schedule_to_close_timeout=STATE_ACTIVITY_SCHEDULE_TO_CLOSE,
+            retry_policy=STATE_ACTIVITY_RETRY,
+        )
+
+    async def _mark_ineligible(self, observation_id: UUID, scanner_type: ScannerType, kind: str, message: str) -> None:
+        await wf.execute_activity(
+            mark_observation_ineligible_activity,
+            MarkObservationIneligibleInputs(
+                observation_id=observation_id,
+                scanner_type=scanner_type,
+                error_reason=_encode_reason(kind, message),
+            ),
+            start_to_close_timeout=dt.timedelta(seconds=30),
+            schedule_to_close_timeout=STATE_ACTIVITY_SCHEDULE_TO_CLOSE,
+            retry_policy=STATE_ACTIVITY_RETRY,
+        )
+
+    async def _apply_scanner_side_effects(
+        self,
+        inputs: ApplyScannerInputs,
+        observation_id: UUID,
+        model_output: object,
+    ) -> None:
+        """Dispatch scanner-type-specific side-effects after the observation is marked succeeded.
+
+        Each fails soft — the result is already persisted, and one effect's outage must not abort the rest.
+
+        Dispatch changes here are deliberately NOT gated behind `workflow.patched()`: runs are short (≤1h
+        timeout), so a deploy strands at most the handful of in-flight runs past this step, which the reaper
+        then fails as re-runnable — accepted over carrying permanent patch gates.
+        """
+        # Embed the observation's explanation text (reasoning, or the summary) for natural-language search.
+        if has_embeddable_text(model_output):
+            try:
+                await wf.execute_activity(
+                    embed_observation_activity,
+                    EmbedObservationInputs(
+                        team_id=inputs.team_id,
+                        session_id=inputs.session_id,
+                        observation_id=observation_id,
+                        scanner_id=inputs.scanner_id,
+                        model_output=model_output,
+                    ),
+                    start_to_close_timeout=dt.timedelta(seconds=30),
+                    schedule_to_close_timeout=dt.timedelta(minutes=2),
+                    retry_policy=_SIDE_EFFECT_RETRY,
+                )
+            except Exception:
+                wf.logger.exception("Embedding emission failed for succeeded observation %s", observation_id)
+        # Classifiers additionally fan their tags out onto the recording.
+        if isinstance(model_output, ClassifierOutput):
+            try:
+                await wf.execute_activity(
+                    emit_classifier_tags_activity,
+                    EmitClassifierTagsInputs(
+                        team_id=inputs.team_id,
+                        session_id=inputs.session_id,
+                        observation_id=observation_id,
+                        classifier_output=model_output,
+                    ),
+                    start_to_close_timeout=dt.timedelta(seconds=30),
+                    schedule_to_close_timeout=dt.timedelta(minutes=2),
+                    retry_policy=_SIDE_EFFECT_RETRY,
+                )
+            except Exception:
+                wf.logger.exception("Classifier tag emission failed for succeeded observation %s", observation_id)

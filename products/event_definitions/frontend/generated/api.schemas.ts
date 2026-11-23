@@ -1,0 +1,513 @@
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * To modify these types, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+/**
+ * * `engineering` - Engineering
+ * * `data` - Data
+ * * `product` - Product Management
+ * * `founder` - Founder
+ * * `leadership` - Leadership
+ * * `marketing` - Marketing
+ * * `sales` - Sales / Success
+ * * `student` - Student
+ * * `other` - Other
+ */
+export type RoleAtOrganizationEnumApi = (typeof RoleAtOrganizationEnumApi)[keyof typeof RoleAtOrganizationEnumApi]
+
+export const RoleAtOrganizationEnumApi = {
+    Engineering: 'engineering',
+    Data: 'data',
+    Product: 'product',
+    Founder: 'founder',
+    Leadership: 'leadership',
+    Marketing: 'marketing',
+    Sales: 'sales',
+    Student: 'student',
+    Other: 'other',
+} as const
+
+export type BlankEnumApi = (typeof BlankEnumApi)[keyof typeof BlankEnumApi]
+
+export const BlankEnumApi = {
+    '': '',
+} as const
+
+/**
+ * @nullable
+ */
+export type UserBasicApiHedgehogConfig = { [key: string]: unknown } | null
+
+export interface UserBasicApi {
+    readonly id: number
+    readonly uuid: string
+    /**
+     * @maxLength 200
+     * @nullable
+     */
+    distinct_id?: string | null
+    /** @maxLength 150 */
+    first_name?: string
+    /** @maxLength 150 */
+    last_name?: string
+    /** @maxLength 254 */
+    email: string
+    /** @nullable */
+    is_email_verified?: boolean | null
+    /** @nullable */
+    readonly hedgehog_config: UserBasicApiHedgehogConfig
+    role_at_organization?: RoleAtOrganizationEnumApi | BlankEnumApi | null
+}
+
+/**
+ * * `allow` - Allow
+ * * `reject` - Reject
+ */
+export type SchemaEnforcementModeEnumApi =
+    (typeof SchemaEnforcementModeEnumApi)[keyof typeof SchemaEnforcementModeEnumApi]
+
+export const SchemaEnforcementModeEnumApi = {
+    Allow: 'allow',
+    Reject: 'reject',
+} as const
+
+/**
+ * Serializer mixin that handles tags for objects.
+ */
+export interface EnterpriseEventDefinitionApi {
+    readonly id: string
+    /** @maxLength 400 */
+    name: string
+    /** The user responsible for the event, or null when it has no owner. */
+    readonly owner?: UserBasicApi | null
+    /** @nullable */
+    description?: string | null
+    tags?: unknown[]
+    /** @nullable */
+    readonly created_at: string | null
+    readonly updated_at: string
+    readonly updated_by: UserBasicApi
+    /** @nullable */
+    readonly last_seen_at: string | null
+    readonly last_updated_at: string
+    verified?: boolean
+    /** @nullable */
+    readonly verified_at: string | null
+    readonly verified_by: UserBasicApi
+    /** @nullable */
+    hidden?: boolean | null
+    /** @nullable */
+    readonly scheduled_deletion_at: string | null
+    enforcement_mode?: SchemaEnforcementModeEnumApi
+    /**
+     * Name of a single property on this event that PostHog UIs should display alongside the event (for example `$pathname` on `$pageview`). When set, surfaces like the session replay inspector show the property's value next to the event name without the user having to open the event.
+     * @maxLength 400
+     * @nullable
+     */
+    primary_property?: string | null
+    readonly is_action: boolean
+    readonly action_id: number
+    readonly is_calculating: boolean
+    readonly last_calculated_at: string
+    readonly created_by: UserBasicApi
+    post_to_slack?: boolean
+    default_columns?: string[]
+    readonly media_preview_urls: readonly string[]
+}
+
+export interface PaginatedEnterpriseEventDefinitionListApi {
+    count: number
+    /** @nullable */
+    next?: string | null
+    /** @nullable */
+    previous?: string | null
+    results: EnterpriseEventDefinitionApi[]
+    /** True when `count` stopped at a cap, so it is a lower bound and `next` keeps paging past it. */
+    count_is_capped?: boolean
+}
+
+/**
+ * Serializer mixin that handles tags for objects.
+ */
+export interface EnterpriseEventDefinitionRequestApi {
+    readonly id: string
+    /** @maxLength 400 */
+    name: string
+    /**
+     * ID of the user responsible for the event. Null removes the owner.
+     * @nullable
+     */
+    owner?: number | null
+    /** @nullable */
+    description?: string | null
+    tags?: unknown[]
+    /** @nullable */
+    readonly created_at: string | null
+    readonly updated_at: string
+    readonly updated_by: UserBasicApi
+    /** @nullable */
+    readonly last_seen_at: string | null
+    readonly last_updated_at: string
+    verified?: boolean
+    /** @nullable */
+    readonly verified_at: string | null
+    readonly verified_by: UserBasicApi
+    /** @nullable */
+    hidden?: boolean | null
+    /** @nullable */
+    readonly scheduled_deletion_at: string | null
+    enforcement_mode?: SchemaEnforcementModeEnumApi
+    /**
+     * Name of a single property on this event that PostHog UIs should display alongside the event (for example `$pathname` on `$pageview`). When set, surfaces like the session replay inspector show the property's value next to the event name without the user having to open the event.
+     * @maxLength 400
+     * @nullable
+     */
+    primary_property?: string | null
+    readonly is_action: boolean
+    readonly action_id: number
+    readonly is_calculating: boolean
+    readonly last_calculated_at: string
+    readonly created_by: UserBasicApi
+    post_to_slack?: boolean
+    default_columns?: string[]
+    readonly media_preview_urls: readonly string[]
+}
+
+/**
+ * Serializer mixin that handles tags for objects.
+ */
+export interface PatchedEnterpriseEventDefinitionApi {
+    readonly id?: string
+    /** @maxLength 400 */
+    name?: string
+    /**
+     * ID of the user responsible for the event. Null removes the owner.
+     * @nullable
+     */
+    owner?: number | null
+    /** @nullable */
+    description?: string | null
+    tags?: unknown[]
+    /** @nullable */
+    readonly created_at?: string | null
+    readonly updated_at?: string
+    readonly updated_by?: UserBasicApi
+    /** @nullable */
+    readonly last_seen_at?: string | null
+    readonly last_updated_at?: string
+    verified?: boolean
+    /** @nullable */
+    readonly verified_at?: string | null
+    readonly verified_by?: UserBasicApi
+    /** @nullable */
+    hidden?: boolean | null
+    /** @nullable */
+    readonly scheduled_deletion_at?: string | null
+    enforcement_mode?: SchemaEnforcementModeEnumApi
+    /**
+     * Name of a single property on this event that PostHog UIs should display alongside the event (for example `$pathname` on `$pageview`). When set, surfaces like the session replay inspector show the property's value next to the event name without the user having to open the event.
+     * @maxLength 400
+     * @nullable
+     */
+    primary_property?: string | null
+    readonly is_action?: boolean
+    readonly action_id?: number
+    readonly is_calculating?: boolean
+    readonly last_calculated_at?: string
+    readonly created_by?: UserBasicApi
+    post_to_slack?: boolean
+    default_columns?: string[]
+    readonly media_preview_urls?: readonly string[]
+}
+
+/**
+ * Serializer mixin that handles tags for objects.
+ */
+export interface EventDefinitionRecordApi {
+    readonly id: string
+    /** @maxLength 400 */
+    name: string
+    /** @nullable */
+    created_at?: string | null
+    /** @nullable */
+    last_seen_at?: string | null
+    readonly last_updated_at: string
+    tags?: unknown[]
+    enforcement_mode?: SchemaEnforcementModeEnumApi
+    /**
+     * Name of a single property on this event that PostHog UIs should display alongside the event (for example `$pathname` on `$pageview`). When set, surfaces like the session replay inspector show the property's value next to the event name without the user having to open the event.
+     * @maxLength 400
+     * @nullable
+     */
+    primary_property?: string | null
+    readonly is_action: boolean
+    readonly action_id: number
+    readonly is_calculating: boolean
+    readonly last_calculated_at: string
+    readonly created_by: UserBasicApi
+    post_to_slack?: boolean
+}
+
+/**
+ * * `add` - add
+ * * `remove` - remove
+ * * `set` - set
+ */
+export type BulkUpdateTagsActionEnumApi = (typeof BulkUpdateTagsActionEnumApi)[keyof typeof BulkUpdateTagsActionEnumApi]
+
+export const BulkUpdateTagsActionEnumApi = {
+    Add: 'add',
+    Remove: 'remove',
+    Set: 'set',
+} as const
+
+/**
+ * Variant of ``BulkUpdateTagsRequestSerializer`` for resources keyed by UUID (e.g. event definitions).
+ */
+export interface BulkUpdateTagsUUIDRequestApi {
+    /**
+     * List of object UUIDs to update tags on.
+     * @maxItems 500
+     */
+    ids: string[]
+    /** 'add' merges with existing tags, 'remove' deletes specific tags, 'set' replaces all tags.
+     *
+     * * `add` - add
+     * * `remove` - remove
+     * * `set` - set */
+    action: BulkUpdateTagsActionEnumApi
+    /**
+     * Tag names to add, remove, or set (up to 100 per request, 255 characters each).
+     * @maxItems 100
+     * @items.maxLength 255
+     */
+    tags: string[]
+}
+
+export interface BulkUpdateTagsUUIDItemApi {
+    /** UUID of the object whose tags were updated. */
+    id: string
+    /** The object's full tag list after the update. */
+    tags: string[]
+}
+
+export interface BulkUpdateTagsUUIDErrorApi {
+    /** UUID of the object that was skipped. */
+    id: string
+    /** Why the object was skipped, e.g. 'Not found or no edit access'. */
+    reason: string
+}
+
+export interface BulkUpdateTagsUUIDResponseApi {
+    /** Objects whose tags were successfully updated. */
+    updated: BulkUpdateTagsUUIDItemApi[]
+    /** Objects that were skipped, with a reason each. */
+    skipped: BulkUpdateTagsUUIDErrorApi[]
+}
+
+export interface EventDefinitionBulkUpdateVerifiedRequestApi {
+    /**
+     * List of event definition UUIDs to update.
+     * @maxItems 500
+     */
+    ids: string[]
+    /** Target verified state to apply to every matched event. `true` marks the events as verified (and unhides them, since an event cannot be both hidden and verified); `false` unverifies them. */
+    verified: boolean
+}
+
+export interface EventDefinitionBulkUpdateVerifiedItemApi {
+    /** UUID of the event definition whose verified state changed. */
+    id: string
+    /** The event's verified state after the update. */
+    verified: boolean
+}
+
+export interface EventDefinitionBulkUpdateVerifiedResponseApi {
+    /** Events whose verified state was changed. Events already in the target state are omitted. */
+    updated: EventDefinitionBulkUpdateVerifiedItemApi[]
+    /** Events that were skipped (e.g. not found in this project), with a reason each. */
+    skipped: BulkUpdateTagsUUIDErrorApi[]
+}
+
+/**
+ * * `posthog-go` - posthog-go 1.x
+ * * `posthog-go-v2` - posthog-go 2.x
+ */
+export type GoSDKEnumApi = (typeof GoSDKEnumApi)[keyof typeof GoSDKEnumApi]
+
+export const GoSDKEnumApi = {
+    PosthogGo: 'posthog-go',
+    PosthogGoV2: 'posthog-go-v2',
+} as const
+
+export interface GeneratedGolangDefinitionsApi {
+    /** The generated module, ready to write to a file. */
+    content: string
+    /** How many events the module types. */
+    event_count: number
+    /** A hash of the event schemas and generator version. It changes when the module would change. */
+    schema_hash: string
+    /** The version of the generator that wrote the module. */
+    generator_version: string
+    /** The posthog-go major the package imports. Clients check it to detect a PostHog that ignores `sdk`.
+     *
+     * * `posthog-go` - posthog-go 1.x
+     * * `posthog-go-v2` - posthog-go 2.x */
+    sdk?: GoSDKEnumApi
+}
+
+/**
+ * Mapping from event name to the team-configured primary property for that event. Names without a configured primary property are omitted; callers should fall back to the core taxonomy defaults for those.
+ */
+export type PrimaryPropertiesResponseApiPrimaryProperties = { [key: string]: string }
+
+export interface PrimaryPropertiesResponseApi {
+    /** Mapping from event name to the team-configured primary property for that event. Names without a configured primary property are omitted; callers should fall back to the core taxonomy defaults for those. */
+    primary_properties: PrimaryPropertiesResponseApiPrimaryProperties
+}
+
+/**
+ * * `posthog-js` - posthog-js
+ * * `none` - None
+ */
+export type TypeScriptSDKEnumApi = (typeof TypeScriptSDKEnumApi)[keyof typeof TypeScriptSDKEnumApi]
+
+export const TypeScriptSDKEnumApi = {
+    PosthogJs: 'posthog-js',
+    None: 'none',
+} as const
+
+export interface GeneratedDefinitionsApi {
+    /** The generated module, ready to write to a file. */
+    content: string
+    /** How many events the module types. */
+    event_count: number
+    /** A hash of the event schemas and generator version. It changes when the module would change. */
+    schema_hash: string
+    /** The version of the generator that wrote the module. */
+    generator_version: string
+    /** TypeScript only: the SDK the module wraps. Clients check it to detect a PostHog that ignores `sdk`.
+     *
+     * * `posthog-js` - posthog-js
+     * * `none` - None */
+    sdk?: TypeScriptSDKEnumApi
+}
+
+export type EventDefinitionsListParams = {
+    /**
+     * `event_custom` keeps only names without a `$` prefix and `event_posthog` only names with one. Default `event`.
+     */
+    event_type?: EventDefinitionsListEventType
+    /**
+     * When true, omit events that have been explicitly hidden by a team admin (Enterprise only).
+     */
+    exclude_hidden?: boolean
+    /**
+     * When true, omit events whose last ingested occurrence is older than 30 days. Events that have never been seen (`last_seen_at` is null) are kept so newly-defined events remain discoverable. Default false. If a search returns zero results with this filter on, retry with `exclude_stale=false` and tell the user the matches are stale.
+     */
+    exclude_stale?: boolean
+    /**
+     * JSON-encoded list of event names to omit. The name matches the property definitions endpoint that shares it.
+     */
+    excluded_properties?: string
+    /**
+     * When true, find similar event names only if the filtered search has no matches.
+     */
+    fuzzy_search?: boolean
+    /**
+     * Number of results to return per page.
+     * @minimum 1
+     */
+    limit?: number
+    /**
+     * Return exact matches for these event names. Pass names as repeated or comma-separated values.
+     */
+    names?: string[]
+    /**
+     * The initial index from which to return the results.
+     * @minimum 0
+     */
+    offset?: number
+    /**
+     * Sort keys, prefixed with `-` for descending. Default `-last_seen_at::date` then `name`. Projects with more than 100000 event definitions default to `name`, unless the request sets `search`, `exclude_stale`, `verified`, `names`, `tags` or `event_type=event_posthog`.
+     */
+    ordering?: string[]
+    /**
+     * Case-insensitive match on the event name. Every whitespace-separated term has to match.
+     */
+    search?: string
+    /**
+     * JSON-encoded list of tag names. Keeps events that carry any of them.
+     */
+    tags?: string
+    /**
+     * When true, keep only verified events and core PostHog events. When false, keep the rest (Enterprise only).
+     */
+    verified?: boolean
+}
+
+export type EventDefinitionsListEventType =
+    (typeof EventDefinitionsListEventType)[keyof typeof EventDefinitionsListEventType]
+
+export const EventDefinitionsListEventType = {
+    Event: 'event',
+    EventCustom: 'event_custom',
+    EventPosthog: 'event_posthog',
+} as const
+
+export type EventDefinitionsByNameRetrieveParams = {
+    /**
+     * The exact event name to look up
+     */
+    name: string
+}
+
+export type EventDefinitionsGolangRetrieveParams = {
+    /**
+     * The posthog-go major the package imports. `posthog-go` imports `github.com/posthog/posthog-go` (1.x). `posthog-go-v2` imports `github.com/posthog/posthog-go/v2` (2.x). A package built for one major does not compile against the other.
+     *
+     * * `posthog-go` - posthog-go 1.x
+     * * `posthog-go-v2` - posthog-go 2.x
+     * @minLength 1
+     */
+    sdk?: EventDefinitionsGolangRetrieveSdk
+}
+
+export type EventDefinitionsGolangRetrieveSdk =
+    (typeof EventDefinitionsGolangRetrieveSdk)[keyof typeof EventDefinitionsGolangRetrieveSdk]
+
+export const EventDefinitionsGolangRetrieveSdk = {
+    PosthogGo: 'posthog-go',
+    PosthogGoV2: 'posthog-go-v2',
+} as const
+
+export type EventDefinitionsPrimaryPropertiesRetrieveParams = {
+    /**
+     * Optional: restrict the response to these event names. Repeat the parameter for multiple names (e.g. `?names=a&names=b`). When omitted, returns every team-configured primary property.
+     */
+    names?: string[]
+}
+
+export type EventDefinitionsTypescriptRetrieveParams = {
+    /**
+     * The SDK the module wraps. `posthog-js` exports a typed posthog-js instance. `none` exports only the event types, with no imports, for any other SDK.
+     *
+     * * `posthog-js` - posthog-js
+     * * `none` - None
+     * @minLength 1
+     */
+    sdk?: EventDefinitionsTypescriptRetrieveSdk
+}
+
+export type EventDefinitionsTypescriptRetrieveSdk =
+    (typeof EventDefinitionsTypescriptRetrieveSdk)[keyof typeof EventDefinitionsTypescriptRetrieveSdk]
+
+export const EventDefinitionsTypescriptRetrieveSdk = {
+    PosthogJs: 'posthog-js',
+    None: 'none',
+} as const

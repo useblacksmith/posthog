@@ -1,0 +1,574 @@
+import { MOCK_DEFAULT_ORGANIZATION, MOCK_DEFAULT_TEAM, MOCK_DEFAULT_USER, MOCK_TEAM_ID } from 'lib/api.mock'
+
+import { render } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { router } from 'kea-router'
+import { expectLogic } from 'kea-test-utils'
+
+import { productSetupStatusLogic } from 'lib/components/ProductEmptyState/productSetupStatusLogic'
+import { ProductSetupStatus } from 'lib/components/ProductEmptyState/types'
+import { reverseProxyCheckerLogic } from 'lib/components/ReverseProxyChecker/reverseProxyCheckerLogic'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
+import { apiStatusLogic } from 'lib/logic/apiStatusLogic'
+import { billingLogic } from 'lib/logic/billing/billingLogic'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { preflightLogic } from 'lib/logic/preflightLogic'
+import { verifyEmailLogic } from 'scenes/authentication/verify-email/verifyEmailLogic'
+import { organizationLogic } from 'scenes/organizationLogic'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { useMocks } from '~/mocks/jest'
+import { ProductKey } from '~/queries/schema/schema-general'
+import { initKeaTests } from '~/test/init'
+import { AppContext } from '~/types'
+
+import { projectNoticeLogic } from './projectNoticeLogic'
+
+const DISMISS_KEY = 'project-notice-dismissed.missing_reverse_proxy'
+
+window.POSTHOG_APP_CONTEXT = {
+    current_team: { id: MOCK_TEAM_ID },
+    current_project: { id: MOCK_TEAM_ID },
+} as unknown as AppContext
+
+describe('projectNoticeLogic', () => {
+    describe('projects without events', () => {
+        it.each<ProductSetupStatus>(['loading', 'unknown', 'has-data', 'needs-setup'])(
+            'only shows the no-events notice after warehouse setup is ruled out (%s)',
+            (status) => {
+                initKeaTests()
+                teamLogic.actions.loadCurrentTeamSuccess({ ...MOCK_DEFAULT_TEAM, ingested_event: false })
+                userLogic.actions.loadUserSuccess({ ...MOCK_DEFAULT_USER, is_email_verified: true })
+                const logic = projectNoticeLogic()
+                logic.mount()
+                productSetupStatusLogic({ productKey: ProductKey.DATA_WAREHOUSE }).actions.setDetectedStatus(status)
+
+                expect(logic.values.postHogNoticeVariant === 'real_project_with_no_events').toBe(
+                    status === 'needs-setup'
+                )
+                logic.unmount()
+            }
+        )
+    })
+
+    describe('proxy records conditional loading', () => {
+        let getItemSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            useMocks({
+                get: {
+                    '/api/organizations/:organization_id/proxy_records': [200, { results: [] }],
+                },
+            })
+            initKeaTests()
+            getItemSpy = jest.spyOn(Storage.prototype, 'getItem')
+        })
+
+        afterEach(() => {
+            getItemSpy.mockRestore()
+            jest.useRealTimers()
+        })
+
+        it.each([
+            { label: 'day of month is > 7', date: new Date(2026, 3, 15), dismissed: false },
+            { label: 'notice is dismissed', date: new Date(2026, 3, 3), dismissed: true },
+        ])('does not load proxy records when $label', async ({ date, dismissed }) => {
+            jest.useFakeTimers()
+            jest.setSystemTime(date)
+            getItemSpy.mockImplementation((key: string) => (dismissed && key === DISMISS_KEY ? 'true' : null))
+
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            await expectLogic(logic).toNotHaveDispatchedActions(['loadRecords'])
+            expect(logic.values.proxyRecords).toBeNull()
+
+            logic.unmount()
+        })
+
+        it('loads proxy records when day <= 7 and notice not dismissed', async () => {
+            jest.useFakeTimers()
+            jest.setSystemTime(new Date(2026, 3, 3)) // April 3
+
+            getItemSpy.mockImplementation(() => null)
+
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            await expectLogic(logic).toDispatchActions(['loadRecords'])
+
+            logic.unmount()
+        })
+    })
+
+    describe('unauthenticated session', () => {
+        let getItemSpy: jest.SpyInstance
+        let getDateSpy: jest.SpyInstance
+        let originalAppContext: AppContext | undefined
+
+        beforeEach(() => {
+            originalAppContext = window.POSTHOG_APP_CONTEXT
+            // Simulate a missing/expired session — userLogic boots to a null user.
+            window.POSTHOG_APP_CONTEXT = {
+                ...originalAppContext,
+                current_user: null,
+            } as unknown as AppContext
+            useMocks({
+                get: {
+                    '/api/organizations/:organization_id/proxy_records': [200, { results: [] }],
+                },
+                post: {
+                    '/api/environments/:team_id/query/:kind': () => [200, { results: [] }],
+                },
+            })
+            initKeaTests()
+            getItemSpy = jest.spyOn(Storage.prototype, 'getItem').mockImplementation(() => null)
+            // Inside the first-7-days nudge window, so only the auth guard can hold the fetch back.
+            getDateSpy = jest.spyOn(Date.prototype, 'getDate').mockReturnValue(3)
+        })
+
+        afterEach(() => {
+            getItemSpy.mockRestore()
+            getDateSpy.mockRestore()
+            window.POSTHOG_APP_CONTEXT = originalAppContext
+        })
+
+        it('does not load proxy records when the user is unauthenticated', async () => {
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            await expectLogic(logic).toNotHaveDispatchedActions(['loadRecords'])
+            expect(logic.values.proxyRecords).toBeNull()
+
+            logic.unmount()
+        })
+    })
+
+    describe.each([
+        { status: 401, reason: 'missing or expired session' },
+        { status: 403, reason: 'restricted org member below read access' },
+    ])('proxy records $status handling', ({ status }) => {
+        let getItemSpy: jest.SpyInstance
+        let getDateSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            useMocks({
+                get: {
+                    // Function form so the [status, body] tuple is honored — a static array value
+                    // would be served as a 200 JSON body instead of the error status.
+                    '/api/organizations/:organization_id/proxy_records': () => [status, {}],
+                },
+                post: {
+                    '/api/environments/:team_id/query/:kind': () => [200, { results: [] }],
+                },
+            })
+            initKeaTests()
+            getItemSpy = jest.spyOn(Storage.prototype, 'getItem').mockImplementation(() => null)
+            getDateSpy = jest.spyOn(Date.prototype, 'getDate').mockReturnValue(3)
+        })
+
+        afterEach(() => {
+            getItemSpy.mockRestore()
+            getDateSpy.mockRestore()
+        })
+
+        it(`swallows a ${status} instead of surfacing a load failure`, async () => {
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            await expectLogic(logic).toDispatchActions(['loadRecords', 'loadRecordsSuccess'])
+            await expectLogic(logic).toNotHaveDispatchedActions(['loadRecordsFailure'])
+            expect(logic.values.proxyRecords).toBeNull()
+
+            logic.unmount()
+        })
+    })
+
+    describe('reverse proxy checker connection', () => {
+        let getItemSpy: jest.SpyInstance
+        let getDateSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            useMocks({
+                get: {
+                    // currentOrganizationId resolves to the loaded org id, not "@current" —
+                    // match any id so loadRecords resolves instead of erroring.
+                    '/api/organizations/:organization_id/proxy_records': [200, { results: [] }],
+                },
+                post: {
+                    // reverseProxyCheckerLogic's HogQL detection query.
+                    '/api/environments/:team_id/query/:kind': () => [200, { results: [] }],
+                },
+            })
+            initKeaTests()
+            getItemSpy = jest.spyOn(Storage.prototype, 'getItem').mockImplementation(() => null)
+            getDateSpy = jest.spyOn(Date.prototype, 'getDate')
+        })
+
+        afterEach(() => {
+            getItemSpy.mockRestore()
+            getDateSpy.mockRestore()
+        })
+
+        it.each([
+            { label: 'inside the nudge window', dayOfMonth: 3 },
+            { label: 'outside the nudge window', dayOfMonth: 15 },
+        ])('mounts the connected checker $label and tears it down on unmount', async ({ dayOfMonth }) => {
+            getDateSpy.mockReturnValue(dayOfMonth)
+
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            // Connected via connect(), so it mounts with projectNoticeLogic regardless of the date gate.
+            expect(reverseProxyCheckerLogic.isMounted()).toBe(true)
+            // Let the auto-triggered detection settle so no async work outlives the test.
+            await expectLogic(reverseProxyCheckerLogic).toDispatchActions(['loadHasReverseProxySuccess'])
+
+            logic.unmount()
+            expect(reverseProxyCheckerLogic.isMounted()).toBe(false)
+        })
+    })
+
+    describe('reverse proxy banner suppression', () => {
+        let getItemSpy: jest.SpyInstance
+        let getDateSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            useMocks({
+                get: {
+                    '/api/organizations/:organization_id/proxy_records': [200, { results: [] }],
+                },
+                post: {
+                    '/api/environments/:team_id/query/:kind': () => [200, { results: [] }],
+                },
+            })
+            initKeaTests()
+            // isCloudOrDev gates the nudge — self-hosted users manage their own infrastructure.
+            preflightLogic.actions.loadPreflightSuccess({ cloud: true } as any)
+            getItemSpy = jest.spyOn(Storage.prototype, 'getItem').mockImplementation(() => null)
+            // Inside the first-7-days nudge window.
+            getDateSpy = jest.spyOn(Date.prototype, 'getDate').mockReturnValue(3)
+        })
+
+        afterEach(() => {
+            getItemSpy.mockRestore()
+            getDateSpy.mockRestore()
+        })
+
+        // Drives the projectNoticeVariant selector deterministically: wait for the checker's
+        // auto-load to settle, then force the detection result and an empty managed-proxy list so
+        // the assertion doesn't depend on async msw timing. A forced value wins because it is
+        // dispatched after the awaited auto-load.
+        const mountWithDetectedProxy = async (
+            hasReverseProxy: boolean
+        ): Promise<ReturnType<typeof projectNoticeLogic>> => {
+            const logic = projectNoticeLogic()
+            logic.mount()
+            await expectLogic(reverseProxyCheckerLogic).toDispatchActions(['loadHasReverseProxySuccess'])
+            reverseProxyCheckerLogic.actions.loadHasReverseProxySuccess(hasReverseProxy)
+            logic.actions.loadRecordsSuccess([])
+            return logic
+        }
+
+        it('suppresses the nudge when a self-managed proxy is detected', async () => {
+            const logic = await mountWithDetectedProxy(true)
+
+            // Zero managed proxy records, but a DIY proxy is routing events — the banner must not nag.
+            expect(logic.values.projectNoticeVariant).not.toEqual('missing_reverse_proxy')
+
+            logic.unmount()
+        })
+
+        it('shows the nudge when no proxy exists and there are no managed records', async () => {
+            const logic = await mountWithDetectedProxy(false)
+
+            expect(logic.values.projectNoticeVariant).toEqual('missing_reverse_proxy')
+
+            logic.unmount()
+        })
+    })
+
+    describe('unverified email banner CTA', () => {
+        beforeEach(() => {
+            useMocks({
+                get: {
+                    '/api/organizations/:organization_id/proxy_records': [200, { results: [] }],
+                },
+                post: {
+                    '/api/users/request_email_verification/': [200, { success: true }],
+                },
+            })
+            initKeaTests()
+        })
+
+        it('mounts verifyEmailLogic so the CTA reaches its request loader', async () => {
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            // The banner renders on every scene, but verifyEmailLogic is otherwise only mounted on the
+            // verify-email scene — without this connection the CTA action dispatches into an unmounted
+            // logic and silently no-ops.
+            expect(verifyEmailLogic.isMounted()).toBe(true)
+
+            await expectLogic(verifyEmailLogic, () => {
+                verifyEmailLogic.actions.requestVerificationCode('test-uuid')
+            }).toDispatchActions(['requestVerificationCode', 'requestVerificationCodeSuccess'])
+
+            logic.unmount()
+        })
+
+        // The verification email carries a 6-digit code, not a link. A CTA that only sends the
+        // code leaves a logged-in user (Vercel-provisioned accounts hit this) with nowhere to type it.
+        it('sends a code and routes to the code entry page when the banner CTA is clicked', async () => {
+            preflightLogic.actions.loadPreflightSuccess({ email_service_available: true } as any)
+            userLogic.actions.loadUserSuccess({ ...MOCK_DEFAULT_USER, is_email_verified: false })
+            router.actions.push(urls.settings('user'))
+
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            expect(logic.values.projectNoticeVariant).toEqual('unverified_email')
+
+            await expectLogic(verifyEmailLogic, () => {
+                logic.values.projectNotice?.action?.onClick?.({} as any)
+            }).toDispatchActions(['requestVerificationCode', 'requestVerificationCodeSuccess'])
+
+            // Routing prefixes the current project, so assert the targets rather than exact paths.
+            expect(router.values.location.pathname).toMatch(new RegExp(`${urls.verifyEmail(MOCK_DEFAULT_USER.uuid)}$`))
+            expect(router.values.searchParams.next).toMatch(new RegExp(`${urls.settings('user')}$`))
+
+            logic.unmount()
+        })
+    })
+
+    describe('reverse proxy banner CTA navigation', () => {
+        let getItemSpy: jest.SpyInstance
+        let getDateSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            useMocks({
+                get: {
+                    '/api/organizations/:organization_id/proxy_records': [200, { results: [] }],
+                },
+                post: {
+                    '/api/environments/:team_id/query/:kind': () => [200, { results: [] }],
+                },
+            })
+            initKeaTests()
+            preflightLogic.actions.loadPreflightSuccess({ cloud: true } as any)
+            getItemSpy = jest.spyOn(Storage.prototype, 'getItem').mockImplementation(() => null)
+            getDateSpy = jest.spyOn(Date.prototype, 'getDate').mockReturnValue(3)
+        })
+
+        afterEach(() => {
+            getItemSpy.mockRestore()
+            getDateSpy.mockRestore()
+        })
+
+        // The CTA used to be a mid-sentence inline <Link> in the banner message — a small, fragile
+        // click target. A user clicked it and nothing happened (no navigation, no autocapture). It now
+        // lives in the banner's `action` prop as a real button; this asserts that button still routes.
+        it('navigates to the reverse proxy settings when the banner CTA is clicked', async () => {
+            const logic = projectNoticeLogic()
+            logic.mount()
+            await expectLogic(reverseProxyCheckerLogic).toDispatchActions(['loadHasReverseProxySuccess'])
+            reverseProxyCheckerLogic.actions.loadHasReverseProxySuccess(false)
+            logic.actions.loadRecordsSuccess([])
+
+            expect(logic.values.projectNoticeVariant).toEqual('missing_reverse_proxy')
+
+            const notice = logic.values.projectNotice
+            const { container } = render(
+                <LemonBanner type={notice?.type || 'info'} action={notice?.action} onClose={notice?.onClose}>
+                    {notice?.message}
+                </LemonBanner>
+            )
+
+            // The banner renders the action at two responsive breakpoints, both sharing the data-attr.
+            const cta = container.querySelector<HTMLElement>('[data-attr="missing-reverse-proxy-settings_link"]')
+            expect(cta).not.toBeNull()
+
+            await userEvent.click(cta!)
+
+            // Routing prefixes the current project, so assert the settings target rather than an exact path.
+            expect(router.values.location.pathname).toMatch(/\/settings\/organization-proxy$/)
+
+            logic.unmount()
+        })
+    })
+
+    describe('billing alert CTA navigation', () => {
+        beforeEach(() => {
+            initKeaTests()
+        })
+
+        it('links single-product billing alerts to that product from the billing root', () => {
+            router.actions.push(urls.organizationBilling())
+            billingLogic.mount()
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            billingLogic.actions.setBillingAlert({
+                status: 'error',
+                title: 'Usage limit reached',
+                message: 'You have reached the usage limit for Product analytics.',
+                productKey: ProductKey.PRODUCT_ANALYTICS,
+            })
+
+            expect(logic.values.projectNoticeVariant).toBe('billing_alert')
+            expect(logic.values.projectNotice?.action).toEqual(
+                expect.objectContaining({
+                    to: urls.organizationBilling([ProductKey.PRODUCT_ANALYTICS]),
+                    children: 'Manage billing',
+                })
+            )
+
+            logic.unmount()
+            billingLogic.unmount()
+        })
+
+        it.each([
+            ['billing root', urls.organizationBilling()],
+            ['billing overview', urls.organizationBillingSection('overview')],
+        ])('hides generic billing alert CTAs on the %s page with checkout query params', (_, billingPath) => {
+            router.actions.push(billingPath, { success: 'true' })
+            billingLogic.mount()
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            billingLogic.actions.setBillingAlert({
+                status: 'error',
+                title: 'Usage limit reached',
+                message: 'You have reached a usage limit.',
+            })
+
+            expect(logic.values.projectNoticeVariant).toBe('billing_alert')
+            expect(logic.values.projectNotice?.action).toBeUndefined()
+
+            logic.unmount()
+            billingLogic.unmount()
+        })
+
+        it.each([
+            ['billing root', urls.organizationBilling()],
+            ['billing overview', urls.organizationBillingSection('overview')],
+        ])('hides single-product billing alert CTAs when the current %s URL targets that product', (_, billingPath) => {
+            router.actions.push(billingPath, {
+                products: ProductKey.PRODUCT_ANALYTICS,
+                success: 'true',
+            })
+            billingLogic.mount()
+            const logic = projectNoticeLogic()
+            logic.mount()
+
+            billingLogic.actions.setBillingAlert({
+                status: 'error',
+                title: 'Usage limit reached',
+                message: 'You have reached the usage limit for Product analytics.',
+                productKey: ProductKey.PRODUCT_ANALYTICS,
+            })
+
+            expect(logic.values.projectNoticeVariant).toBe('billing_alert')
+            expect(logic.values.projectNotice?.action).toBeUndefined()
+
+            logic.unmount()
+            billingLogic.unmount()
+        })
+
+        it.each([
+            ['billing root', urls.organizationBilling()],
+            ['billing overview', urls.organizationBillingSection('overview')],
+        ])(
+            'keeps single-product billing alert CTAs when the current %s URL does not target that product',
+            (_, billingPath) => {
+                router.actions.push(billingPath, { success: 'true' })
+                billingLogic.mount()
+                const logic = projectNoticeLogic()
+                logic.mount()
+
+                billingLogic.actions.setBillingAlert({
+                    status: 'error',
+                    title: 'Usage limit reached',
+                    message: 'You have reached the usage limit for Product analytics.',
+                    productKey: ProductKey.PRODUCT_ANALYTICS,
+                })
+
+                expect(logic.values.projectNoticeVariant).toBe('billing_alert')
+                expect(logic.values.projectNotice?.action).toEqual(
+                    expect.objectContaining({
+                        to: urls.organizationBilling([ProductKey.PRODUCT_ANALYTICS]),
+                        children: 'Manage billing',
+                    })
+                )
+
+                logic.unmount()
+                billingLogic.unmount()
+            }
+        )
+    })
+
+    describe('organization member notice', () => {
+        beforeEach(() => {
+            useMocks({
+                get: {
+                    '/api/organizations/:organization_id/proxy_records': [200, { results: [] }],
+                },
+            })
+            initKeaTests()
+        })
+
+        it('shows only after the other notices, and stays after they are dismissed for the session', () => {
+            const logic = projectNoticeLogic()
+            logic.mount()
+            organizationLogic.actions.loadCurrentOrganizationSuccess({
+                ...MOCK_DEFAULT_ORGANIZATION,
+                member_notice: {
+                    message: 'Read <b>how</b> we handle your data.',
+                    action: { label: 'Read the policy', url: 'https://intranet.example.com/policy' },
+                },
+            })
+            apiStatusLogic.actions.setInternetConnectionIssue(true)
+            expect(logic.values.projectNoticeVariant).toEqual('internet_connection_issue')
+
+            apiStatusLogic.actions.setInternetConnectionIssue(false)
+            expect(logic.values.projectNoticeVariant).toEqual('organization_member_notice')
+
+            logic.actions.dismissProjectNotice('invite_teammates')
+            expect(logic.values.projectNoticeVariant).toEqual('organization_member_notice')
+            expect(logic.values.projectNotice?.onClose).toBeUndefined()
+            expect(logic.values.projectNotice?.action).toMatchObject({
+                to: 'https://intranet.example.com/policy',
+                targetBlank: true,
+                children: 'Read the policy',
+            })
+
+            logic.unmount()
+        })
+
+        it.each([
+            {
+                label: 'falls back to the member notice',
+                memberNotice: { message: 'Read the policy.' },
+                expected: 'organization_member_notice',
+            },
+            { label: 'shows nothing without a member notice', memberNotice: null, expected: null },
+        ])('$label when the hide-notice flag is on and a PostHog notice applies', ({ memberNotice, expected }) => {
+            const logic = projectNoticeLogic()
+            logic.mount()
+            organizationLogic.actions.loadCurrentOrganizationSuccess({
+                ...MOCK_DEFAULT_ORGANIZATION,
+                member_notice: memberNotice,
+            })
+            apiStatusLogic.actions.setInternetConnectionIssue(true)
+
+            featureFlagLogic.actions.setFeatureFlags([], { [FEATURE_FLAGS.UX_HIDE_PROJECT_NOTICE]: true })
+
+            expect(logic.values.projectNoticeVariant).toEqual(expected)
+
+            logic.unmount()
+        })
+    })
+})

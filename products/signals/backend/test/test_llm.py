@@ -1,0 +1,292 @@
+import os
+import json
+import importlib
+from collections.abc import Iterator
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from django.test import override_settings
+
+from anthropic.types import Message, TextBlock, Usage
+
+from products.signals.backend.llm_spend import _generation_source
+from products.signals.backend.temporal import llm
+from products.signals.backend.temporal.llm import call_llm
+from products.signals.eval.llm_gen.client import CanonicalSignal, CanonicalSignalBatch, generate_canonical_signals
+
+MODULE_PATH = "products.signals.backend.temporal.llm"
+
+
+@pytest.fixture(autouse=True)
+def no_trial() -> Iterator[None]:
+    with (
+        patch("products.signals.backend.trial.reports.requires_trial_accounting", return_value=False),
+        patch("products.signals.backend.llm_spend.TrialLLMExecution.prepare", return_value=None),
+    ):
+        yield
+
+
+def _text_response(text: str) -> Message:
+    return Message(
+        id="msg_test",
+        content=[TextBlock(text=text, type="text")],
+        model="claude-sonnet-4-5",
+        role="assistant",
+        type="message",
+        usage=Usage(input_tokens=1, output_tokens=1),
+    )
+
+
+def _mock_anthropic_client() -> MagicMock:
+    client = MagicMock()
+    client.messages.create = AsyncMock(return_value=_text_response("ok"))
+    return client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [None, "claude-opus-5"])
+async def test_trial_short_stage_preserves_regular_model_profile(model: str | None) -> None:
+    client = _mock_anthropic_client()
+    client.with_options.return_value = client
+    client.default_headers = {}
+    source_token = _generation_source.set("generation:trial")
+    try:
+        with (
+            patch("products.signals.backend.trial.reports.requires_trial_accounting", return_value=True),
+            patch(f"{MODULE_PATH}.build_async_anthropic_client", return_value=client),
+        ):
+            assert (
+                await call_llm(
+                    team_id=1,
+                    system_prompt="s",
+                    user_prompt="u",
+                    validate=lambda text: text,
+                    thinking=True,
+                    model=model,
+                    ai_product="signals_grouping",
+                )
+                == "ok"
+            )
+    finally:
+        _generation_source.reset(source_token)
+    request = client.messages.create.call_args.kwargs
+    assert request["model"] == (model or llm.MATCHING_MODEL)
+    assert request["thinking"] == {"type": "adaptive"}
+    assert request["output_config"] == llm.effort_kwargs(model or llm.MATCHING_MODEL)["output_config"]
+    assert request["messages"] == [{"role": "user", "content": "u"}]
+    assert json.loads(request["extra_headers"]["X-PostHog-Properties"])["signals_cost_source_id"] == "generation:trial"
+    client.with_options.assert_called_with(max_retries=0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_text", [False, True])
+async def test_explicit_refusal_is_not_treated_as_text(has_text: bool) -> None:
+    response = _text_response("refused")
+    response.stop_reason = "refusal"
+    if not has_text:
+        response.content = []
+    client = _mock_anthropic_client()
+    client.messages.create.return_value = response
+    with patch(f"{MODULE_PATH}.build_async_anthropic_client", return_value=client):
+        with pytest.raises(llm.LLMRefusalError):
+            await call_llm(
+                team_id=1, system_prompt="s", user_prompt="u", validate=lambda text: text, ai_product="signals_grouping"
+            )
+
+
+@pytest.mark.asyncio
+@override_settings(AI_GATEWAY_URL="https://ai-gateway.example/v1", AI_GATEWAY_API_KEY="phs_test")
+async def test_gateway_mode_omits_legacy_stage_header():
+    client = _mock_anthropic_client()
+    with patch(f"{MODULE_PATH}.build_async_anthropic_client", return_value=client) as build_client:
+        await call_llm(
+            team_id=1,
+            system_prompt="s",
+            user_prompt="u",
+            validate=lambda text: text,
+            stage="match",
+            ai_product="signals_grouping",
+            trace_id="decision-1",
+            properties={"signals_decision_id": "decision-1"},
+        )
+
+    assert build_client.call_args.kwargs["trace_id"] == "decision-1"
+    assert build_client.call_args.kwargs["properties"] == {"signals_decision_id": "decision-1"}
+    # In gateway mode the labels ride on the builder's X-PostHog-Properties blob; the per-key
+    # ai_stage header (which the Go gateway drops) must not be sent.
+    assert "extra_headers" not in client.messages.create.call_args.kwargs
+
+
+@pytest.mark.asyncio
+@override_settings(AI_GATEWAY_URL="", AI_GATEWAY_API_KEY="")
+async def test_fallback_mode_sends_legacy_stage_header():
+    client = _mock_anthropic_client()
+    with patch(f"{MODULE_PATH}.build_async_anthropic_client", return_value=client):
+        await call_llm(
+            team_id=1,
+            system_prompt="s",
+            user_prompt="u",
+            validate=lambda text: text,
+            stage="match",
+            ai_product="signals_grouping",
+        )
+
+    # On the Python-gateway fallback the stage still rides as a per-key header the route reads.
+    assert client.messages.create.call_args.kwargs["extra_headers"] == {"x-posthog-property-ai_stage": "match"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cache_system_prompt,expected_system",
+    [
+        (False, "s"),
+        (True, [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}]),
+    ],
+)
+async def test_cache_system_prompt_marks_the_system_block(
+    cache_system_prompt: bool, expected_system: str | list[dict[str, object]]
+) -> None:
+    client = _mock_anthropic_client()
+    with patch(f"{MODULE_PATH}.build_async_anthropic_client", return_value=client):
+        await call_llm(
+            team_id=1,
+            system_prompt="s",
+            user_prompt="u",
+            validate=lambda text: text,
+            stage="safety_filter",
+            ai_product="signals_safety",
+            cache_system_prompt=cache_system_prompt,
+        )
+
+    assert client.messages.create.call_args.kwargs["system"] == expected_system
+
+
+@pytest.mark.asyncio
+@override_settings(AI_GATEWAY_URL="https://ai-gateway.example/v1", AI_GATEWAY_API_KEY="phs_test")
+async def test_non_message_response_raises_descriptive_error():
+    client = _mock_anthropic_client()
+    client.messages.create.return_value = "not json"
+
+    with (
+        patch(f"{MODULE_PATH}.build_async_anthropic_client", return_value=client),
+        pytest.raises(TypeError, match="Expected Anthropic Message response, got str"),
+    ):
+        await call_llm(
+            team_id=1,
+            system_prompt="s",
+            user_prompt="u",
+            validate=lambda text: text,
+            stage="match",
+            ai_product="signals_grouping",
+        )
+
+
+@pytest.mark.asyncio
+async def test_eval_fixture_generation_opts_in_as_signals_eval():
+    batch = CanonicalSignalBatch(signals=[CanonicalSignal(title="a" * 10, body="b" * 20)])
+    with patch("products.signals.eval.llm_gen.client.call_llm", new=AsyncMock(return_value=batch)) as generation_call:
+        await generate_canonical_signals(team_id=1, system_prompt="s", user_prompt="u")
+
+    kwargs = generation_call.call_args.kwargs
+    assert kwargs["ai_product"] == "signals_eval"
+    assert kwargs["stage"] == "eval_signal_generation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model,thinking,expect_prefill,expect_temperature,expect_thinking,expect_effort",
+    [
+        ("claude-sonnet-4-5", False, True, True, None, None),
+        ("claude-sonnet-4-5", True, False, True, "enabled", None),
+        ("claude-sonnet-5", False, False, False, None, "medium"),
+        ("claude-sonnet-5", True, False, False, "adaptive", "medium"),
+        ("claude-sonnet-5-5", False, False, False, None, "medium"),
+        ("claude-sonnet-5-5", True, False, False, "adaptive", "medium"),
+        ("claude-sonnet-4-6", False, False, True, None, "medium"),
+    ],
+)
+async def test_request_shape_follows_model_capabilities(
+    model, thinking, expect_prefill, expect_temperature, expect_thinking, expect_effort
+):
+    client = _mock_anthropic_client()
+    with (
+        patch(f"{MODULE_PATH}.MATCHING_MODEL", model),
+        patch(f"{MODULE_PATH}.build_async_anthropic_client", return_value=client),
+    ):
+        await call_llm(
+            team_id=1,
+            system_prompt="s",
+            user_prompt="u",
+            validate=lambda text: text,
+            thinking=thinking,
+            stage="match",
+            ai_product="signals_grouping",
+        )
+
+    kwargs = client.messages.create.call_args.kwargs
+    prefilled = kwargs["messages"][-1]["role"] == "assistant"
+    assert prefilled is expect_prefill
+    assert ("temperature" in kwargs) is expect_temperature
+    assert (kwargs.get("thinking") or {}).get("type") == expect_thinking
+    assert kwargs.get("output_config") == ({"effort": expect_effort} if expect_effort else None)
+
+
+@pytest.mark.asyncio
+async def test_explicit_model_overrides_the_matching_model() -> None:
+    client = _mock_anthropic_client()
+    with (
+        patch(f"{MODULE_PATH}.MATCHING_MODEL", "claude-sonnet-4-5"),
+        patch(f"{MODULE_PATH}.build_async_anthropic_client", return_value=client),
+    ):
+        await call_llm(
+            team_id=1,
+            system_prompt="s",
+            user_prompt="u",
+            validate=lambda text: text,
+            stage="safety_filter",
+            ai_product="signals_safety",
+            model="claude-sonnet-5",
+        )
+
+    kwargs = client.messages.create.call_args.kwargs
+
+    # The capabilities follow the override, not MATCHING_MODEL, so dropping it flips all three.
+    assert kwargs["model"] == "claude-sonnet-5"
+    assert kwargs["messages"][-1]["role"] == "user"
+    assert "temperature" not in kwargs
+
+
+def _reload_model_constants(env: dict[str, str]) -> tuple[str, str]:
+    # Both constants resolve at import, so the environment has to change around a reload. The
+    # second reload puts the module back on the real environment for the rest of the session.
+    try:
+        with patch.dict(os.environ, env):
+            for key in ("SIGNAL_MATCHING_LLM_MODEL", "SIGNAL_SAFETY_LLM_MODEL"):
+                if key not in env:
+                    os.environ.pop(key, None)
+            importlib.reload(llm)
+            return llm.MATCHING_MODEL, llm.SAFETY_MODEL
+    finally:
+        importlib.reload(llm)
+
+
+@pytest.mark.parametrize(
+    "env,expected_matching,expected_safety",
+    [
+        ({}, "claude-sonnet-5-5", "claude-sonnet-5-5"),
+        ({"SIGNAL_MATCHING_LLM_MODEL": "claude-opus-5"}, "claude-opus-5", "claude-sonnet-5-5"),
+        (
+            {"SIGNAL_MATCHING_LLM_MODEL": "claude-opus-5", "SIGNAL_SAFETY_LLM_MODEL": "claude-haiku-4-5"},
+            "claude-opus-5",
+            "claude-haiku-4-5",
+        ),
+    ],
+)
+def test_safety_model_does_not_follow_the_matching_model(
+    env: dict[str, str], expected_matching: str, expected_safety: str
+) -> None:
+    matching, safety = _reload_model_constants(env)
+
+    assert matching == expected_matching
+    assert safety == expected_safety

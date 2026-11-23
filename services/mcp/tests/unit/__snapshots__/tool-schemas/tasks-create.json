@@ -1,0 +1,28 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+        "description": {
+            "description": "The task for the agent to carry out, written as a direct prompt (e.g. \"Investigate the spike in $exception events on the checkout page and open a PR with a fix\"). Passed verbatim to the agent as its instructions, so be specific.",
+            "type": "string"
+        },
+        "repository": {
+            "anyOf": [
+                {
+                    "maxLength": 255,
+                    "type": "string"
+                },
+                {
+                    "type": "null"
+                }
+            ],
+            "description": "Target repository. For GitHub, use `organization/repo` (e.g. `posthog/posthog-js`). For GitLab, set `repository_integration` and use the full project path, which can include nested groups (e.g. `acme/platform/api`)."
+        },
+        "title": {
+            "description": "Short human-readable title. Auto-generated from `description` when omitted.",
+            "maxLength": 255,
+            "type": "string"
+        }
+    },
+    "required": ["description"],
+    "type": "object"
+}

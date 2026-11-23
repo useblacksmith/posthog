@@ -1,0 +1,268 @@
+"""CDC error taxonomy.
+
+Classifies an extraction failure into a user-facing category with a friendly,
+credential-safe message and a retryable flag. Engine-agnostic: the engine-specific
+interpretation (which psycopg exception means "authentication failed", etc.) lives
+behind ``CDCSourceAdapter.classify_error`` in each source's adapter, mirroring the
+``is_slot_invalidation_error`` seam. This module owns the shared vocabulary, the
+user-facing copy, and the orchestration-level fallbacks.
+"""
+
+from __future__ import annotations
+
+import enum
+import dataclasses
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from products.warehouse_sources.backend.temporal.data_imports.cdc.adapters import CDCSourceAdapter
+
+# Friendly messages land in the user-visible `latest_error`; cap them so the column stays tidy.
+MAX_FRIENDLY_MESSAGE_LENGTH = 500
+
+
+class CDCErrorCategory(enum.StrEnum):
+    AUTH_FAILED = "auth_failed"
+    SSL_REQUIRED = "ssl_required"
+    CERTIFICATE_REJECTED = "certificate_rejected"
+    CONNECTION_FAILED = "connection_failed"
+    HOST_UNREACHABLE = "host_unreachable"
+    QUOTA_EXCEEDED = "quota_exceeded"
+    POOLER_TENANT_NOT_FOUND = "pooler_tenant_not_found"
+    SSH_TUNNEL_FAILED = "ssh_tunnel_failed"
+    SLOT_MISSING = "slot_missing"
+    SLOT_NOT_CONFIGURED = "slot_not_configured"
+    PUBLICATION_MISSING = "publication_missing"
+    SLOT_IN_USE = "slot_in_use"
+    PERMISSION_DENIED = "permission_denied"
+    WAL_DECODE_ERROR = "wal_decode_error"
+    TRANSACTION_TOO_LARGE = "transaction_too_large"
+    RESERVED_COLUMN_CONFLICT = "reserved_column_conflict"
+    MASKED_KEY_CONFLICT = "masked_key_conflict"
+    MASKING_KEY_UNAVAILABLE = "masking_key_unavailable"
+    UNKNOWN = "unknown"
+
+
+@dataclasses.dataclass(frozen=True)
+class CDCErrorInfo:
+    category: CDCErrorCategory
+    friendly_message: str
+    retryable: bool
+
+
+class CDCTransactionTooLargeError(Exception):
+    """A single source transaction exceeded the decoder's per-transaction caps (changes, spill bytes or decode time).
+
+    Non-retryable: re-decoding replays the same oversized transaction. The decoder guard
+    that raises this lives in the source-specific decoder; the type is defined here so the
+    shared classifier owns the mapping to ``TRANSACTION_TOO_LARGE``.
+    """
+
+
+class CDCSlotNotConfiguredError(Exception):
+    """Change data capture is enabled but the source has no replication slot name stored.
+
+    Non-retryable: without a slot name there is nothing to stream from and nothing to recreate,
+    so retrying — or the slot-invalidation recovery / Repair CDC paths — replays the same dead
+    end. The extraction activity raises this before streaming (streaming an empty slot name would
+    surface as a misleading "replication slot does not exist"). Defined here so the shared
+    classifier owns the mapping to ``SLOT_NOT_CONFIGURED``.
+    """
+
+
+class CDCReservedColumnError(Exception):
+    """A source table carries a column whose name PostHog stamps onto change rows.
+
+    Non-retryable: the collision is a property of the customer's table, so replaying re-fails.
+
+    Names are compared the way the load writes them, after snake_case normalization, so
+    `_PH_CDC_SEQ` collides with `_ph_cdc_seq`. Capture raises it before it writes the buffer: buffer
+    files derive their name, ordering, and retry cleanup from the engine position, and ordering or
+    cleaning up by customer data can silently delete unconsumed buffer files.
+
+    The SCD2 stamp raises it too, because Delta refuses the duplicate name at write time anyway, and
+    failing before the writer names the column instead of a qualified field in a schema error.
+    """
+
+
+class CDCMaskingKeyError(Exception):
+    """A table masks columns, but the instance has no secret key to hash them with.
+
+    Non-retryable: the key is deployment configuration, so replaying re-fails until it is set.
+    """
+
+
+class CDCMaskedKeyError(Exception):
+    """A table masks a column that capture resolved as its primary key.
+
+    Non-retryable: the conflict is in the table's configuration, so replaying re-fails. Capture
+    cannot hash a merge key, and it must not write the masked column to the buffer in plaintext.
+    """
+
+    def __init__(self, table_name: str, columns: list[str]) -> None:
+        super().__init__(f"Table {table_name} masks its primary-key columns {columns}")
+        self.table_name = table_name
+        self.columns = columns
+
+
+# (friendly_message, retryable) per category. Messages are STATIC templates — they never
+# interpolate host/user/password or raw exception text, so stored copy can't leak credentials.
+_CATEGORY_DEFAULTS: dict[CDCErrorCategory, tuple[str, bool]] = {
+    CDCErrorCategory.AUTH_FAILED: (
+        "Could not authenticate with the source database. Check the configured username and "
+        "password, then re-enable change data capture.",
+        False,
+    ),
+    CDCErrorCategory.SSL_REQUIRED: (
+        "Could not establish a required encrypted (SSL) connection to the source database. Check "
+        "that the database accepts SSL connections, then re-enable change data capture.",
+        False,
+    ),
+    CDCErrorCategory.CERTIFICATE_REJECTED: (
+        "The TLS certificate check failed. Either the source database's certificate did not pass "
+        "verification, or the database rejected the client certificate. Check the TLS settings of the "
+        "source, then re-enable change data capture.",
+        False,
+    ),
+    CDCErrorCategory.CONNECTION_FAILED: (
+        "Could not connect to the source database. PostHog will keep retrying — if this persists, "
+        "check that the database is reachable and accepting connections.",
+        True,
+    ),
+    CDCErrorCategory.HOST_UNREACHABLE: (
+        "PostHog couldn't open a network connection to the source database. Check that the host "
+        "and port are correct, and that the database accepts connections from the public internet "
+        "with PostHog's IP addresses allowed through. If all of that looks right, contact support: "
+        "some hosts resolve to an address PostHog can't reach, which is ours to fix. Re-enable "
+        "change data capture once it's reachable.",
+        False,
+    ),
+    CDCErrorCategory.QUOTA_EXCEEDED: (
+        "Your database provider blocked the connection because your account or project exceeded a "
+        "usage quota. Upgrade your provider's plan or wait for the quota to reset, then re-enable "
+        "change data capture.",
+        False,
+    ),
+    CDCErrorCategory.POOLER_TENANT_NOT_FOUND: (
+        "Your connection pooler couldn't find your database project or user. Check that the project "
+        "is active and the pooler username is correct, then re-enable change data capture.",
+        False,
+    ),
+    CDCErrorCategory.SSH_TUNNEL_FAILED: (
+        "Could not connect to your SSH tunnel — PostHog couldn't open a session to the SSH gateway. "
+        "Check that the SSH host and port point to a reachable SSH server (not the database port), "
+        "that the bastion is running, and that PostHog's IP addresses are allowed through its "
+        "firewall, then re-enable change data capture.",
+        False,
+    ),
+    CDCErrorCategory.SLOT_MISSING: (
+        "The replication slot no longer exists on the source database, so changes can no longer be "
+        "read. Use Repair CDC to recreate it and re-sync.",
+        False,
+    ),
+    CDCErrorCategory.SLOT_NOT_CONFIGURED: (
+        "Change data capture is enabled for this source but no replication slot is configured, so "
+        "changes can't be read. Disable and re-enable change data capture to set it up again.",
+        False,
+    ),
+    CDCErrorCategory.PUBLICATION_MISSING: (
+        "The publication used for change data capture no longer exists on the source database. "
+        "Recreate it (self-managed), or use Repair CDC (PostHog-managed) to recreate it and re-sync.",
+        False,
+    ),
+    CDCErrorCategory.SLOT_IN_USE: (
+        "Another connection held your replication slot, so this run couldn't read changes. If this keeps "
+        "happening, check that no other tool or PostHog source reads from that slot.",
+        True,
+    ),
+    CDCErrorCategory.PERMISSION_DENIED: (
+        "The database role connected for change data capture lacks a privilege it needs on the "
+        "source database. This is often table ownership: managing the publication (for example "
+        "adding a table to it) requires owning every table in it, not just SELECT. Grant the "
+        "missing privilege or ownership, or switch the affected tables to Incremental sync instead "
+        "of CDC, then re-enable change data capture.",
+        False,
+    ),
+    CDCErrorCategory.WAL_DECODE_ERROR: (
+        "PostHog could not decode the change stream from the source database. This usually points to "
+        "an unsupported column type or replication setting. Contact support if it persists.",
+        False,
+    ),
+    CDCErrorCategory.TRANSACTION_TOO_LARGE: (
+        "A single database transaction contained more changes than change data capture can process at "
+        "once. Reduce the size of bulk operations on the source, then re-sync.",
+        False,
+    ),
+    CDCErrorCategory.RESERVED_COLUMN_CONFLICT: (
+        "A source table has a column that loads under a name PostHog writes for change data capture, "
+        "such as _ph_cdc_seq or _ph_valid_from, or valid_from on an older history table that ends in _cdc. "
+        "Rename the column on your database, leave it out of the synced columns, or choose another sync "
+        "method for that table.",
+        False,
+    ),
+    CDCErrorCategory.MASKED_KEY_CONFLICT: (
+        "A table masks a column that is its primary key, and a primary key can't be masked. "
+        "Remove the column from the table's masked columns, then re-enable change data capture.",
+        False,
+    ),
+    CDCErrorCategory.MASKING_KEY_UNAVAILABLE: (
+        "A table masks columns, but this PostHog instance has no secret key to hash them with. "
+        "Set WAREHOUSE_COLUMN_MASKING_KEY to a secret value, then re-enable change data capture.",
+        False,
+    ),
+    CDCErrorCategory.UNKNOWN: (
+        "Change data capture hit an unexpected error. PostHog will retry automatically — if it "
+        "persists, check the source's sync logs or contact support.",
+        True,
+    ),
+}
+
+
+def cdc_error_info(category: CDCErrorCategory) -> CDCErrorInfo:
+    """Build the canonical ``CDCErrorInfo`` for a category from the shared copy table."""
+    message, retryable = _CATEGORY_DEFAULTS[category]
+    return CDCErrorInfo(category=category, friendly_message=message, retryable=retryable)
+
+
+def _iter_cause_chain(exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc`` and every exception in its ``__cause__``/``__context__`` chain once."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def classify_cdc_error(exc: BaseException, adapter: CDCSourceAdapter | None) -> CDCErrorInfo:
+    """Classify a CDC extraction failure into a user-facing ``CDCErrorInfo``.
+
+    Walks the exception's cause chain. Orchestration-level errors that any engine can hit are
+    matched here; engine-specific interpretation is delegated to ``adapter.classify_error``.
+    Falls back to a retryable ``unknown`` so a misclassification never strands a recoverable run.
+    """
+    for err in _iter_cause_chain(exc):
+        if isinstance(err, CDCSlotNotConfiguredError):
+            return cdc_error_info(CDCErrorCategory.SLOT_NOT_CONFIGURED)
+        if isinstance(err, CDCTransactionTooLargeError):
+            return cdc_error_info(CDCErrorCategory.TRANSACTION_TOO_LARGE)
+        if isinstance(err, CDCReservedColumnError):
+            return cdc_error_info(CDCErrorCategory.RESERVED_COLUMN_CONFLICT)
+        if isinstance(err, CDCMaskingKeyError):
+            return cdc_error_info(CDCErrorCategory.MASKING_KEY_UNAVAILABLE)
+        if isinstance(err, CDCMaskedKeyError):
+            # Every table on the source shows this error, so it names the one to fix. Names are not secrets.
+            return dataclasses.replace(
+                cdc_error_info(CDCErrorCategory.MASKED_KEY_CONFLICT),
+                friendly_message=(
+                    f"Table {err.table_name} masks its primary-key columns {', '.join(err.columns)}, and a primary "
+                    "key can't be masked. Remove them from the table's masked columns, then re-enable change "
+                    "data capture."
+                ),
+            )
+        if adapter is not None:
+            info = adapter.classify_error(err)
+            if info is not None:
+                return info
+    return cdc_error_info(CDCErrorCategory.UNKNOWN)

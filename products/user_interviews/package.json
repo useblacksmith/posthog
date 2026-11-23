@@ -1,0 +1,6 @@
+{
+    "name": "@posthog/products-user-interviews",
+    "scripts": {
+        "backend:test": "echo 'vestigial app — no tests'"
+    }
+}

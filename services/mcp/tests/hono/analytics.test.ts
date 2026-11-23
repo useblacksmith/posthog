@@ -1,0 +1,1050 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const { mockCaptureToolCall, mockCaptureInitialize, mockCaptureToolsList, mockCapture } = vi.hoisted(() => ({
+    mockCaptureToolCall: vi.fn(),
+    mockCaptureInitialize: vi.fn(),
+    mockCaptureToolsList: vi.fn(),
+    // Raw `capture`; must never be used for the retired legacy `mcp_*` event names.
+    mockCapture: vi.fn(),
+}))
+
+vi.mock('@/lib/posthog', () => ({
+    getPostHogClient: vi.fn(() => ({
+        captureToolCall: mockCaptureToolCall,
+        captureInitialize: mockCaptureInitialize,
+        captureToolsList: mockCaptureToolsList,
+        capture: mockCapture,
+    })),
+}))
+
+import {
+    trackExecuteSqlGeneration,
+    trackInitEvent,
+    trackSkillInvoked,
+    trackToolCall,
+    trackToolsList,
+    trackToolSpan,
+} from '@/hono/analytics'
+import { MCP_EXEC_SKILLS_FEATURE_FLAG, MCP_INBOX_FIRST_FLAG } from '@/hono/constants'
+import { InstructionsBuilder } from '@/hono/instructions'
+import { MCP_INTENT_PROMPT_FLAG } from '@/hono/intent-prompt'
+import type { ResolvedState } from '@/hono/request-state-resolver'
+import { MCPClientProfile } from '@/lib/client-detection'
+import { makeSkillFile, SkillCatalog } from '@/skills/skill-catalog'
+import type { SkillInvocation } from '@/tools/exec-learn'
+import { MAX_CAPTURED_DESCRIPTION_LENGTH, getToolDefinition } from '@/tools/toolDefinitions'
+
+function makeState(overrides: Partial<ResolvedState> = {}): ResolvedState {
+    return {
+        reqCtx: {
+            safelyGetAnalyticsContext: vi.fn(async () => undefined),
+            getSessionUuid: vi.fn(async () => 'session-uuid'),
+            getEffectiveSessionUuid: vi.fn(async () => 'session-uuid'),
+        } as any,
+        context: {
+            stateManager: {},
+        } as any,
+        useSingleExec: true,
+        toolFeatureFlags: undefined,
+        apiKeyScopes: [],
+        oauthClientId: undefined,
+        clientProfile: {} as any,
+        requestContext: {
+            authMethod: 'personal_api_key',
+            sessionId: 'sess-1',
+            organizationId: 'org-request',
+            projectId: 'project-request',
+            readOnly: true,
+            viaSseRedirect: true,
+            requestStartTime: Date.now(),
+            clientUserAgent: 'request-agent/1.0',
+            mcpClientName: 'Claude Desktop',
+            mcpClientVersion: '2.0',
+            mcpProtocolVersion: '2025-03-26',
+            transport: 'streamable-http',
+            mcpSessionId: 'mcp-session-request',
+            mcpConversationId: 'conversation-request',
+            mcpConsumer: 'request-consumer',
+            mode: 'cli',
+            region: 'us',
+            features: ['insights', 'product_analytics', 'insights', 'bad\nvalue'],
+            tools: ['dashboard-get', 'x'.repeat(200)],
+            excludeTools: ['insight-delete'],
+            mcpVendorClient: 'ClaudeAI',
+        },
+        sessionContext: {
+            mcpClientName: 'claude-code',
+            mcpClientVersion: '1.0',
+            mcpProtocolVersion: '2025-03-26',
+            mcpConsumer: 'session-consumer',
+            mcpVendorClient: 'ClaudeCode',
+        },
+        allTools: [],
+        scopeGatedTools: [],
+        findScopeGatedTool: () => undefined,
+        supportsStepUp: false,
+        flagGatedTools: [],
+        gatewayToolsEnabled: false,
+        distinctId: 'distinct-id',
+        renderUiEnabled: false,
+        ...overrides,
+    }
+}
+
+describe('Hono MCP analytics contexts', () => {
+    beforeEach(() => {
+        mockCaptureToolCall.mockClear()
+        mockCaptureInitialize.mockClear()
+        mockCaptureToolsList.mockClear()
+        mockCapture.mockClear()
+    })
+
+    it.each([false, true])(
+        'records recruitment diagnostics without exposing them on suppressed calls: %s',
+        async (suppressed) => {
+            const state = makeState({
+                suppressAnalytics: suppressed,
+                interviewRecruitmentDiagnostics: {
+                    reason: 'url_unsupported',
+                    urlSupported: false,
+                    formSupported: true,
+                    campaignId: 'synthetic-study',
+                },
+            })
+            await trackToolCall('user-get', 12, false, state)
+            const properties = mockCaptureToolCall.mock.calls[0]![0].properties
+            if (suppressed) {
+                expect(properties).not.toHaveProperty('interview_recruitment_reason')
+                expect(properties).not.toHaveProperty('interview_recruitment_form_supported')
+            } else {
+                expect(properties).toMatchObject({
+                    interview_recruitment_reason: 'url_unsupported',
+                    interview_recruitment_url_supported: false,
+                    interview_recruitment_form_supported: true,
+                    interview_recruitment_campaign_id: 'synthetic-study',
+                })
+                expect(properties).not.toHaveProperty('interview_recruitment_completed_calls')
+            }
+            expect(mockCapture).not.toHaveBeenCalled()
+        }
+    )
+
+    it.each([
+        { name: 'saved metrics', tools: ['metric-list'], metricCatalog: { hasMetrics: true }, expected: 'lookup' },
+        { name: 'no saved metrics', tools: ['metric-list'], metricCatalog: { hasMetrics: false }, expected: 'empty' },
+        { name: 'failed catalog read', tools: ['metric-list'], metricCatalog: undefined, expected: 'unknown' },
+        { name: 'no metric-list tool', tools: ['user-get'], metricCatalog: undefined, expected: undefined },
+    ])('records the metric catalog mode: $name', async ({ tools, metricCatalog, expected }) => {
+        await trackToolCall(
+            'user-get',
+            12,
+            false,
+            makeState({ allTools: tools.map((name) => ({ name })) as any, metricCatalog })
+        )
+        expect(mockCaptureToolCall.mock.calls[0]![0].properties.metric_catalog_mode).toBe(expected)
+    })
+
+    it('does not dual-emit the retired legacy mcp_tool_call / mcp_initialize names', async () => {
+        // Guards against reintroducing the legacy dual-emit, which double-counted every call.
+        await trackInitEvent(makeState())
+        await trackToolCall('user-get', 12, false, makeState())
+
+        expect(mockCapture).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        'scout-trial-create',
+        'scout-trial-get',
+        'scout-trial-start',
+        'scout-trial-report',
+        'scout-trial-list',
+        'scout-trial-resume',
+        'scout-trial-archive',
+        'scout-trial-setup',
+        'scout-rubric-generate',
+        'scout-rubric-get',
+        'scout-rubric-save',
+    ])('excludes exec discovery metadata for %s with ordinary operator credentials', async (targetTool) => {
+        await trackToolCall(
+            'exec',
+            12,
+            false,
+            makeState({ suppressAnalytics: false }),
+            { $mcp_exec_verb: 'info', $mcp_exec_target_tool: targetTool },
+            { intent: 'Compare synthetic scout variants' }
+        )
+
+        expect(mockCaptureToolCall).not.toHaveBeenCalled()
+        expect(mockCapture).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        { impersonated: true, isError: false },
+        { impersonated: true, isError: true },
+        { impersonated: false, isError: false },
+        { impersonated: false, isError: true },
+    ])('passes impersonated=$impersonated to the SDK with isError=$isError', async ({ impersonated, isError }) => {
+        const state = makeState({ isImpersonated: impersonated, suppressAnalytics: impersonated })
+
+        await trackToolCall('user-get', 12, isError, state, {
+            is_impersonated: !impersonated,
+            suppress_analytics: !impersonated,
+        })
+        await trackInitEvent(state)
+        await trackToolsList(['user-get'], state)
+        await trackExecuteSqlGeneration('execute-sql', { query: 'SELECT 1' }, state, { durationMs: 12, isError })
+        await trackToolSpan('user-get', state, { input: {}, output: {}, durationMs: 12, isError })
+        await trackSkillInvoked(state, { source: 'posthog', skill: 'test-skill', readKind: 'skill' })
+
+        expect(mockCaptureToolCall).toHaveBeenCalledWith(
+            expect.objectContaining({
+                toolName: 'user-get',
+                isError,
+                properties: expect.objectContaining({
+                    is_impersonated: impersonated,
+                    suppress_analytics: impersonated,
+                }),
+            })
+        )
+        for (const capture of [mockCaptureInitialize, mockCaptureToolsList]) {
+            expect(capture).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    properties: expect.objectContaining({
+                        is_impersonated: impersonated,
+                        suppress_analytics: impersonated,
+                    }),
+                })
+            )
+        }
+        expect(mockCapture).toHaveBeenCalledTimes(3)
+        for (const [event] of mockCapture.mock.calls) {
+            expect(event.properties.suppress_analytics).toBe(impersonated)
+        }
+    })
+
+    it.each([
+        ['an ordinary tool', 'query-logs', { query: 'level:error' }, true, true],
+        ['execute-sql on plain data', 'execute-sql', { query: 'SELECT count() FROM events' }, true, false],
+        [
+            'execute-sql with editor filters',
+            'execute-sql',
+            {
+                query: 'SELECT name FROM system.information_schema.metrics WHERE {filters}',
+                filters: { properties: [{ key: 'api_token', value: ['fake-token'] }] },
+            },
+            false,
+            false,
+        ],
+        [
+            'execute-sql through exec',
+            'exec',
+            { command: 'call execute-sql {"query":"SELECT 1","filters":{"properties":[{"value":"fake-token"}]}}' },
+            false,
+            false,
+        ],
+        [
+            'execute-sql querying metadata',
+            'execute-sql',
+            { query: 'SELECT name FROM system.information_schema.metrics' },
+            true,
+            true,
+        ],
+        ['a proxied third-party tool', 'linear__create_issue', { title: 'Customer escalation' }, false, false],
+        ['the presigned upload tool', 'media-image-upload-start', { name: 'logo.png' }, false, false],
+        ['a connection forward', 'posthog-connection-forward', { id: '1', path: 'api/' }, false, false],
+        ['an email log search', 'workflows-transactional-emails-list', { search: 'jane@example.com' }, false, false],
+        ['an opt-out removal', 'opt-outs-remove', { identifier: 'ada@example.com' }, false, false],
+        ['an opt-out search', 'opt-outs-list', { search: 'reader@example.org' }, false, false],
+        [
+            'an opt-out search through exec',
+            'exec',
+            { command: 'call opt-outs-list {"search":"reader@example.org"}' },
+            false,
+            false,
+        ],
+        [
+            'an email send through exec',
+            'exec',
+            { command: 'call workflows-send-email-prepare {"to":"ada@example.com"}' },
+            false,
+            false,
+        ],
+        [
+            'a suppression list import',
+            'suppressions-add',
+            { suppressions: [{ identifier: 'ada@example.com' }] },
+            false,
+            true,
+        ],
+        [
+            'an opt-out list import through exec',
+            'exec',
+            { command: 'call opt-outs-add {"opt_outs":[{"identifier":"ada@example.com"}]}' },
+            false,
+            true,
+        ],
+    ])(
+        'gates captured arguments and result for %s',
+        async (_case, toolName, parameters, sendsArguments, sendsResult) => {
+            await trackToolCall(toolName, 12, false, makeState(), undefined, { parameters, response: 'rows' })
+
+            const captured = mockCaptureToolCall.mock.calls[0]![0]
+            expect(captured.parameters).toEqual(sendsArguments ? parameters : undefined)
+            expect(captured.response).toEqual(sendsResult ? 'rows' : undefined)
+        }
+    )
+
+    it.each([
+        [
+            'a failed call',
+            true,
+            { parameters: { query: 'level:error' }, response: 'Error: upstream body' },
+            true,
+            false,
+        ],
+        [
+            'an argument nested past the capture depth',
+            false,
+            { parameters: JSON.parse('['.repeat(20_000) + ']'.repeat(20_000)), response: 'rows' },
+            true,
+            true,
+        ],
+    ])('captures what policy and size allow for %s', async (_case, isError, meta, sendsArguments, sendsResult) => {
+        await trackToolCall('query-logs', 12, isError, makeState(), undefined, meta)
+
+        const captured = mockCaptureToolCall.mock.calls[0]![0]
+        expect(captured.toolName).toBe('query-logs')
+        expect(captured.parameters !== undefined).toBe(sendsArguments)
+        expect(captured.response !== undefined).toBe(sendsResult)
+    })
+
+    it('bounds how much of a payload it walks before capture', async () => {
+        const wide = Array.from({ length: 10_000 }, (_, i) => ({ id: i, token: 'secret' }))
+        await trackToolCall('query-logs', 12, false, makeState(), undefined, { parameters: { rows: wide } })
+
+        const { rows } = mockCaptureToolCall.mock.calls[0]![0].parameters
+        expect(rows.length).toBeLessThan(wide.length)
+        expect(rows[0]).toEqual({ id: 0, token: '[redacted]' })
+    })
+
+    it('drops preloaded app data from the captured result for every consumer', async () => {
+        const appData = { rows: [{ value: 'widget-only-data' }] }
+        await trackToolCall('render-ui', 12, false, makeState(), undefined, {
+            response: {
+                content: [{ type: 'text', text: 'ok' }],
+                structuredContent: { tool_name: 'survey-get', 'com.posthog.mcp/app_data': appData },
+                _meta: { 'com.posthog.mcp/app_data': appData },
+            },
+        })
+
+        expect(mockCaptureToolCall.mock.calls[0]![0].response).toEqual({
+            content: [{ type: 'text', text: 'ok' }],
+            structuredContent: { tool_name: 'survey-get' },
+            _meta: {},
+        })
+    })
+
+    it('redacts secret-bearing fields from captured arguments and result', async () => {
+        await trackToolCall('user-settings-update', 12, false, makeState(), undefined, {
+            parameters: { first_name: 'Ada', password: 'hunter2', payload: { client_secret: 'oauth-secret' } },
+            response: { id: 1, api_key: 'phx_live_123' },
+        })
+
+        const { parameters, response } = mockCaptureToolCall.mock.calls[0]![0]
+        expect(parameters).toEqual({
+            first_name: 'Ada',
+            password: '[redacted]',
+            payload: { client_secret: '[redacted]' },
+        })
+        expect(response).toEqual({ id: 1, api_key: '[redacted]' })
+    })
+
+    it.each([
+        [MCP_INTENT_PROMPT_FLAG, true],
+        [MCP_INTENT_PROMPT_FLAG, false],
+        [MCP_INTENT_PROMPT_FLAG, undefined],
+        [MCP_INBOX_FIRST_FLAG, true],
+        [MCP_INBOX_FIRST_FLAG, false],
+        [MCP_INBOX_FIRST_FLAG, undefined],
+    ])('records the evaluated experiment flag %s: %s', async (flagKey, flagValue) => {
+        const state = makeState({ toolFeatureFlags: { [flagKey]: flagValue } })
+
+        await trackToolCall('user-get', 12, false, state)
+
+        expect(mockCaptureToolCall.mock.calls[0]![0].properties[`$feature/${flagKey}`]).toBe(flagValue)
+    })
+
+    it('emits request properties on $mcp fields and session properties on mcp_session fields', async () => {
+        await trackInitEvent(makeState())
+
+        expect(mockCaptureInitialize).toHaveBeenCalledTimes(1)
+        // The SDK maps its own `conversationId` field, so the property is stamped only when a
+        // handle exists. An explicit `undefined` would erase the SDK's value.
+        expect(mockCaptureInitialize.mock.calls[0]![0].conversationId).toBe('conversation-request')
+        expect(mockCaptureInitialize.mock.calls[0]![0].properties.$mcp_conversation_id).toBe('conversation-request')
+        expect(mockCaptureInitialize.mock.calls[0]![0].properties).toMatchObject({
+            $mcp_client_name: 'Claude Desktop',
+            $mcp_client_version: '2.0',
+            $mcp_client_user_agent: 'request-agent/1.0',
+            $mcp_protocol_version: '2025-03-26',
+            $mcp_transport: 'streamable-http',
+            $mcp_session_id: 'mcp-session-request',
+            $mcp_consumer: 'request-consumer',
+            $mcp_mode: 'cli',
+            $mcp_region: 'us',
+            $mcp_auth_method: 'personal_api_key',
+            $mcp_vendor_client: 'ClaudeAI',
+            mcp_session_client_name: 'claude-code',
+            mcp_session_client_version: '1.0',
+            mcp_session_protocol_version: '2025-03-26',
+            mcp_session_consumer: 'session-consumer',
+            mcp_session_vendor_client: 'ClaudeCode',
+            requested_features: ['insights', 'product_analytics'],
+            requested_tools: ['dashboard-get'],
+            requested_exclude_tools: ['insight-delete'],
+        })
+    })
+
+    it('stamps the surface as `source` so MCP events join product events', async () => {
+        // Without it, $mcp_* events carry no `source` at all and sit outside the breakdown
+        // that measures MCP adoption. The resolution matrix itself is covered in
+        // tests/event-source.test.ts — this only proves the property reaches the event.
+        await trackToolCall(
+            'user-get',
+            12,
+            false,
+            makeState({
+                apiKeyScopes: ['insight:read', 'internal_run:read'],
+                requestContext: { ...makeState().requestContext, mcpConsumer: 'slack' },
+            })
+        )
+
+        expect(mockCaptureToolCall.mock.calls[0]![0].properties.source).toBe('slack')
+    })
+
+    it('omits session properties when there is no MCP session context', async () => {
+        await trackToolCall('user-get', 12, false, makeState({ sessionContext: null }))
+
+        const properties = mockCaptureToolCall.mock.calls[0]![0].properties
+        expect(properties.$mcp_client_name).toBe('Claude Desktop')
+        expect(properties.mcp_session_client_name).toBeUndefined()
+        expect(properties.mcp_session_vendor_client).toBeUndefined()
+    })
+
+    it.each([
+        { llmModel: undefined, llmModelMissingReason: 'unknown' as const, expected: 'unknown' },
+        { llmModel: 'example-model', llmModelMissingReason: 'unknown' as const, expected: undefined },
+        { llmModel: undefined, llmModelMissingReason: undefined, expected: undefined },
+    ])('emits a missing model reason only for unresolved calls: $llmModel', async ({ expected, ...analyticsMeta }) => {
+        await trackToolCall('user-get', 12, false, makeState(), undefined, analyticsMeta)
+
+        expect(mockCaptureToolCall.mock.calls[0]![0].properties.$mcp_llm_model_missing_reason).toBe(expected)
+    })
+
+    it('categorizes a proxied third-party tool and names its server', async () => {
+        // A gateway tool has no catalog entry, so without the fallback it lands
+        // uncategorized and disappears from every category-sliced view.
+        await trackToolCall('linear__create_issue', 12, false, makeState())
+
+        const properties = mockCaptureToolCall.mock.calls[0]![0].properties
+        expect(properties.$mcp_tool_category).toBe('Third-party tools')
+        expect(properties.mcp_gateway_server).toBe('linear')
+    })
+
+    it('leaves a PostHog tool without a gateway server', async () => {
+        await trackToolCall('user-get', 12, false, makeState())
+
+        expect(mockCaptureToolCall.mock.calls[0]![0].properties.mcp_gateway_server).toBeUndefined()
+    })
+
+    describe('client identity live-first fallback', () => {
+        // $mcp_client_name is the property this whole fix targets: `clientInfo` arrives
+        // only on `initialize`, so it was empty on every tool call that followed. The
+        // same live-first-then-session precedence applies to every field a live request
+        // can carry.
+        it.each([
+            ['$mcp_client_name', 'mcpClientName'],
+            ['$mcp_client_version', 'mcpClientVersion'],
+            ['$mcp_protocol_version', 'mcpProtocolVersion'],
+            ['$mcp_consumer', 'mcpConsumer'],
+            ['$mcp_vendor_client', 'mcpVendorClient'],
+        ] as const)(
+            '%s: live value wins when both live and session values are present',
+            async (eventProp, contextField) => {
+                const state = makeState({
+                    requestContext: { ...makeState().requestContext, [contextField]: 'live-value' },
+                    sessionContext: { ...makeState().sessionContext, [contextField]: 'session-value' },
+                })
+                await trackToolCall('user-get', 12, false, state)
+
+                expect(mockCaptureToolCall.mock.calls[0]![0].properties[eventProp]).toBe('live-value')
+            }
+        )
+
+        it.each([
+            ['$mcp_client_name', 'mcpClientName'],
+            ['$mcp_client_version', 'mcpClientVersion'],
+            ['$mcp_protocol_version', 'mcpProtocolVersion'],
+            ['$mcp_consumer', 'mcpConsumer'],
+            ['$mcp_vendor_client', 'mcpVendorClient'],
+        ] as const)(
+            '%s: falls back to the session-pinned value when the live request has none (the tools/call case)',
+            async (eventProp, contextField) => {
+                const state = makeState({
+                    requestContext: { ...makeState().requestContext, [contextField]: undefined },
+                    sessionContext: { ...makeState().sessionContext, [contextField]: 'session-value' },
+                })
+                await trackToolCall('user-get', 12, false, state)
+
+                expect(mockCaptureToolCall.mock.calls[0]![0].properties[eventProp]).toBe('session-value')
+            }
+        )
+
+        it.each([
+            ['$mcp_client_name', 'mcpClientName'],
+            ['$mcp_client_version', 'mcpClientVersion'],
+            ['$mcp_protocol_version', 'mcpProtocolVersion'],
+            ['$mcp_consumer', 'mcpConsumer'],
+            ['$mcp_vendor_client', 'mcpVendorClient'],
+        ] as const)(
+            '%s: stays undefined (never an empty string) when both live and session values are absent',
+            async (eventProp, contextField) => {
+                const state = makeState({
+                    requestContext: { ...makeState().requestContext, [contextField]: undefined },
+                    sessionContext: { ...makeState().sessionContext, [contextField]: undefined },
+                })
+                await trackToolCall('user-get', 12, false, state)
+
+                expect(mockCaptureToolCall.mock.calls[0]![0].properties[eventProp]).toBeUndefined()
+            }
+        )
+
+        it('initialize with no session context is unchanged: live request value is used as-is', async () => {
+            await trackInitEvent(makeState({ sessionContext: null }))
+
+            expect(mockCaptureInitialize.mock.calls[0]![0].properties).toMatchObject({
+                $mcp_client_name: 'Claude Desktop',
+                $mcp_client_version: '2.0',
+                $mcp_protocol_version: '2025-03-26',
+                $mcp_consumer: 'request-consumer',
+                $mcp_vendor_client: 'ClaudeAI',
+            })
+        })
+
+        it('initialize with no session context and no live value stays undefined', async () => {
+            const state = makeState({
+                sessionContext: null,
+                requestContext: { ...makeState().requestContext, mcpClientName: undefined },
+            })
+            await trackInitEvent(state)
+
+            expect(mockCaptureInitialize.mock.calls[0]![0].properties.$mcp_client_name).toBeUndefined()
+        })
+
+        it.each([
+            ['$mcp_client_user_agent', 'clientUserAgent'],
+            ['$mcp_transport', 'transport'],
+            ['$mcp_session_id', 'mcpSessionId'],
+            ['$mcp_conversation_id', 'mcpConversationId'],
+            ['$mcp_mode', 'mode'],
+            ['$mcp_region', 'region'],
+        ] as const)(
+            '%s is per-request only: it stays undefined even when the live request has none, regardless of session context',
+            async (eventProp, contextField) => {
+                const state = makeState({
+                    requestContext: { ...makeState().requestContext, [contextField]: undefined },
+                })
+                await trackToolCall('user-get', 12, false, state)
+
+                expect(mockCaptureToolCall.mock.calls[0]![0].properties[eventProp]).toBeUndefined()
+            }
+        )
+
+        it('mcp_runtime is a static constant, unaffected by request or session context', async () => {
+            await trackToolCall('user-get', 12, false, makeState())
+
+            expect(mockCaptureToolCall.mock.calls[0]![0].properties.mcp_runtime).toBe('hono')
+        })
+    })
+
+    it('stamps $mcp_tool_category and $mcp_tool_description from the catalogued tool definition', async () => {
+        await trackToolCall('query-logs', 5, false, makeState())
+
+        const properties = mockCaptureToolCall.mock.calls[0]![0].properties
+        expect(properties.$mcp_tool_category).toBe('Logs')
+        // query-logs' catalogued description is ~13 KB, so this assertion also locks in
+        // the capture-side clip. Description capture died silently once before (the hono
+        // migration dropped it while the category stamp survived), so the two are asserted
+        // together at the same call site.
+        expect(properties.$mcp_tool_description).toBe(
+            getToolDefinition('query-logs').description.slice(0, MAX_CAPTURED_DESCRIPTION_LENGTH)
+        )
+        expect((properties.$mcp_tool_description as string).length).toBe(MAX_CAPTURED_DESCRIPTION_LENGTH)
+    })
+
+    it('omits $mcp_tool_category and $mcp_tool_description for tools without a catalogued definition', async () => {
+        await trackToolCall('exec', 5, false, makeState())
+
+        expect(mockCaptureToolCall.mock.calls[0]![0].properties).not.toHaveProperty('$mcp_tool_category')
+        expect(mockCaptureToolCall.mock.calls[0]![0].properties).not.toHaveProperty('$mcp_tool_description')
+    })
+
+    it('prefers the served description over the catalog text, clipped', async () => {
+        // execute-sql advertises a per-request formatted description, so stamping
+        // the catalog text would record words the agent never saw.
+        const served = 'served '.repeat(200)
+        await trackToolCall('query-logs', 5, false, makeState(), undefined, undefined, served)
+
+        const properties = mockCaptureToolCall.mock.calls[0]![0].properties
+        expect(properties.$mcp_tool_description).toBe(served.slice(0, MAX_CAPTURED_DESCRIPTION_LENGTH))
+    })
+
+    describe('trackExecuteSqlGeneration', () => {
+        it('emits an $ai_generation carrying the intent as input and the HogQL as output', async () => {
+            await trackExecuteSqlGeneration(
+                'execute-sql',
+                { query: 'SELECT count() FROM events' },
+                makeState(),
+                { durationMs: 1500, isError: false },
+                { intent: 'count yesterday signups' }
+            )
+
+            expect(mockCapture).toHaveBeenCalledTimes(1)
+            const payload = mockCapture.mock.calls[0]![0]
+            expect(payload.event).toBe('$ai_generation')
+            expect(payload.distinctId).toBe('distinct-id')
+            expect(payload.properties).toMatchObject({
+                $ai_span_name: 'execute-sql',
+                $ai_trace_id: 'session-uuid',
+                $session_id: 'session-uuid',
+                $ai_input: [{ role: 'user', content: 'count yesterday signups' }],
+                $ai_output_choices: [{ role: 'assistant', content: 'SELECT count() FROM events' }],
+                $ai_latency: 1.5,
+                $ai_is_error: false,
+                // Rides the same base MCP context as every other event, so
+                // evaluations can condition on client/session properties.
+                $mcp_client_name: 'Claude Desktop',
+            })
+        })
+
+        it('flags failed calls so evaluations can target errored SQL too', async () => {
+            await trackExecuteSqlGeneration('execute-sql', { query: 'SELECT bogus' }, makeState(), {
+                durationMs: 200,
+                isError: true,
+                errorMessage: 'Unknown table',
+            })
+
+            expect(mockCapture.mock.calls[0]![0].properties).toMatchObject({
+                $ai_is_error: true,
+                $ai_error: 'Unknown table',
+            })
+        })
+
+        it.each([
+            ['a different tool', 'query-logs', { query: 'SELECT 1' }],
+            ['a missing query', 'execute-sql', {}],
+            ['a non-string query', 'execute-sql', { query: 42 }],
+            ['editor filters', 'execute-sql', { query: 'SELECT count() FROM events WHERE {filters}', filters: {} }],
+        ])('does not emit for %s', async (_case, toolName, args) => {
+            await trackExecuteSqlGeneration(toolName, args, makeState(), { durationMs: 5, isError: false })
+
+            expect(mockCapture).not.toHaveBeenCalled()
+        })
+    })
+
+    describe('trackToolSpan', () => {
+        it.each(['posthog_ai', 'claude'])(
+            'captures model output without adding native widget data for %s',
+            async (consumer) => {
+                const state = makeState()
+                const appData = { rows: [{ value: 'widget-only-data' }] }
+                const output = {
+                    content: [{ type: 'text', text: '1 row' }],
+                    _meta: { 'com.posthog.mcp/app_data': appData, resourceUri: 'ui://query' },
+                }
+                await trackToolSpan(
+                    'query-trends',
+                    {
+                        ...state,
+                        clientProfile: new MCPClientProfile({ consumer }),
+                    },
+                    { durationMs: 100, isError: false, output }
+                )
+
+                const captured = JSON.parse(mockCapture.mock.calls[0]![0].properties.$ai_output_state)
+                expect(captured.content).toEqual(output.content)
+                expect(captured._meta).toEqual(consumer === 'posthog_ai' ? { resourceUri: 'ui://query' } : output._meta)
+                expect(output._meta['com.posthog.mcp/app_data']).toBe(appData)
+            }
+        )
+
+        it.each([
+            ['a non-execute-sql tool', 'data-catalog-metric-run', { name: 'mrr' }, true],
+            ['any other non-execute-sql tool', 'query-logs', { query: 'SELECT 1' }, true],
+            [
+                'execute-sql querying metadata',
+                'execute-sql',
+                { query: 'SELECT name FROM system.information_schema.metrics' },
+                true,
+            ],
+            ['execute-sql on plain data', 'execute-sql', { query: 'SELECT count() FROM events' }, false],
+            [
+                'execute-sql metadata with editor filters',
+                'execute-sql',
+                {
+                    query: 'SELECT name FROM system.information_schema.metrics WHERE {filters}',
+                    filters: { properties: [{ key: 'api_token', value: ['fake-token'] }] },
+                },
+                false,
+            ],
+            [
+                'execute-sql through exec',
+                'exec',
+                { command: 'call execute-sql {"query":"SELECT 1","filters":{"properties":[{"value":"fake-token"}]}}' },
+                false,
+            ],
+            [
+                'execute-sql with the marker only in a string literal',
+                'execute-sql',
+                { query: "SELECT distinct_id FROM events WHERE 'information_schema' != ''" },
+                false,
+            ],
+            [
+                'execute-sql with the marker only in a comment',
+                'execute-sql',
+                { query: 'SELECT count() FROM events -- information_schema' },
+                false,
+            ],
+            // A proxied vendor tool's args and result are the customer's content passing
+            // through the gateway. Key-based redaction only catches credential-shaped
+            // fields, so capturing the payload would put arbitrary third-party content in
+            // analytics to serve evaluations that target PostHog's own tools.
+            ['a proxied third-party tool', 'linear__create_issue', { title: 'Customer escalation' }, false],
+            // Its result is a live presigned S3 POST (policy, signature, credential) — output
+            // fields, not secret-shaped keys, so key-based redaction can't catch them.
+            ['the presigned upload tool', 'media-image-upload-start', { name: 'logo.png', purpose: 'email' }, false],
+            // Its args are raw Fivetran responses, with secrets in fields redaction can't name.
+            [
+                'the Fivetran upload tool',
+                'warehouse-migration-upload-connections',
+                { connections: [{ connection: { config: { pat: 'fake-token' } } }] },
+                false,
+            ],
+            [
+                'the Fivetran upload tool through exec',
+                'exec',
+                {
+                    command:
+                        'call warehouse-migration-upload-connections {"connections":[{"connection":{"config":{"pat":"fake-token"}}}]}',
+                },
+                false,
+            ],
+            [
+                'a Fivetran upload exec rejects for a missing verb',
+                'exec',
+                {
+                    command:
+                        'warehouse-migration-upload-connections {"connections":[{"connection":{"pat":"fake-token"}}]}',
+                },
+                false,
+            ],
+            ['the presigned upload tool through exec', 'exec', { command: 'call media-image-upload-start {}' }, false],
+            [
+                'execute-sql wrapped in a connection call',
+                'posthog-connection-call',
+                { connection_id: '1', tool: 'execute-sql', arguments: { query: 'SELECT count() FROM events' } },
+                false,
+            ],
+            [
+                'a connection forward',
+                'posthog-connection-forward',
+                { id: '1', method: 'GET', path: 'api/projects/1/persons/' },
+                false,
+            ],
+            [
+                'an email log search by recipient',
+                'workflows-transactional-emails-list',
+                { search: 'jane@example.com' },
+                false,
+            ],
+            [
+                'one email log entry',
+                'workflows-transactional-email-get',
+                { id: '01a19f0e-9fd0-0001-a1d4-3a2b4579b763' },
+                false,
+            ],
+            [
+                'an email log search through exec',
+                'exec',
+                { command: 'call workflows-transactional-emails-list {"search":"jane@example.com"}' },
+                false,
+            ],
+            ['a workflow email list', 'workflows-emails-list', { workflow_id: 'wf_1' }, false],
+            [
+                'one workflow email',
+                'workflows-email-get',
+                { invocation_id: '01a19f0e-9fd0-0001-a1d4-3a2b4579b763', action_id: 'welcome' },
+                false,
+            ],
+            [
+                'a workflow email recipient activity through exec',
+                'exec',
+                { command: 'call workflows-email-activity {"action_id":"welcome"}' },
+                false,
+            ],
+            ['email delivery stats', 'workflows-transactional-email-stats', { group_by: 'template' }, true],
+            ['an opt-out search', 'opt-outs-list', { search: 'reader@example.org' }, false],
+            [
+                'an opt-out search through exec',
+                'exec',
+                { command: 'call opt-outs-list {"search":"reader@example.org"}' },
+                false,
+            ],
+            [
+                'preparing an email send',
+                'workflows-send-email-prepare',
+                { to: 'ada@example.com', html: '<a href="https://example.com/reset?t=1">Reset</a>' },
+                false,
+            ],
+            ['starting a provider import', 'provider-imports-create', { api_key: 're_key' }, false],
+            ['reading a provider import', 'provider-imports-get', { id: 'run' }, false],
+            ['listing provider imports', 'provider-imports-list', {}, false],
+            [
+                'reading a provider import through exec',
+                'exec',
+                { command: 'call provider-imports-get {"id":"run"}' },
+                false,
+            ],
+            [
+                'a provider import through exec',
+                'exec',
+                { command: 'call provider-imports-create {"provider":"resend","api_key":"re_key"}' },
+                false,
+            ],
+            ['executing an email send', 'workflows-send-email-execute', { confirmation: 'confirm' }, false],
+            [
+                'an email send through exec',
+                'exec',
+                { command: 'call workflows-send-email-prepare {"to":"ada@example.com","html":"<p>code 123456</p>"}' },
+                false,
+            ],
+            [
+                'an email send forwarded through a PostHog connection',
+                'exec',
+                {
+                    command:
+                        'call posthog-connection-call {"connection_id":"1","tool":"workflows-send-email-prepare","arguments":{"html":"<p>code 123456</p>"}}',
+                },
+                false,
+            ],
+            [
+                'an email send exec rejects for a missing verb',
+                'exec',
+                { command: 'workflows-send-email-prepare {"html":"<p>code 123456</p>"}' },
+                false,
+            ],
+            ['another tool through exec', 'exec', { command: 'call feature-flag-get-all {}' }, true],
+        ])('gates capture for %s', async (_case, toolName, input, captured) => {
+            await trackToolSpan(toolName, makeState(), { durationMs: 100, isError: false, input, output: 'rows' })
+
+            const spanCalls = mockCapture.mock.calls.filter(([payload]) => payload.event === '$ai_span')
+            expect(spanCalls).toHaveLength(captured ? 1 : 0)
+        })
+
+        it.each([
+            [
+                'a suppression list import',
+                'suppressions-add',
+                { suppressions: [{ identifier: 'ada@example.com', reason: 'bounce' }] },
+            ],
+            [
+                'an opt-out list import through exec',
+                'exec',
+                { command: 'call opt-outs-add {"opt_outs":[{"identifier":"ada@example.com"}]}' },
+            ],
+        ])('keeps the counts but not the addresses for %s', async (_case, toolName, input) => {
+            await trackToolSpan(toolName, makeState(), {
+                durationMs: 100,
+                isError: false,
+                input,
+                output: '{"total":1,"created":1}',
+            })
+            await trackToolSpan(toolName, makeState(), {
+                durationMs: 100,
+                isError: true,
+                errorMessage: 'Invalid command: ada@example.com',
+                input,
+            })
+
+            const spanCalls = mockCapture.mock.calls.filter(([payload]) => payload.event === '$ai_span')
+            expect(spanCalls).toHaveLength(1)
+            expect(spanCalls[0]![0].properties).toMatchObject({ $ai_output_state: '{"total":1,"created":1}' })
+            expect(spanCalls[0]![0].properties).not.toHaveProperty('$ai_input_state')
+        })
+
+        it('joins the MCP session trace and truncates oversized results', async () => {
+            await trackToolSpan('data-catalog-metric-run', makeState(), {
+                durationMs: 1500,
+                isError: false,
+                input: { name: 'mrr' },
+                output: 'x'.repeat(50_000),
+            })
+
+            const payload = mockCapture.mock.calls[0]![0]
+            expect(payload.event).toBe('$ai_span')
+            expect(payload.properties).toMatchObject({
+                $ai_span_name: 'data-catalog-metric-run',
+                // Must match the execute-sql generations' trace id, or the span
+                // detaches from the session trace evaluations are scoped to.
+                $ai_trace_id: 'session-uuid',
+                $session_id: 'session-uuid',
+                $ai_input_state: JSON.stringify({ name: 'mrr' }),
+                $ai_latency: 1.5,
+                $ai_is_error: false,
+                $mcp_tool_category: 'Data catalog',
+            })
+            expect(payload.properties.$ai_output_state).toHaveLength(30_000)
+        })
+
+        it('records the error message on failed calls', async () => {
+            await trackToolSpan('data-catalog-metric-run', makeState(), {
+                durationMs: 200,
+                isError: true,
+                errorMessage: 'metric not found',
+                input: { name: 'bogus' },
+            })
+
+            expect(mockCapture.mock.calls[0]![0].properties).toMatchObject({
+                $ai_is_error: true,
+                $ai_error: 'metric not found',
+            })
+        })
+
+        it('redacts secret-bearing fields from captured input and output', async () => {
+            // Capturing every tool by default would otherwise land user-settings /
+            // warehouse-source credentials in telemetry.
+            await trackToolSpan('user-settings-update', makeState(), {
+                durationMs: 100,
+                isError: false,
+                input: { first_name: 'Ada', password: 'hunter2', payload: { client_secret: 'oauth-secret' } },
+                output: { id: 1, api_key: 'phx_live_123' },
+            })
+
+            const { $ai_input_state, $ai_output_state } = mockCapture.mock.calls[0]![0].properties
+            expect(JSON.parse($ai_input_state)).toEqual({
+                first_name: 'Ada',
+                password: '[redacted]',
+                payload: { client_secret: '[redacted]' },
+            })
+            expect(JSON.parse($ai_output_state)).toEqual({ id: 1, api_key: '[redacted]' })
+        })
+
+        // Redaction is key-name based, so a source whose credential field the
+        // pattern does not name ships that credential verbatim. Cloudflare's
+        // `api_token` did exactly that. These are real field names from
+        // products/warehouse_sources/.../sources/*/source.py, paired with the
+        // metadata and token-count fields the pattern must keep readable.
+        it.each([
+            ['api_token', true],
+            ['database_token', true],
+            ['consumer_key', true],
+            ['signing_key', true],
+            ['key_file', true],
+            ['keypair', true],
+            ['token', true],
+            ['client_secret', true],
+            ['connection_string', true],
+            ['webhook_url', true],
+            ['pagerduty_routing_key', true],
+            ['client_certificate', true],
+            ['app_id', true],
+            ['api_id', true],
+            ['basic_auth_username', true],
+            ['username', true],
+            ['server_client_root_ca', false],
+            ['token_id', false],
+            ['token_url', false],
+            ['app_tokens', false],
+            ['input_tokens', false],
+        ])('redacts %s: %s', async (field, redacted) => {
+            await trackToolSpan('external-data-sources-create', makeState(), {
+                durationMs: 100,
+                isError: false,
+                input: { payload: { [field]: 'sensitive-value' } },
+            })
+
+            const { $ai_input_state } = mockCapture.mock.calls[0]![0].properties
+            expect(JSON.parse($ai_input_state).payload[field]).toBe(redacted ? '[redacted]' : 'sensitive-value')
+        })
+    })
+
+    describe('trackSkillInvoked', () => {
+        it.each<SkillInvocation['readKind']>(['skill', 'file', 'file_search', 'file_lines'])(
+            'captures %s reads with skill_read_kind and the file path so file-only consumption still counts',
+            async (readKind) => {
+                await trackSkillInvoked(makeState(), {
+                    source: 'posthog',
+                    skill: 'retention-analysis',
+                    path: readKind === 'skill' ? undefined : 'references/functions.md',
+                    readKind,
+                })
+
+                expect(mockCapture).toHaveBeenCalledTimes(1)
+                expect(mockCapture.mock.calls[0]![0]).toMatchObject({
+                    event: 'skill invoked',
+                    properties: {
+                        skill_identifier: 'posthog:retention-analysis',
+                        skill_read_kind: readKind,
+                    },
+                })
+                const properties = mockCapture.mock.calls[0]![0].properties
+                if (readKind === 'skill') {
+                    expect(properties).not.toHaveProperty('skill_file_path')
+                } else {
+                    expect(properties.skill_file_path).toBe('references/functions.md')
+                }
+            }
+        )
+    })
+
+    describe('exec learn catalog skill-invoked dedupe', () => {
+        function skillsCatalog(): SkillCatalog {
+            return new SkillCatalog([
+                {
+                    name: 'retention-analysis',
+                    description: 'Retention.',
+                    files: [
+                        makeSkillFile('SKILL.md', '# Retention'),
+                        makeSkillFile('a.md', 'alpha'),
+                        makeSkillFile('b.md', 'beta'),
+                    ],
+                },
+                { name: 'funnels', description: 'Funnels.', files: [makeSkillFile('SKILL.md', '# Funnels')] },
+            ])
+        }
+
+        function skillsState(): ResolvedState {
+            return makeState({
+                clientProfile: { isClaudeChatHost: () => false, isAnthropicConnector: () => false } as any,
+                toolFeatureFlags: { [MCP_EXEC_SKILLS_FEATURE_FLAG]: true },
+            })
+        }
+
+        it('counts one skill once per command but each command separately', async () => {
+            const catalog = new InstructionsBuilder('').buildExecLearnCatalog(skillsState(), skillsCatalog())!
+
+            // A batch that reads two files of one skill must dedupe to a single event.
+            await catalog.execute('posthog:retention-analysis a.md b.md')
+            await vi.waitFor(() => expect(mockCapture).toHaveBeenCalledTimes(1))
+
+            // A separate command reading another skill still counts.
+            await catalog.execute('posthog:funnels')
+            await vi.waitFor(() => expect(mockCapture).toHaveBeenCalledTimes(2))
+
+            expect(mockCapture.mock.calls.map((call) => call[0].properties.skill_identifier)).toEqual([
+                'posthog:retention-analysis',
+                'posthog:funnels',
+            ])
+        })
+    })
+})

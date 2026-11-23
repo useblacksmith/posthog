@@ -1,0 +1,2198 @@
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, time, timedelta
+from typing import Any
+
+import pytest
+import time_machine
+from posthog.test.base import BaseTest
+from unittest.mock import MagicMock, patch
+
+from django.db import DatabaseError, OperationalError, connection, transaction
+from django.db.models import Model
+from django.test import SimpleTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
+
+from dateutil import parser
+from parameterized import parameterized
+
+from posthog.models.signals import model_activity_signal
+from posthog.models.team import Team
+
+from products.warehouse_sources.backend.models.credential import DataWarehouseCredential
+from products.warehouse_sources.backend.models.external_data_job import ExternalDataJob
+from products.warehouse_sources.backend.models.external_data_schema import (
+    DUPLICATE_PRIMARY_KEY_DISABLED_MESSAGE,
+    DUPLICATE_PRIMARY_KEYS_RAW_ERROR,
+    MISSING_PRIMARY_KEY_DISABLED_MESSAGE,
+    MISSING_PRIMARY_KEYS_RAW_ERROR,
+    PREFIX_PROMOTION_KEY,
+    REPARTITION_HOLD_MAX_AGE,
+    STAGED_CURSOR_PENDING_LIMIT,
+    ExternalDataSchema,
+    apply_incremental_lookback,
+    mark_initial_sync_complete,
+    mark_schema_running_unless_halted,
+    prefix_promotion_rows_synced,
+    process_incremental_value,
+    staged_handoff_resume_point,
+    staged_handoff_resume_value,
+    staged_run_last_value,
+    update_should_sync,
+    update_sync_type_config_keys,
+)
+from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+from products.warehouse_sources.backend.models.oom_event import ExternalDataSchemaOOMEvent
+from products.warehouse_sources.backend.models.ssh_tunnel import SSHTunnel
+from products.warehouse_sources.backend.models.table import DataWarehouseTable
+from products.warehouse_sources.backend.models.util import (
+    CLICKHOUSE_HOGQL_MAPPING,
+    clean_type,
+    clickhouse_column_to_dwh_column,
+)
+from products.warehouse_sources.backend.types import IncrementalFieldType
+
+
+@pytest.mark.parametrize(
+    "model,expected_db_table",
+    [
+        (DataWarehouseCredential, "posthog_datawarehousecredential"),
+        (DataWarehouseTable, "posthog_datawarehousetable"),
+        (ExternalDataJob, "posthog_externaldatajob"),
+        (ExternalDataSchema, "posthog_externaldataschema"),
+        (ExternalDataSource, "posthog_externaldatasource"),
+    ],
+)
+def test_db_table_preserved_across_split(model: type[Model], expected_db_table: str) -> None:
+    """The split moved these models to a new Django app via SeparateDatabaseAndState;
+    the `posthog_*` table names must remain unchanged or prod reads break silently."""
+    assert model._meta.db_table == expected_db_table
+
+
+@pytest.mark.parametrize(
+    "s3_folder_name,sync_type_config,expected",
+    [
+        ("legacy_users", {"dwh_storage_key": "ignored"}, "legacy_users"),
+        (None, {"dwh_storage_key": "legacy_users"}, "legacy_users"),
+        ("", {"dwh_storage_key": "legacy_users"}, "legacy_users"),
+        (None, {"dwh_storage_key": ""}, None),
+        (None, {"dwh_storage_key": 123}, None),
+        (None, {}, None),
+        (None, None, None),
+    ],
+)
+def test_resolved_s3_folder_name(
+    s3_folder_name: str | None, sync_type_config: dict | None, expected: str | None
+) -> None:
+    """Column wins; rows written by pre-column workers fall back to the JSON key; junk yields None
+    so callers fall back to the schema name."""
+    schema = ExternalDataSchema(s3_folder_name=s3_folder_name, sync_type_config=sync_type_config)
+    assert schema.resolved_s3_folder_name == expected
+
+
+class TestExternalDataSchemaSave(BaseTest):
+    def _source(self) -> ExternalDataSource:
+        return ExternalDataSource.objects.create(
+            team_id=self.team.pk,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            status="Completed",
+            source_type="Postgres",
+        )
+
+    def _create(self, name: str, **kwargs) -> ExternalDataSchema:
+        return ExternalDataSchema.objects.create(team_id=self.team.pk, source=self._source(), name=name, **kwargs)
+
+    def test_save_populates_s3_folder_name_from_name(self) -> None:
+        # The folder is the normalized name — never NULL for a new row.
+        schema = self._create("My Table")
+        assert schema.s3_folder_name == "my_table"
+        schema.refresh_from_db()
+        assert schema.s3_folder_name == "my_table"
+
+    def test_save_uses_legacy_key_when_present(self) -> None:
+        schema = self._create("public.users", sync_type_config={"dwh_storage_key": "users"})
+        assert schema.s3_folder_name == "users"
+
+    def test_save_does_not_overwrite_existing_folder(self) -> None:
+        schema = self._create("My Table", s3_folder_name="pinned")
+        assert schema.s3_folder_name == "pinned"
+
+    def test_partial_update_backfills_null_folder(self) -> None:
+        # A pre-existing NULL row heals on its next save, even a partial one.
+        schema = self._create("orders")
+        ExternalDataSchema.objects.filter(pk=schema.pk).update(s3_folder_name=None)
+        schema.refresh_from_db()
+        assert schema.s3_folder_name is None
+
+        schema.status = "Completed"
+        schema.save(update_fields=["status", "updated_at"])
+        schema.refresh_from_db()
+        assert schema.s3_folder_name == "orders"
+
+    @parameterized.expand(
+        [
+            ("cdc", ExternalDataSchema.SyncType.CDC, None, True, None),
+            ("cdc_schedule_sync_fails", ExternalDataSchema.SyncType.CDC, None, True, RuntimeError("temporal down")),
+            ("cdc_waiting_for_repair", ExternalDataSchema.SyncType.CDC, "slot_missing", False, None),
+            ("full_refresh", ExternalDataSchema.SyncType.FULL_REFRESH, None, False, None),
+        ]
+    )
+    def test_re_enabling_restores_the_cdc_extraction_schedule(
+        self, _name, sync_type, broken_reason, restores, sync_error
+    ) -> None:
+        schema = self._create("orders", sync_type=sync_type, should_sync=False)
+        if broken_reason:
+            schema.sync_type_config = {**(schema.sync_type_config or {}), "cdc_broken": {"reason": broken_reason}}
+            schema.save()
+        service = "products.data_warehouse.backend.logic.data_load.service"
+
+        with (
+            patch(f"{service}.external_data_workflow_exists", return_value=True),
+            patch(f"{service}.cdc_extraction_schedule_exists", return_value=False),
+            patch(f"{service}.unpause_external_data_schedule"),
+            patch(f"{service}.sync_cdc_extraction_schedule", side_effect=sync_error) as mock_sync,
+        ):
+            update_should_sync(schema_id=str(schema.id), team_id=self.team.pk, should_sync=True)
+
+        assert mock_sync.called is restores
+        schema.refresh_from_db()
+        assert schema.should_sync is True
+
+    @parameterized.expand(
+        [
+            ("warehouse_disable_pauses", ExternalDataSource.AccessMethod.WAREHOUSE, False, True, True),
+            ("direct_disable_pauses_leftover_schedule", ExternalDataSource.AccessMethod.DIRECT, False, True, True),
+            ("direct_disable_without_schedule", ExternalDataSource.AccessMethod.DIRECT, False, False, False),
+            ("direct_enable_leaves_schedule_paused", ExternalDataSource.AccessMethod.DIRECT, True, True, False),
+        ]
+    )
+    def test_disabling_pauses_an_existing_schedule(
+        self, _name, access_method, should_sync, schedule_exists, expect_pause
+    ) -> None:
+        source = self._source()
+        source.access_method = access_method
+        source.save()
+        schema = ExternalDataSchema.objects.create(
+            team_id=self.team.pk, source=source, name="orders", should_sync=not should_sync
+        )
+        service = "products.data_warehouse.backend.logic.data_load.service"
+
+        with (
+            patch(f"{service}.external_data_workflow_exists", return_value=schedule_exists),
+            patch(f"{service}.pause_external_data_schedule") as mock_pause,
+            patch(f"{service}.unpause_external_data_schedule") as mock_unpause,
+            patch(f"{service}.sync_external_data_job_workflow") as mock_create,
+        ):
+            update_should_sync(schema_id=str(schema.id), team_id=self.team.pk, should_sync=should_sync)
+
+        assert mock_pause.called is expect_pause
+        if access_method == ExternalDataSource.AccessMethod.DIRECT:
+            assert not mock_unpause.called
+            assert not mock_create.called
+        schema.refresh_from_db()
+        assert schema.should_sync is should_sync
+
+
+class TestExternalDataSchemaActivityLogging(BaseTest):
+    """Internal pipeline-driven bookkeeping saves must bypass ModelActivityMixin so they neither
+    emit a (low-value) activity signal nor perform the extra `_get_before_update` SELECT — that
+    read can raise OperationalError when the transaction pooler drops the connection mid-sync."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.signal_received = False
+        self.source = ExternalDataSource.objects.create(
+            team_id=self.team.pk,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            status="Completed",
+            source_type="Postgres",
+        )
+
+    def _signal_handler(self, sender, **kwargs) -> None:
+        self.signal_received = True
+
+    def _create(self, **kwargs) -> ExternalDataSchema:
+        return ExternalDataSchema.objects.create(team_id=self.team.pk, source=self.source, name="users", **kwargs)
+
+    def test_normal_update_triggers_activity_signal(self) -> None:
+        schema = self._create()
+        model_activity_signal.connect(self._signal_handler, sender=ExternalDataSchema)
+        try:
+            schema.should_sync = False
+            schema.save()
+            assert self.signal_received
+        finally:
+            model_activity_signal.disconnect(self._signal_handler, sender=ExternalDataSchema)
+
+    def test_skip_activity_log_bypasses_before_update_read(self) -> None:
+        schema = self._create()
+        with patch.object(ExternalDataSchema, "_get_before_update") as before_update:
+            schema.status = "Running"
+            schema.save(skip_activity_log=True)
+            assert not before_update.called
+
+    def test_default_save_performs_before_update_read(self) -> None:
+        schema = self._create()
+        # return_value=None matches the "no prior row" path the activity handler already tolerates.
+        with patch.object(ExternalDataSchema, "_get_before_update", return_value=None) as before_update:
+            schema.status = "Running"
+            schema.save()
+            assert before_update.called
+
+    def test_reset_pipeline_save_skips_activity_log(self) -> None:
+        schema = self._create(
+            sync_type=ExternalDataSchema.SyncType.XMIN,
+            sync_type_config={"xmin_last_value": 100, "xmin_ceiling": 4294967396, "xmin_num_wraparound": 1},
+            initial_sync_complete=True,
+        )
+        model_activity_signal.connect(self._signal_handler, sender=ExternalDataSchema)
+        try:
+            with patch.object(ExternalDataSchema, "_get_before_update") as before_update:
+                schema.update_sync_type_config_for_reset_pipeline()
+                assert not before_update.called
+            assert not self.signal_received
+        finally:
+            model_activity_signal.disconnect(self._signal_handler, sender=ExternalDataSchema)
+        schema.refresh_from_db()
+        assert schema.initial_sync_complete is False
+        assert "xmin_last_value" not in schema.sync_type_config
+
+    def test_update_source_cursor_save_skips_activity_log(self) -> None:
+        schema = self._create(sync_type=ExternalDataSchema.SyncType.XMIN, sync_type_config={})
+        payload = {"kind": "postgres_xmin", "data": {"ceiling_xid": 100}}
+        model_activity_signal.connect(self._signal_handler, sender=ExternalDataSchema)
+        try:
+            schema.update_source_cursor(payload)
+            assert not self.signal_received
+        finally:
+            model_activity_signal.disconnect(self._signal_handler, sender=ExternalDataSchema)
+        schema.refresh_from_db()
+        assert schema.sync_type_config["source_cursor"] == payload
+
+    def test_update_incremental_field_value_save_skips_activity_log(self) -> None:
+        schema = self._create(
+            sync_type=ExternalDataSchema.SyncType.INCREMENTAL,
+            sync_type_config={"incremental_field_type": IncrementalFieldType.Integer},
+        )
+        model_activity_signal.connect(self._signal_handler, sender=ExternalDataSchema)
+        try:
+            schema.update_incremental_field_value(42)
+            assert not self.signal_received
+        finally:
+            model_activity_signal.disconnect(self._signal_handler, sender=ExternalDataSchema)
+        schema.refresh_from_db()
+        assert schema.incremental_field_last_value == 42
+
+    def test_set_partitioning_enabled_save_skips_activity_log(self) -> None:
+        schema = self._create(sync_type_config={})
+        model_activity_signal.connect(self._signal_handler, sender=ExternalDataSchema)
+        try:
+            schema.set_partitioning_enabled(
+                partitioning_keys=["id"],
+                partition_count=10,
+                partition_size=None,
+                partition_mode="md5",
+                partition_format=None,
+            )
+            assert not self.signal_received
+        finally:
+            model_activity_signal.disconnect(self._signal_handler, sender=ExternalDataSchema)
+        schema.refresh_from_db()
+        assert schema.sync_type_config["partitioning_enabled"] is True
+
+    def test_stage_incremental_field_value_save_skips_activity_log(self) -> None:
+        schema = self._create(
+            sync_type=ExternalDataSchema.SyncType.INCREMENTAL,
+            sync_type_config={"incremental_field_type": IncrementalFieldType.Integer},
+        )
+        model_activity_signal.connect(self._signal_handler, sender=ExternalDataSchema)
+        try:
+            schema.stage_incremental_field_value("run-1", 42)
+            assert not self.signal_received
+        finally:
+            model_activity_signal.disconnect(self._signal_handler, sender=ExternalDataSchema)
+        schema.refresh_from_db()
+        assert schema.sync_type_config["incremental_staged"]["last_value"] == 42
+
+    def test_a_handoff_resume_value_never_moves_the_stored_watermark(self) -> None:
+        schema = self._create(
+            sync_type=ExternalDataSchema.SyncType.INCREMENTAL,
+            sync_type_config={
+                "incremental_field_type": IncrementalFieldType.Integer,
+                "incremental_field_last_value": 10,
+            },
+        )
+        schema.stage_incremental_field_value("wfrun-1-a1", 50)
+        schema.stage_handoff_resume_value("wfrun-1-a1", 40)
+        # The next attempt displaces the first one, which must keep its value in the parked list.
+        schema.stage_handoff_resume_value("wfrun-1-a2", 40)
+        schema.stage_incremental_field_value("wfrun-1-a2", 90)
+
+        schema.refresh_from_db()
+        # The run never completed, so nothing was promoted: the next workflow run starts from 10
+        # and extracts again the rows that this run queued but did not finish loading.
+        assert schema.sync_type_config["incremental_field_last_value"] == 10
+        assert staged_handoff_resume_value(schema.sync_type_config, "wfrun-1") == 40
+        assert staged_handoff_resume_value(schema.sync_type_config, "wfrun-2") is None
+
+        assert schema.promote_staged_incremental_values("wfrun-1-a2")
+        schema.refresh_from_db()
+        assert schema.sync_type_config["incremental_field_last_value"] == 90
+
+    def test_a_resume_value_inherited_without_a_new_batch_keeps_the_earlier_owner(self) -> None:
+        # Attempt a2 inherits a1's resume value before it has queued a batch of its own: the batches
+        # the value describes still belong to a1, so a3 must finalize a1, not a2, if a2 never queues one.
+        schema = self._create(
+            sync_type=ExternalDataSchema.SyncType.INCREMENTAL,
+            sync_type_config={"incremental_field_type": IncrementalFieldType.Integer},
+        )
+        schema.stage_handoff_resume_value("wfrun-1-a1", 40)
+        schema.stage_handoff_resume_value("wfrun-1-a2", 40, owner_run_uuid="wfrun-1-a1")
+
+        schema.refresh_from_db()
+        assert staged_handoff_resume_point(schema.sync_type_config, "wfrun-1") == ("wfrun-1-a1", 40)
+
+        # Once a2 queues a batch of its own, it becomes the owner for any later attempt.
+        schema.stage_handoff_resume_value("wfrun-1-a2", 55)
+        schema.refresh_from_db()
+        assert staged_handoff_resume_point(schema.sync_type_config, "wfrun-1") == ("wfrun-1-a2", 55)
+
+    def test_promote_staged_incremental_values_save_skips_activity_log(self) -> None:
+        schema = self._create(
+            sync_type=ExternalDataSchema.SyncType.INCREMENTAL,
+            sync_type_config={
+                "incremental_field_type": IncrementalFieldType.Integer,
+                "incremental_staged": {"run_uuid": "run-1", "last_value": 42},
+            },
+        )
+        model_activity_signal.connect(self._signal_handler, sender=ExternalDataSchema)
+        try:
+            assert schema.promote_staged_incremental_values("run-1")
+            assert not self.signal_received
+        finally:
+            model_activity_signal.disconnect(self._signal_handler, sender=ExternalDataSchema)
+        schema.refresh_from_db()
+        assert schema.sync_type_config["incremental_field_last_value"] == 42
+
+    def test_bookkeeping_save_raises_instead_of_resurrecting_deleted_row(self) -> None:
+        # Source (and its schema, via CASCADE) deleted concurrently with a sync still holding a
+        # stale in-memory schema reference. Without force_update, Django's UUID-pk insert fallback
+        # would silently recreate the row here and hit an FK violation on source_id instead.
+        schema = self._create(
+            sync_type=ExternalDataSchema.SyncType.INCREMENTAL,
+            sync_type_config={"incremental_field_type": IncrementalFieldType.Integer},
+        )
+        schema_id = schema.pk
+        # A queryset delete (unlike self.source.delete()) doesn't null out this process's cached
+        # `schema.source`, matching production where the delete happens on another connection.
+        ExternalDataSource.objects.filter(pk=self.source.pk).delete()
+
+        # Postgres aborts the whole transaction on an unhandled DatabaseError; a savepoint keeps
+        # the failure scoped so the existence check below can still run.
+        with self.assertRaises(DatabaseError), transaction.atomic():
+            schema.update_incremental_field_value(42)
+
+        assert not ExternalDataSchema.objects.filter(pk=schema_id).exists()
+
+
+class TestSaveSyncTypeConfigRetriesOnConnectionDrop(BaseTest):
+    """A pgbouncer `query_wait_timeout` (surfaced as `OperationalError`) on this per-batch
+    bookkeeping write used to propagate straight past `record_partition_measurement` and get
+    swallowed by the caller's broad except, silently losing the write for that run."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.source = ExternalDataSource.objects.create(
+            team_id=self.team.pk,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            status="Completed",
+            source_type="Postgres",
+        )
+
+    def _create(self, **kwargs) -> ExternalDataSchema:
+        return ExternalDataSchema.objects.create(team_id=self.team.pk, source=self.source, name="users", **kwargs)
+
+    def test_retries_once_on_operational_error_then_succeeds(self) -> None:
+        schema = self._create()
+        real_save = ExternalDataSchema.save
+        calls = 0
+
+        def flaky_save(self: ExternalDataSchema, *args: Any, **kwargs: Any) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OperationalError("query_wait_timeout")
+            real_save(self, *args, **kwargs)
+
+        with patch.object(ExternalDataSchema, "save", flaky_save):
+            schema.record_partition_measurement(123)
+
+        assert calls == 2
+        schema.refresh_from_db()
+        assert schema.sync_type_config["max_partition_bytes"] == 123
+
+    def test_second_consecutive_operational_error_propagates(self) -> None:
+        schema = self._create()
+        with patch.object(ExternalDataSchema, "save", side_effect=OperationalError("query_wait_timeout")):
+            with self.assertRaises(OperationalError):
+                schema.record_partition_measurement(123)
+
+
+class TestPartitionMeasurementPreservesConcurrentKeys(BaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.source = ExternalDataSource.objects.create(
+            team_id=self.team.pk,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            status="Completed",
+            source_type="Postgres",
+        )
+
+    def test_a_key_written_after_this_instance_loaded_survives(self) -> None:
+        schema = ExternalDataSchema.objects.create(
+            team_id=self.team.pk, source=self.source, name="users", sync_type_config={"incremental_field": "updated_at"}
+        )
+        stale = ExternalDataSchema.objects.get(id=schema.id)
+
+        update_sync_type_config_keys(schema.id, self.team.pk, updates={"last_full_run_at": "2026-09-03T12:00:00+00:00"})
+        stale.record_partition_measurement(4096)
+
+        schema.refresh_from_db()
+        assert schema.sync_type_config["last_full_run_at"] == "2026-09-03T12:00:00+00:00"
+        assert schema.sync_type_config["max_partition_bytes"] == 4096
+        assert schema.sync_type_config["incremental_field"] == "updated_at"
+
+    def test_repartition_claims_are_ordered_and_preserve_concurrent_keys(self) -> None:
+        schema = ExternalDataSchema.objects.create(
+            team_id=self.team.pk, source=self.source, name="orders", sync_type_config={"repartition_pending": {}}
+        )
+        stale = ExternalDataSchema.objects.get(id=schema.id)
+
+        update_sync_type_config_keys(
+            schema.id,
+            self.team.pk,
+            updates={
+                "repartition_claim": {"token": "newer", "claimed_at": "2026-10-05T12:01:00+00:00"},
+                "last_full_run_at": "2026-10-05T12:00:00+00:00",
+            },
+        )
+        assert not stale.set_repartition_claim({"token": "zombie", "claimed_at": "2026-10-05T11:59:00+00:00"})
+
+        schema.refresh_from_db()
+        assert schema.sync_type_config["repartition_claim"] == {
+            "token": "newer",
+            "claimed_at": "2026-10-05T12:01:00+00:00",
+        }
+        assert schema.sync_type_config["repartition_pending"] == {}
+        assert schema.sync_type_config["last_full_run_at"] == "2026-10-05T12:00:00+00:00"
+
+        assert stale.set_repartition_claim({"token": "latest", "claimed_at": "2026-10-05T12:02:00+00:00"})
+        schema.refresh_from_db()
+        assert schema.sync_type_config["repartition_claim"]["token"] == "latest"
+
+        update_sync_type_config_keys(
+            schema.id,
+            self.team.pk,
+            updates={"repartition_swap": {"state": "ready"}, "repartition_rewrite": {"rows_written": 1}},
+        )
+        assert not stale.abandon_repartition_if_claimed("newer")
+        assert not stale.abandon_repartition_if_claimed("latest")
+        schema.refresh_from_db()
+        assert schema.repartition_swap == {"state": "ready"}
+        assert schema.repartition_rewrite == {"rows_written": 1}
+
+        update_sync_type_config_keys(schema.id, self.team.pk, removes=["repartition_swap"])
+        assert stale.abandon_repartition_if_claimed("latest")
+        schema = ExternalDataSchema.objects.get(id=schema.id)
+        assert schema.repartition_rewrite is None
+        assert schema.last_repartition_at is not None
+
+    @parameterized.expand(
+        [
+            ("reset", lambda schema: schema.update_sync_type_config_for_reset_pipeline()),
+            ("partitioning", lambda schema: schema.set_partitioning_enabled(["id"], 10, None, "md5", None)),
+        ]
+    )
+    def test_a_snapshot_marker_set_after_this_instance_loaded_survives(self, _name, write) -> None:
+        # A sync holds its copy for the whole run while capture marks the table's snapshot. Losing the
+        # marker makes the next capture run empty the buffer under the snapshot.
+        schema = ExternalDataSchema.objects.create(
+            team_id=self.team.pk, source=self.source, name="orders", sync_type_config={"cdc_mode": "snapshot"}
+        )
+        stale = ExternalDataSchema.objects.get(id=schema.id)
+
+        update_sync_type_config_keys(schema.id, self.team.pk, updates={"cdc_snapshot_lane": "buffer"})
+        write(stale)
+
+        schema.refresh_from_db()
+        assert schema.sync_type_config["cdc_snapshot_lane"] == "buffer"
+
+
+class TestExternalDataSchemaOOMEvent(BaseTest):
+    def _source(self, team_id: int | None = None) -> ExternalDataSource:
+        return ExternalDataSource.objects.create(
+            team_id=team_id if team_id is not None else self.team.pk,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            status="Completed",
+            source_type="Postgres",
+        )
+
+    def _schema(self, name: str, team_id: int | None = None) -> ExternalDataSchema:
+        team_id = team_id if team_id is not None else self.team.pk
+        return ExternalDataSchema.objects.create(team_id=team_id, source=self._source(team_id), name=name)
+
+    def _other_team(self) -> Team:
+        return Team.objects.create(organization=self.organization)
+
+    def _oom(
+        self,
+        schema: ExternalDataSchema,
+        *,
+        age_days: float = 0,
+        run_id: str | None = None,
+        self_phase: str | None = None,
+        # Fresh by default: the recorder snapshots the age from the same report as the rest of the
+        # evidence, so evidence-carrying rows always have one. Tests override it to model staleness.
+        self_report_age_at_death_seconds: float | None = 1.0,
+        self_peak_buffer_bytes: int | None = None,
+        co_tenant_correlated_max_peak_buffer_bytes: int | None = None,
+    ) -> ExternalDataSchemaOOMEvent:
+        event = ExternalDataSchemaOOMEvent.objects.for_team(schema.team_id).create(
+            team_id=schema.team_id,
+            schema=schema,
+            run_id=run_id,
+            self_phase=self_phase,
+            self_report_age_at_death_seconds=self_report_age_at_death_seconds,
+            self_peak_buffer_bytes=self_peak_buffer_bytes,
+            co_tenant_correlated_max_peak_buffer_bytes=co_tenant_correlated_max_peak_buffer_bytes,
+        )
+        if age_days:
+            # created_at is auto_now_add, so backdate via an update to place the row outside the window.
+            ExternalDataSchemaOOMEvent.objects.unscoped().filter(pk=event.pk).update(
+                created_at=timezone.now() - timedelta(days=age_days)
+            )
+        return event
+
+    def test_recent_count_windows_and_scopes_to_schema(self) -> None:
+        # A miscounted window or a dropped schema filter would force-repartition a healthy table
+        # (or never fire): recent_count must count only this schema's occurrences inside the window.
+        schema_a = self._schema("orders")
+        schema_b = self._schema("events")
+        self._oom(schema_a)
+        self._oom(schema_a)
+        self._oom(schema_a, age_days=10)  # outside a 7-day window
+        self._oom(schema_b)  # different schema
+
+        assert ExternalDataSchemaOOMEvent.recent_count(schema_a, days=7) == 2
+        assert ExternalDataSchemaOOMEvent.recent_count(schema_a, days=30) == 3
+        assert ExternalDataSchemaOOMEvent.recent_count(schema_b, days=7) == 1
+
+    def test_recent_count_ignores_ooms_before_last_repartition(self) -> None:
+        # A repartition fixes the OOMs that preceded it. Without this floor, those OOMs keep counting
+        # and re-trigger a repartition on the same healthy table every cooldown until they age out.
+        schema = self._schema("orders")
+        self._oom(schema, age_days=2)
+        self._oom(schema, age_days=2)
+        self._oom(schema, age_days=2)
+        schema.sync_type_config = {
+            **(schema.sync_type_config or {}),
+            "last_repartition_at": (timezone.now() - timedelta(days=1)).isoformat(),
+        }
+        schema.save()
+
+        # All three OOMs predate the repartition, so none count toward re-triggering it.
+        assert ExternalDataSchemaOOMEvent.recent_count(schema, days=7) == 0
+
+        # An OOM recorded after the repartition still counts: the rewrite did not fix it, so this is a
+        # real escalation the controller should act on.
+        self._oom(schema)
+        assert ExternalDataSchemaOOMEvent.recent_count(schema, days=7) == 1
+
+    def test_recent_count_counts_every_retry_attempt(self) -> None:
+        # Retries of one job are separate attempts at the same merge, each rescheduled onto whichever
+        # worker picks it up. A job that OOMs attempt after attempt is a table failing deterministically,
+        # so collapsing those into one occurrence would discard the clearest evidence this log carries.
+        schema = self._schema("orders")
+        for _ in range(5):
+            self._oom(schema, run_id="run-1")
+
+        assert ExternalDataSchemaOOMEvent.recent_count(schema, days=7) == 5
+
+    @parameterized.expand(
+        [
+            # A death self-reported mid-extract (or in the consumer's pre-merge load, or after
+            # finishing) is not a merge memory problem, so a finer partition layout cannot fix it.
+            # Counting these is how tables that OOM on big fetches get wrongly repartitioned.
+            ("extract_phase_does_not_count", {"self_phase": "extract"}, 0),
+            ("load_phase_does_not_count", {"self_phase": "load"}, 0),
+            ("finished_phase_does_not_count", {"self_phase": "finished"}, 0),
+            ("merge_phase_counts", {"self_phase": "merge"}, 1),
+            # No workload report (rollout gap, expired key, Redis down) must fail open, or a partial
+            # rollout would silently switch the trigger off.
+            ("unknown_phase_counts", {}, 1),
+            # A co-tenant that self-reported a strictly larger working set is the likelier culprit for
+            # a pod kill; counting the victim would repartition the wrong table.
+            (
+                "larger_co_tenant_exonerates",
+                {
+                    "self_phase": "merge",
+                    "self_peak_buffer_bytes": 1_000,
+                    "co_tenant_correlated_max_peak_buffer_bytes": 900_000,
+                },
+                0,
+            ),
+            (
+                "smaller_co_tenant_does_not_exonerate",
+                {
+                    "self_phase": "merge",
+                    "self_peak_buffer_bytes": 900_000,
+                    "co_tenant_correlated_max_peak_buffer_bytes": 1_000,
+                },
+                1,
+            ),
+            # Unknown on either side never exonerates: blame requires evidence, absence of it does not.
+            (
+                "unknown_own_size_still_counts",
+                {"self_phase": "merge", "co_tenant_correlated_max_peak_buffer_bytes": 900_000},
+                1,
+            ),
+            # Reports are periodic, so a snapshot flushed long before the death describes an earlier
+            # phase of the run: a merge that OOMs within one report interval of leaving extract still
+            # shows "extract" in Redis. Stale or unknown-age evidence must not exonerate.
+            (
+                "stale_extract_phase_still_counts",
+                {"self_phase": "extract", "self_report_age_at_death_seconds": 999.0},
+                1,
+            ),
+            (
+                "unknown_age_extract_phase_still_counts",
+                {"self_phase": "extract", "self_report_age_at_death_seconds": None},
+                1,
+            ),
+            (
+                "stale_larger_co_tenant_still_counts",
+                {
+                    "self_phase": "merge",
+                    "self_report_age_at_death_seconds": 999.0,
+                    "self_peak_buffer_bytes": 1_000,
+                    "co_tenant_correlated_max_peak_buffer_bytes": 900_000,
+                },
+                1,
+            ),
+        ]
+    )
+    def test_recent_count_applies_workload_evidence_rules(self, _name: str, evidence: dict, expected: int) -> None:
+        schema = self._schema("orders")
+        self._oom(schema, **evidence)
+
+        assert ExternalDataSchemaOOMEvent.recent_count(schema, days=7) == expected
+
+    @override_settings(DATA_WAREHOUSE_OOM_INFRA_BURST_MIN_SCHEMAS=3, DATA_WAREHOUSE_OOM_INFRA_BURST_MIN_TEAMS=3)
+    def test_recent_count_ignores_occurrences_inside_a_fleet_wide_burst(self) -> None:
+        # A deploy or node drain kills workers fleet-wide and every syncing schema records an
+        # occurrence. Counting those is what repartitioned healthy tables for reasons that had
+        # nothing to do with their partitions; a burst is judged from the rows themselves.
+        schema = self._schema("orders")
+        self._oom(schema, self_phase="merge")
+        for name in ("events", "persons"):
+            self._oom(self._schema(name, team_id=self._other_team().pk))
+
+        assert ExternalDataSchemaOOMEvent.recent_count(schema, days=7) == 0
+
+    @override_settings(DATA_WAREHOUSE_OOM_INFRA_BURST_MIN_SCHEMAS=3, DATA_WAREHOUSE_OOM_INFRA_BURST_MIN_TEAMS=3)
+    def test_recent_count_keeps_occurrences_when_a_burst_spans_only_one_tenant(self) -> None:
+        # One tenant's source outage kills all of that tenant's schemas at once — many schemas, one
+        # team. That is the tenant's own problem, not infrastructure: classifying it as a burst would
+        # let one tenant's failures suppress another tenant's remediation, and (without this floor)
+        # its own.
+        schema = self._schema("orders")
+        self._oom(schema, self_phase="merge")
+        for name in ("events", "persons", "invoices"):
+            self._oom(self._schema(name))
+
+        assert ExternalDataSchemaOOMEvent.recent_count(schema, days=7) == 1
+
+    def test_recent_count_screens_bursts_with_one_aggregate_on_a_quiet_fleet(self) -> None:
+        # The burst rule must not cost one aggregate per row: a schema can carry dozens of
+        # occurrences, and this runs on every detection pass. One bucketed aggregate over the whole
+        # window screens them all; on a quiet fleet no bucket crosses the thresholds, so everything
+        # counts.
+        schema = self._schema("orders")
+        for _ in range(6):
+            self._oom(schema, self_phase="merge")
+        self._oom(schema, self_phase="merge", age_days=5)  # days apart must change nothing
+
+        # Bounded, not exact: the team-scoped manager adds constant overhead we don't want to pin.
+        with CaptureQueriesContext(connection) as queries:
+            assert ExternalDataSchemaOOMEvent.recent_count(schema, days=7) == 7
+        assert len(queries) <= 4, [q["sql"][:120] for q in queries.captured_queries]
+
+    @override_settings(DATA_WAREHOUSE_OOM_INFRA_BURST_MIN_SCHEMAS=1, DATA_WAREHOUSE_OOM_INFRA_BURST_MIN_TEAMS=1)
+    def test_recent_count_burst_screening_work_does_not_grow_with_retained_history(self) -> None:
+        # The shape an adversarially (or chronically) failing schema can induce: many occurrences
+        # spaced just under the window across days. Screening must stay a constant number of queries
+        # — one bucketed aggregate for the whole window — never a query per occurrence.
+        schema = self._schema("orders")
+        for i in range(40):
+            self._oom(schema, self_phase="merge", age_days=(40 - i) * 25 / (60 * 24))
+
+        with CaptureQueriesContext(connection) as queries:
+            # Thresholds of 1/1 make every occurrence its own crossing bucket, so all are excluded —
+            # the point here is the query count, not the (absurd) threshold configuration.
+            assert ExternalDataSchemaOOMEvent.recent_count(schema, days=7) == 0
+        assert len(queries) <= 4, [q["sql"][:120] for q in queries.captured_queries]
+
+    @override_settings(DATA_WAREHOUSE_OOM_INFRA_BURST_MIN_SCHEMAS=10)
+    def test_recent_count_keeps_occurrences_below_the_burst_threshold(self) -> None:
+        # The mirror case: a handful of schemas failing in one window is normal operation, and
+        # discarding those would leave the trigger unable to fire at all.
+        schema = self._schema("orders")
+        self._oom(schema, self_phase="merge")
+        for name in ("events", "persons"):
+            self._oom(self._schema(name))
+
+        assert ExternalDataSchemaOOMEvent.recent_count(schema, days=7) == 1
+
+
+class TestUpdateSyncTypeConfigKeys(BaseTest):
+    """The locked-merge helper that keeps the CDC extract activity and concurrent API PATCHes from
+    clobbering each other's sync_type_config keys."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.source = ExternalDataSource.objects.create(
+            team_id=self.team.pk,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            status="Completed",
+            source_type="Postgres",
+        )
+
+    def _create(self, sync_type_config: dict) -> ExternalDataSchema:
+        return ExternalDataSchema.objects.create(
+            team_id=self.team.pk, source=self.source, name="users", sync_type_config=sync_type_config
+        )
+
+    def test_updates_merge_and_preserve_unrelated_keys(self) -> None:
+        schema = self._create({"cdc_mode": "streaming", "cdc_last_log_position": "0/100"})
+        result = update_sync_type_config_keys(schema.id, self.team.pk, updates={"cdc_last_log_position": "0/200"})
+        assert result == {"cdc_mode": "streaming", "cdc_last_log_position": "0/200"}
+        schema.refresh_from_db()
+        assert schema.sync_type_config == {"cdc_mode": "streaming", "cdc_last_log_position": "0/200"}
+
+    def test_removes_pop_keys(self) -> None:
+        schema = self._create({"cdc_mode": "snapshot", "cdc_last_log_position": "0/100", "cdc_snapshot_lane": "buffer"})
+        result = update_sync_type_config_keys(
+            schema.id,
+            self.team.pk,
+            updates={"cdc_mode": "snapshot"},
+            removes=["cdc_last_log_position", "cdc_snapshot_lane"],
+        )
+        assert result == {"cdc_mode": "snapshot"}
+        schema.refresh_from_db()
+        assert schema.sync_type_config == {"cdc_mode": "snapshot"}
+
+    def test_remove_of_absent_key_is_noop(self) -> None:
+        schema = self._create({"cdc_mode": "streaming"})
+        update_sync_type_config_keys(schema.id, self.team.pk, removes=["not_there"])
+        schema.refresh_from_db()
+        assert schema.sync_type_config == {"cdc_mode": "streaming"}
+
+    def test_mutate_appends_inside_critical_section(self) -> None:
+        schema = self._create({"runs": [{"run_uuid": "a", "batch_results": []}]})
+
+        def _mutate(config: dict) -> None:
+            for entry in config["runs"]:
+                if entry["run_uuid"] == "a":
+                    entry["batch_results"].append({"s3_path": "s3://x"})
+
+        update_sync_type_config_keys(schema.id, self.team.pk, mutate=_mutate)
+        schema.refresh_from_db()
+        assert schema.sync_type_config["runs"][0]["batch_results"] == [{"s3_path": "s3://x"}]
+
+    def test_apply_order_is_updates_removes_mutate(self) -> None:
+        schema = self._create({"a": 1})
+
+        def _mutate(config: dict) -> None:
+            config["seen"] = sorted(config.keys())
+
+        result = update_sync_type_config_keys(schema.id, self.team.pk, updates={"b": 2}, removes=["a"], mutate=_mutate)
+        assert "a" not in result
+        assert result["seen"] == ["b"]
+
+    def test_wrong_team_id_does_not_match(self) -> None:
+        schema = self._create({"cdc_mode": "streaming"})
+        with self.assertRaises(ExternalDataSchema.DoesNotExist):
+            update_sync_type_config_keys(schema.id, self.team.pk + 12345, updates={"cdc_mode": "snapshot"})
+
+    def test_skips_activity_log(self) -> None:
+        schema = self._create({"cdc_mode": "streaming"})
+        received: list = []
+
+        def _handler(sender, **kwargs) -> None:
+            received.append(kwargs)
+
+        model_activity_signal.connect(_handler, sender=ExternalDataSchema, weak=False)
+        try:
+            with patch.object(ExternalDataSchema, "_get_before_update") as before_update:
+                update_sync_type_config_keys(schema.id, self.team.pk, updates={"cdc_last_log_position": "0/5"})
+                assert not before_update.called
+            assert received == []
+        finally:
+            model_activity_signal.disconnect(_handler, sender=ExternalDataSchema)
+
+    def test_interleaved_writes_do_not_clobber(self) -> None:
+        # Two activity-style position writes with an API-style cdc_table_mode write in between —
+        # every key survives because each call re-reads the row before merging.
+        schema = self._create({"cdc_mode": "streaming", "cdc_table_mode": "consolidated"})
+        update_sync_type_config_keys(schema.id, self.team.pk, updates={"cdc_last_log_position": "0/100"})
+        update_sync_type_config_keys(schema.id, self.team.pk, updates={"cdc_table_mode": "both"})
+        update_sync_type_config_keys(schema.id, self.team.pk, updates={"cdc_last_log_position": "0/200"})
+        schema.refresh_from_db()
+        assert schema.sync_type_config == {
+            "cdc_mode": "streaming",
+            "cdc_table_mode": "both",
+            "cdc_last_log_position": "0/200",
+        }
+
+    def test_merges_onto_latest_committed_not_stale_in_memory_copy(self) -> None:
+        # A writer holding a copy loaded before a concurrent commit must not revert that commit.
+        schema = self._create({"cdc_mode": "streaming", "cdc_last_log_position": "0/100"})
+        stale = ExternalDataSchema.objects.get(id=schema.id)  # in-memory copy: position 0/100
+        # A concurrent committed write moves the position forward:
+        update_sync_type_config_keys(schema.id, self.team.pk, updates={"cdc_last_log_position": "0/900"})
+        # The holder of the stale copy now persists an unrelated key through the helper:
+        result = update_sync_type_config_keys(schema.id, self.team.pk, updates={"cdc_table_mode": "both"})
+        # The concurrent position survives; the stale 0/100 never reaches the row.
+        assert result["cdc_last_log_position"] == "0/900"
+        assert result["cdc_table_mode"] == "both"
+        assert stale.sync_type_config["cdc_last_log_position"] == "0/100"  # the copy really was stale
+        schema.refresh_from_db()
+        assert schema.sync_type_config["cdc_last_log_position"] == "0/900"
+
+
+class TestMarkInitialSyncComplete(BaseTest):
+    """The first-sync-complete transition (V3 loader post-load), whose
+    False→True edge is what moves a CDC schema out of snapshot mode into streaming."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.source = ExternalDataSource.objects.create(
+            team_id=self.team.pk,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            status="Completed",
+            source_type="Postgres",
+        )
+
+    def _create(
+        self, sync_type: str, sync_type_config: dict, *, initial_sync_complete: bool = False
+    ) -> ExternalDataSchema:
+        return ExternalDataSchema.objects.create(
+            team_id=self.team.pk,
+            source=self.source,
+            name="users",
+            sync_type=sync_type,
+            sync_type_config=sync_type_config,
+            initial_sync_complete=initial_sync_complete,
+        )
+
+    @parameterized.expand(
+        [
+            (
+                # First completion of a CDC snapshot flips it to streaming; keys written
+                # concurrently by the CDC extract activity (its last run time) must survive the flip.
+                "cdc_snapshot_flips_to_streaming_preserving_other_keys",
+                "cdc",
+                {"cdc_mode": "snapshot", "cdc_last_run_at": "2026-01-01T00:00:00+00:00", "dwh_storage_key": "users"},
+                False,
+                True,
+                {"cdc_mode": "streaming", "cdc_last_run_at": "2026-01-01T00:00:00+00:00", "dwh_storage_key": "users"},
+            ),
+            (
+                # Already-streaming CDC schema (re-run after a reset) completes without a config rewrite.
+                "cdc_already_streaming_config_unchanged",
+                "cdc",
+                {"cdc_mode": "streaming"},
+                False,
+                True,
+                {"cdc_mode": "streaming"},
+            ),
+            (
+                # Non-CDC schemas must never get a cdc_mode key injected.
+                "non_cdc_config_untouched",
+                "incremental",
+                {"incremental_field": "id"},
+                False,
+                True,
+                {"incremental_field": "id"},
+            ),
+            (
+                # Only the False→True transition flips: a schema manually put back into snapshot
+                # mode must not be flipped to streaming by a later run's completion.
+                "already_complete_is_noop_even_in_snapshot_mode",
+                "cdc",
+                {"cdc_mode": "snapshot"},
+                True,
+                True,
+                {"cdc_mode": "snapshot"},
+            ),
+        ]
+    )
+    def test_transition(
+        self,
+        _name: str,
+        sync_type: str,
+        config: dict,
+        initial_flag: bool,
+        expected_flag: bool,
+        expected_config: dict,
+    ) -> None:
+        schema = self._create(sync_type, config, initial_sync_complete=initial_flag)
+        mark_initial_sync_complete(schema.id, self.team.pk)
+        schema.refresh_from_db()
+        assert schema.initial_sync_complete == expected_flag
+        assert schema.sync_type_config == expected_config
+
+
+class TestMarkSchemaRunningUnlessHalted(BaseTest):
+    @parameterized.expand(
+        [
+            ("healthy", {}, True),
+            ("broken", {"cdc_broken": {"reason": "critical_lag_self_managed"}}, False),
+            ("paused", {"cdc_extraction_paused": {"reason": "transaction_too_large"}}, False),
+        ]
+    )
+    def test_only_a_schema_without_a_halt_marker_is_painted_running(
+        self, _name: str, sync_type_config: dict, painted: bool
+    ) -> None:
+        source = ExternalDataSource.objects.create(
+            team_id=self.team.pk,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            status="Completed",
+            source_type="Postgres",
+        )
+        schema = ExternalDataSchema.objects.create(
+            team_id=self.team.pk,
+            source=source,
+            name="users",
+            sync_type="cdc",
+            sync_type_config=sync_type_config,
+            status=ExternalDataSchema.Status.FAILED,
+        )
+        stale = ExternalDataSchema.objects.get(id=schema.id)
+        stale.sync_type_config = {}
+
+        assert mark_schema_running_unless_halted(stale) is painted
+
+        schema.refresh_from_db()
+        expected = ExternalDataSchema.Status.RUNNING if painted else ExternalDataSchema.Status.FAILED
+        assert schema.status == expected
+
+
+@pytest.mark.parametrize(
+    "clickhouse_type,expected",
+    [
+        ("String", "String"),
+        ("Nullable(String)", "String"),
+        ("LowCardinality(String)", "String"),
+        ("LowCardinality(Nullable(String))", "String"),
+    ],
+)
+def test_clean_type_unwraps_low_cardinality(clickhouse_type: str, expected: str) -> None:
+    """`ai_events` exposes LowCardinality columns (event, model, provider, ...). clean_type must
+    unwrap LowCardinality so the ClickHouse->HogQL mapping lookup resolves instead of KeyError-ing."""
+    cleaned = clean_type(clickhouse_type)
+    assert cleaned == expected
+    assert cleaned in CLICKHOUSE_HOGQL_MAPPING
+
+
+@pytest.mark.parametrize(
+    "clickhouse_type,nullable,expected",
+    [
+        ("String", False, "String"),
+        ("String", True, "Nullable(String)"),
+        ("Nullable(String)", True, "Nullable(String)"),
+        # LowCardinality must stay outermost — ClickHouse rejects Nullable(LowCardinality(...)).
+        ("LowCardinality(String)", True, "LowCardinality(Nullable(String))"),
+        ("LowCardinality(Nullable(String))", True, "LowCardinality(Nullable(String))"),
+    ],
+)
+def test_clickhouse_column_to_dwh_column_nullable_wrapping(clickhouse_type: str, nullable: bool, expected: str) -> None:
+    assert clickhouse_column_to_dwh_column("col", clickhouse_type, nullable)["clickhouse"] == expected
+
+
+@pytest.mark.parametrize(
+    "sync_type,expected",
+    [
+        (ExternalDataSchema.SyncType.XMIN, True),
+        (ExternalDataSchema.SyncType.INCREMENTAL, False),
+        (ExternalDataSchema.SyncType.CDC, False),
+        (None, False),
+    ],
+)
+def test_is_xmin(sync_type: str | None, expected: bool) -> None:
+    assert ExternalDataSchema(sync_type=sync_type).is_xmin is expected
+
+
+@pytest.mark.parametrize(
+    "sync_type,expected",
+    [
+        (ExternalDataSchema.SyncType.XMIN, True),
+        (ExternalDataSchema.SyncType.INCREMENTAL, True),
+        (ExternalDataSchema.SyncType.APPEND, True),
+        (ExternalDataSchema.SyncType.WEBHOOK, True),
+        (ExternalDataSchema.SyncType.CDC, True),
+        (ExternalDataSchema.SyncType.FULL_REFRESH, False),
+        (None, False),
+    ],
+)
+def test_table_row_count_is_cumulative(sync_type: str | None, expected: bool) -> None:
+    assert ExternalDataSchema(sync_type=sync_type).table_row_count_is_cumulative is expected
+
+
+@contextmanager
+def _merge_in_memory(schema: ExternalDataSchema) -> Iterator[None]:
+    def apply(
+        schema_id: Any,
+        team_id: Any,
+        *,
+        updates: dict[str, Any] | None = None,
+        removes: Any = None,
+        extra_model_fields: dict[str, Any] | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        schema.sync_type_config.update(updates or {})
+        for key in removes or []:
+            schema.sync_type_config.pop(key, None)
+        for field, value in (extra_model_fields or {}).items():
+            setattr(schema, field, value)
+        return schema.sync_type_config
+
+    with patch(
+        "products.warehouse_sources.backend.models.external_data_schema.update_sync_type_config_keys",
+        side_effect=apply,
+    ):
+        yield
+
+
+@pytest.mark.parametrize(
+    "sync_type_config",
+    [
+        {"source_cursor": {"kind": "postgres_xmin", "data": {"ceiling_xid": 100}}},
+        {"xmin_last_value": 100, "xmin_ceiling": 4294967396, "xmin_num_wraparound": 1},
+    ],
+)
+def test_reset_pipeline_clears_the_source_cursor(sync_type_config: dict[str, Any]) -> None:
+    schema = ExternalDataSchema(
+        sync_type=ExternalDataSchema.SyncType.XMIN,
+        sync_type_config=dict(sync_type_config),
+        initial_sync_complete=True,
+    )
+    with _merge_in_memory(schema):
+        schema.update_sync_type_config_for_reset_pipeline()
+    assert not set(sync_type_config) & set(schema.sync_type_config)
+    assert schema.initial_sync_complete is False
+
+
+def test_clear_source_cursor_drops_the_legacy_keys_it_is_given() -> None:
+    schema = ExternalDataSchema(
+        sync_type_config={
+            "source_cursor": {"kind": "postgres_xmin", "data": {}},
+            "xmin_last_value": 100,
+            "primary_key_columns": ["id"],
+        }
+    )
+    with _merge_in_memory(schema):
+        schema.clear_source_cursor(legacy_keys=["xmin_last_value"])
+    assert schema.sync_type_config == {"primary_key_columns": ["id"]}
+
+
+def test_reset_pipeline_preserves_partition_overrides_but_clears_auto_detected() -> None:
+    # The operator pins a count via the admin repartition action; it must survive the reset
+    # that repartition bundles, while the auto-detected partition_count is wiped so it gets
+    # re-derived (and then loses to the override) on the resync.
+    schema = ExternalDataSchema(
+        sync_type_config={
+            "partition_count": 72,
+            "partition_count_override": 10,
+            "partition_size_override": 5,
+            "partitioning_enabled": True,
+            "partition_mode": "md5",
+        }
+    )
+    with _merge_in_memory(schema):
+        schema.update_sync_type_config_for_reset_pipeline()
+    assert "partition_count" not in schema.sync_type_config
+    assert "partitioning_enabled" not in schema.sync_type_config
+    assert schema.partition_count_override == 10
+    assert schema.partition_size_override == 5
+
+
+def test_set_partitioning_enabled_consumes_partition_overrides() -> None:
+    # Once the override is baked into the effective settings, it's a one-shot pin: drop it so
+    # a later reset re-detects instead of re-applying a stale value.
+    schema = ExternalDataSchema(sync_type_config={"partition_count_override": 10, "partition_size_override": 5})
+    with _merge_in_memory(schema):
+        schema.set_partitioning_enabled(
+            partitioning_keys=["id"],
+            partition_count=10,
+            partition_size=None,
+            partition_mode="md5",
+            partition_format=None,
+        )
+    assert schema.partition_count == 10
+    assert schema.partition_count_override is None
+    assert schema.partition_size_override is None
+
+
+def test_reset_pipeline_preserves_partition_mode_override() -> None:
+    # Operator switches a table from md5 to datetime via the admin change-partition-mode action.
+    # The mode/keys overrides must survive the bundled reset (which wipes the auto-detected
+    # partition_mode and partitioning_keys) so the new mode wins the resync.
+    schema = ExternalDataSchema(
+        sync_type_config={
+            "partition_mode": "md5",
+            "partitioning_keys": ["record_id", "action_date"],
+            "partition_count": 30,
+            "partition_mode_override": "datetime",
+            "partitioning_keys_override": ["action_date"],
+            "partition_format": "month",
+            "partitioning_enabled": True,
+        }
+    )
+    with _merge_in_memory(schema):
+        schema.update_sync_type_config_for_reset_pipeline()
+    assert "partition_mode" not in schema.sync_type_config
+    assert "partitioning_keys" not in schema.sync_type_config
+    assert schema.partition_mode_override == "datetime"
+    assert schema.partitioning_keys_override == ["action_date"]
+    # partition_format is never reset, so the datetime granularity carries into the resync.
+    assert schema.partition_format == "month"
+
+
+class TestRunSavesKeepTheFullRefreshInterval(BaseTest):
+    def test_a_cursor_save_keeps_an_interval_saved_during_the_run(self) -> None:
+        source = ExternalDataSource.objects.create(team=self.team, source_type="Postgres", job_inputs={})
+        created = ExternalDataSchema.objects.create(
+            name="orders",
+            team=self.team,
+            source=source,
+            sync_type=ExternalDataSchema.SyncType.INCREMENTAL,
+            sync_type_config={"incremental_field": "id", "incremental_field_type": IncrementalFieldType.Integer},
+            full_refresh_interval_days=7,
+        )
+        run_copy = ExternalDataSchema.objects.get(pk=created.pk)
+        ExternalDataSchema.objects.filter(pk=created.pk).update(full_refresh_interval_days=3)
+
+        run_copy.update_incremental_field_value(42)
+
+        created.refresh_from_db()
+        assert created.full_refresh_interval_days == 3
+        assert created.sync_type_config["incremental_field_last_value"] == 42
+
+    def test_the_clock_restarts_from_the_interval_saved_during_the_run(self) -> None:
+        source = ExternalDataSource.objects.create(team=self.team, source_type="Postgres", job_inputs={})
+        created = ExternalDataSchema.objects.create(
+            name="orders",
+            team=self.team,
+            source=source,
+            sync_type=ExternalDataSchema.SyncType.INCREMENTAL,
+            sync_type_config={"reset_pipeline": True},
+            full_refresh_interval_days=7,
+            next_full_refresh_at=datetime(2026, 9, 22, 3, 0, tzinfo=UTC),
+        )
+        run_copy = ExternalDataSchema.objects.get(pk=created.pk)
+        ExternalDataSchema.objects.filter(pk=created.pk).update(full_refresh_interval_days=3)
+
+        with time_machine.travel(datetime(2026, 9, 22, 3, 10, tzinfo=UTC), tick=False):
+            run_copy.update_sync_type_config_for_reset_pipeline()
+            assert run_copy.scheduled_full_refresh_due() is False
+
+        created.refresh_from_db()
+        assert (created.full_refresh_interval_days, created.next_full_refresh_at) == (
+            3,
+            datetime(2026, 9, 25, 3, 10, tzinfo=UTC),
+        )
+
+
+class TestScheduledFullRefreshDue:
+    def _schema(self, sync_type: str, sync_frequency_interval: timedelta) -> ExternalDataSchema:
+        return ExternalDataSchema(
+            sync_type=sync_type,
+            sync_frequency_interval=sync_frequency_interval,
+            full_refresh_interval_days=7,
+            next_full_refresh_at=datetime(2026, 9, 22, 3, 10, tzinfo=UTC),
+        )
+
+    @parameterized.expand(
+        [
+            ("daily_tick_just_before_the_due_time", timedelta(days=1), datetime(2026, 9, 22, 3, 0, 5), True),
+            ("daily_tick_a_day_early", timedelta(days=1), datetime(2026, 9, 21, 3, 0, 5), False),
+            ("half_hourly_tick_just_before_the_due_time", timedelta(minutes=30), datetime(2026, 9, 22, 3, 0, 5), True),
+            ("half_hourly_tick_one_cadence_early", timedelta(minutes=30), datetime(2026, 9, 22, 2, 30, 5), False),
+        ]
+    )
+    def test_due_on_the_tick_nearest_the_due_time(
+        self, _name: str, sync_frequency_interval: timedelta, now: datetime, expected: bool
+    ) -> None:
+        schema = self._schema(ExternalDataSchema.SyncType.INCREMENTAL, sync_frequency_interval)
+        with time_machine.travel(now.replace(tzinfo=UTC), tick=False):
+            assert schema.scheduled_full_refresh_due() is expected
+
+    @parameterized.expand([("full_refresh", "full_refresh"), ("cdc", "cdc"), ("webhook", "webhook")])
+    def test_never_due_for_a_sync_type_that_rereads_or_streams(self, _name: str, sync_type: str) -> None:
+        schema = self._schema(sync_type, timedelta(days=1))
+        with time_machine.travel(datetime(2026, 10, 1, tzinfo=UTC), tick=False):
+            assert schema.scheduled_full_refresh_due() is False
+
+
+class TestRestartFullRefreshClock:
+    @parameterized.expand(
+        [
+            ("wipe_just_after_the_time", datetime(2026, 9, 22, 3, 4), datetime(2026, 9, 29, 3, 0)),
+            ("wipe_on_a_sync_up_to_an_hour_early", datetime(2026, 9, 22, 2, 10), datetime(2026, 9, 29, 3, 0)),
+            ("wipe_on_a_later_daily_sync", datetime(2026, 9, 22, 5, 0), datetime(2026, 9, 29, 3, 0)),
+            ("saved_hours_before_the_time", datetime(2026, 9, 22, 1, 0), datetime(2026, 9, 28, 3, 0)),
+        ]
+    )
+    def test_the_next_refresh_keeps_the_chosen_time(self, _name: str, now: datetime, expected: datetime) -> None:
+        schema = ExternalDataSchema(full_refresh_interval_days=7, full_refresh_time_of_day=time(3, 0))
+        with time_machine.travel(now.replace(tzinfo=UTC), tick=False):
+            schema.restart_full_refresh_clock()
+        assert schema.next_full_refresh_at == expected.replace(tzinfo=UTC)
+
+
+def test_set_partitioning_enabled_consumes_partition_mode_override() -> None:
+    schema = ExternalDataSchema(
+        sync_type_config={"partition_mode_override": "datetime", "partitioning_keys_override": ["action_date"]}
+    )
+    with _merge_in_memory(schema):
+        schema.set_partitioning_enabled(
+            partitioning_keys=["action_date"],
+            partition_count=None,
+            partition_size=None,
+            partition_mode="datetime",
+            partition_format="month",
+        )
+    assert schema.partition_mode == "datetime"
+    assert schema.partitioning_keys == ["action_date"]
+    assert schema.partition_mode_override is None
+    assert schema.partitioning_keys_override is None
+
+
+def test_process_incremental_value_xid_returns_value_as_is() -> None:
+    assert process_incremental_value(4294967396, IncrementalFieldType.XID) == 4294967396
+    assert process_incremental_value(None, IncrementalFieldType.XID) is None
+
+
+@pytest.mark.parametrize(
+    "value,field_type,expected",
+    [
+        # Unix-epoch cursors (e.g. Stripe `created`) arrive as numbers on datetime-typed fields;
+        # dateutil raised "Parser must be a string or character stream, not int" before this passthrough.
+        (1718377611, IncrementalFieldType.DateTime, 1718377611),
+        (1718377611, IncrementalFieldType.Timestamp, 1718377611),
+        (1718377611, IncrementalFieldType.Date, 1718377611),
+        (1718377611.5, IncrementalFieldType.DateTime, 1718377611.5),
+        (datetime(2024, 6, 14, 15, 33, 31), IncrementalFieldType.DateTime, datetime(2024, 6, 14, 15, 33, 31)),
+        ("2024-06-14T15:33:31", IncrementalFieldType.DateTime, datetime(2024, 6, 14, 15, 33, 31)),
+        (date(2024, 6, 14), IncrementalFieldType.DateTime, datetime(2024, 6, 14)),
+        (date(2024, 6, 14), IncrementalFieldType.Timestamp, datetime(2024, 6, 14)),
+        ("2024-06-14", IncrementalFieldType.Date, date(2024, 6, 14)),
+        # JS `Date.prototype.toString()` cursors carry a parenthetical timezone name dateutil
+        # can't parse on its own, even though the GMT offset earlier in the string is sufficient.
+        (
+            "Sun Mar 15 2026 16:59:47 GMT+0000 (Coordinated Universal Time)",
+            IncrementalFieldType.DateTime,
+            datetime(2026, 3, 15, 16, 59, 47, tzinfo=timezone.get_fixed_timezone(0)),
+        ),
+        (
+            "Mon Jan 05 2026 09:15:00 GMT-0800 (Pacific Standard Time)",
+            IncrementalFieldType.Date,
+            date(2026, 1, 5),
+        ),
+        # A bare digit-string cursor on a date/time-typed field (e.g. a ClickHouse column Arrow
+        # casts to String) crashed here: dateutil misreads it as a calendar year and overflows
+        # past datetime's year-9999 ceiling. Fall back to the raw integer instead of crashing.
+        ("20662", IncrementalFieldType.Timestamp, 20662),
+        ("20662", IncrementalFieldType.DateTime, 20662),
+        ("20662", IncrementalFieldType.Date, 20662),
+        # Longer digit runs overflow C's int range and raise `OverflowError` instead of
+        # `ParserError` - same fallback must catch both.
+        ("20662123456", IncrementalFieldType.DateTime, 20662123456),
+        # A genuine compact date string (YYYYMMDD) must still parse as a real date, not fall
+        # back to the raw-integer path.
+        ("20240115", IncrementalFieldType.Date, date(2024, 1, 15)),
+        # MySQL's zero-date sentinel for "no date set" (also emitted verbatim by some REST
+        # sources, e.g. ServiceM8's `edit_date`) must be treated as absent instead of
+        # crashing on dateutil's year-0 ParserError.
+        ("0000-00-00 00:00:00", IncrementalFieldType.DateTime, None),
+        ("0000-00-00 00:00:00", IncrementalFieldType.Timestamp, None),
+        ("0000-00-00", IncrementalFieldType.Date, None),
+    ],
+)
+def test_process_incremental_value_datetime_handles_epoch_numbers(value, field_type, expected) -> None:
+    assert process_incremental_value(value, field_type) == expected
+
+
+@pytest.mark.parametrize(
+    "field_type",
+    [IncrementalFieldType.DateTime, IncrementalFieldType.Timestamp, IncrementalFieldType.Date],
+)
+def test_process_incremental_value_datetime_reraises_unparseable_non_numeric_string(field_type) -> None:
+    with pytest.raises(parser.ParserError):
+        process_incremental_value("not-a-date-at-all", field_type)
+
+
+@pytest.mark.parametrize(
+    "value,field_type,lookback_seconds,expected",
+    [
+        (datetime(2026, 6, 14, 15, 33, 31), IncrementalFieldType.Timestamp, 3600, datetime(2026, 6, 14, 14, 33, 31)),
+        (datetime(2026, 6, 14, 15, 33, 31), IncrementalFieldType.DateTime, 86400, datetime(2026, 6, 13, 15, 33, 31)),
+        (date(2026, 6, 14), IncrementalFieldType.Date, 86400, date(2026, 6, 13)),
+        # Date arithmetic ignores the sub-day part of the delta, so a <1-day lookback is a no-op for date fields.
+        (date(2026, 6, 14), IncrementalFieldType.Date, 3600, date(2026, 6, 14)),
+        (datetime(2026, 6, 14, 15, 33, 31), IncrementalFieldType.Timestamp, None, datetime(2026, 6, 14, 15, 33, 31)),
+        (datetime(2026, 6, 14, 15, 33, 31), IncrementalFieldType.Timestamp, 0, datetime(2026, 6, 14, 15, 33, 31)),
+        (datetime(2026, 6, 14, 15, 33, 31), IncrementalFieldType.Timestamp, -5, datetime(2026, 6, 14, 15, 33, 31)),
+        (100, IncrementalFieldType.Integer, 3600, 100),
+        (100, IncrementalFieldType.Numeric, 3600, 100),
+        # Epoch-second cursor on a datetime field shifts directly instead of crashing on int - timedelta.
+        (1718377611, IncrementalFieldType.DateTime, 3600, 1718374011),
+        ("abc123", IncrementalFieldType.ObjectID, 3600, "abc123"),
+        (None, IncrementalFieldType.Timestamp, 3600, None),
+        (datetime(2026, 6, 14, 15, 33, 31), None, 3600, datetime(2026, 6, 14, 15, 33, 31)),
+    ],
+)
+def test_apply_incremental_lookback(value, field_type, lookback_seconds, expected) -> None:
+    assert apply_incremental_lookback(value, field_type, lookback_seconds) == expected
+
+
+class TestStagedIncrementalCursor:
+    @staticmethod
+    def _merge_kafka_offsets(current: Any, candidate: Any) -> dict[str, Any]:
+        current_offsets = current["data"]["offsets"]
+        candidate_offsets = candidate["data"]["offsets"]
+        merged_offsets = dict(current_offsets)
+        for partition, offset in candidate_offsets.items():
+            merged_offsets[partition] = max(merged_offsets.get(partition, offset), offset)
+        return {"kind": "kafka", "data": {"offsets": merged_offsets}}
+
+    def _make_schema(self, **config: object) -> ExternalDataSchema:
+        schema = ExternalDataSchema(
+            sync_type_config={
+                "incremental_field_type": IncrementalFieldType.Integer,
+                **config,
+            }
+        )
+        return schema
+
+    @contextmanager
+    def _staged_in_memory(self, schema: ExternalDataSchema) -> Iterator[None]:
+        def apply(schema_id: Any, team_id: Any, *, mutate: Any, **_: Any) -> dict[str, Any]:
+            mutate(schema.sync_type_config)
+            return schema.sync_type_config
+
+        with patch(
+            "products.warehouse_sources.backend.models.external_data_schema.update_sync_type_config_keys",
+            side_effect=apply,
+        ):
+            yield
+
+    def test_stage_writes_run_uuid_and_last_value(self) -> None:
+        schema = self._make_schema()
+        with self._staged_in_memory(schema):
+            schema.stage_incremental_field_value("run-1", 42)
+        staged = schema.sync_type_config["incremental_staged"]
+        assert staged == {"run_uuid": "run-1", "last_value": 42}
+
+    def test_stage_keeps_epoch_number_for_datetime_field(self) -> None:
+        # A datetime-typed epoch cursor must round-trip as a number, not "1718377611", so the next
+        # run's read-back doesn't feed a numeric string into dateutil and crash.
+        schema = self._make_schema(incremental_field_type=IncrementalFieldType.DateTime)
+        with self._staged_in_memory(schema):
+            schema.stage_incremental_field_value("run-1", 1718377611)
+        assert schema.sync_type_config["incremental_staged"]["last_value"] == 1718377611
+
+    def test_update_incremental_field_value_keeps_epoch_number_for_datetime_field(self) -> None:
+        schema = self._make_schema(incremental_field_type=IncrementalFieldType.DateTime)
+        schema.update_incremental_field_value(1718377611, save=False)
+        assert schema.sync_type_config["incremental_field_last_value"] == 1718377611
+
+    def test_stage_writes_earliest_value(self) -> None:
+        schema = self._make_schema()
+        with self._staged_in_memory(schema):
+            schema.stage_incremental_field_value("run-1", None, earliest_value=10)
+        staged = schema.sync_type_config["incremental_staged"]
+        assert staged == {"run_uuid": "run-1", "earliest_value": 10}
+
+    def test_stage_overwrites_when_different_run_uuid(self) -> None:
+        schema = self._make_schema(incremental_staged={"run_uuid": "old", "last_value": 1, "earliest_value": 5})
+        with self._staged_in_memory(schema):
+            schema.stage_incremental_field_value("run-2", 99)
+        staged = schema.sync_type_config["incremental_staged"]
+        assert staged["run_uuid"] == "run-2"
+        assert staged["last_value"] == 99
+        assert "earliest_value" not in staged
+        assert schema.sync_type_config["incremental_staged_pending"] == [
+            {"run_uuid": "old", "last_value": 1, "earliest_value": 5}
+        ]
+
+    def test_stage_does_not_park_a_cursor_that_holds_no_value(self) -> None:
+        schema = self._make_schema(incremental_staged={"run_uuid": "run-1"})
+        with self._staged_in_memory(schema):
+            schema.stage_incremental_field_value("run-2", 99)
+        assert "incremental_staged_pending" not in schema.sync_type_config
+
+    def test_stage_continues_a_parked_cursor_for_the_same_run(self) -> None:
+        schema = self._make_schema(
+            incremental_staged={"run_uuid": "run-2", "earliest_value": 3},
+            incremental_staged_pending=[{"run_uuid": "run-1", "earliest_value": 5}],
+        )
+        with self._staged_in_memory(schema):
+            schema.stage_incremental_field_value("run-1", 42)
+        assert schema.sync_type_config["incremental_staged"] == {
+            "run_uuid": "run-1",
+            "earliest_value": 5,
+            "last_value": 42,
+        }
+        assert schema.sync_type_config["incremental_staged_pending"] == [{"run_uuid": "run-2", "earliest_value": 3}]
+
+    def test_parked_cursors_stay_bounded(self) -> None:
+        schema = self._make_schema()
+        with self._staged_in_memory(schema):
+            for index in range(STAGED_CURSOR_PENDING_LIMIT + 5):
+                schema.stage_incremental_field_value(f"run-{index}", index)
+        pending = schema.sync_type_config["incremental_staged_pending"]
+        assert len(pending) == STAGED_CURSOR_PENDING_LIMIT
+        assert pending[0]["run_uuid"] == "run-4"
+        assert pending[-1]["run_uuid"] == f"run-{STAGED_CURSOR_PENDING_LIMIT + 3}"
+        assert schema.sync_type_config["incremental_staged"]["run_uuid"] == f"run-{STAGED_CURSOR_PENDING_LIMIT + 4}"
+
+    def test_promote_reads_a_parked_cursor(self) -> None:
+        schema = self._make_schema(
+            incremental_staged={"run_uuid": "run-2", "last_value": 10},
+            incremental_staged_pending=[{"run_uuid": "run-1", "last_value": 42}],
+        )
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-1") is True
+        assert schema.sync_type_config["incremental_field_last_value"] == 42
+        assert schema.sync_type_config["incremental_staged"] == {"run_uuid": "run-2", "last_value": 10}
+        assert "incremental_staged_pending" not in schema.sync_type_config
+
+    def test_promote_never_moves_last_value_backwards(self) -> None:
+        schema = self._make_schema(
+            incremental_field_last_value=99,
+            incremental_staged_pending=[{"run_uuid": "run-1", "last_value": 42}],
+        )
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-1") is True
+        assert schema.sync_type_config["incremental_field_last_value"] == 99
+
+    def test_promote_never_moves_earliest_value_forwards(self) -> None:
+        schema = self._make_schema(
+            incremental_field_earliest_value=5,
+            incremental_staged_pending=[{"run_uuid": "run-1", "earliest_value": 40}],
+        )
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-1") is True
+        assert schema.sync_type_config["incremental_field_earliest_value"] == 5
+
+    def test_promote_advances_earliest_value_backwards(self) -> None:
+        schema = self._make_schema(
+            incremental_field_earliest_value=40,
+            incremental_staged={"run_uuid": "run-1", "earliest_value": 5},
+        )
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-1") is True
+        assert schema.sync_type_config["incremental_field_earliest_value"] == 5
+
+    @parameterized.expand(
+        [
+            # A run that read only above the stored watermark saw none of the older rows of the table.
+            # Its oldest row as the earliest value makes the next run read the whole table below it again.
+            ("a_forward_only_run_sets_no_earliest_value", {"incremental_field_last_value": 90}, None),
+            ("the_first_run_sets_the_earliest_value", {}, 5),
+            (
+                "a_backfill_below_the_stored_earliest_value_advances_it",
+                {"incremental_field_last_value": 90, "incremental_field_earliest_value": 40},
+                5,
+            ),
+        ]
+    )
+    def test_promote_sets_the_earliest_value_unless_the_watermark_has_none(
+        self, _name: str, stored: dict[str, Any], expected_earliest: int | None
+    ) -> None:
+        schema = self._make_schema(
+            **stored, incremental_staged={"run_uuid": "run-1", "last_value": 99, "earliest_value": 5}
+        )
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-1") is True
+        assert schema.sync_type_config["incremental_field_last_value"] == 99
+        assert schema.sync_type_config.get("incremental_field_earliest_value") == expected_earliest
+
+    @parameterized.expand(
+        [
+            ("older_epoch_keeps_iso", IncrementalFieldType.DateTime, "2026-06-14T00:00:00+00:00", 1767225600),
+            ("older_iso_keeps_epoch", IncrementalFieldType.DateTime, 1781395200, "2026-01-01T00:00:00+00:00"),
+            ("older_epoch_keeps_naive_iso", IncrementalFieldType.DateTime, "2026-06-14T00:00:00", 1767225600),
+            ("older_epoch_keeps_date", IncrementalFieldType.Date, "2026-06-14", 1767225600),
+            (
+                "older_objectid_keeps_newer",
+                IncrementalFieldType.ObjectID,
+                "65f0c0c0a1b2c3d4e5f60002",
+                "65f0c0c0a1b2c3d4e5f60001",
+            ),
+        ]
+    )
+    def test_promote_never_moves_last_value_backwards_across_cursor_encodings(
+        self, _name: str, field_type: IncrementalFieldType, current: Any, older: Any
+    ) -> None:
+        schema = self._make_schema(
+            incremental_field_type=field_type,
+            incremental_field_last_value=current,
+            incremental_staged={"run_uuid": "run-1", "last_value": older},
+        )
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-1") is True
+        assert schema.sync_type_config["incremental_field_last_value"] == current
+
+    def test_promote_advances_an_epoch_cursor_to_a_newer_iso_cursor(self) -> None:
+        schema = self._make_schema(
+            incremental_field_type=IncrementalFieldType.DateTime,
+            incremental_field_last_value=1767225600,
+            incremental_staged={"run_uuid": "run-1", "last_value": "2026-06-14T00:00:00+00:00"},
+        )
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-1") is True
+        assert schema.sync_type_config["incremental_field_last_value"] == "2026-06-14T00:00:00+00:00"
+
+    def test_promote_keeps_newest_when_cursors_cannot_be_ordered(self) -> None:
+        schema = self._make_schema(
+            incremental_field_type=None,
+            incremental_field_last_value="aaa",
+            incremental_staged={"run_uuid": "run-1", "last_value": "bbb"},
+        )
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-1") is True
+        assert schema.sync_type_config["incremental_field_last_value"] == "bbb"
+
+    def test_promote_rejects_a_run_uuid_with_no_slot_anywhere(self) -> None:
+        schema = self._make_schema(
+            incremental_staged={"run_uuid": "run-2", "last_value": 10},
+            incremental_staged_pending=[{"run_uuid": "run-1", "last_value": 42}],
+        )
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-WRONG") is False
+        assert "incremental_field_last_value" not in schema.sync_type_config
+
+    def test_stage_merges_when_same_run_uuid(self) -> None:
+        schema = self._make_schema()
+        with self._staged_in_memory(schema):
+            schema.stage_incremental_field_value("run-1", None, earliest_value=10)
+            schema.stage_incremental_field_value("run-1", 42)
+        staged = schema.sync_type_config["incremental_staged"]
+        assert staged == {"run_uuid": "run-1", "earliest_value": 10, "last_value": 42}
+
+    def test_promote_moves_last_value_to_live(self) -> None:
+        schema = self._make_schema(incremental_staged={"run_uuid": "run-1", "last_value": 42})
+        with self._staged_in_memory(schema):
+            result = schema.promote_staged_incremental_values("run-1")
+        assert result is True
+        assert schema.sync_type_config["incremental_field_last_value"] == 42
+        assert "incremental_staged" not in schema.sync_type_config
+
+    def test_promote_moves_earliest_value_to_live(self) -> None:
+        schema = self._make_schema(incremental_staged={"run_uuid": "run-1", "earliest_value": 5})
+        with self._staged_in_memory(schema):
+            result = schema.promote_staged_incremental_values("run-1")
+        assert result is True
+        assert schema.sync_type_config["incremental_field_earliest_value"] == 5
+
+    @parameterized.expand(
+        [
+            (
+                "live_slot_of_a_later_attempt",
+                IncrementalFieldType.Integer,
+                {"run_uuid": "wf-1-a2", "last_value": 7},
+                [],
+                7,
+                [],
+            ),
+            (
+                "highest_across_live_and_parked_attempts",
+                IncrementalFieldType.Integer,
+                {"run_uuid": "wf-1-a3", "earliest_value": 1},
+                [{"run_uuid": "wf-1-a1", "last_value": 42}, {"run_uuid": "wf-1-a2", "last_value": 9}],
+                42,
+                [],
+            ),
+            (
+                "another_run_is_ignored",
+                IncrementalFieldType.Integer,
+                {"run_uuid": "wf-2-a1", "last_value": 42},
+                [],
+                None,
+                [],
+            ),
+            (
+                "a_run_id_that_merely_shares_a_prefix_is_ignored",
+                IncrementalFieldType.Integer,
+                {"run_uuid": "wf-10-a1", "last_value": 42},
+                [{"run_uuid": "wf-1-a1", "last_value": 3}],
+                3,
+                [],
+            ),
+            (
+                "malformed_attempt_suffixes_are_ignored",
+                IncrementalFieldType.Integer,
+                {"run_uuid": "wf-1-ax", "last_value": 90},
+                [
+                    {"run_uuid": "wf-1", "last_value": 91},
+                    {"run_uuid": "wf-1-a", "last_value": 92},
+                    {"run_uuid": "wf-1-a2-retry", "last_value": 93},
+                    {"run_uuid": 1, "last_value": 94},
+                    {"run_uuid": "wf-1-a1", "last_value": 5},
+                ],
+                5,
+                [],
+            ),
+            (
+                "earliest_only_is_not_a_high_water_mark",
+                IncrementalFieldType.Integer,
+                {"run_uuid": "wf-1-a1", "earliest_value": 5},
+                [],
+                None,
+                [],
+            ),
+            (
+                "unparseable_value_is_skipped",
+                IncrementalFieldType.DateTime,
+                {"run_uuid": "wf-1-a2", "last_value": "not-a-date"},
+                [{"run_uuid": "wf-1-a1", "last_value": "2026-01-09T00:00:00+00:00"}],
+                datetime(2026, 1, 9, tzinfo=UTC),
+                ["staged_run_last_value_unparseable"],
+            ),
+            (
+                "epoch_and_iso_values_order_by_time",
+                IncrementalFieldType.DateTime,
+                {"run_uuid": "wf-1-a2", "last_value": "2026-01-01T00:00:00+00:00"},
+                [{"run_uuid": "wf-1-a1", "last_value": 1768000000}],
+                1768000000,
+                [],
+            ),
+            (
+                "unordered_pair_keeps_the_newest_attempt",
+                IncrementalFieldType.DateTime,
+                {"run_uuid": "wf-1-a2", "last_value": "2026-01-01T00:00:00"},
+                [{"run_uuid": "wf-1-a1", "last_value": "2026-01-09T00:00:00+00:00"}],
+                datetime(2026, 1, 1),
+                ["staged_run_last_value_unordered"],
+            ),
+        ]
+    )
+    def test_staged_run_last_value(
+        self,
+        _name: str,
+        field_type: IncrementalFieldType,
+        live: dict[str, Any],
+        parked: list[dict[str, Any]],
+        expected: Any,
+        warnings: list[str],
+    ) -> None:
+        config = {
+            "incremental_field_type": field_type,
+            "incremental_staged": live,
+            "incremental_staged_pending": parked,
+        }
+        with patch("products.warehouse_sources.backend.models.external_data_schema.logger") as mock_logger:
+            assert staged_run_last_value(config, "wf-1") == expected
+        assert [call.args[0] for call in mock_logger.warning.call_args_list] == warnings
+
+    def test_promote_rejects_wrong_run_uuid(self) -> None:
+        schema = self._make_schema(incremental_staged={"run_uuid": "run-1", "last_value": 42})
+        with self._staged_in_memory(schema):
+            result = schema.promote_staged_incremental_values("run-WRONG")
+        assert result is False
+        assert "incremental_field_last_value" not in schema.sync_type_config
+
+    def test_promote_merges_the_source_cursor_with_the_current_value(self) -> None:
+        current_cursor = {"kind": "kafka", "data": {"offsets": {"0": 50}}}
+        schema = self._make_schema(source_cursor=current_cursor)
+        staged_cursor = {"kind": "kafka", "data": {"offsets": {"0": 10}}}
+        with self._staged_in_memory(schema):
+            schema.stage_incremental_field_value("run-1", 42)
+            schema.stage_source_cursor("run-1", staged_cursor)
+            assert (
+                schema.promote_staged_incremental_values("run-1", merge_source_cursors=self._merge_kafka_offsets)
+                is True
+            )
+        assert schema.sync_type_config["source_cursor"] == current_cursor
+        assert schema.sync_type_config["incremental_field_last_value"] == 42
+        assert "incremental_staged" not in schema.sync_type_config
+
+    def test_an_older_displaced_source_cursor_cannot_replace_a_newer_cursor(self) -> None:
+        older_cursor = {"kind": "kafka", "data": {"offsets": {"0": 10}}}
+        newer_cursor = {"kind": "kafka", "data": {"offsets": {"0": 20}}}
+        schema = self._make_schema(
+            source_cursor=newer_cursor,
+            incremental_staged_pending=[{"run_uuid": "run-1", "source_cursor": older_cursor}],
+        )
+        with self._staged_in_memory(schema):
+            assert (
+                schema.promote_staged_incremental_values("run-1", merge_source_cursors=self._merge_kafka_offsets)
+                is True
+            )
+        assert schema.sync_type_config["source_cursor"] == newer_cursor
+
+    def test_promote_returns_false_when_no_staged(self) -> None:
+        schema = self._make_schema()
+        with self._staged_in_memory(schema):
+            result = schema.promote_staged_incremental_values("run-1")
+        assert result is False
+
+    def test_reset_pipeline_clears_staged(self) -> None:
+        schema = self._make_schema(
+            incremental_staged={"run_uuid": "run-1", "last_value": 42},
+            incremental_staged_pending=[{"run_uuid": "run-0", "last_value": 1}],
+            **{PREFIX_PROMOTION_KEY: {"job_id": "job-1", "run_uuid": "run-1", "value": 30, "rows_synced": 7}},
+        )
+        with _merge_in_memory(schema):
+            schema.update_sync_type_config_for_reset_pipeline()
+        assert "incremental_staged" not in schema.sync_type_config
+        assert "incremental_staged_pending" not in schema.sync_type_config
+        assert PREFIX_PROMOTION_KEY not in schema.sync_type_config
+
+    def _promote_prefix(self, schema: ExternalDataSchema, value: Any, *, field: str = "id") -> bool:
+        with self._staged_in_memory(schema):
+            return schema.promote_loaded_prefix_value(
+                run_uuid="run-1", job_id="job-1", field=field, value=value, job_rows_synced=7
+            )
+
+    @parameterized.expand(
+        [
+            ("no_watermark_yet", {}, 30),
+            ("above_the_watermark", {"incremental_field_last_value": 10}, 30),
+            (
+                "parked_staged_cursor",
+                {
+                    "incremental_staged": {"run_uuid": "run-2", "last_value": 5},
+                    "incremental_staged_pending": [{"run_uuid": "run-1", "last_value": 50}],
+                },
+                30,
+            ),
+        ]
+    )
+    def test_promote_loaded_prefix_moves_the_watermark_up(self, _name: str, config: dict, value: Any) -> None:
+        schema = self._make_schema(
+            incremental_field="id", **{"incremental_staged": {"run_uuid": "run-1", "last_value": 50}, **config}
+        )
+
+        assert self._promote_prefix(schema, value) is True
+
+        assert schema.sync_type_config["incremental_field_last_value"] == value
+        assert schema.sync_type_config[PREFIX_PROMOTION_KEY] == {
+            "job_id": "job-1",
+            "run_uuid": "run-1",
+            "value": value,
+            "rows_synced": 7,
+        }
+
+    @parameterized.expand(
+        [
+            # A newer run already moved the watermark past this run's prefix.
+            ("newer_run_is_ahead", {"incremental_field_last_value": 40}, "id", 30),
+            ("equal_to_the_watermark", {"incremental_field_last_value": 30}, "id", 30),
+            # A reset dropped the staged cursors, so the loaded rows belong to the deleted table.
+            ("reset_dropped_the_staged_cursor", {"incremental_staged": None}, "id", 30),
+            (
+                "staged_cursor_of_another_run_only",
+                {"incremental_staged": {"run_uuid": "run-2", "last_value": 50}},
+                "id",
+                30,
+            ),
+            ("value_above_what_the_run_read", {}, "id", 60),
+            ("incremental_field_changed", {}, "updated_at", 30),
+            (
+                "values_cannot_be_ordered",
+                {"incremental_field_type": IncrementalFieldType.ObjectID, "incremental_field_last_value": "abc"},
+                "id",
+                "65f0c0c0a1b2c3d4e5f60001",
+            ),
+        ]
+    )
+    def test_promote_loaded_prefix_keeps_the_watermark(self, _name: str, config: dict, field: str, value: Any) -> None:
+        schema = self._make_schema(
+            incremental_field="id", **{"incremental_staged": {"run_uuid": "run-1", "last_value": 50}, **config}
+        )
+        if schema.sync_type_config["incremental_staged"] is None:
+            del schema.sync_type_config["incremental_staged"]
+        watermark_before = schema.sync_type_config.get("incremental_field_last_value")
+
+        assert self._promote_prefix(schema, value, field=field) is False
+
+        assert schema.sync_type_config.get("incremental_field_last_value") == watermark_before
+        assert PREFIX_PROMOTION_KEY not in schema.sync_type_config
+
+    def test_final_promotion_still_moves_the_watermark_to_the_full_value_after_a_prefix(self) -> None:
+        schema = self._make_schema(incremental_field="id", incremental_staged={"run_uuid": "run-1", "last_value": 50})
+
+        assert self._promote_prefix(schema, 30) is True
+        with self._staged_in_memory(schema):
+            assert schema.promote_staged_incremental_values("run-1") is True
+
+        assert schema.sync_type_config["incremental_field_last_value"] == 50
+
+    @parameterized.expand(
+        [
+            ("same_job_and_watermark", "job-1", 30, 7),
+            ("another_job", "job-2", 30, None),
+            # A later promotion moved the watermark, so this attempt does not start at the prefix.
+            ("watermark_moved_since", "job-1", 45, None),
+        ]
+    )
+    def test_prefix_promotion_rows_synced(self, _name: str, job_id: str, watermark: Any, expected: int | None) -> None:
+        config = {
+            "incremental_field_last_value": watermark,
+            PREFIX_PROMOTION_KEY: {"job_id": "job-1", "run_uuid": "run-1", "value": 30, "rows_synced": 7},
+        }
+
+        assert prefix_promotion_rows_synced(config, job_id) == expected
+
+    def test_prefix_promotion_rows_synced_without_a_promotion(self) -> None:
+        assert prefix_promotion_rows_synced({"incremental_field_last_value": 30}, "job-1") is None
+
+
+class TestStagedIncrementalCursorStaleWriters(BaseTest):
+    def test_two_stale_instances_of_one_run_keep_each_others_entries(self) -> None:
+        source = ExternalDataSource.objects.create(
+            team_id=self.team.pk,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            status="Completed",
+            source_type="Postgres",
+        )
+        schema = ExternalDataSchema.objects.create(
+            team_id=self.team.pk,
+            source=source,
+            name="events",
+            sync_type_config={"incremental_field_type": IncrementalFieldType.Integer},
+        )
+        outgoing = ExternalDataSchema.objects.get(id=schema.id)
+        incoming = ExternalDataSchema.objects.get(id=schema.id)
+
+        outgoing.stage_incremental_field_value("run-a1", None, earliest_value=5)
+        incoming.stage_incremental_field_value("run-a2", None, earliest_value=7)
+        outgoing.stage_incremental_field_value("run-a1", 42)
+
+        schema.refresh_from_db()
+        assert schema.sync_type_config["incremental_staged"] == {
+            "run_uuid": "run-a1",
+            "earliest_value": 5,
+            "last_value": 42,
+        }
+        assert schema.sync_type_config["incremental_staged_pending"] == [{"run_uuid": "run-a2", "earliest_value": 7}]
+
+        assert schema.promote_staged_incremental_values("run-a1") is True
+        assert schema.promote_staged_incremental_values("run-a2") is True
+        schema.refresh_from_db()
+        assert schema.sync_type_config["incremental_field_last_value"] == 42
+        assert schema.sync_type_config["incremental_field_earliest_value"] == 5
+        assert "incremental_staged" not in schema.sync_type_config
+        assert "incremental_staged_pending" not in schema.sync_type_config
+
+
+class TestSSHTunnelPortValidation(SimpleTestCase):
+    @parameterized.expand(
+        [
+            # Out-of-range ports previously slipped through to sshtunnel, which asserted `port >= 0`
+            # and crashed credential validation with a bare AssertionError ("PORT < 0 (...)").
+            ("negative", -122, False),
+            ("zero", 0, False),
+            ("too_large", 70000, False),
+            ("non_numeric", "not-a-number", False),
+            ("http", 80, False),
+            ("https", 443, False),
+            ("ssh", 22, True),
+            ("postgres", 5432, True),
+            ("max_valid", 65535, True),
+        ]
+    )
+    def test_has_valid_port(self, _name: str, port: int | str, expected_valid: bool) -> None:
+        tunnel = SSHTunnel(
+            enabled=True,
+            host="ssh.example.com",
+            port=port,
+            auth_type="password",
+            username="user",
+            password="pw",
+            private_key=None,
+            passphrase=None,
+        )
+        assert tunnel.has_valid_port()[0] is expected_valid
+
+
+class TestRepartitionHoldsImport:
+    """The hold pauses a schema's imports so a multi-budget rewrite can keep its checkpoint.
+
+    Every condition here decides whether a customer's table keeps ingesting, so each case is a
+    distinct way of getting that wrong: no rewrite at all, a rewrite still advancing, one that
+    stopped, and checkpoints whose stamp we cannot age out.
+    """
+
+    def _schema_with(self, rewrite: dict[str, Any] | None) -> ExternalDataSchema:
+        config: dict[str, Any] = {}
+        if rewrite is not None:
+            config["repartition_rewrite"] = rewrite
+        return ExternalDataSchema(sync_type_config=config)
+
+    def _stamped(self, ago: timedelta) -> dict[str, Any]:
+        return {"temp_uri": "s3://t", "rows_written": 10, "held_at": (datetime.now(UTC) - ago).isoformat()}
+
+    @parameterized.expand(
+        [
+            ("no_rewrite", None, False),
+            ("fresh_checkpoint", timedelta(minutes=5), True),
+            ("within_the_window", REPARTITION_HOLD_MAX_AGE - timedelta(hours=1), True),
+            ("lapsed", REPARTITION_HOLD_MAX_AGE + timedelta(hours=1), False),
+        ]
+    )
+    def test_hold_tracks_whether_the_rewrite_is_still_advancing(
+        self, _name: str, ago: timedelta | None, expected: bool
+    ) -> None:
+        rewrite = None if ago is None else self._stamped(ago)
+        assert self._schema_with(rewrite).repartition_holds_import is expected
+
+    @parameterized.expand(
+        [
+            # A checkpoint written before `held_at` existed. Holding on it would pause imports with no
+            # way to ever age the hold out.
+            ("missing_stamp", {"temp_uri": "s3://t", "rows_written": 10}),
+            ("unparseable_stamp", {"temp_uri": "s3://t", "held_at": "not-a-timestamp"}),
+            ("non_string_stamp", {"temp_uri": "s3://t", "held_at": 1234}),
+        ]
+    )
+    def test_an_unusable_stamp_never_holds(self, _name: str, rewrite: dict[str, Any]) -> None:
+        assert self._schema_with(rewrite).repartition_holds_import is False
+
+    def test_a_naive_stamp_is_read_as_utc(self) -> None:
+        # `held_at` is written with `datetime.now(UTC).isoformat()`, but a hand-edited or older row
+        # can carry a naive string. Comparing that against an aware now() raises, which would fail
+        # the import activity rather than skip the hold.
+        naive = (datetime.now(UTC) - timedelta(minutes=5)).replace(tzinfo=None).isoformat()
+        schema = self._schema_with({"temp_uri": "s3://t", "held_at": naive})
+        assert schema.repartition_holds_import is True
+
+
+class TestIncrementalSyncBlocked(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("friendly_missing", MISSING_PRIMARY_KEY_DISABLED_MESSAGE, "missing_primary_key"),
+            ("friendly_duplicate", DUPLICATE_PRIMARY_KEY_DISABLED_MESSAGE, "duplicate_primary_key"),
+            ("raw_missing", f"MissingPrimaryKeysException: {MISSING_PRIMARY_KEYS_RAW_ERROR}", "missing_primary_key"),
+            (
+                "raw_duplicate",
+                f"DuplicatePrimaryKeysException: {DUPLICATE_PRIMARY_KEYS_RAW_ERROR}. Primary keys being used are: ['id']",
+                "duplicate_primary_key",
+            ),
+            ("unrelated_failure", "Your SSH tunnel credentials are not valid", None),
+            ("healthy_schema", None, None),
+        ]
+    )
+    def test_only_a_key_failure_reports_a_blocked_sync(
+        self, _name: str, latest_error: str | None, expected: str | None
+    ) -> None:
+        assert ExternalDataSchema(latest_error=latest_error).incremental_sync_blocked == expected
+
+    def test_blocked_markers_match_the_raised_errors(self) -> None:
+        from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.arrow_utils import (  # noqa: PLC0415 — pulls pyarrow, which the model path must not import
+            DUPLICATE_PRIMARY_KEYS_ERROR,
+            MISSING_PRIMARY_KEYS_ERROR,
+        )
+
+        assert MISSING_PRIMARY_KEYS_RAW_ERROR == MISSING_PRIMARY_KEYS_ERROR
+        assert DUPLICATE_PRIMARY_KEYS_RAW_ERROR == DUPLICATE_PRIMARY_KEYS_ERROR
+
+
+class TestMergeConnectionMetadata(BaseTest):
+    def _source(self, connection_metadata: Any) -> ExternalDataSource:
+        return ExternalDataSource.objects.create(
+            team=self.team,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            source_type="MongoDB",
+            connection_metadata=connection_metadata,
+        )
+
+    def test_a_write_that_lands_before_the_merge_survives(self) -> None:
+        source = self._source({})
+        ExternalDataSource.objects.filter(pk=source.pk).update(connection_metadata={"database": "analytics"})
+
+        source.merge_connection_metadata({"engine": "mongodb", "wire_version": 7})
+
+        source.refresh_from_db()
+        assert source.connection_metadata == {"database": "analytics", "engine": "mongodb", "wire_version": 7}
+
+    def test_the_merged_value_wins_on_overlap(self) -> None:
+        source = self._source({"wire_version": 21})
+
+        source.merge_connection_metadata({"wire_version": 7})
+
+        source.refresh_from_db()
+        assert source.connection_metadata == {"wire_version": 7}
+
+    @parameterized.expand([("a_list", ["unexpected"]), ("null", None)])
+    def test_a_value_that_is_not_a_mapping_is_replaced(self, _name: str, stored: Any) -> None:
+        source = self._source(stored)
+
+        source.merge_connection_metadata({"engine": "mongodb"})
+
+        source.refresh_from_db()
+        assert source.connection_metadata == {"engine": "mongodb"}
+
+    def test_the_lock_stays_off_the_joined_config_row(self) -> None:
+        # The default manager joins revenue_analytics_config, so an unqualified FOR UPDATE would
+        # lock that table's rows as well as this one.
+        source = self._source({})
+
+        with CaptureQueriesContext(connection) as queries:
+            source.merge_connection_metadata({"engine": "mongodb"})
+
+        locking = [query["sql"] for query in queries.captured_queries if "FOR UPDATE" in query["sql"]]
+        assert len(locking) == 1
+        assert 'FOR UPDATE OF "posthog_externaldatasource"' in locking[0]
+
+    def test_updated_at_is_left_where_it_was(self) -> None:
+        # A probe is not a customer edit, so it must not move the source's updated_at.
+        source = self._source({})
+        before = source.updated_at
+
+        source.merge_connection_metadata({"engine": "mongodb"})
+
+        source.refresh_from_db()
+        assert source.updated_at == before
+
+
+class TestDeleteTable(BaseTest):
+    def _schema(self) -> ExternalDataSchema:
+        source = ExternalDataSource.objects.create(
+            team=self.team,
+            source_id=str(uuid.uuid4()),
+            connection_id=str(uuid.uuid4()),
+            source_type="Postgres",
+        )
+        table = DataWarehouseTable.objects.create(
+            team=self.team,
+            name="orders",
+            format="Parquet",
+            external_data_source=source,
+        )
+        return ExternalDataSchema.objects.create(
+            team=self.team,
+            source=source,
+            name="orders",
+            table=table,
+            status=ExternalDataSchema.Status.COMPLETED,
+            last_synced_at=timezone.now(),
+        )
+
+    @parameterized.expand(
+        [
+            # s3fs raises FileNotFoundError when the prefix holds no objects. The files are
+            # already gone, so the delete succeeded and nothing needs reporting.
+            ("prefix_already_gone", FileNotFoundError("s3://bucket/prefix"), False),
+            ("access_denied", PermissionError("Access Denied"), True),
+        ]
+    )
+    def test_the_teardown_finishes_when_the_s3_delete_fails(
+        self, _name: str, error: Exception, expected_reported: bool
+    ) -> None:
+        schema = self._schema()
+        schema.live_query_enabled = True
+        schema.save(update_fields=["live_query_enabled"])
+        table_id = schema.table_id
+        assert table_id is not None
+        client = MagicMock()
+        client.delete.side_effect = error
+
+        with (
+            patch("products.data_warehouse.backend.facade.api.get_s3_client", return_value=client),
+            patch("products.warehouse_sources.backend.models.external_data_schema.capture_exception") as capture,
+        ):
+            schema.delete_table()
+
+        assert capture.called is expected_reported
+        schema.refresh_from_db()
+        assert schema.table_id is None
+        assert schema.live_query_enabled is False
+        assert schema.status is None
+        assert schema.last_synced_at is None
+        assert DataWarehouseTable.objects.get(id=table_id).deleted is True
+
+
+class TestFailureStreakMarker(SimpleTestCase):
+    # These properties are read on the terminal-status write of every run, so an unparseable
+    # marker must read as "no streak" rather than fail every sync of the schema.
+    @parameterized.expand(
+        [
+            ("no_config", None, 0),
+            ("empty_config", {}, 0),
+            ("marker_absent", {"reset_pipeline": True}, 0),
+            ("marker_is_not_a_dict", {"failure_streak": "7"}, 0),
+            ("runs_missing", {"failure_streak": {}}, 0),
+            ("runs_is_not_an_int", {"failure_streak": {"runs": "7"}}, 0),
+            ("runs_is_negative", {"failure_streak": {"runs": -3}}, 0),
+            ("runs_is_a_count", {"failure_streak": {"runs": 7}}, 7),
+        ]
+    )
+    def test_failed_runs_in_a_row(self, _name: str, config: dict[str, Any] | None, expected: int) -> None:
+        assert ExternalDataSchema(sync_type_config=config).failed_runs_in_a_row == expected
+
+    @parameterized.expand(
+        [
+            ("no_marker", {}, None),
+            ("stamp_missing", {"failure_streak": {"runs": 7}}, None),
+            ("stamp_is_not_a_string", {"failure_streak": {"runs": 7, "last_failed_at": 12345}}, None),
+            ("stamp_is_unparseable", {"failure_streak": {"runs": 7, "last_failed_at": "not a date"}}, None),
+            (
+                "stamp_is_an_aware_timestamp",
+                {"failure_streak": {"runs": 7, "last_failed_at": "2026-01-02T03:04:05+00:00"}},
+                datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+            ),
+            # Read as UTC rather than left naive, so arithmetic against an aware `now` cannot raise.
+            (
+                "stamp_is_a_naive_timestamp",
+                {"failure_streak": {"runs": 7, "last_failed_at": "2026-01-02T03:04:05"}},
+                datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+            ),
+        ]
+    )
+    def test_failure_streak_last_failed_at(self, _name: str, config: dict[str, Any], expected: datetime | None) -> None:
+        assert ExternalDataSchema(sync_type_config=config).failure_streak_last_failed_at == expected
+
+    def test_a_failed_run_adds_to_the_streak_and_keeps_the_other_keys(self) -> None:
+        schema = ExternalDataSchema(sync_type_config={"incremental_field": "updated_at", "failure_streak": {"runs": 2}})
+
+        schema.note_failed_run(datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC))
+
+        assert schema.failed_runs_in_a_row == 3
+        assert schema.failure_streak_last_failed_at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+        assert schema.sync_type_config["incremental_field"] == "updated_at"
+
+    def test_clearing_the_streak_keeps_the_other_keys(self) -> None:
+        schema = ExternalDataSchema(sync_type_config={"incremental_field": "updated_at", "failure_streak": {"runs": 9}})
+
+        schema.clear_failure_streak()
+
+        assert schema.failed_runs_in_a_row == 0
+        assert schema.failure_streak_last_failed_at is None
+        assert schema.sync_type_config == {"incremental_field": "updated_at"}

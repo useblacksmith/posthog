@@ -1,0 +1,271 @@
+import os
+import json
+import uuid
+import datetime as dt
+import operator
+import collections.abc
+
+from psycopg import sql
+
+from posthog.models.integration import Integration
+from posthog.temporal.common.clickhouse import ClickHouseClient
+
+from products.batch_exports.backend.service import (
+    AnyBatchExportModel,
+    AWSCredentials,
+    BackfillDetails,
+    BatchExportEventsCustomModel,
+    BatchExportEventsModel,
+    BatchExportPersonsModel,
+    BatchExportSchema,
+    BatchExportSessionsModel,
+)
+from products.batch_exports.backend.temporal.destinations.redshift_batch_export import redshift_default_fields
+from products.batch_exports.backend.temporal.queue import RecordBatchQueue
+from products.batch_exports.backend.temporal.record_batch_model import SessionsRecordBatchModel
+from products.batch_exports.backend.temporal.temporary_file import remove_escaped_whitespace_recursive
+from products.batch_exports.backend.tests.temporal.utils.clickhouse_test_producer import ClickHouseTestProducer
+from products.batch_exports.backend.tests.temporal.utils.records import (
+    get_record_batch_from_queue,
+    remove_duplicates_from_records,
+)
+
+REQUIRED_ENV_VARS = (
+    "REDSHIFT_USER",
+    "REDSHIFT_PASSWORD",
+    "REDSHIFT_HOST",
+)
+
+MISSING_REQUIRED_ENV_VARS = any(env_var not in os.environ for env_var in REQUIRED_ENV_VARS)
+
+
+async def make_redshift_integration(team_id: int, redshift_config: dict) -> Integration:
+    """Get or create a plain Redshift integration that connects with `redshift_config`."""
+    host, port, user = redshift_config["host"], redshift_config["port"], redshift_config["user"]
+    integration, _ = await Integration.objects.aget_or_create(
+        team_id=team_id,
+        kind=Integration.IntegrationKind.AWS_REDSHIFT,
+        integration_id=f"{team_id}-{host}-{port}-{user}",
+        defaults={
+            "config": {"host": host, "port": port, "user": user, "ssl_mode": "prefer"},
+            "sensitive_config": {"password": redshift_config["password"]},
+        },
+    )
+    return integration
+
+
+async def make_aws_s3_integration(team_id: int, credentials: AWSCredentials) -> Integration:
+    """Create an AWS S3 integration that holds `credentials`, for COPY staging and authorization."""
+    return await Integration.objects.acreate(
+        team_id=team_id,
+        kind=Integration.IntegrationKind.AWS_S3,
+        integration_id=f"aws-s3-{uuid.uuid4()}",
+        config={"name": "redshift-copy-test"},
+        sensitive_config={
+            "aws_access_key_id": credentials.aws_access_key_id,
+            "aws_secret_access_key": credentials.aws_secret_access_key,
+        },
+    )
+
+
+TEST_MODELS: list[AnyBatchExportModel | None] = [
+    BatchExportEventsModel(),
+    BatchExportPersonsModel(),
+    BatchExportSessionsModel(),
+    None,
+]
+
+
+async def assert_clickhouse_records_in_redshift(
+    redshift_connection,
+    clickhouse_client: ClickHouseClient,
+    schema_name: str,
+    table_name: str,
+    team_id: int,
+    batch_export_model: AnyBatchExportModel | BatchExportSchema | None,
+    date_ranges: list[tuple[dt.datetime, dt.datetime]],
+    exclude_events: list[str] | None = None,
+    include_events: list[str] | None = None,
+    properties_data_type: str = "varchar",
+    sort_key: str = "event",
+    backfill_details: BackfillDetails | None = None,
+    expected_duplicates_threshold: float = 0.0,
+    expected_fields: list[str] | None = None,
+    primary_key: collections.abc.Sequence[str] | None = None,
+    copy: bool = False,
+    extra_fields: list[str] | None = None,
+):
+    """Assert expected records are written to a given Redshift table.
+
+    The steps this function takes to assert records are written are:
+    1. Read all records inserted into given Redshift table.
+    2. Cast records read from Redshift to a Python list of dicts.
+    3. Assert records read from Redshift have the expected column names.
+    4. Read all records that were supposed to be inserted from ClickHouse.
+    5. Cast records returned by ClickHouse to a Python list of dicts.
+    6. Compare each record returned by ClickHouse to each record read from Redshift.
+
+    Caveats:
+    * Casting records to a Python list of dicts means losing some type precision.
+
+    Arguments:
+        redshift_connection: A Redshift connection used to read inserted events.
+        clickhouse_client: A ClickHouseClient used to read events that are expected to be inserted.
+        schema_name: Redshift schema name.
+        table_name: Redshift table name.
+        team_id: The ID of the team that we are testing events for.
+        batch_export_model: Model used in the batch export.
+        date_ranges: Ranges of records we should expect to have been exported.
+        expected_duplicates_threshold: Threshold of duplicates we should expect relative to
+            number of unique events, fail if we exceed it.
+        expected_fields: The expected fields to be exported.
+        copy: Whether using Redshift's COPY or not. This impacts handling of special
+            characters as Parquet+COPY can handle a lot more than JSON.
+        extra_fields: Additional fields present in the Redshift table.
+    """
+    super_columns = ["properties", "set", "set_once", "person_properties"]
+    array_super_columns = ["urls"]
+
+    inserted_records = []
+    async with redshift_connection.cursor() as cursor:
+        await cursor.execute(sql.SQL("SELECT * FROM {}").format(sql.Identifier(schema_name, table_name)))
+        columns = [column.name for column in cursor.description]
+
+        for row in await cursor.fetchall():
+            event = dict(zip(columns, row))
+
+            for column in super_columns:
+                # When reading a SUPER type field we read it as a str.
+                # But Redshift will remove all unquoted whitespace, so
+                # '{"prop": 1, "prop": 2}' in CH becomes '{"prop":1,"prop":2}' in Redshift.
+                # To make comparison easier we load them as JSON even if we don't have
+                # properties_data_type set to SUPER, thus they are both dicts.
+                if column in event and event.get(column, None) is not None:
+                    event[column] = json.loads(event[column])
+
+            for column in array_super_columns:
+                # Arrays stored in SUPER are dumped almost like the string
+                # representation of as Python sets, but without quotes for the values:
+                # '"{value,value1}"'. We expect these to be Python lists rather than
+                # whatever garbage that is, as reading from ClickHouse returns Python
+                #  lists. So, we load up the string as JSON, and compare against '"{}"'
+                # to determine if it is empty. If it is, we can just set the value to
+                # empty list. Otherwise, we strip the '"{}"', and iterate through the
+                # values adding them to a new list.
+                if column in event and event.get(column, None) is not None:
+                    loaded = json.loads(event[column])
+                    if isinstance(loaded, list):
+                        # In COPY tests, it is already a list. I have no clue why.
+                        # TODO: investigate.
+                        event[column] = loaded
+                    elif loaded == "{}":
+                        event[column] = []
+                    else:
+                        # ruff complains that using `strip` is misleading, but the
+                        # alternative would mean calling two functions, and the example
+                        # in their docs (removing only a file suffix) is not what I'm
+                        # doing here. So, I respectfully disagree.
+                        stripped = loaded.strip("{}")  # noqa: B005
+                        values = list(stripped.split(","))
+                        event[column] = values
+
+            if extra_fields:
+                for column in extra_fields:
+                    event.pop(column)
+
+            inserted_records.append(event)
+
+    if batch_export_model is not None:
+        if isinstance(batch_export_model, AnyBatchExportModel):
+            model_name = batch_export_model.name
+            schema = batch_export_model.schema if isinstance(batch_export_model, BatchExportEventsCustomModel) else None
+            fields = schema["fields"] if schema is not None else None
+            filters = (
+                batch_export_model.filters
+                if isinstance(batch_export_model, BatchExportEventsModel | BatchExportEventsCustomModel)
+                else None
+            )
+            extra_query_parameters = schema["values"] if schema is not None else None
+        else:
+            model_name = "events"
+            fields = batch_export_model["fields"]
+            filters = None
+            extra_query_parameters = batch_export_model["values"]
+    else:
+        model_name = "events"
+        extra_query_parameters = None
+        fields = None
+        filters = None
+
+    expected_records = []
+    queue = RecordBatchQueue()
+    if model_name == "sessions":
+        producer = ClickHouseTestProducer(model=SessionsRecordBatchModel(team_id))
+    else:
+        producer = ClickHouseTestProducer()
+
+    for data_interval_start, data_interval_end in date_ranges:
+        producer_task = await producer.start(
+            queue=queue,
+            model_name=model_name,
+            team_id=team_id,
+            full_range=(data_interval_start, data_interval_end),
+            fields=fields,
+            filters=filters,
+            destination_default_fields=redshift_default_fields(),
+            exclude_events=exclude_events,
+            include_events=include_events,
+            is_backfill=backfill_details is not None,
+            backfill_details=backfill_details,
+            extra_query_parameters=extra_query_parameters,
+        )
+        while True:
+            record_batch = await get_record_batch_from_queue(queue, producer_task)
+
+            if record_batch is None:
+                break
+
+            select = record_batch.column_names
+            if expected_fields:
+                select = expected_fields
+
+            for record in record_batch.select(select).to_pylist():
+                expected_record = {}
+
+                for k, v in record.items():
+                    if k == "_inserted_at":
+                        # _inserted_at is not exported, only used for tracking progress.
+                        continue
+
+                    elif k in super_columns and v is not None:
+                        if copy is False:
+                            expected_record[k] = remove_escaped_whitespace_recursive(json.loads(v))
+                        else:
+                            expected_record[k] = json.loads(v)
+                    elif isinstance(v, dt.datetime):
+                        expected_record[k] = v.replace(tzinfo=dt.UTC)
+                    else:
+                        expected_record[k] = v
+
+                expected_records.append(expected_record)
+
+    if expected_duplicates_threshold > 0.0:
+        unduplicated_len = len(inserted_records)
+        inserted_records = remove_duplicates_from_records(inserted_records, primary_key)
+        assert (unduplicated_len - len(inserted_records)) / len(inserted_records) < expected_duplicates_threshold
+
+    inserted_column_names = list(inserted_records[0].keys())
+    expected_column_names = list(expected_records[0].keys())
+
+    inserted_column_names.sort()
+    expected_column_names.sort()
+
+    inserted_records.sort(key=operator.itemgetter(sort_key))
+    expected_records.sort(key=operator.itemgetter(sort_key))
+
+    assert inserted_column_names == expected_column_names, (
+        f"Expected column names to be '{expected_column_names}', got '{inserted_column_names}'"
+    )
+    assert inserted_records[0] == expected_records[0]
+    assert inserted_records == expected_records
+    assert len(inserted_records) == len(expected_records)

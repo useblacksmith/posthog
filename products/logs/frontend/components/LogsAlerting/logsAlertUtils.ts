@@ -1,0 +1,255 @@
+import { lemonToast } from '@posthog/lemon-ui'
+
+import {
+    LOGS_ALERT_AUTO_DISABLED_EVENT_ID,
+    LOGS_ALERT_ERRORED_EVENT_ID,
+    LOGS_ALERT_FIRING_EVENT_ID,
+    LOGS_ALERT_INCIDENT_CLOSED_EVENT_ID,
+    LOGS_ALERT_INCIDENT_OPENED_EVENT_ID,
+    LOGS_ALERT_RESOLVED_EVENT_ID,
+} from 'lib/constants'
+
+import { FilterLogicalOperator, UniversalFiltersGroup } from '~/types'
+import {
+    CyclotronJobFiltersType,
+    HogFunctionType,
+    PropertyFilterType,
+    PropertyOperator,
+    SlackChannelType,
+} from '~/types'
+
+import { pagerDutyDestinationLabel } from 'products/alerts/frontend/components/AlertNotificationDestinationEditor'
+import { LogsAlertConfigurationApi } from 'products/logs/frontend/generated/api.schemas'
+
+export type LogsAlertEventKind = 'firing' | 'resolved' | 'broken' | 'errored' | 'incident_opened' | 'incident_closed'
+
+export const LOGS_ALERT_EVENT_KIND_META: Record<LogsAlertEventKind, { label: string; description: string }> = {
+    firing: {
+        label: 'Firing',
+        description: 'Sent when the alert starts firing.',
+    },
+    resolved: {
+        label: 'Resolved',
+        description: 'Sent when a firing alert returns to normal.',
+    },
+    broken: {
+        label: 'Auto-disabled',
+        description: 'Sent if the alert is auto-disabled after repeated check failures.',
+    },
+    errored: {
+        label: 'Errored',
+        description: "Sent when an alert check can't evaluate.",
+    },
+    incident_opened: {
+        label: 'Trigger incident',
+        description: 'Opens an incident when the alert starts firing.',
+    },
+    incident_closed: {
+        label: 'Resolve incident',
+        description:
+            'Resolves the incident when the alert stops firing, including when you disable, snooze, or edit it, or it is auto-disabled.',
+    },
+}
+
+export function getHogFunctionEventKind(hf: HogFunctionType): LogsAlertEventKind | null {
+    const eventId = hf.filters?.events?.[0]?.id
+    switch (eventId) {
+        case LOGS_ALERT_FIRING_EVENT_ID:
+            return 'firing'
+        case LOGS_ALERT_RESOLVED_EVENT_ID:
+            return 'resolved'
+        case LOGS_ALERT_AUTO_DISABLED_EVENT_ID:
+            return 'broken'
+        case LOGS_ALERT_ERRORED_EVENT_ID:
+            return 'errored'
+        case LOGS_ALERT_INCIDENT_OPENED_EVENT_ID:
+            return 'incident_opened'
+        case LOGS_ALERT_INCIDENT_CLOSED_EVENT_ID:
+            return 'incident_closed'
+        default:
+            return null
+    }
+}
+
+export type PreEnableFilters = {
+    severityLevels: string[]
+    serviceNames: string[]
+    filterGroup: UniversalFiltersGroup
+}
+
+export type PreEnableCheckResult = { ok: true } | { blocked: true; reason: string }
+
+export function runPreEnableChecks(filters: PreEnableFilters): PreEnableCheckResult {
+    if (!hasAnyFilter(filters.severityLevels, filters.serviceNames, filters.filterGroup)) {
+        return { blocked: true, reason: 'Add at least one filter to enable' }
+    }
+    return { ok: true }
+}
+
+export function alertFiltersForPreEnableCheck(alert: LogsAlertConfigurationApi): PreEnableFilters {
+    const filters = (alert.filters ?? {}) as Record<string, unknown>
+    const filterGroupWrapper = filters.filterGroup as { values: UniversalFiltersGroup[] } | undefined
+    return {
+        severityLevels: (filters.severityLevels as string[] | undefined) ?? [],
+        serviceNames: (filters.serviceNames as string[] | undefined) ?? [],
+        filterGroup: filterGroupWrapper?.values?.[0] ?? { type: FilterLogicalOperator.And, values: [] },
+    }
+}
+
+export function dispatchPreEnableCheck(result: PreEnableCheckResult, onConfirm: () => void): void {
+    if ('blocked' in result) {
+        lemonToast.error(result.reason)
+        return
+    }
+    onConfirm()
+}
+
+export const CUSTOM_MESSAGE_TAG = {
+    label: 'Custom message',
+    tooltip: 'This destination was edited, so it sends what you configured instead of the standard alert message.',
+}
+
+export const SNOOZE_DURATIONS = [
+    { label: '30 minutes', minutes: 30 },
+    { label: '1 hour', minutes: 60 },
+    { label: '4 hours', minutes: 240 },
+    { label: '24 hours', minutes: 1440 },
+]
+
+export const LOGS_ALERT_NOTIFICATION_TYPE_SLACK = 'slack' as const
+export const LOGS_ALERT_NOTIFICATION_TYPE_WEBHOOK = 'webhook' as const
+export const LOGS_ALERT_NOTIFICATION_TYPE_TEAMS = 'teams' as const
+export const LOGS_ALERT_NOTIFICATION_TYPE_PAGERDUTY = 'pagerduty' as const
+export function logsAlertEventKindsFor(type: LogsAlertNotificationType): LogsAlertEventKind[] {
+    return type === LOGS_ALERT_NOTIFICATION_TYPE_PAGERDUTY
+        ? ['incident_opened', 'incident_closed']
+        : ['firing', 'resolved', 'broken', 'errored']
+}
+
+export type LogsAlertNotificationType =
+    | typeof LOGS_ALERT_NOTIFICATION_TYPE_SLACK
+    | typeof LOGS_ALERT_NOTIFICATION_TYPE_WEBHOOK
+    | typeof LOGS_ALERT_NOTIFICATION_TYPE_TEAMS
+    | typeof LOGS_ALERT_NOTIFICATION_TYPE_PAGERDUTY
+
+// Filter used to list every HogFunction tied to a given alert, regardless of which
+// event kind it handles. Deliberately omits the `events` array: the backend
+// create endpoint fans out into one HogFunction per event kind, and JSONB `@>`
+// matching would require a HogFunction's `filters.events` to contain every event
+// we list — which no single HogFunction does post-fan-out. The `alert_id`
+// property alone uniquely identifies all HogFunctions belonging to the alert.
+export function hasAnyFilter(
+    severityLevels: string[],
+    serviceNames: string[],
+    filterGroup: UniversalFiltersGroup
+): boolean {
+    return severityLevels.length > 0 || serviceNames.length > 0 || filterGroup.values.length > 0
+}
+
+export function buildAlertFilters(
+    severityLevels: string[],
+    serviceNames: string[],
+    filterGroup: UniversalFiltersGroup
+): Record<string, unknown> {
+    const filters: Record<string, unknown> = {}
+    if (severityLevels.length > 0) {
+        filters.severityLevels = severityLevels
+    }
+    if (serviceNames.length > 0) {
+        filters.serviceNames = serviceNames
+    }
+    if (filterGroup.values.length > 0) {
+        filters.filterGroup = {
+            type: FilterLogicalOperator.And,
+            values: [filterGroup],
+        }
+    }
+    return filters
+}
+
+export function buildLogsAlertFilterConfig(alertId: string): CyclotronJobFiltersType {
+    return {
+        properties: [
+            {
+                key: 'alert_id',
+                value: alertId,
+                operator: PropertyOperator.Exact,
+                type: PropertyFilterType.Event,
+            },
+        ],
+    }
+}
+
+export type LogsAlertDestinationGroup = {
+    key: string
+    type: LogsAlertNotificationType
+    label: string
+    hogFunctions: HogFunctionType[]
+    enabled: boolean
+}
+
+export function slackChannelLabel(channelValue: string, slackChannels: SlackChannelType[]): string {
+    const channelId = channelValue.split('|')[0]
+    const name = slackChannels.find((c) => c.id === channelId)?.name
+    return name ? `Slack #${name}` : 'Slack'
+}
+
+export function resolveGroupLabel(group: LogsAlertDestinationGroup, slackChannels: SlackChannelType[]): string {
+    if (group.type === LOGS_ALERT_NOTIFICATION_TYPE_SLACK) {
+        const hf = group.hogFunctions[0]
+        const channelValue = hf?.inputs?.channel?.value
+        if (typeof channelValue === 'string') {
+            return slackChannelLabel(channelValue, slackChannels)
+        }
+    }
+    return group.label
+}
+
+export function groupLogsAlertDestinations(
+    hogFunctions: HogFunctionType[],
+    resolveSlackLabel: (channelValue: string) => string | null
+): LogsAlertDestinationGroup[] {
+    const groups = new Map<string, LogsAlertDestinationGroup>()
+    for (const hf of hogFunctions) {
+        const templateId = hf.template_id ?? hf.template?.id
+        const slackChannelValue = hf.inputs?.channel?.value as string | undefined
+        const destinationWebhookUrl = hf.inputs?.webhookUrl?.value as string | undefined
+        const webhookUrl = hf.inputs?.url?.value as string | undefined
+        let key: string
+        let type: LogsAlertNotificationType
+        let label: string
+
+        if (templateId === 'template-slack') {
+            type = LOGS_ALERT_NOTIFICATION_TYPE_SLACK
+            key = `slack:${slackChannelValue ?? hf.id}`
+            const channelName = slackChannelValue ? resolveSlackLabel(slackChannelValue) : null
+            label = channelName ? `Slack #${channelName}` : 'Slack'
+        } else if (templateId === 'template-microsoft-teams') {
+            type = LOGS_ALERT_NOTIFICATION_TYPE_TEAMS
+            key = `teams:${destinationWebhookUrl ?? hf.id}`
+            label = destinationWebhookUrl ? `Microsoft Teams ${destinationWebhookUrl}` : 'Microsoft Teams'
+        } else if (templateId === 'template-webhook') {
+            type = LOGS_ALERT_NOTIFICATION_TYPE_WEBHOOK
+            key = `webhook:${webhookUrl ?? hf.id}`
+            label = webhookUrl ? `Webhook ${webhookUrl}` : 'Webhook'
+        } else if (templateId === 'template-pagerduty') {
+            const destinationSegment = pagerDutyDestinationLabel(hf)
+            type = LOGS_ALERT_NOTIFICATION_TYPE_PAGERDUTY
+            key = `pagerduty:${destinationSegment ?? hf.id}`
+            label = destinationSegment ?? 'PagerDuty'
+        } else {
+            type = LOGS_ALERT_NOTIFICATION_TYPE_WEBHOOK
+            key = `unknown:${hf.id}`
+            label = hf.name
+        }
+
+        const existing = groups.get(key)
+        if (existing) {
+            existing.hogFunctions.push(hf)
+            existing.enabled = existing.enabled && hf.enabled
+        } else {
+            groups.set(key, { key, type, label, hogFunctions: [hf], enabled: hf.enabled })
+        }
+    }
+    return Array.from(groups.values())
+}

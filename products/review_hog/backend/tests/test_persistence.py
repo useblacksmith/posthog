@@ -1,0 +1,1365 @@
+import uuid
+from dataclasses import replace
+from typing import TypeVar
+
+from posthog.test.base import BaseTest
+
+from parameterized import parameterized
+
+from products.review_hog.backend.models import ReviewReport, ReviewReportArtefact
+from products.review_hog.backend.reviewer.artefact_content import (
+    ChunkSetArtefact,
+    DroppedFindingArtefact,
+    PerspectiveResultArtefact,
+    ReviewIssueFinding,
+    ValidationVerdict,
+    parse_artefact_content,
+)
+from products.review_hog.backend.reviewer.constants import (
+    CONTROL_ARM_SET,
+    DEFAULT_REVIEW_ARM,
+    DEFAULT_VALIDATION_ARM,
+    FLASH_ARM,
+    FLASH_LENSES,
+    REVIEW_ARMS_BY_TIER,
+    REVIEW_MODE_FLASH,
+    REVIEW_MODE_FULL,
+    SINGLE_AGENT_ARM_SETS,
+    SINGLE_AGENT_FLASH_ARM,
+    SINGLE_AGENT_PASS_NUMBER,
+    ReviewTier,
+    SingleAgentArms,
+)
+from products.review_hog.backend.reviewer.models.github_meta import PRComment, PRFile, PRMetadata
+from products.review_hog.backend.reviewer.models.issue_validation import IssueValidation
+from products.review_hog.backend.reviewer.models.issues_review import (
+    DroppedIssue,
+    Issue,
+    IssuePriority,
+    IssuesReview,
+    LineRange,
+)
+from products.review_hog.backend.reviewer.models.split_pr_into_chunks import Chunk, ChunksList, FileInfo
+from products.review_hog.backend.reviewer.persistence import (
+    finalize_review_report,
+    load_chunk_set,
+    load_perspective_results,
+    load_pr_snapshot,
+    load_prior_findings,
+    load_prior_findings_with_verdicts,
+    load_review_arm,
+    load_run_issues,
+    load_run_validations,
+    load_single_agent_results,
+    load_turn_findings,
+    load_valid_findings,
+    persist_chunk_set,
+    persist_commit_snapshot,
+    persist_findings,
+    persist_perspective_results,
+    persist_pr_snapshot,
+    persist_verdict,
+    persist_verdicts,
+    replace_deduplicated_findings,
+    replace_dropped_findings,
+    upsert_review_report,
+)
+from products.review_hog.backend.reviewer.review_design import REVIEW_DESIGN_PIPELINE, REVIEW_DESIGN_SINGLE_AGENT
+from products.review_hog.backend.temporal.activities import SandboxStageInput, _prepare_single_agent_prompt
+from products.review_hog.backend.temporal.types import TRIGGER_INBOX, TRIGGER_STAMPHOG, TRIGGER_UI
+from products.signals.backend.facade.report_artefacts import Commit
+from products.signals.backend.facade.taxonomy import ArtefactAttribution, ReportPriority
+from products.tasks.backend.facade.run_config import ReasoningEffort
+
+_ContentT = TypeVar("_ContentT")
+
+
+def _content_as(model: type[_ContentT], artefact_type: str, content: str) -> _ContentT:
+    parsed = parse_artefact_content(artefact_type, content)
+    assert isinstance(parsed, model)
+    return parsed
+
+
+def _pr_metadata(pr_number: int = 123, head_sha: str | None = None, author: str = "a") -> PRMetadata:
+    return PRMetadata(
+        number=pr_number,
+        title="t",
+        state="open",
+        draft=False,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-01-01T00:00:00Z",
+        author=author,
+        base_branch="main",
+        head_branch="feat",
+        head_sha=head_sha,
+        commits=1,
+        additions=1,
+        deletions=0,
+        changed_files=1,
+    )
+
+
+def _issue(issue_id: str, *, file: str = "a.py", start: int = 10, **kwargs: object) -> Issue:
+    defaults: dict = {
+        "title": "t",
+        "file": file,
+        "lines": [LineRange(start=start)],
+        "issue": "problem",
+        "suggestion": "fix",
+        "priority": IssuePriority.MUST_FIX,
+        "source_perspective": "Logic & Correctness",
+    }
+    defaults.update(kwargs)
+    return Issue(id=issue_id, **defaults)
+
+
+class TestUpsertReviewReport(BaseTest):
+    def test_upsert_is_idempotent_and_each_finalized_turn_bumps_run_count(self) -> None:
+        # The living-report premise: re-running a PR must reuse one report (not spawn a second) and
+        # count each finalized turn. A broken idempotency key or a finalize that forgets to bump
+        # would break the loop-y design.
+        report_id_1 = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata()
+        )
+        finalize_review_report(
+            team_id=self.team.id, report_id=report_id_1, body_markdown="# report", run_index=1, head_sha="sha-1"
+        )
+        report_id_2 = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata()
+        )
+        finalize_review_report(
+            team_id=self.team.id, report_id=report_id_2, body_markdown="# report", run_index=2, head_sha="sha-2"
+        )
+
+        assert report_id_1 == report_id_2
+        reports = ReviewReport.objects.for_team(self.team.id).filter(repository="o/r", pr_number=123)
+        assert reports.count() == 1
+        report = reports.get()
+        assert report.run_count == 2
+        assert report.report_markdown == "# report"
+        assert report.status == ReviewReport.Status.IDLE
+        assert report.completed_head_sha == "sha-2"  # what the finished turn reviewed, for read anchoring
+        assert report.updated_at == report.last_run_at  # the reviews table sorts finished turns by updated_at
+
+    def test_finalize_defers_idle_for_publishing_runs(self) -> None:
+        # On publishing runs the publish stage owns the idle write: going idle at finalize hands
+        # the UI's poll a completed-but-unpublished row as the run's final state, freezing a wrong
+        # "Not published" on screen until a manual refresh.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        finalize_review_report(
+            team_id=self.team.id,
+            report_id=report_id,
+            body_markdown="# report",
+            run_index=1,
+            head_sha="sha-1",
+            will_publish=True,
+        )
+        report = ReviewReport.objects.for_team(self.team.id).get(id=report_id)
+        assert report.status == ReviewReport.Status.ACTIVE
+        assert report.run_count == 1  # the turn still finalizes fully; only the idle write is deferred
+
+    def _routing(self, report_id: str) -> tuple[str | None, str | None, str | None]:
+        report = ReviewReport.objects.for_team(self.team.id).get(id=report_id)
+        return report.review_tier, report.review_signal_priority, report.review_reasoning_effort
+
+    def test_review_tier_is_decided_at_creation_and_only_a_human_trigger_lifts_it(self) -> None:
+        # The tier's invariants: decided once from the creating turn's provenance (a Signals link
+        # makes it an agent PR, routed by the priority handed in), sticky across re-turns even when
+        # the report is re-judged, and lifted only when a person asks. A re-decision on the update
+        # path would flip a report's reviewer between turns and feed a cheap turn's findings into a
+        # stronger turn's "already covered" injection; a downgrade would hand a person a cheap review.
+        signal_report_id = str(uuid.uuid4())
+        report_id = upsert_review_report(
+            team_id=self.team.id,
+            repository="o/r",
+            pr_url="u",
+            pr_metadata=_pr_metadata(),
+            signal_report_id=signal_report_id,
+            trigger_source=TRIGGER_INBOX,
+            signal_priority=ReportPriority.P2,
+        )
+        assert self._routing(report_id) == ("agent_p2", "P2", "medium")
+        # Through the real loader, not just the raw columns: the values_list → resolve positional
+        # coupling would otherwise silently fall every off-default report back to the default pins.
+        assert load_review_arm(team_id=self.team.id, report_id=report_id) == REVIEW_ARMS_BY_TIER[ReviewTier.AGENT_P2]
+        assert load_review_arm(team_id=self.team.id, report_id=str(uuid.uuid4())) == DEFAULT_REVIEW_ARM
+
+        # An inbox re-turn after a re-judgment keeps the tier and the priority the decision used.
+        upsert_review_report(
+            team_id=self.team.id,
+            repository="o/r",
+            pr_url="u",
+            pr_metadata=_pr_metadata(),
+            signal_report_id=signal_report_id,
+            trigger_source=TRIGGER_INBOX,
+            signal_priority=ReportPriority.P0,
+        )
+        assert self._routing(report_id) == ("agent_p2", "P2", "medium")
+
+        # The resolution stage upserts under the person's trigger too; a resolve-only request
+        # reviews nothing, so without the review turn's opt-in the tier must hold.
+        upsert_review_report(
+            team_id=self.team.id,
+            repository="o/r",
+            pr_url="u",
+            pr_metadata=_pr_metadata(),
+            trigger_source=TRIGGER_UI,
+        )
+        assert self._routing(report_id) == ("agent_p2", "P2", "medium")
+
+        # A person's label review lifts the report to the human tier for this and every later turn...
+        upsert_review_report(
+            team_id=self.team.id,
+            repository="o/r",
+            pr_url="u",
+            pr_metadata=_pr_metadata(),
+            trigger_source=TRIGGER_STAMPHOG,
+            lift_tier_on_human_trigger=True,
+        )
+        assert self._routing(report_id) == ("human", "P2", "xhigh")
+        assert load_review_arm(team_id=self.team.id, report_id=report_id) == DEFAULT_REVIEW_ARM
+
+        # ...and a later inbox turn never lowers it back.
+        upsert_review_report(
+            team_id=self.team.id,
+            repository="o/r",
+            pr_url="u",
+            pr_metadata=_pr_metadata(),
+            signal_report_id=signal_report_id,
+            trigger_source=TRIGGER_INBOX,
+            signal_priority=ReportPriority.P3,
+            lift_tier_on_human_trigger=True,
+        )
+        assert self._routing(report_id) == ("human", "P2", "xhigh")
+
+    def test_unknown_persisted_tier_degrades_instead_of_crashing_the_upsert(self) -> None:
+        # `review_tier` is an unconstrained column, so a newer deploy can persist a tier value this
+        # deploy can't parse. The update-path read runs on every turn, before the lift condition, so
+        # a raise would fail the turn and its retries. It must degrade to "no lift", not crash.
+        report_id = upsert_review_report(
+            team_id=self.team.id,
+            repository="o/r",
+            pr_url="u",
+            pr_metadata=_pr_metadata(),
+            trigger_source=TRIGGER_INBOX,
+        )
+        ReviewReport.objects.for_team(self.team.id).filter(id=report_id).update(review_tier="agent_p9_from_the_future")
+
+        upsert_review_report(
+            team_id=self.team.id,
+            repository="o/r",
+            pr_url="u",
+            pr_metadata=_pr_metadata(),
+            trigger_source=TRIGGER_STAMPHOG,
+            lift_tier_on_human_trigger=True,
+        )
+        # The unparseable value is left as-is: the lift is skipped rather than raising or relabeling.
+        assert ReviewReport.objects.for_team(self.team.id).get(id=report_id).review_tier == "agent_p9_from_the_future"
+
+    def test_author_login_is_stamped_on_create_and_refreshed_each_turn(self) -> None:
+        # The "For you" scope's authored-PRs match rides this stamp. It must track the PR's current
+        # author (the login is the stable fact, not a login→user resolution), and a turn with
+        # unknown authorship must not erase a known one.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        assert ReviewReport.objects.for_team(self.team.id).get(id=report_id).author_login == "a"
+        upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(author="b"))
+        assert ReviewReport.objects.for_team(self.team.id).get(id=report_id).author_login == "b"
+        upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(author=""))
+        assert ReviewReport.objects.for_team(self.team.id).get(id=report_id).author_login == "b"
+
+    def test_finalize_stamps_the_turns_urgency_threshold(self) -> None:
+        # The detail view buckets published vs held-back findings by this stamp; a finalize that
+        # stops writing it silently reverts the drawer to bucketing by the VIEWER's settings — the
+        # exact lie the stamp exists to fix. Absent (pre-column) turns stay null for the fallback.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        assert ReviewReport.objects.for_team(self.team.id).get(id=report_id).run_urgency_threshold is None
+        finalize_review_report(
+            team_id=self.team.id,
+            report_id=report_id,
+            body_markdown="# r",
+            run_index=1,
+            head_sha="sha-1",
+            urgency_threshold="must_fix",
+        )
+        report = ReviewReport.objects.for_team(self.team.id).get(id=report_id)
+        assert (report.run_urgency_threshold, report.run_count) == ("must_fix", 1)
+
+    def test_finalize_is_idempotent_within_a_turn(self) -> None:
+        # build_body_activity retries on worker crash after its finalize committed: the retry must
+        # not double-bump run_count, or run_index != run_count and every latest-turn reader (list
+        # counts, publish, prior-findings scoping) points one turn ahead of the real findings.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+
+        finalize_review_report(
+            team_id=self.team.id, report_id=report_id, body_markdown="# report", run_index=1, head_sha="sha-1"
+        )
+        finalize_review_report(
+            team_id=self.team.id, report_id=report_id, body_markdown="# report", run_index=1, head_sha="sha-1"
+        )
+
+        assert ReviewReport.objects.for_team(self.team.id).get(id=report_id).run_count == 1
+
+    @parameterized.expand([("same_casing", "o/r"), ("github_casing", "O/R")])
+    def test_branch_target_upserts_by_head_branch_and_upgrades_to_pr(self, _name, pr_turn_repository) -> None:
+        # A PR-less branch target keys by head_branch (pr_number NULL); the first fetch that finds a
+        # PR for the branch must upgrade the SAME row (backfilling number + url) so the stored review
+        # and its watermarks carry into the publishable turn instead of splitting across two reports.
+        # The two turns can disagree on repository casing — a branch target carries the caller's
+        # slug, the PR turn carries GitHub's — and a casing-sensitive match splits the target in two.
+        branch_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="", pr_metadata=_pr_metadata(pr_number=0)
+        )
+        assert (
+            upsert_review_report(
+                team_id=self.team.id, repository="o/r", pr_url="", pr_metadata=_pr_metadata(pr_number=0)
+            )
+            == branch_id
+        )
+        row = ReviewReport.objects.for_team(self.team.id).get(id=branch_id)
+        assert row.pr_number is None
+        assert row.head_branch == "feat"
+
+        upgraded = upsert_review_report(
+            team_id=self.team.id,
+            repository=pr_turn_repository,
+            pr_url="https://github.com/o/r/pull/123",
+            pr_metadata=_pr_metadata(),
+        )
+        assert upgraded == branch_id
+        # Re-fetch instead of refresh_from_db: the `pr_number is None` assert above narrows the
+        # attribute for mypy, and a refresh does not reset that narrowing.
+        refreshed = ReviewReport.objects.for_team(self.team.id).get(id=branch_id)
+        assert refreshed.pr_number == 123
+        assert refreshed.pr_url == "https://github.com/o/r/pull/123"
+        assert ReviewReport.objects.for_team(self.team.id).filter(repository__iexact="o/r").count() == 1
+
+    def test_provenance_is_stamped_on_create_and_never_overwritten(self) -> None:
+        # The signals link is the durable provenance (the artefact on the signals side is deletable):
+        # an inbox create stamps it, and a later label re-trigger of the same PR must not erase it.
+        signal_report_id = str(uuid.uuid4())
+        report_id = upsert_review_report(
+            team_id=self.team.id,
+            repository="o/r",
+            pr_url="u",
+            pr_metadata=_pr_metadata(),
+            signal_report_id=signal_report_id,
+            trigger_source="inbox",
+        )
+        upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(), trigger_source="stamphog"
+        )
+
+        row = ReviewReport.objects.for_team(self.team.id).get(id=report_id)
+        assert str(row.signal_report_id) == signal_report_id
+        assert row.trigger_source == "inbox"
+
+    def test_provenance_backfills_only_when_missing(self) -> None:
+        # The reverse overlap: a Stamphog-created report later re-triggered by the inbox flow gains the
+        # missing signal link but keeps its creating trigger.
+        report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(), trigger_source="stamphog"
+        )
+        signal_report_id = str(uuid.uuid4())
+        upsert_review_report(
+            team_id=self.team.id,
+            repository="o/r",
+            pr_url="u",
+            pr_metadata=_pr_metadata(),
+            signal_report_id=signal_report_id,
+            trigger_source="inbox",
+        )
+
+        row = ReviewReport.objects.for_team(self.team.id).get(id=report_id)
+        assert str(row.signal_report_id) == signal_report_id
+        assert row.trigger_source == "stamphog"
+
+
+class TestPersistResults(BaseTest):
+    def test_finding_and_verdict_share_key_and_map_fields(self) -> None:
+        # The mapping + join is the whole point of this layer: Issue.issue → finding.body (not
+        # suggestion), the typo'd is_directy_* → is_directly_*, and the verdict reaching the finding
+        # by a shared issue_key (so latest-wins can pair them). Catches a field swap or a key drift.
+        issue = _issue(
+            "1-2-3",
+            title="Off-by-one",
+            file="a.py",
+            issue="loop runs one short",
+            suggestion="use <=",
+            is_directly_related_to_changes=True,
+        )
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        assert persist_findings(team_id=self.team.id, report_id=report_id, issues=[issue], run_index=1) == ["1-2-3"]
+        assert (
+            persist_verdicts(
+                team_id=self.team.id,
+                report_id=report_id,
+                issues=[issue],
+                run_index=1,
+                validations={"1-2-3": IssueValidation(is_valid=True, argumentation="real bug", category="bug")},
+            )
+            == 1
+        )
+
+        finding_row = ReviewReportArtefact.objects.for_team(self.team.id).get(
+            report_id=report_id, type=ReviewReportArtefact.ArtefactType.ISSUE_FINDING
+        )
+        verdict_row = ReviewReportArtefact.objects.for_team(self.team.id).get(
+            report_id=report_id, type=ReviewReportArtefact.ArtefactType.VALIDATION_VERDICT
+        )
+        finding = parse_artefact_content(finding_row.type, finding_row.content)
+        verdict = parse_artefact_content(verdict_row.type, verdict_row.content)
+        assert isinstance(finding, ReviewIssueFinding)
+        assert isinstance(verdict, ValidationVerdict)
+        assert finding.body == "loop runs one short"
+        assert finding.suggestion == "use <="
+        assert finding.is_directly_related_to_changes is True
+        assert finding.priority == IssuePriority.MUST_FIX
+        assert verdict.issue_key == finding.issue_key
+        assert verdict.is_valid is True
+        assert verdict.category == "bug"
+        # System attribution: aggregated across many sandbox tasks, so neither column is set.
+        assert finding_row.created_by_id is None
+        assert finding_row.task_id is None
+
+    def test_colliding_findings_persist_distinctly_and_pair_to_own_verdict(self) -> None:
+        # Two genuinely distinct issues from the same perspective on the same start line survive dedup with
+        # different ids. They must NOT collapse to one issue_key (which would shadow a finding) and
+        # each must pair to its OWN verdict (not the other's ruling).
+        a = _issue("1-2-1", file="x.py", start=5, title="A", issue="problem A", suggestion="fix A")
+        b = _issue(
+            "1-2-2",
+            file="x.py",
+            start=5,
+            title="B",
+            issue="problem B",
+            suggestion="fix B",
+            priority=IssuePriority.SHOULD_FIX,
+        )
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        assert persist_findings(team_id=self.team.id, report_id=report_id, issues=[a, b], run_index=1) == [
+            "1-2-1",
+            "1-2-2",
+        ]
+        assert (
+            persist_verdicts(
+                team_id=self.team.id,
+                report_id=report_id,
+                issues=[a, b],
+                run_index=1,
+                validations={
+                    "1-2-1": IssueValidation(is_valid=True, argumentation="A is real"),
+                    "1-2-2": IssueValidation(is_valid=False, argumentation="B dismissed"),
+                },
+            )
+            == 2
+        )
+
+        finding_keys = {
+            _content_as(ReviewIssueFinding, r.type, r.content).issue_key
+            for r in ReviewReportArtefact.objects.for_team(self.team.id).filter(
+                report_id=report_id, type=ReviewReportArtefact.ArtefactType.ISSUE_FINDING
+            )
+        }
+        assert len(finding_keys) == 2
+        verdicts = {
+            v.issue_key: v
+            for v in (
+                _content_as(ValidationVerdict, r.type, r.content)
+                for r in ReviewReportArtefact.objects.for_team(self.team.id).filter(
+                    report_id=report_id, type=ReviewReportArtefact.ArtefactType.VALIDATION_VERDICT
+                )
+            )
+        }
+        assert set(verdicts) == finding_keys
+        a_key = next(k for k in verdicts if k.endswith(":1-2-1"))
+        b_key = next(k for k in verdicts if k.endswith(":1-2-2"))
+        assert verdicts[a_key].is_valid is True
+        assert verdicts[b_key].is_valid is False
+
+    def test_verdict_not_written_for_issue_whose_finding_was_skipped(self) -> None:
+        # An issue that fails durable finding validation must not leave behind an orphan verdict, even
+        # when it has a validation result (the finding schema is stricter than the verdict's).
+        good = _issue(
+            "1-1-1", file="a.py", start=1, title="ok", issue="real description", priority=IssuePriority.CONSIDER
+        )
+        bad = _issue("1-1-2", file="b.py", start=1, title="bad", issue="   ", priority=IssuePriority.CONSIDER)
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        assert persist_findings(team_id=self.team.id, report_id=report_id, issues=[good, bad], run_index=1) == ["1-1-1"]
+        assert (
+            persist_verdicts(
+                team_id=self.team.id,
+                report_id=report_id,
+                issues=[good, bad],
+                run_index=1,
+                validations={
+                    "1-1-1": IssueValidation(is_valid=True, argumentation="ok"),
+                    "1-1-2": IssueValidation(is_valid=True, argumentation="orphan ruling"),
+                },
+            )
+            == 1
+        )
+
+        verdicts = [
+            _content_as(ValidationVerdict, r.type, r.content)
+            for r in ReviewReportArtefact.objects.for_team(self.team.id).filter(
+                report_id=report_id, type=ReviewReportArtefact.ArtefactType.VALIDATION_VERDICT
+            )
+        ]
+        assert len(verdicts) == 1
+        assert verdicts[0].issue_key.endswith(":1-1-1")
+
+    def test_persist_findings_skips_unpersistable_and_keeps_the_rest(self) -> None:
+        # A single malformed LLM finding (empty body) must not abort the whole batch.
+        good = _issue(
+            "1-1-1", file="a.py", start=1, title="ok", issue="real description", priority=IssuePriority.CONSIDER
+        )
+        bad = _issue("1-1-2", file="b.py", title="bad", lines=[], issue="   ", priority=IssuePriority.CONSIDER)
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        assert persist_findings(team_id=self.team.id, report_id=report_id, issues=[good, bad], run_index=1) == ["1-1-1"]
+
+        rows = ReviewReportArtefact.objects.for_team(self.team.id).filter(
+            report_id=report_id, type=ReviewReportArtefact.ArtefactType.ISSUE_FINDING
+        )
+        assert rows.count() == 1
+
+    @parameterized.expand(
+        [
+            ("same_context", True),
+            ("changed_claim", False),
+            ("ordinal_collision", False),
+            ("changed_reviewer", False),
+            ("changed_validator", False),
+            ("changed_effort", False),
+            ("changed_mode", False),
+            ("changed_head", False),
+            ("empty", False),
+        ]
+    )
+    def test_load_run_issues_round_trips_persisted_findings_by_id(self, change: str, reuses_verdict: bool) -> None:
+        # Validate + body-build reload issues from the finding rows by id (only ids cross Temporal
+        # payloads): a drift between _to_finding/_from_finding, or a broken id reconstruction from
+        # issue_key, would silently feed validation wrong or missing issues. A dropped
+        # reported_priority would make a stored P0 indistinguishable from a P1.
+        a = _issue(
+            "1-2-1",
+            file="x.py",
+            start=5,
+            title="A",
+            issue="problem A",
+            suggestion="fix A",
+            is_directly_related_to_changes=True,
+            reported_priority="P0",
+        )
+        b = _issue(
+            "1000-2-1",
+            file="y.py",
+            start=9,
+            title="B",
+            issue="problem B",
+            suggestion="fix B",
+            priority=IssuePriority.SHOULD_FIX,
+            source_perspective="review-hog-blind-spots-general",
+        )
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        head_sha = "sha-1"
+        review_mode = REVIEW_MODE_FLASH
+        review_arm = FLASH_ARM
+        validation_arm = FLASH_ARM
+
+        def replace_snapshot(issues: list[Issue]) -> list[str]:
+            return replace_deduplicated_findings(
+                team_id=self.team.id,
+                report_id=report_id,
+                issues=issues,
+                run_index=1,
+                head_sha=head_sha,
+                review_mode=review_mode,
+                review_arm=review_arm,
+                validation_arm=validation_arm,
+            )
+
+        persisted = replace_snapshot([a, b])
+        assert persisted == ["1-2-1", "1000-2-1"]
+
+        assert load_run_issues(team_id=self.team.id, report_id=report_id, run_index=1, issue_ids=persisted) == [a, b]
+        # The id filter scopes to the requested subset (a chunk's slice of the survivors).
+        assert load_run_issues(team_id=self.team.id, report_id=report_id, run_index=1, issue_ids=["1000-2-1"]) == [b]
+        persist_verdicts(
+            team_id=self.team.id,
+            report_id=report_id,
+            issues=[a, b],
+            run_index=1,
+            validations={issue.id: IssueValidation(is_valid=True, argumentation="real") for issue in (a, b)},
+        )
+
+        current = [a]
+        if change == "changed_claim":
+            current = [a.model_copy(update={"issue": "A different claim at the same anchor"})]
+        elif change == "ordinal_collision":
+            current = [a.model_copy(update={"file": "another.py"})]
+        elif change == "changed_reviewer":
+            review_arm = DEFAULT_REVIEW_ARM
+        elif change == "changed_validator":
+            validation_arm = DEFAULT_VALIDATION_ARM
+        elif change == "changed_effort":
+            validation_arm = replace(FLASH_ARM, reasoning_effort=ReasoningEffort.HIGH)
+        elif change == "changed_mode":
+            review_mode = REVIEW_MODE_FULL
+        elif change == "changed_head":
+            head_sha = "sha-2"
+        elif change == "empty":
+            current = []
+
+        assert replace_snapshot(current) == [issue.id for issue in current]
+        assert load_run_issues(team_id=self.team.id, report_id=report_id, run_index=1, issue_ids=persisted) == current
+        validations = load_run_validations(team_id=self.team.id, report_id=report_id, run_index=1, issues=[a, b])
+        assert set(validations) == ({a.id} if reuses_verdict else set())
+        assert len(load_valid_findings(team_id=self.team.id, report_id=report_id, run_index=1)) == int(reuses_verdict)
+
+
+class TestLoadValidFindings(BaseTest):
+    def test_returns_only_valid_pairs_latest_wins(self) -> None:
+        # Publish reads its inline comments from here: each issue_key's LATEST finding joined to its
+        # LATEST verdict, keeping only the valid ones. A stale-row read or a kept-invalid would post
+        # the wrong comments.
+        valid = _issue("1-1-1", file="a.py", title="keep me", issue="real")
+        invalid = _issue("1-1-2", file="b.py", title="drop me", issue="not real")
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        persist_findings(team_id=self.team.id, report_id=report_id, issues=[valid, invalid], run_index=1)
+        persist_verdicts(
+            team_id=self.team.id,
+            report_id=report_id,
+            issues=[valid, invalid],
+            run_index=1,
+            validations={
+                "1-1-1": IssueValidation(is_valid=True, argumentation="real"),
+                "1-1-2": IssueValidation(is_valid=False, argumentation="not real"),
+            },
+        )
+
+        pairs = load_valid_findings(team_id=self.team.id, report_id=report_id, run_index=1)
+        assert len(pairs) == 1
+        finding, verdict = pairs[0]
+        assert finding.title == "keep me"
+        assert verdict.is_valid is True
+        assert verdict.issue_key == finding.issue_key
+
+    def test_latest_verdict_overrides_an_earlier_one(self) -> None:
+        # A later turn can flip a verdict; the latest row wins, so a finding first dismissed then
+        # confirmed must publish (and vice versa). Guards the loop-y re-review contract.
+        issue = _issue("1-1-1", file="a.py", title="flip", issue="real")
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        persist_findings(team_id=self.team.id, report_id=report_id, issues=[issue], run_index=1)
+        persist_verdicts(
+            team_id=self.team.id,
+            report_id=report_id,
+            issues=[issue],
+            run_index=1,
+            validations={"1-1-1": IssueValidation(is_valid=False, argumentation="dismissed")},
+        )
+        assert load_valid_findings(team_id=self.team.id, report_id=report_id, run_index=1) == []
+
+        persist_verdicts(
+            team_id=self.team.id,
+            report_id=report_id,
+            issues=[issue],
+            run_index=1,
+            validations={"1-1-1": IssueValidation(is_valid=True, argumentation="actually real")},
+        )
+        pairs = load_valid_findings(team_id=self.team.id, report_id=report_id, run_index=1)
+        assert len(pairs) == 1
+        assert pairs[0][1].argumentation == "actually real"
+
+    def test_scopes_findings_to_the_requested_run(self) -> None:
+        # Guards the duplicate-comment bug: publishing once replayed the whole finding history. Each
+        # run's findings must stay scoped to that run, even when a later turn reuses the same id.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        old = _issue("1-1-1", file="a.py", title="run-1 finding", issue="real")
+        persist_findings(team_id=self.team.id, report_id=report_id, issues=[old], run_index=1)
+        persist_verdict(
+            team_id=self.team.id,
+            report_id=report_id,
+            issue=old,
+            validation=IssueValidation(is_valid=True, argumentation="real"),
+            run_index=1,
+        )
+        finalize_review_report(
+            team_id=self.team.id, report_id=report_id, body_markdown="stored review", run_index=1, head_sha="sha-1"
+        )
+        prior_rows = list(
+            ReviewReportArtefact.objects.for_team(self.team.id).filter(report_id=report_id).values_list("id", "content")
+        )
+        with self.assertRaisesMessage(ValueError, "Cannot replace findings from a completed review turn"):
+            replace_deduplicated_findings(
+                team_id=self.team.id,
+                report_id=report_id,
+                issues=[],
+                run_index=1,
+                head_sha="sha-1",
+                review_mode=REVIEW_MODE_FLASH,
+                review_arm=FLASH_ARM,
+                validation_arm=FLASH_ARM,
+            )
+        new = _issue("1-1-1", file="b.py", title="run-2 finding", issue="real")
+        replace_deduplicated_findings(
+            team_id=self.team.id,
+            report_id=report_id,
+            issues=[new],
+            run_index=2,
+            head_sha="sha-2",
+            review_mode=REVIEW_MODE_FULL,
+            review_arm=DEFAULT_REVIEW_ARM,
+            validation_arm=DEFAULT_VALIDATION_ARM,
+        )
+        persist_verdict(
+            team_id=self.team.id,
+            report_id=report_id,
+            issue=new,
+            validation=IssueValidation(is_valid=True, argumentation="real"),
+            run_index=2,
+        )
+
+        assert [f.title for f, _ in load_valid_findings(team_id=self.team.id, report_id=report_id, run_index=2)] == [
+            "run-2 finding"
+        ]
+        assert [f.title for f, _ in load_valid_findings(team_id=self.team.id, report_id=report_id, run_index=1)] == [
+            "run-1 finding"
+        ]
+        assert (
+            list(
+                ReviewReportArtefact.objects.for_team(self.team.id)
+                .filter(report_id=report_id, id__in=[row_id for row_id, _ in prior_rows])
+                .values_list("id", "content")
+            )
+            == prior_rows
+        )
+
+
+class TestReplaceDroppedFindings(BaseTest):
+    def test_a_retry_replaces_the_record_and_no_findings_reader_sees_it(self) -> None:
+        # A retried turn keeps its index, so a record that only appends counts every attempt's drops
+        # again. A dropped finding that a findings reader picks up would post, or keep a later turn
+        # from raising the same problem.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        kept = _issue("2000-1-1", title="kept", source_perspective="flash-single-agent")
+        cut = _issue("2002-1-1", file="b.py", title="cut", priority=IssuePriority.CONSIDER)
+        repeat = _issue("2001-2-1", title="repeat", reported_priority="P1", source_perspective="flash-lens-perf")
+
+        def record_turn(dropped: list[DroppedIssue]) -> None:
+            replace_deduplicated_findings(
+                team_id=self.team.id,
+                report_id=report_id,
+                issues=[kept],
+                run_index=1,
+                head_sha="sha-1",
+                review_mode=REVIEW_MODE_FLASH,
+                review_arm=FLASH_ARM,
+                validation_arm=None,
+            )
+            replace_dropped_findings(
+                team_id=self.team.id,
+                report_id=report_id,
+                run_index=1,
+                head_sha="sha-1",
+                dropped=dropped,
+                cap=6,
+                lens_part_count=2,
+            )
+
+        record_turn([DroppedIssue(issue=cut, disposition="cap", rank=7)])
+        record_turn([DroppedIssue(issue=repeat, disposition="dedup_anchor", duplicate_of=kept)])
+
+        rows = ReviewReportArtefact.objects.for_team(self.team.id).filter(
+            report_id=report_id, type=ReviewReportArtefact.ArtefactType.DROPPED_FINDING
+        )
+        [dropped] = [_content_as(DroppedFindingArtefact, row.type, row.content) for row in rows]
+        assert (
+            dropped.finding.title,
+            dropped.finding.reported_priority,
+            dropped.pass_number,
+            dropped.chunk_id,
+            dropped.disposition,
+            dropped.duplicate_of,
+            (dropped.cap, dropped.lens_part_count),
+        ) == ("repeat", "P1", 2001, 2, "dedup_anchor", "r1:a.py:10:flash-single-agent:2000-1-1", (6, 2))
+        finalize_review_report(
+            team_id=self.team.id, report_id=report_id, body_markdown="b", run_index=1, head_sha="sha-1"
+        )
+        assert [f.title for f, _ in load_turn_findings(team_id=self.team.id, report_id=report_id, run_index=1)] == [
+            "kept"
+        ]
+        assert [
+            f.title for f in load_prior_findings(team_id=self.team.id, report_id=report_id, before_run_index=2)
+        ] == ["kept"]
+
+
+class TestLoadRunValidations(BaseTest):
+    def test_maps_issues_to_this_runs_verdicts_and_ignores_other_runs(self) -> None:
+        # Powers validator skip-resume + DB-sourced body: each issue → this run's verdict (lossless),
+        # unjudged issues absent, and an earlier run's verdict for the same id must not leak in.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        judged = _issue("1-1-1", file="a.py")
+        unjudged = _issue("1-1-2", file="b.py", start=20)
+        persist_verdict(
+            team_id=self.team.id,
+            report_id=report_id,
+            issue=judged,
+            validation=IssueValidation(is_valid=True, argumentation="real", category="bug"),
+            run_index=2,
+        )
+        # Same issue id, but an EARLIER run — keyed under run 1, so run 2's view must not return it.
+        persist_verdict(
+            team_id=self.team.id,
+            report_id=report_id,
+            issue=judged,
+            validation=IssueValidation(is_valid=False, argumentation="stale", category="security"),
+            run_index=1,
+        )
+
+        out = load_run_validations(team_id=self.team.id, report_id=report_id, run_index=2, issues=[judged, unjudged])
+
+        assert set(out) == {"1-1-1"}  # the unjudged issue has no verdict this run
+        assert out["1-1-1"].is_valid is True
+        assert out["1-1-1"].category == "bug"
+        assert out["1-1-1"].argumentation == "real"  # run 2's verdict, not run 1's "stale"
+
+    def test_adjusted_priority_round_trips_through_the_verdict(self) -> None:
+        # The validator's priority override must survive persist → load so the body + publish gates see
+        # the adjusted severity; an unset override stays None (the no-migration default).
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        raised = _issue("1-1-1", file="a.py", priority=IssuePriority.CONSIDER)
+        unchanged = _issue("1-1-2", file="b.py", start=20, priority=IssuePriority.MUST_FIX)
+        persist_verdict(
+            team_id=self.team.id,
+            report_id=report_id,
+            issue=raised,
+            validation=IssueValidation(
+                is_valid=True, argumentation="actually critical", adjusted_priority=IssuePriority.MUST_FIX
+            ),
+            run_index=1,
+        )
+        persist_verdict(
+            team_id=self.team.id,
+            report_id=report_id,
+            issue=unchanged,
+            validation=IssueValidation(is_valid=True, argumentation="as flagged"),
+            run_index=1,
+        )
+
+        out = load_run_validations(team_id=self.team.id, report_id=report_id, run_index=1, issues=[raised, unchanged])
+
+        assert out["1-1-1"].adjusted_priority == IssuePriority.MUST_FIX
+        assert out["1-1-2"].adjusted_priority is None
+
+
+class TestLoadPriorFindings(BaseTest):
+    def test_returns_only_earlier_turns_findings(self) -> None:
+        # The "already covered" context for a re-review must be PRIOR turns' findings only — never the
+        # current turn's own, which would tell the agent to skip the very issues it's there to find.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        persist_findings(
+            team_id=self.team.id,
+            report_id=report_id,
+            issues=[_issue("1-1-1", file="a.py", title="run-1 issue")],
+            run_index=1,
+        )
+        persist_findings(
+            team_id=self.team.id,
+            report_id=report_id,
+            issues=[_issue("1-1-1", file="b.py", title="run-2 issue")],
+            run_index=2,
+        )
+
+        # Reviewing turn 2 sees turn 1's findings as covered, not its own; turn 1 has nothing prior.
+        assert [
+            f.title for f in load_prior_findings(team_id=self.team.id, report_id=report_id, before_run_index=2)
+        ] == ["run-1 issue"]
+        assert load_prior_findings(team_id=self.team.id, report_id=report_id, before_run_index=1) == []
+
+    def test_with_verdicts_pairs_each_prior_finding_with_its_ruling(self) -> None:
+        # Dedup drops a re-found problem citing the earlier ruling — pairing the wrong verdict (or a
+        # current-turn finding) would suppress fresh issues or re-litigate settled ones.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        judged = _issue("1-1-1", file="a.py", title="judged")
+        persist_findings(team_id=self.team.id, report_id=report_id, issues=[judged], run_index=1)
+        persist_findings(
+            team_id=self.team.id,
+            report_id=report_id,
+            issues=[_issue("1-1-2", file="b.py", title="unjudged")],
+            run_index=1,
+        )
+        persist_verdict(
+            team_id=self.team.id,
+            report_id=report_id,
+            issue=judged,
+            validation=IssueValidation(is_valid=False, argumentation="not real"),
+            run_index=1,
+        )
+
+        pairs = load_prior_findings_with_verdicts(team_id=self.team.id, report_id=report_id, before_run_index=2)
+
+        by_title = {finding.title: verdict for finding, verdict in pairs}
+        assert by_title["judged"] is not None and by_title["judged"].is_valid is False
+        assert by_title["unjudged"] is None
+
+
+# The per-turn working-state rows that back the DB-driven resume.
+class TestWorkingState(BaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(head_sha="sha-aaa")
+        )
+
+    def _chunks(self) -> ChunksList:
+        return ChunksList(chunks=[Chunk(chunk_id=1, files=[FileInfo(filename="a.py")], chunk_type="feature")])
+
+    def test_chunk_set_round_trips_and_is_scoped_to_its_head_sha(self) -> None:
+        # Resume reuses the chunking only for the current head; a new head must re-chunk, not reuse a
+        # prior turn's chunks (line numbers would be wrong).
+        persist_chunk_set(team_id=self.team.id, report_id=self.report_id, head_sha="sha-aaa", chunks=self._chunks())
+        loaded = load_chunk_set(team_id=self.team.id, report_id=self.report_id, head_sha="sha-aaa")
+        assert loaded is not None
+        assert [c.chunk_id for c in loaded.chunks] == [1]
+        assert load_chunk_set(team_id=self.team.id, report_id=self.report_id, head_sha="sha-bbb") is None
+
+    def test_chunk_set_with_duplicate_ids_degrades_to_absent_instead_of_crashing(self) -> None:
+        # The unique-chunk_id invariant lives on ChunksList, which the per-Chunk artefact parse never
+        # runs — only load_chunk_set's reassembly does. A bad persisted row (pre-validator local data
+        # or a future writer bug) must degrade like any unparseable row (None → the stage re-runs),
+        # not crash every resume of the turn with a raw ValidationError.
+        ReviewReportArtefact.add_working_state(
+            team_id=self.team.id,
+            report_id=self.report_id,
+            content=ChunkSetArtefact(
+                head_sha="sha-aaa",
+                chunks=[
+                    Chunk(chunk_id=1, files=[FileInfo(filename="a.py")]),
+                    Chunk(chunk_id=1, files=[FileInfo(filename="b.py")]),
+                ],
+            ),
+            attribution=ArtefactAttribution.system(),
+        )
+
+        assert load_chunk_set(team_id=self.team.id, report_id=self.report_id, head_sha="sha-aaa") is None
+
+    def test_perspective_results_round_trip_keyed_by_pass_chunk_and_arm(self) -> None:
+        results = {
+            (1, 1): IssuesReview(issues=[_issue("1-1-1")]),
+            (2, 1): IssuesReview(issues=[_issue("2-1-1")]),
+        }
+        ReviewReportArtefact.add_working_state(
+            team_id=self.team.id,
+            report_id=self.report_id,
+            content=PerspectiveResultArtefact(
+                head_sha="sha-aaa", pass_number=1, chunk_id=1, review=results[(1, 1)], review_model=FLASH_ARM.model
+            ),
+            attribution=ArtefactAttribution.system(),
+        )
+        assert (
+            load_perspective_results(
+                team_id=self.team.id,
+                report_id=self.report_id,
+                head_sha="sha-aaa",
+                review_arm=FLASH_ARM,
+                review_design=REVIEW_DESIGN_PIPELINE,
+            )
+            == {}
+        )
+        persist_perspective_results(
+            team_id=self.team.id, report_id=self.report_id, head_sha="sha-aaa", results=results, review_arm=FLASH_ARM
+        )
+        stronger_arm = replace(FLASH_ARM, reasoning_effort=ReasoningEffort.XHIGH)
+        assert (
+            load_perspective_results(
+                team_id=self.team.id,
+                report_id=self.report_id,
+                head_sha="sha-aaa",
+                review_arm=stronger_arm,
+                review_design=REVIEW_DESIGN_PIPELINE,
+            )
+            == {}
+        )
+        persist_perspective_results(
+            team_id=self.team.id,
+            report_id=self.report_id,
+            head_sha="sha-aaa",
+            results={(1, 1): IssuesReview(issues=[_issue("1-1-xhigh")])},
+            review_arm=stronger_arm,
+        )
+        loaded = load_perspective_results(
+            team_id=self.team.id,
+            report_id=self.report_id,
+            head_sha="sha-aaa",
+            review_arm=FLASH_ARM,
+            review_design=REVIEW_DESIGN_PIPELINE,
+        )
+        assert set(loaded.keys()) == {(1, 1), (2, 1)}
+        assert loaded[(1, 1)].issues[0].id == "1-1-1"
+        assert (
+            load_perspective_results(
+                team_id=self.team.id,
+                report_id=self.report_id,
+                head_sha="sha-bbb",
+                review_arm=FLASH_ARM,
+                review_design=REVIEW_DESIGN_PIPELINE,
+            )
+            == {}
+        )
+        # A flash turn and a full turn can share a commit: the full turn must not resume the flash
+        # turn's rows (it would skip its own reviewer entirely), and the reverse holds too.
+        assert (
+            load_perspective_results(
+                team_id=self.team.id,
+                report_id=self.report_id,
+                head_sha="sha-aaa",
+                review_arm=DEFAULT_REVIEW_ARM,
+                review_design=REVIEW_DESIGN_PIPELINE,
+            )
+            == {}
+        )
+        stronger_results = load_perspective_results(
+            team_id=self.team.id,
+            report_id=self.report_id,
+            head_sha="sha-aaa",
+            review_arm=stronger_arm,
+            review_design=REVIEW_DESIGN_PIPELINE,
+        )
+        assert set(stronger_results) == {(1, 1)}
+        assert stronger_results[(1, 1)].issues[0].id == "1-1-xhigh"
+
+    def test_perspective_results_of_one_arm_stay_apart_by_design(self) -> None:
+        # A Full turn and a single-agent Flash turn at one head can run on the same arm. Without the
+        # design filter, each turn's dedup would combine the other turn's findings.
+        lens_pass = FLASH_LENSES["contracts-security"].pass_number
+        persist_perspective_results(
+            team_id=self.team.id,
+            report_id=self.report_id,
+            head_sha="sha-aaa",
+            results={
+                (1, 1): IssuesReview(issues=[_issue("1-1-1")]),
+                (SINGLE_AGENT_PASS_NUMBER, 1): IssuesReview(issues=[_issue("2000-1-1")]),
+                (lens_pass, 2): IssuesReview(issues=[_issue("2002-2-1")]),
+            },
+            review_arm=SINGLE_AGENT_FLASH_ARM,
+        )
+
+        loaded = {
+            design: set(
+                load_perspective_results(
+                    team_id=self.team.id,
+                    report_id=self.report_id,
+                    head_sha="sha-aaa",
+                    review_arm=SINGLE_AGENT_FLASH_ARM,
+                    review_design=design,
+                )
+            )
+            for design in (REVIEW_DESIGN_PIPELINE, REVIEW_DESIGN_SINGLE_AGENT)
+        }
+
+        assert loaded == {
+            REVIEW_DESIGN_PIPELINE: {(1, 1)},
+            REVIEW_DESIGN_SINGLE_AGENT: {(SINGLE_AGENT_PASS_NUMBER, 1), (lens_pass, 2)},
+        }
+
+    def test_single_agent_results_read_each_session_under_its_own_arm(self) -> None:
+        # A set whose main and lens sessions run on different arms loses its lens findings if dedup reads one arm.
+        # A fallback must count for its own set only: an earlier control turn's result at this head is not one.
+        trial = SingleAgentArms(
+            main=replace(SINGLE_AGENT_FLASH_ARM, reasoning_effort=ReasoningEffort.HIGH),
+            lens=replace(SINGLE_AGENT_FLASH_ARM, model="gpt-6-luna"),
+        )
+        perf_pass = FLASH_LENSES["performance-reliability"].pass_number
+        contracts_pass = FLASH_LENSES["contracts-security"].pass_number
+        stored = [
+            ((SINGLE_AGENT_PASS_NUMBER, 1), trial.main, None, "main-trial"),
+            ((perf_pass, 1), SINGLE_AGENT_FLASH_ARM, None, "perf-control-turn"),
+            ((perf_pass, 1), trial.lens, None, "perf-trial"),
+            ((contracts_pass, 1), SINGLE_AGENT_FLASH_ARM, trial.lens, "contracts-fallback"),
+            ((contracts_pass, 2), SINGLE_AGENT_FLASH_ARM, None, "contracts-control-turn"),
+            ((1, 1), SINGLE_AGENT_FLASH_ARM, None, "pipeline"),
+        ]
+        for key, arm, fallback_for, issue_id in stored:
+            persist_perspective_results(
+                team_id=self.team.id,
+                report_id=self.report_id,
+                head_sha="sha-aaa",
+                results={key: IssuesReview(issues=[_issue(issue_id)])},
+                review_arm=arm,
+                fallback_for=fallback_for,
+            )
+
+        loaded = {
+            name: load_single_agent_results(
+                team_id=self.team.id, report_id=self.report_id, head_sha="sha-aaa", arms=arms
+            )
+            for name, arms in (("control", SINGLE_AGENT_ARM_SETS[CONTROL_ARM_SET]), ("trial", trial))
+        }
+
+        assert {
+            name: {key: r.issues[0].id for key, r in results.reviews.items()} for name, results in loaded.items()
+        } == {
+            "control": {(perf_pass, 1): "perf-control-turn", (contracts_pass, 2): "contracts-control-turn"},
+            "trial": {
+                (SINGLE_AGENT_PASS_NUMBER, 1): "main-trial",
+                (perf_pass, 1): "perf-trial",
+                (contracts_pass, 1): "contracts-fallback",
+            },
+        }
+        assert (loaded["control"].fallbacks, loaded["trial"].fallbacks) == (
+            frozenset(),
+            frozenset({(contracts_pass, 1)}),
+        )
+
+
+class TestPersistCommitSnapshot(BaseTest):
+    def _commits(self, report_id: str):
+        return ReviewReportArtefact.objects.for_team(self.team.id).filter(
+            report_id=report_id, type=ReviewReportArtefact.ArtefactType.COMMIT
+        )
+
+    def test_snapshot_stores_the_diff_at_head_sha_and_advances_both_watermarks(self) -> None:
+        # The point-in-time guarantee: the reviewed diff is captured against the exact head_sha and
+        # the watermark advances so a later turn knows what was reviewed. A dropped diff, a wrong
+        # sha, or a forgotten watermark bump would all surface here.
+        comments = [PRComment(id=11, path="a.py", body="hi", diff_hunk="", user="u", created_at="t")]
+        report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(head_sha="sha-aaa")
+        )
+        appended = persist_commit_snapshot(
+            team_id=self.team.id,
+            report_id=report_id,
+            repository="o/r",
+            pr_metadata=_pr_metadata(head_sha="sha-aaa"),
+            pr_comments=comments,
+            diff="=== a.py [modified] ===\n@@ -1 +1 @@\n-old\n+new",
+        )
+
+        assert appended is True
+        row = self._commits(report_id).get()
+        commit = parse_artefact_content(row.type, row.content)
+        assert isinstance(commit, Commit)
+        assert commit.commit_sha == "sha-aaa"
+        assert commit.diff == "=== a.py [modified] ===\n@@ -1 +1 @@\n-old\n+new"
+        assert row.created_by_id is None
+        assert row.task_id is None
+        report = ReviewReport.objects.for_team(self.team.id).get(id=report_id)
+        assert report.head_sha == "sha-aaa"
+        assert report.last_seen_comment_id == 11
+
+    def test_snapshot_is_idempotent_when_head_sha_is_unchanged(self) -> None:
+        # A re-run with no new commits must not duplicate the snapshot — this is exactly the loop's
+        # no-op turn. Without the watermark guard the report would accrete identical snapshots forever.
+        report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(head_sha="sha-aaa")
+        )
+        first = persist_commit_snapshot(
+            team_id=self.team.id,
+            report_id=report_id,
+            repository="o/r",
+            pr_metadata=_pr_metadata(head_sha="sha-aaa"),
+            pr_comments=[],
+            diff="@@ -1 +1 @@",
+        )
+        second = persist_commit_snapshot(
+            team_id=self.team.id,
+            report_id=report_id,
+            repository="o/r",
+            pr_metadata=_pr_metadata(head_sha="sha-aaa"),
+            pr_comments=[],
+            diff="@@ -1 +1 @@",
+        )
+        assert first is True
+        assert second is False
+        assert self._commits(report_id).count() == 1
+
+    def test_new_head_sha_appends_a_second_snapshot(self) -> None:
+        # When the PR head actually moves, the new turn must append its own snapshot (never mutate
+        # the prior one) so the per-turn history survives later force-pushes.
+        report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(head_sha="sha-aaa")
+        )
+        persist_commit_snapshot(
+            team_id=self.team.id,
+            report_id=report_id,
+            repository="o/r",
+            pr_metadata=_pr_metadata(head_sha="sha-aaa"),
+            pr_comments=[],
+            diff="turn-1 diff",
+        )
+        appended = persist_commit_snapshot(
+            team_id=self.team.id,
+            report_id=report_id,
+            repository="o/r",
+            pr_metadata=_pr_metadata(head_sha="sha-bbb"),
+            pr_comments=[],
+            diff="turn-2 diff",
+        )
+        assert appended is True
+        diffs = {_content_as(Commit, r.type, r.content).diff for r in self._commits(report_id)}
+        assert diffs == {"turn-1 diff", "turn-2 diff"}
+        report = ReviewReport.objects.for_team(self.team.id).get(id=report_id)
+        assert report.head_sha == "sha-bbb"
+
+    def test_snapshot_skipped_when_head_sha_missing(self) -> None:
+        # No head_sha (a degraded fetch) must skip cleanly rather than build a Commit with a blank
+        # sha (which the schema rejects) or advance the watermark.
+        report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(head_sha=None)
+        )
+        appended = persist_commit_snapshot(
+            team_id=self.team.id,
+            report_id=report_id,
+            repository="o/r",
+            pr_metadata=_pr_metadata(head_sha=None),
+            pr_comments=[],
+            diff="some diff",
+        )
+        assert appended is False
+        assert self._commits(report_id).count() == 0
+        assert ReviewReport.objects.for_team(self.team.id).get(id=report_id).head_sha is None
+
+    def test_snapshot_records_empty_diff_when_no_reviewable_files(self) -> None:
+        # An empty diff is a legitimate "everything filtered out" turn: record the commit with
+        # diff=None and advance the watermark, rather than skip.
+        report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(head_sha="sha-aaa")
+        )
+        appended = persist_commit_snapshot(
+            team_id=self.team.id,
+            report_id=report_id,
+            repository="o/r",
+            pr_metadata=_pr_metadata(head_sha="sha-aaa"),
+            pr_comments=[],
+            diff="",
+        )
+        assert appended is True
+        commit = _content_as(Commit, *self._commits(report_id).values_list("type", "content").get())
+        assert commit.diff is None
+        assert commit.commit_sha == "sha-aaa"
+        assert ReviewReport.objects.for_team(self.team.id).get(id=report_id).head_sha == "sha-aaa"
+
+
+class TestPRSnapshot(BaseTest):
+    def test_round_trips_and_is_head_scoped(self) -> None:
+        # The by-reference reload the Temporal stage activities depend on: the fetch persists the PR
+        # inputs once, every later activity reloads them by (report_id, head_sha). A broken head tag
+        # or working-state load would silently strand the whole fan-out, so guard the round-trip and
+        # the head scoping.
+        report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(head_sha="sha1")
+        )
+        persist_pr_snapshot(
+            team_id=self.team.id,
+            report_id=report_id,
+            head_sha="sha1",
+            pr_metadata=_pr_metadata(head_sha="sha1"),
+            pr_comments=[PRComment(path="a.py", line=3, body="b", diff_hunk="", user="u", created_at="2026-01-01")],
+            pr_files=[],
+        )
+
+        loaded = load_pr_snapshot(team_id=self.team.id, report_id=report_id, head_sha="sha1")
+        assert loaded is not None
+        assert loaded.pr_metadata.number == 123
+        assert [c.path for c in loaded.pr_comments] == ["a.py"]
+        # A different head returns nothing — resume reuses only the current turn's inputs.
+        assert load_pr_snapshot(team_id=self.team.id, report_id=report_id, head_sha="other") is None
+
+    def test_flash_lens_parts_ignore_a_later_pipeline_snapshot_at_the_same_head(self) -> None:
+        report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(head_sha="sha1")
+        )
+        source = PRFile(filename="src/a.py", status="modified", additions=500, deletions=0)
+        test = PRFile(filename="src/tests/test_a.py", status="modified", additions=500, deletions=0)
+        for review_design, pr_files in [
+            (REVIEW_DESIGN_SINGLE_AGENT, [source, test]),
+            (REVIEW_DESIGN_PIPELINE, [source]),
+        ]:
+            persist_pr_snapshot(
+                team_id=self.team.id,
+                report_id=report_id,
+                head_sha="sha1",
+                pr_metadata=_pr_metadata(head_sha="sha1"),
+                pr_comments=[],
+                pr_files=pr_files,
+                review_design=review_design,
+            )
+        flash_input = SandboxStageInput(
+            team_id=self.team.id,
+            user_id=self.user.id,
+            report_id=report_id,
+            head_sha="sha1",
+            repository="o/r",
+            branch="feat",
+            run_index=1,
+            review_mode=REVIEW_MODE_FLASH,
+            review_design=REVIEW_DESIGN_SINGLE_AGENT,
+        )
+
+        prompt = _prepare_single_agent_prompt(flash_input, chunk_id=2, for_lens=True, guidelines="lens")
+
+        assert "src/tests/test_a.py" in prompt
+        pipeline = load_pr_snapshot(
+            team_id=self.team.id, report_id=report_id, head_sha="sha1", review_design=REVIEW_DESIGN_PIPELINE
+        )
+        assert pipeline is not None
+        assert [f.filename for f in pipeline.pr_files] == ["src/a.py"]
+
+    def test_a_delta_lens_session_without_its_baseline_reviews_the_whole_pr(self) -> None:
+        report_id = upsert_review_report(
+            team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata(head_sha="sha1")
+        )
+        persist_pr_snapshot(
+            team_id=self.team.id,
+            report_id=report_id,
+            head_sha="sha1",
+            pr_metadata=_pr_metadata(head_sha="sha1"),
+            pr_comments=[],
+            pr_files=[
+                PRFile(filename="src/a.py", status="modified", additions=500, deletions=0),
+                PRFile(filename="src/tests/test_a.py", status="modified", additions=500, deletions=0),
+            ],
+            review_design=REVIEW_DESIGN_SINGLE_AGENT,
+        )
+        delta_input = SandboxStageInput(
+            team_id=self.team.id,
+            user_id=self.user.id,
+            report_id=report_id,
+            head_sha="sha1",
+            repository="o/r",
+            branch="feat",
+            run_index=3,
+            review_mode=REVIEW_MODE_FLASH,
+            review_design=REVIEW_DESIGN_SINGLE_AGENT,
+            delta_since_head_sha="0" * 40,
+        )
+
+        prompt = _prepare_single_agent_prompt(delta_input, chunk_id=1, for_lens=True, guidelines="lens")
+
+        assert "## Scope" not in prompt
+        assert "## Changes since the last review" not in prompt
+
+
+class TestPersistVerdict(BaseTest):
+    def test_persist_verdict_pairs_with_its_finding_by_issue_key(self) -> None:
+        # The per-issue validate fan-out persists one verdict per issue; it must pair 1:1 with the
+        # finding dedup wrote (shared issue_key) so load_valid_findings joins them. A drifted key would
+        # orphan the verdict and drop the finding from publish.
+        report_id = upsert_review_report(team_id=self.team.id, repository="o/r", pr_url="u", pr_metadata=_pr_metadata())
+        issue = _issue("1-1-1")
+        persist_findings(team_id=self.team.id, report_id=report_id, issues=[issue], run_index=1)
+        wrote = persist_verdict(
+            team_id=self.team.id,
+            report_id=report_id,
+            issue=issue,
+            validation=IssueValidation(is_valid=True, argumentation="reachable bug", category="bug"),
+            run_index=1,
+        )
+
+        assert wrote is True
+        pairs = load_valid_findings(team_id=self.team.id, report_id=report_id, run_index=1)
+        assert len(pairs) == 1
+        finding, verdict = pairs[0]
+        assert verdict.is_valid is True
+        assert verdict.argumentation == "reachable bug"
+        assert verdict.issue_key == finding.issue_key

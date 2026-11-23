@@ -1,0 +1,390 @@
+# stamphog — invariants for agents
+
+Read [README.md](README.md) for the product shape first, and [docs/digest.md](docs/digest.md) for
+the digest design. This file is the contract: the
+invariants below were each earned through a real review finding — do not relax one without
+understanding what it closes, and hold new code to all of them.
+
+## The stale-approval invariant (the big one)
+
+**No stamphog approval may remain standing over commits it didn't review.** GitHub never
+auto-dismisses approvals, so every path that skips, supersedes, or abandons a review after a
+head-changing event must retract standing approvals itself:
+
+- The workflow runs `dismiss_stale_approvals` FIRST, and it voids EVERY standing approval —
+  same-head included, since a re-review means fresh judgment is pending (fail-closed: if any
+  later step crashes, the prior approval is already gone). The sweep's same-head exclusion is
+  only for skip paths, where no new verdict is coming. A base retarget gets its own explicit
+  all-heads retraction — it changes the diff without moving the head.
+- Every Celery skip path that never reaches the workflow (trigger-label absent, author below
+  write permission, untrusted association, disabled repo) retracts via
+  `_retract_stale_approvals_on_skip`.
+- `post_verdict` persists `posted_review_id` the moment GitHub accepts the review, and any path
+  that abandons the run _after_ posting (lost terminal save, superseded/head-moved guards on
+  retry) dismisses its own orphan (`_dismiss_orphaned_approval`). Before posting it also
+  ADOPTS-then-persists: if this App already has an active APPROVE pinned to exactly `run.head_sha`
+  on GitHub (a prior attempt that posted, then crashed before the immediate persist), it takes that
+  review's id instead of stacking a second approval the DB-keyed sweep could never see.
+- The sweep in [`logic/approvals.py`](backend/logic/approvals.py) keys off `posted_review_id`
+  alone — filtering on a saved verdict would miss crashed runs' orphans.
+- `dismiss_stale_approvals` also runs a GitHub-side belt-and-braces sweep after the DB sweep: it
+  lists this App's still-active APPROVED reviews and dismisses every one regardless of head, catching
+  an orphan that has no `ReviewRun` row at all (the DB sweep is blind to it). Both write-adjacent
+  paths (this sweep and `post_verdict`'s adopt) identify "ours" via the exact `<slug>[bot]` login and
+  do NOTHING when `STAMPHOG_GITHUB_APP_SLUG` is unset — a fuzzy "any Bot" match must never dismiss or
+  adopt another bot's review.
+- A run that reaches a **non-approve terminal** (`post_verdict`'s gated/refused/escalate/wait branch,
+  or `mark_review_failed`) re-runs the GitHub-side own-approvals sweep at its own end
+  (`_sweep_orphan_approvals_at_terminal`). This closes the supersession race: an older run can clear
+  `post_verdict`'s final guards, get superseded, then land its GitHub approval AFTER the newer run's
+  STARTUP sweep — and if the newer run refuses (or fails), nothing lists our approvals again, so the
+  orphan stands over a refusing verdict. The keep-set excludes every OTHER live run's persisted
+  `posted_review_id` (writer-pinned read), so a slow run at terminal never dismisses a newer run's
+  legit approval. UNLIKE the fail-closed startup sweep, the terminal sweep is fail-open: a GitHub error
+  must not block the terminal save (the integrity gap on error is the pre-existing exposure, no worse).
+
+The one deliberate exception is **approval retention**.
+A head-changing delivery whose push left the PR's own diff byte-identical skips both the retraction and the review (`_standing_approval_retention` in the Celery task, deciding through [`logic/approval_retention.py`](backend/logic/approval_retention.py)).
+It is content-based rather than commit-based: the PR's own unified diff at the approved head against the same at the current head.
+So a merge of the base branch that touches none of the PR's files retains.
+A base merge that also edits a PR file changes the diff text, because the PR's hunks move. It still retains through `base_merge_is_clean`, which proves two things.
+The lineage proof: the head has exactly two parents, the first is an approved or already retained head, and the second is an ancestor of the payload's base sha.
+The content proof: every file that differs between the two diffs is exactly the `git merge-file` result of the merge base, the approved parent and the base parent.
+A conflict resolution, or any other content that the author put in the merge commit, fails that proof and re-reviews.
+Comparing the diff text rather than per-file blob shas is deliberate, because the text carries file modes and renames, and a blob sha covers contents only.
+The one thing the text does not carry is binary content, which git renders as `Binary files ... differ` over an abbreviated blob id, so a diff mentioning one is refused rather than compared.
+
+There is deliberately no "this file is harmless" rule, and adding one back needs a very good argument.
+Successive review passes found every candidate wrong in this repository: lockfiles select the dependency code that gets installed, tests run in CI with CI's credentials, a file under a `generated/` directory can be hand-edited and still compiles into a service, `docs/onboarding` is aliased into the production frontend, MDX compiles to JavaScript, snapshot files are JavaScript modules the test runner executes, and even plain Markdown ships, because `services/mcp` imports `.md` templates and product `tools.yaml` files compile `.md` prompts into shipped tool definitions.
+
+The digest carries the one narrow exception, and it is not a gate.
+`detect_ownership` counts each team's files under `products/<name>/frontend/generated/` and keeps them out of the team's path sample, and `backend/logic/audiences.py` subtracts that count, so a team's `owned_file_count` is the files a person edited.
+A team left with none of those is not a digest audience at all.
+`hogli build:openapi` rewrites those types whenever any shared serializer changes anywhere in the repo, so a team owning nothing else in a PR was not touched by it: that is how an error-tracking change reached the product analytics channel.
+Subtracting rather than only dropping the all-generated case came from the same channel getting swept again: one regenerated file next to one real one read as a two-file stake, which is above the graze rule's threshold, so the sweep looked like ownership.
+Three things keep it from being the harmless-file rule above.
+It decides who hears about a merge, never whether code is safe to approve.
+[`.agents/architecture.md`](../../.agents/architecture.md) forbids hand-editing those files, so the hand-edited-and-still-ships case does not apply to this path.
+And it names one exact directory shape rather than any `generated/` directory, which is the match that would catch hand-editable code elsewhere.
+
+Both sides are read with `compare_diff`, from the base and head shas the run and the payload already fixed.
+That is load-bearing rather than incidental: `get_pr_files` answers for whichever head is live when the request runs, so a contributor could push the approved content, let the comparison run, and push the unreviewed head back.
+Retention must never consult that endpoint.
+
+Everything ambiguous falls through to the normal path, which dismisses first: no standing approval, an approval already at this head, a run with no recorded base sha, an empty diff on either side, a diff describing a binary change, or any GitHub error, a diff too large for GitHub to render included.
+Retention also re-checks GitHub that the stored approval is still active, because a maintainer dismissing it by hand updates nothing in the product DB, and skipping the review over a dismissed approval would leave the PR with neither.
+A retained head is recorded on the approving run (`retained_head_shas`), because `_record_merged_pull_request` matches an approving run on `head_sha` alone and would otherwise treat every retained merge as unapproved and drop it from the digest for good.
+Self-driving inbox runs are excluded so the carve-out's head pinning stays untouched.
+The trigger-label skip asks the same retention before it retracts, after the author write-permission gate that the skip would otherwise run before, so it retains only what the main path retains.
+
+## Supersession and terminal states
+
+A newer relevant delivery supersedes older non-terminal runs. Rules that keep this sound:
+
+- Terminal states (`TERMINAL_STATUSES` in `facade/enums.py`) are never rewritten — `mark_review_failed`
+  must not clobber a delivered outcome, and terminal saves are conditional
+  (`.exclude(status=SUPERSEDED).update(...)`), never plain `save()`.
+- `post_verdict` guards before ANY GitHub write: superseded status, current head vs run head, current base (ref and SHA) vs the reviewed one (a retarget, or a parent branch moving under a stacked PR, rewrites the diff with the head unchanged, and the retarget delivery can trail the activity), and a last fresh status read.
+  Losing the final conditional update means dismiss-your-own-approval, not "log and return".
+- Out-of-order webhook deliveries are dropped by the `payload_updated_at` clock — checked before
+  the transaction AND re-checked under the row lock, and the descriptive-field refresh is gated on
+  the same clock inside the UPDATE's WHERE clause.
+
+## Reader-lag: pin decision reads to the writer
+
+The product DB has replicas. **Any read that gates a side effect (GitHub write, Slack post,
+supersession, run creation) must be pinned via `.using(router.db_for_write(Model))`** — a lagged
+reader silently skips retractions, resurrects disabled channels, or strands queued runs. If you
+add a read-then-act path, pin it; this class of bug has been found on five separate paths.
+
+## Sandbox credentials and egress
+
+- The sandbox holds NO long-lived secret. `_mint_reviewer_scoped_token` mints a per-run `phe_`
+  from the Go ai-gateway (`POST /v1/tokens`) with the worker's `phs_` (`AI_GATEWAY_API_KEY`), pinned
+  to `product=aio_stamphog` and `obo=<customer team>`, capped at `cap_usd=5` and `ttl_seconds=3600`,
+  acting as the repo's connecting user. The `phs_` never enters the sandbox; a mint failure fails
+  the run (no shared-key fallback); the worker revokes the token once the reviewer returns,
+  without waiting for the sandbox teardown. The review mints the token after the sandbox exists, so
+  the token reaches it as a file (`STAMPHOG_SANDBOX_GATEWAY_TOKEN_PATH`), never in the creation env
+  or a command line. Do not widen the cap or TTL without a run-cost reason: they bound what a prompt-injected reviewer can
+  spend with a leaked token.
+- The raw-Anthropic fallback exists for a local `review_pr.py` run only; hosted runs fail closed
+  without a gateway. No `ANTHROPIC_API_KEY` may enter the sandbox environment.
+- Egress is an explicit domain allowlist (`_sandbox_egress_allowlist`). Additions go through
+  `STAMPHOG_SANDBOX_EXTRA_EGRESS_DOMAINS`, not code edits.
+- Everything posted to GitHub goes through `scrub_credentials` AND `neutralize_active_markdown` (`logic/scrubbing.py`)
+  (GitHub's camo proxy auto-fetches images — a markdown image URL is an exfiltration channel).
+- The sandbox checkout is the PR head, so the engine's Agent SDK session runs with `setting_sources=[]` + `strict_mcp_config` (reviewer.py): a PR-shipped `.claude/settings.json` hook, `CLAUDE.md`, or `.mcp.json` is readable as untrusted content, never loaded as configuration.
+  The default OpenAI reviewer (openai_reviewer.py) discovers no SDK settings, hooks or MCP servers from the tree; only the trusted `.stamphog/` guidance files shape its prompt. Its read_file/grep/glob tools refuse any path that resolves outside the checkout.
+  Don't reintroduce filesystem settings discovery there.
+
+## The self-driving inbox carve-out (the one exception to the bot-author refusal)
+
+Bot-authored PRs are refused at every layer — the webhook pre-filter (`_review_skip_reason`) and
+the engine (`review_pr.py::_refuse_bot_author`, called by `review_local.py`) — with ONE deliberate
+exception: a PR **positively linked** to a
+self-driving Inbox implementation run (a signal-report-carrying TaskRun at
+`ai_stage="implementation"`, matched through the tasks facade), one of whose assigned reviewers
+opted in via ReviewHog's per-user `stamphog_review_inbox_prs` toggle. Rules that keep the exception
+narrow:
+
+- Identification is **server-attested task linkage plus server-attested PR identity** — both
+  required, neither trusted alone. The task link is unforgeable by construction: signals'
+  auto_start generates the head branch name (`posthog-self-driving/<slug>-<hex>`) before the
+  agent runs and stamps it into PATCH-protected run state (`state.self_driving_head_branch`),
+  and `find_signal_implementation_run` matches the PR's GitHub-attested head ref against that
+  stamp — never against the API-writable `output.pr_url` / `output.head_branch`. The identity
+  half, `_is_self_driving_pr`, requires two facts only GitHub attests — the PR is authored
+  by this instance's PostHog GitHub App machine user (`<GITHUB_APP_SLUG>[bot]`) on a repo-native head
+  (never a fork) — enforced on **both** the receiver leg (`process_inbox_pr_review`) and the
+  webhook leg (`_inbox_rereview_carve_out`), failing closed when the App slug is unconfigured.
+  The fork exclusion is load-bearing for the linkage too: a head ref is only GitHub's word when
+  the head lives in the base repo. This is a positive App-identity match, not the general "any
+  bot" rule: `github.py::is_bot_author` must not be weakened, and dependabot / renovate /
+  posthog-bot / any foreign App fail it.
+- **What a malicious teammate can still do, and what they can't.** Rewriting `output.pr_url`,
+  `TaskRun.branch`, `Task.repository`, or `suggested_reviewers` no longer aims the carve-out at a
+  different PR: matching reads none of them, and the stamped branch plus `ai_stage` and
+  `signal_report_id` are not PATCHable. What remains team-internal and accepted: an opted-in
+  assigned reviewer's existence is still the gate (see the reviewer-authorization discussion on
+  PR #72680), and a teammate who can edit the _report_ before auto-start still influences what
+  the implementation agent builds — that is the product working as designed, reviewed as any PR.
+- The engine flag (`self_driving_review` in the hosted context JSON →
+  `Pipeline(self_driving=...)`) defaults closed, so a local `review_pr.py` run never turns it on.
+  It relaxes exactly two gates — the bot-author
+  refusal and the draft prerequisite (the verdict must exist at Inbox triage time, while the
+  PR is still a draft) — and swaps human-author trust context for a TRUSTED provenance block
+  in the prompt. The hosted server sets the flag exclusively from the run's persisted inbox
+  provenance (`ReviewRun.output["inbox_review"]`), which only the two linkage-verified
+  trigger paths stamp.
+- The initial review is the receiver leg (`process_inbox_pr_review`, entered via the
+  `queue_inbox_pr_review` facade after review_hog checked the toggles); the webhook leg
+  re-reviews only on synchronize / reopen / base retarget, re-checking them through the
+  `facade/inbox_hooks.py` resolver (registered by review_hog at app-ready — a direct import
+  of review_hog would be a dependency cycle). No registered resolver means fail-closed: no
+  re-review. The gate is **any** assigned reviewer's opt-in, and both legs must resolve it
+  identically: if one fired while the other saw "opted out", a push would retract a standing
+  approval with somebody still opted in.
+- Dismissal is never preference-gated. Every toggle switched off mid-PR stops new runs, but the
+  skip paths' head-changing retraction still voids the standing approval (the stale-approval
+  invariant above is untouched), and every carved-out run still enters the workflow through
+  `dismiss_stale_approvals` first.
+- These runs bypass the review-mode and author-write-permission gates: the reviewers' toggle is
+  the gate, and the App's machine user is not a collaborator (the permission lookup would always
+  deny). `review_mode` keeps governing human PRs only.
+- A refused or escalated verdict hands the PR to ReviewHog (`post_verdict` sets `request_external_review` on the
+  `FinishedReviewRun` it passes to the hooks in `facade/finished_review_hooks.py`) **only** for these runs. A human author reads their own refusal and decides what comes next.
+  A self-driving PR has no such author, and its refusal otherwise sits unread until Inbox triage.
+  In ALL mode an unconditional handoff also fires a second bot review on every PR the repo opens.
+  The condition is the derived `ReviewTrigger`, not the raw provenance flag, so it stays aligned with
+  what the reviewer prompt was told about its own invocation.
+
+## Bot admission (the other exception to the bot-author refusal)
+
+A repo's `.stamphog/policy.yml` may name bots under `bot_authors`, each as `{name, login, id}`.
+The server reads that list from the default branch only (`logic/bot_admission.py`, cached briefly, absence included), so a PR cannot admit its own author.
+Admission needs the login and the numeric account id to match one entry, `user.type == "Bot"`, a repo-native head, and any action that starts a review except `labeled`, because no label requests these reviews.
+A draft stays skipped before admission is considered.
+An admitted delivery passes the bot-author skip, which also stands in for the author-association check, the review-mode gate and the write-permission gate, and nothing else.
+The run is stamped `bot_admission` provenance and the `bot_admission` trigger, and retention never keeps its approvals.
+The engine reads the stamped login as `admitted_bot`, checks it against `POLICY.bot_authors` again, keeps every gate including the draft prerequisite, and adds `every_file_attested`, which refuses the run unless an attestation that pins its publisher (`Attestation.pins_publisher`) proved every file in the PR.
+An attestation pins its publisher through `publisher_files` or through an `issuer` manifest, never both, and one that does neither never counts for a bot, because a job of any PR could post it.
+Neither does a `sibling_files` companion, because the publisher did not name it.
+That proof is the PR's independent assurance (`assurance.every_file_proven`), and the reviewer prompt carries a provenance block for the admitted bot, because its bot-author rule would otherwise refuse the PR.
+A pending pinned attestation that could cover every unproven file turns that gate into a WAIT, and the check-run wake carries the `bot_admission` stamp into the re-run, because the refetched PR fails the bot pre-filter on its own.
+Removing the policy entry is enough to stop reviews.
+The next delivery skips and dismisses the standing approval, and the engine refuses a woken re-run.
+
+## Attestation issuers (who the publisher is, and what it may lift)
+
+An attestation entry splits who the publisher is from what it may do.
+`check` and `app_id` identify the publisher, and `paths` and `lifts` say what it may lift.
+The default-branch paths the publisher runs from are its own description, kept in one place: an `issuer` manifest that the publisher owns, such as `tools/change-prover/issuer.yml`, which holds only `paths`.
+A key ending in `/` is a directory, which the marker pins by its git tree id, so a file added under it changes the pin too. Any other key is a file pinned by its blob id.
+The manifest must cover its own path, so an edit to it changes a pin as well.
+The policy only names the manifest. It never copies the list, so the two cannot drift apart.
+
+- Only trusted configuration selects the source. An entry with both `issuer` and `publisher_files` fails the policy load, and nothing falls back from one to the other.
+- The manifest path must match a `stamphog_policy` path pattern (not `edit_paths`), or the policy load fails. The manifest decides what a proof pins, so an edit to it needs the human review an edit to the policy gets.
+- The engine has no network, so the server reads each manifest the default-branch policy names (`logic/issuer_manifests.py`) from the default branch with the policy files, as the git blob at its path (`get_default_branch_blob_text`). A symlink reads as its link text and leaves the entry unusable, because the contents API would follow it to a target that neither self-governance nor the pins cover. The server stores it in `run.output["policy_files"]`, and writes it into both the sandbox payload and the worker's pre-check and attest tree. The sandbox payload command wipes the PR head's copy first, as it does for the optional policy files, so a manifest the default branch lacks is absent rather than read from the PR.
+- A missing or invalid manifest leaves the entry with no required pins (`Attestation.usable` is false). Such an entry lifts nothing, never counts as pending, and never proves a bot's file.
+- A result counts only when its `blobs` keys hold every manifest path verbatim and the server confirmed every pinned object still current. `logic/attestation_pins.py` compares a `/` key against the default branch's tree id and any other key against the blob id. A type mismatch, or an object that is gone, is not current. The posting-time `_attest_gates` reads the check runs through the same function, so the final check uses the same comparison.
+- The policy, the manifest and the pins are each read from the default branch by name, not from one resolved commit. The manifest covers itself, so an edit to it changes a pinned id and a proof made before the edit reads as stale. A proof made after it is checked against the copy the run read: it lifts when it pins every path that copy lists, and lifts nothing when the edit dropped one.
+
+## The manual trigger (the one exception to label mode)
+
+`request_manual_review` (`POST code_review/approvals/runs/` and the `code-review-approvals-runs-create` MCP tool) queues a review because a project member asked for it.
+The request stands in for the trigger label, so it bypasses `review_mode` and nothing else.
+Every other webhook-path gate still refuses: closed PRs, drafts, bot authors, untrusted author associations, and authors below write permission.
+The requester's own GitHub access is not checked; the `code_review_approval:write` scope and the product's access control are the gate.
+The run is stamped `manual_review` provenance and the `manual` trigger, and it enters the workflow through `dismiss_stale_approvals` like every other run.
+A refusal writes nothing to GitHub and creates no run, so it cannot leave or remove an approval.
+
+## The silent trigger (a clean external review)
+
+`facade/tasks.py::queue_silent_review` lets ReviewHog start a review of one head after a clean review of it.
+The repo's `review_on_clean_external_review` switch must be on, and it takes the `manager` level like `routing_mode`.
+Like the manual trigger it bypasses `review_mode` and nothing else: the Celery task re-reads the config from the writer and refuses a closed PR, a draft, a bot author, an untrusted association, an author below write, a disabled repo, and a head that is no longer current.
+The head dedupe in `_queue_review_at_head` applies, so a head that already has a review gets no second one.
+The run is stamped with the `reviewhog_clean` trigger and no provenance dict, apart from manual and inbox provenance, so it never earns the self-driving carve-out or the ReviewHog refusal handoff. `ReviewRun.is_silent` reads that stamp.
+
+The run is silent: only an approval reaches the PR, through the same attest, adopt and guard steps as any approval.
+Every other verdict, and a failure, writes nothing to GitHub, on retries too: no review, no label strip, no failure notice, no 👀, no WAIT re-review after an external review, and the pre-check skips its LLM refusal summary.
+What it keeps: `dismiss_stale_approvals` first, the conditional terminal save, and the terminal orphan-approval sweep.
+Do not return early before them, or a silent refusal leaves an older approval standing.
+Every path that writes to the PR asks `ReviewRun.may_publish`, so the approval exception is decided in one place.
+Publication is its own state: a withheld verdict keeps `verdict_posted_at` empty (`ReviewRun.verdict_withheld`), so the verdict a run computed is never read as one the PR saw.
+
+FALLBACK routing is the one consumer of a withheld verdict, and the one PR write that does not ask `may_publish`: `_notify_finished_review` queues routing for every outcome of a silent run, because with the switch on `_stamphog_will_review` counts the head as reviewed and it waits for this run.
+Routing writes review requests and a comment that names cuts or the approval, never a withheld verdict, so keep it that way: a routing comment that names the outcome would publish what the run withheld.
+When ReviewHog will not start a silent review of a head (findings, a failed turn, or no automatic turn), it calls `facade/tasks.py::queue_routing_after_external_review`. The task routes the live head in full only while the record waits on the reported head, the repo is FALLBACK with the switch on, no non-superseded stamphog run covers the live head, and the live PR has no trigger label (a push starts no silent review, so a moved head routes too), with writer-pinned reads and the same claim as every other routing trigger. Anything else is a no-op, so the 30-minute safety net stays only a backstop for failures.
+The report and the opening event come from one delivery, in either order. A report that finds no record raises `RoutingBusy`, so the task retries after the opening event saved its waiting record. A record that waits on the live head instead (the author pushed before the opening event ran) routes that head, because a push starts no silent review. Do not turn that into a no-op, or a report that comes first is lost until the safety net.
+A silent review that a gate refuses reports the same way, and a withheld WAIT routes in full, because nothing reviews a silent WAIT again. That holds for the verdict task, for the opening event that finds the WAIT already stored, and for a silent WAIT on a head that only got its pinned owners.
+A verdict for a head that the author pushed past routes the live head in full through `_full_step_on_live_head`, the same helper the external-review step uses, when the record waits on the verdict's head or already on the live head, or holds a pinned-only routing of an older head. An approval of a stale head never earns pinned-only routing for the live head.
+Both supersession paths of a moved head hand the run to routing as a failure: `mark_review_failed` and the head-moved guard in `post_verdict` (`_route_after_moved_head`).
+A skip-path or base-retarget retraction that dismissed an approval queues `route_reviewers_after_approval_retracted`, because no verdict follows it to upgrade a pinned-only routing. It routes the live head in full through `_full_step_on_live_head`, and a retarget, whose approving run still covers the head, routes unless the trigger label brings a visible review.
+The switch needs label mode: the write serializer refuses it with `review_mode=all`, and a save that sets `all` turns it off. A repository without ReviewHog automatic turns must leave it off, or every head waits for the safety net.
+
+A silent run never covers a visible request. `_queue_review_at_head` ignores a silent run whose verdict is unpublished unless the request is silent too, so a manual request supersedes a silent run in flight, as the label webhook always did.
+A visible request (the trigger label, or a manual request) creates its own run as always, so a caller polling that run follows it to the real outcome.
+When the head's latest run withheld a REFUSED or ESCALATE verdict (`_reusable_withheld_run`, asked by `_queue_review_at_head` for every visible request and by the webhook for the trigger label), the new run carries `withheld_run_id`.
+`post_verdict` stores `decision_fingerprint` on a run whose verdict it withholds, in the terminal save (`logic/decision_fingerprint.py`): a hash of the engine context minus the fields that move without changing the decision, each one named in that module.
+The workflow runs `reuse_withheld_verdict` before the sandbox starts. It reads the context again with no sandbox and no LLM call, and adopts the silent run's reviewer output only when the fingerprint matches, the PR is open, the head and the base are the reviewed ones, and a writer-pinned read finds no run between the two.
+The run then goes straight to `post_verdict`, which posts under its usual guards, records `reused_from_run_id`, and stamps the silent run's `verdict_posted_at` with its own, so neither run reads as withheld.
+Every other outcome, an error included, lets the same run review the PR the normal way, from the context the check already stored.
+A stored APPROVE never reaches `post_verdict` from here: a silent approval was posted when it was decided.
+A WAIT is never reused, because a WAIT can end with time alone (a reviewer bot's 👀 ages out) and the fingerprint cannot see that.
+A field added to the engine context belongs in the fingerprint, or a stale verdict gets published over the new input.
+
+## External review evidence
+
+- `facade/review_evidence.py` is a registry of providers that stamphog owns. A product that reviews PRs and depends on stamphog (today review_hog, as PostHog Review) registers one at app-ready, for the same dependency-cycle reason as `inbox_hooks.py`. Stamphog never imports a provider's product.
+- Each provider answers per head (`pending`, `completed`, `failed`, or None). `list_in_flight_reviewer_bots` asks every provider on every wait poll and stores the answers as `run.output["review_evidence"]`. Any pending review keeps the workflow waiting within the bot-wait budget. After any wait, or when a provider reports a completed review, `refresh_review_evidence` reads the reviews, the discussion and the threads again, because the context fetch ran before the polls.
+- In the engine, any review still pending for the head is a WAIT, never an approval. Each completed review of the current head against the current merge base (`base_sha`) counts as current-head assurance in `_cap_assurance_facts` only when its `skipped_paths` is empty. The PR's `base.sha` is no match key, because it moves on every merge to the base branch. Each one gets its own line in the assurance summary and the posted verdict. Its published findings are review threads, so the unresolved-thread rule still applies to them.
+- A provider error is logged and skipped without affecting the other providers. An error, an answer for another head, and `failed` add no evidence, so stamphog reviews as it would without that provider. An error must never read as a clean review. The one exception: a provider that reported `pending` earlier in the run keeps that pending answer (marked `provider_error`), so the run ends in WAIT.
+- A WAIT has no automatic retry, and a Deep review outlasts the wait budget. So ReviewHog calls `facade/tasks.py::request_rereview_after_external_review` when a turn on a head completes or fails. The Celery task re-reviews only when the PR's latest run is COMPLETED with a WAIT verdict at that head, the head is still current, the run is not an inbox run, and every webhook gate passes again (open, payload pre-filters, trigger label unless the run was manual, author write access). It passes `revisit_wait` to `_queue_review_at_head`, so the head dedupe ignores every delivered WAIT at the head but still collapses repeated nudges into one live run. A re-run left QUEUED by a failed workflow start is restarted by the next call, and GitHub or Temporal errors retry with backoff. A nudge that arrives while the run is in flight finds no WAIT, so after a WAIT that waited on a pending review the workflow runs `rereview_after_external_review_finished`. It asks the providers once more and queues the re-review when that review has finished. A provider error keeps that review pending there too and raises, so Temporal retries the recheck. A dispatch error raises, so Temporal retries it.
+- `facade/finished_review_hooks.py` is the other direction: callbacks that hear a run's outcome. `post_verdict` calls them right after the terminal save wins, before its trailing GitHub steps, and `mark_review_failed` right after its FAILED save, before its cleanup. A superseded run, or a save that lost to a supersession, calls nothing. A callback that raises is logged and never fails the run, because the outcome is already saved and posted. The commands product registers one to post the outcome in the Slack thread that asked for the review.
+- `posthog[bot]` is deliberately not a trusted reactor. Its 👀 is a cue for people, and the review evidence replaces it for stamphog.
+
+## Trust boundaries
+
+- Turning reviews **off** (`enabled=False`, the soft-delete) and changing when they run (`review_mode`,
+  `trigger_label`) need the `manager` level on the `code_review_approval` resource, on an update or a create alike. Turning reviews
+  **on** (`enabled=True`, or `add_repository`) needs `editor`, so an editor can re-enable a repository
+  a manager paused; that is the requested self-serve direction. A supplied value counts even when it
+  matches the stored one, because the view's snapshot of the row is stale by the time the facade
+  saves. The digest toggle stays at `editor`. Service credentials are refused at both levels.
+  The model default for `review_mode` is `label`, the narrow mode, so an editor turning reviews on
+  never widens them past opt-in. Do not change the default to `all` without moving that level too.
+- A sync records what the member's own GitHub token lists in the team's `StamphogInstallation`
+  snapshot and creates no repo config. `add_repository` binds only a repository in that snapshot,
+  taking the installation id and the connecting user from the record, never from the request.
+  Never list an installation's repositories with the installation token for this: an outside
+  collaborator on one repository can reach the installation, and that token shows every private
+  repository in it. The snapshot is a union across members' syncs, and only the removal and
+  uninstall webhooks shrink it. A `repositories_added` webhook never grows it: the webhook carries
+  no user, so nobody on the team proved access to that repository. It becomes addable when a member
+  syncs again.
+- Review policy is read from the repo's **default branch**, never the PR head — a PR must not be
+  able to rewrite the policy that gates it. Same for the `digest:` channel declaration and the
+  root `owners.yaml` team registry the digest routes through.
+- A manually-created repo config (blank `installation_id`) binds **disabled** when a sync adopts it,
+  and its review policy (`review_mode`, `trigger_label`, `review_on_clean_external_review`) resets to the model defaults: all of those
+  fields were set by someone who never proved GitHub access, so a pre-selected review mode or label
+  would otherwise go live the moment someone enables the row. `add_repository` resets a placeholder's
+  policy the same way when it binds one. Reinstall rebinds keep settings — those
+  were configured under a verified binding. Such a row is also kept out of the digest candidates:
+  a blank installation can fetch no routing file, and every candidate is read, so leaving it in let
+  one placeholder silence the whole team's digest.
+- Digest routing is derived every run from the repositories and never stored, so nothing here can
+  go stale silently — and nothing degrades either. A registry that cannot be read stops the whole
+  team's run (`RoutingUnavailable`) rather than falling through to derived channel names: the
+  unreadable repo could be the one every other repo inherits from. A repo that is permanently
+  broken gets switched off, which drops it from the candidate list.
+- A name match binds an audience to a Slack channel nobody chose for it, so the shared-channel
+  guard stays on for it and for registry entries alike — that is the only path where a digest
+  leaves the workspace. Only the repo's own `digest:` channel skips the guard, because the
+  `owners.yaml` registry can name a channel for a team the declaring repo does not own.
+- The app is not a member of a channel it only matched by name, so `post_digest` joins on
+  `not_in_channel` and retries the post once. The join is attempted, never gated on the scope:
+  `conversations.join` needs `channels:join`, and whether an install granted it is invisible to the
+  person who set the digest up, so asking Slack is the only way to find out. A refused join fails
+  the run with an error naming the invite, which is a signal in the recent digests list and
+  self-heals the moment somebody adds the app.
+- A declared channel that does not resolve is a dead end, never a retry with the audience slug —
+  the slug is the wrong name the declaration exists to correct.
+- Retrieving one review run returns the reviewer's parsed reasoning (`reasoning`, `showstoppers`, `review_body`, `change_summary`) to anyone who can read the run.
+  That is the text stamphog posts as its GitHub review, and it passes the same `scrub_credentials` and `neutralize_active_markdown` first.
+  The raw reviewer stdout, the PR payload, patches, and policy files never leave the facade.
+- PR content — title, body, diff, comments, reactions — is untrusted input everywhere, including
+  in reviewer prompts and error messages persisted to API-readable fields (`run.error` keeps only
+  a truncated first line for exactly this reason).
+
+## Engine parity (packages/pr-approval-agent)
+
+`review_local.py` is the entrypoint the sandbox runs. It drives `review_pr.Pipeline`'s own steps, so
+gate order, review filtering (bare COMMENTED reviews dropped, non-empty ones kept), in-flight
+bot-reviewer WAIT behavior (`TRUSTED_REACTOR_BOTS` mirrored in `temporal/constants.py`), and
+ownership summaries (individual owners count, not just teams) all come from shared code. `review_pr.py`
+remains as the manual entrypoint for reviewing a PR from a local checkout; changing a `Pipeline` method
+changes both, and divergence here has produced real approve-when-should-wait findings.
+
+Inputs `review_pr.py` fetches over the network reach the sandbox through the context JSON instead, and
+dropping one is a silent behavior change rather than a missing section. `author_team_slugs` feeds
+`author_on_owning_team`, which the reviewer prompt reads with a default of `True`, so an unset key
+tells the reviewer that every author owns the code they touched.
+The same set decides a deny category's `exempt_author_teams`, and there an unset key fails closed: every author is denied, the owning team included.
+Never fill the set from anything the PR controls: it is the only thing that lets stamphog approve an owner-only path.
+
+The sandbox checkout is shallow and holds no PR history, so a hosted context always carries `merge_base_sha` (the engine diffs `merge_base..head`) and `commit_messages` (the provenance trailers).
+Without those keys (a manual `review_pr.py` run) the engine reads git history instead.
+The engine's git has no credential, so every object it reads must arrive in `_clone_pr` or `_prefetch_review_blobs`: an on-demand promisor fetch is anonymous and a private repository refuses it.
+Test clone changes with `GIT_NO_LAZY_FETCH=1`, because a public repository hides that failure.
+
+The server's pre-check (`refuse_on_pre_gates`, `backend/logic/engine_pregate.py`) runs `review_local.py --pregate` in a child process on the worker, in a temporary tree with the run's effective trusted policy and the PR head's `AGENT_APPROVALS.md` files.
+It never imports the engine: the engine's bare module names and its import-time policy load would bind to the worker's own checkout.
+Its fast verdict (a gate refusal, or the pending-migration WAIT) may only be one the sandbox review would also reach, because nothing re-reviews it.
+Every input the sandbox reads from its checkout must reach the tree too, or finality must not depend on it: the folder files decide the size gate, and the manifest scripts scan still needs git, so a dependency manifest keeps the pending-migration case undecided.
+`pregate()` decides that finality in the engine, and the server adds the file-list guards in `pregate_skip_reason` (head moved, list truncated, renames).
+Anything in doubt, and any error, falls through to the full review.
+
+The sandbox runs over a PR-controlled checkout, and nothing authenticates its stdout, so `post_verdict` never posts an approval on the sandbox's report alone.
+Before the approve branch, `_attest_gates` runs `review_local.py --attest` on the worker in the same tree as the pre-check, and a run that does not attest is posted as ESCALATE.
+The check reads the file list from a compare pinned to the merge base and the reviewed head, never from `get_pr_files`, which answers for whatever head is live.
+It reads each dependency manifest at both commits as a git blob, so the scripts scan runs without a checkout and sees a symlink as its link text, as `git show` does.
+Never read them through the contents API, which follows an in-repo symlink to its target.
+Every input the worker cannot confirm fails the check: a file list GitHub may have cut short, one that differs from the stored list, unread folder files or manifests, or an engine error.
+A retry of `post_verdict` reuses a stored answer that did not attest, because a second check that attests would post an approval over a delivered escalation. A stored answer that attested is checked again, because a deny lift can stop holding between attempts.
+The check reads the head's check runs again, so a lift that a policy `attestations` entry grants holds at posting time, and an approval such a lift made possible gets no approval retention.
+The worker records whether a lift was used as `gate_attestation.lifted`, and retention reads only that record, never the sandbox's report. An approval without the record is not retained.
+A failed read of the check runs at posting time counts as no check runs, so it refuses only an approval that needs a lift.
+A new path to an approval must go through this check too.
+
+A pending `Migration risk` check returns WAIT rather than falling through to a refusal, because a
+refusal costs a trigger-label strip, and a ReviewHog handoff on a self-driving PR, over what is a
+race with CI. It can't reuse `Pipeline._only_pending_attestations`: that method disqualifies on
+any failing gate other than the deny-list, and a migrations deny always drags the tier gate to
+T2-never with it, so it answers False for every PR it exists to catch.
+
+The engine records the checks it waited on in `classification.attestations`, and the server acts on that record, never on the policy.
+After a WAIT whose only cause is those checks, the workflow polls GitHub on a workflow timer (`poll_pending_attestations`) until each one has a completed run from its pinned App, the engine's own test for pending.
+It then queues a re-review through the same gates as the external re-review, the inbox exclusion included, and at most `_ATTESTATION_WAKES_PER_HEAD` times per head.
+Stamphog subscribes to no `check_run` webhook, because a subscription delivers every check of every PR, and the poll asks GitHub for each pending check by name and App, one request per check.
+A run that no report can wake, an inbox run or one at the per-head cap, does not poll.
+A check that fails after an approval dismisses nothing, so that approval stands until the next head change.
+
+## Temporal specifics
+
+- Registering a new activity requires adding it to `temporal/registry.py` — the
+  registry-completeness test guards this, don't bypass it.
+- Workflow bodies follow the repo-wide determinism rules (`workflow.patched()` for new commands).
+- Activity payloads stay small; large context rides in `run.output`, not through the workflow.
+- The sandbox start and checkout run beside the context fetch, the pre-check and the bot polls, so every activity that can overlap them writes `run.output` through `_merge_run_output` (a JSONB `||` merge), never a read-modify-write `save()` from a copy loaded earlier. A stale copy drops the other activity's keys, including the sandbox claim that stops a retry from paying for a second sandbox. The merge replaces a key whole, so the sandbox start and checkout record their step timings under their own keys, not in `timings_ms`.
+- No activity waits inside for another activity's write. A waiting activity holds a worker thread and an activity slot, and enough of them starve the activities they wait for. Put the wait in the workflow and split the activity at it.
+
+## Tests
+
+`hogli test products/stamphog/backend/tests/` (Django; `--reuse-db` after the first run) plus
+`packages/pr-approval-agent/` tests for engine changes. The integration tests drive the full chain
+through fakes (`tests/fakes.py`, `tests/conftest.py`) — extend the fakes rather than mocking
+internals, and prefer adding a parameterized case to an existing test over a new function.

@@ -1,0 +1,240 @@
+import logging
+from collections.abc import Iterator
+
+import pytest
+from unittest import mock
+
+from django.conf import settings
+from django.db import connections
+
+from asgiref.sync import SyncToAsync, async_to_sync
+from temporalio.client import (
+    Client as TemporalClient,
+    ScheduleDescription,
+    ScheduleRange,
+)
+from temporalio.service import RPCError
+
+from posthog.models import Team
+from posthog.models.integration import Integration
+from posthog.temporal.common.client import sync_connect
+from posthog.temporal.common.codec import EncryptionCodec
+
+from products.batch_exports.backend.models.batch_export import BATCH_EXPORT_INTERVAL_TO_START_JITTER, BatchExport
+from products.batch_exports.backend.tests.api.fixtures import (
+    create_destination,
+    create_organization,
+    create_team,
+    create_user,
+)
+from products.batch_exports.backend.tests.api.operations import start_test_worker
+
+
+@async_to_sync
+async def delete_temporal_schedule(temporal: TemporalClient, schedule_id: str):
+    """Delete a Temporal Schedule with the given id."""
+    handle = temporal.get_schedule_handle(schedule_id)
+    await handle.delete()
+
+
+def cleanup_temporal_schedules(temporal: TemporalClient):
+    """Clean up any Temporal Schedules created during the test."""
+    for schedule in BatchExport.objects.all():
+        try:
+            delete_temporal_schedule(temporal, str(schedule.id))
+        except RPCError:
+            # Assume this is fine as we are tearing down, but don't fail silently.
+            logging.warn("Schedule %s has already been deleted, ignoring.", schedule.id)
+            continue
+
+
+@async_to_sync
+async def describe_schedule(temporal: TemporalClient, schedule_id: str):
+    """Return the description of a Temporal Schedule with the given id."""
+    handle = temporal.get_schedule_handle(schedule_id)
+    temporal_schedule = await handle.describe()
+    return temporal_schedule
+
+
+@async_to_sync
+async def describe_workflow(temporal: TemporalClient, workflow_id: str):
+    """Return the description of a Temporal Workflow with the given id."""
+    handle = temporal.get_workflow_handle(workflow_id)
+    temporal_workflow = await handle.describe()
+    return temporal_workflow
+
+
+@pytest.fixture(scope="package")
+def temporal():
+    """Return a TemporalClient instance."""
+    client = sync_connect()
+    yield client
+
+
+@pytest.fixture(scope="package")
+def temporal_worker(temporal):
+    """Use a package scoped fixture to start a Temporal Worker.
+
+    This saves a lot of time, as waiting for the worker to stop takes a while.
+    """
+    with start_test_worker(temporal):
+        yield
+
+
+@pytest.fixture
+def cleanup(temporal):
+    # Activities that outlive an earlier test can exit an atomic block while pytest-django blocks the database,
+    # which leaves the activity thread's connection in a transaction that hides every later activity write.
+    SyncToAsync.single_thread_executor.submit(connections.close_all).result()
+    yield
+    cleanup_temporal_schedules(temporal)
+
+
+@pytest.fixture
+def organization():
+    return create_organization("Test Org")
+
+
+@pytest.fixture
+def team(organization):
+    return create_team(organization)
+
+
+@pytest.fixture
+def user(organization):
+    return create_user("test@user.com", "Test User", organization)
+
+
+@pytest.fixture
+def grandfathered_batch_export(team: Team, request: pytest.FixtureRequest) -> Iterator[BatchExport]:
+    match getattr(request, "param", "same-team"):
+        case "same-team":
+            export_team = team
+        case "same-organization":
+            export_team = create_team(team.organization)
+        case "other-organization":
+            export_team = create_team(create_organization("Other organization"))
+        case scope:
+            raise ValueError(f"Unknown grandfathering scope: {scope}")
+    destination = create_destination()
+    batch_export = BatchExport.objects.create(
+        team=export_team,
+        name="Legacy custom schema export",
+        destination=destination,
+        interval="hour",
+        schema={
+            "fields": [{"expression": "events.uuid", "alias": "uuid"}],
+            "values": {},
+            "hogql_query": "SELECT uuid FROM events",
+        },
+    )
+    yield batch_export
+    batch_export.delete()
+    destination.delete()
+
+
+@pytest.fixture
+def aws_s3_integration(team, user):
+    return Integration.objects.create(
+        team=team,
+        kind=Integration.IntegrationKind.AWS_S3,
+        integration_id="prod-aws",
+        config={"name": "prod-aws", "aws_account_id": "123456789012"},
+        sensitive_config={"aws_access_key_id": "key", "aws_secret_access_key": "secret"},
+        created_by=user,
+    )
+
+
+@pytest.fixture
+def aws_redshift_integration(team, user):
+    return Integration.objects.create(
+        team=team,
+        kind=Integration.IntegrationKind.AWS_REDSHIFT,
+        integration_id="prod-redshift-role",
+        config={
+            "name": "prod-redshift-role",
+            "aws_role_arn": "arn:aws:iam::123456789012:role/posthog-batch-exports",
+            "user": "awsuser",
+        },
+        created_by=user,
+    )
+
+
+@pytest.fixture
+def s3_compatible_integration(team, user):
+    return Integration.objects.create(
+        team=team,
+        kind=Integration.IntegrationKind.S3_COMPATIBLE,
+        integration_id="my-r2",
+        config={"name": "my-r2", "endpoint_url": "https://account.r2.cloudflarestorage.com"},
+        sensitive_config={"aws_access_key_id": "key", "aws_secret_access_key": "secret"},
+        created_by=user,
+    )
+
+
+@pytest.fixture
+def hogql_batch_exports_enabled():
+    """Enable the hogql-batch-exports feature flag for the duration of a test."""
+    with mock.patch(
+        "products.batch_exports.backend.presentation.views.utils.posthoganalytics.feature_enabled", return_value=True
+    ) as feature_enabled:
+        yield feature_enabled
+
+
+@pytest.fixture
+def hogql_batch_export_data(s3_batch_export_data) -> dict:
+    """Return the request body for creating a minimal AwsS3 batch export of a HogQL model."""
+    return {
+        **s3_batch_export_data,
+        "model": "hogql",
+        "hogql_query": (
+            "SELECT uuid AS uuid, event AS event, timestamp AS timestamp FROM events "
+            "WHERE timestamp >= {data_interval_start} AND timestamp < {data_interval_end}"
+        ),
+    }
+
+
+@pytest.fixture
+def s3_batch_export_data(aws_s3_integration) -> dict:
+    """Return the request body for creating a minimal AwsS3 batch export.
+
+    Function scoped, so a test may change the returned dictionary without affecting other tests.
+    """
+    return {
+        "name": "my-production-s3-bucket-destination",
+        "destination": {
+            "type": "AwsS3",
+            "integration": aws_s3_integration.id,
+            "config": {
+                "bucket_name": "my-production-s3-bucket",
+                "region": "us-east-1",
+                "prefix": "posthog-events/",
+            },
+        },
+        "interval": "hour",
+    }
+
+
+def assert_is_daily_schedule(schedule: ScheduleDescription, expected_hour: int):
+    """Assert the schedule is a daily schedule."""
+    calendars = schedule.schedule.spec.calendars
+    assert len(calendars) == 1
+    # ensure it's running every day of the week
+    assert calendars[0].day_of_week == (ScheduleRange(start=0, end=6),)
+    assert calendars[0].hour == (ScheduleRange(start=expected_hour, end=expected_hour),)
+    assert schedule.schedule.spec.jitter == BATCH_EXPORT_INTERVAL_TO_START_JITTER["day"]
+
+
+def assert_is_weekly_schedule(schedule: ScheduleDescription, expected_day: int, expected_hour: int):
+    """Assert the schedule is a weekly schedule."""
+    calendars = schedule.schedule.spec.calendars
+    assert len(calendars) == 1
+    assert calendars[0].day_of_week == (ScheduleRange(start=expected_day, end=expected_day),)
+    assert calendars[0].hour == (ScheduleRange(start=expected_hour, end=expected_hour),)
+    assert schedule.schedule.spec.jitter == BATCH_EXPORT_INTERVAL_TO_START_JITTER["week"]
+
+
+@pytest.fixture(scope="module")
+def encryption_codec() -> EncryptionCodec:
+    codec = EncryptionCodec.from_settings(settings)
+    return codec

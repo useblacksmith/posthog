@@ -1,0 +1,1217 @@
+import json
+from datetime import UTC, datetime, timedelta
+
+from posthog.test.base import APIBaseTest, ClickhouseTestMixin, _create_event
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from django.core.cache import cache
+from django.db import IntegrityError
+from django.test import SimpleTestCase
+
+from parameterized import parameterized
+from rest_framework import serializers, status
+from temporalio.exceptions import WorkflowAlreadyStartedError
+
+from posthog.schema import MCPHarnessBreakdownQuery
+
+from posthog.models import Organization, Team
+from posthog.models.utils import uuid7
+from posthog.temporal.mcp_analytics.intent_clustering.constants import (
+    CHILD_WORKFLOW_ID_PREFIX,
+    WORKFLOW_EXECUTION_TIMEOUT,
+    WORKFLOW_NAME,
+)
+
+from products.mcp_analytics.backend import intent_generation
+from products.mcp_analytics.backend.facade.api import custom_harness_rules
+from products.mcp_analytics.backend.facade.contracts import CustomHarnessRule
+from products.mcp_analytics.backend.hogql_queries.harness_breakdown import MCPHarnessBreakdownQueryRunner
+from products.mcp_analytics.backend.logic import STALE_COMPUTING_THRESHOLD
+from products.mcp_analytics.backend.models import (
+    MCPAnalyticsSubmission,
+    MCPCustomHarness,
+    MCPIntentClusterSnapshot,
+    MCPSession,
+)
+from products.mcp_analytics.backend.presentation.serializers import (
+    MCP_SESSION_LIST_DEFAULT_LIMIT,
+    MCP_SESSION_LIST_MAX_LIMIT,
+    MCP_TOOL_CALLS_DEFAULT_LIMIT,
+    MCP_TOOL_CALLS_MAX_LIMIT,
+    MCPActivityOverviewQuerySerializer,
+    MCPSessionListQuerySerializer,
+    MCPSessionToolCallsQuerySerializer,
+)
+from products.mcp_analytics.backend.tests import _MCPAnalyticsTeamScopedTestMixin
+
+
+def _cluster_blob(cluster_id: int, label: str, switches: list[dict[str, str]] | None = None) -> dict:
+    return {
+        "id": cluster_id,
+        "label": label,
+        "intent_count": 1,
+        "call_count": 10,
+        "error_count": 0,
+        "error_rate_pct": 0.0,
+        "routing_entropy": 0.1,
+        "tool_distribution": [{"tool": "flag_get", "count": 10, "pct": 100.0, "errors": 0, "error_rate_pct": 0.0}],
+        "sample_intents": [label],
+        "switches": [{**switch, "count": 2} for switch in switches or []],
+        "self_retries": [],
+    }
+
+
+def _tool_blob(tool: str, cluster_ids: list[int]) -> dict:
+    return {
+        "tool": tool,
+        "call_count": 10,
+        "error_count": 0,
+        "session_count": 2,
+        "contested_score": 0.1,
+        "n_clusters_served": len(cluster_ids),
+        "advertised_sessions": 0,
+        "called_when_advertised": 0,
+        "discovery_rate_pct": None,
+        "description": None,
+        "clusters": [
+            {
+                "cluster_id": cluster_id,
+                "calls": 10,
+                "capture_pct": 100.0,
+                "rank": 1,
+                "description_fit": None,
+                "top_competitor": None,
+            }
+            for cluster_id in cluster_ids
+        ],
+    }
+
+
+class TestMCPAnalyticsPresentation(_MCPAnalyticsTeamScopedTestMixin, APIBaseTest):
+    @parameterized.expand(
+        [
+            ("feedback_create", "post", "feedback/", {"goal": "understand usage", "feedback": "Need clearer results"}),
+            (
+                "missing_capability_create",
+                "post",
+                "missing_capabilities/",
+                {"goal": "debug surveys", "missing_capability": "Need an eligibility explainer"},
+            ),
+            ("feedback_list", "get", "feedback/", None),
+            ("missing_capability_list", "get", "missing_capabilities/", None),
+        ]
+    )
+    def test_endpoints_require_authentication(
+        self, _name: str, method: str, path: str, payload: dict[str, str] | None
+    ) -> None:
+        self.client.logout()
+
+        request = getattr(self.client, method)
+        response = request(f"/api/environments/{self.team.id}/mcp_analytics/{path}", payload, format="json")
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @parameterized.expand(
+        [
+            (
+                "feedback_create",
+                "post",
+                "feedback/",
+                {"goal": "understand usage", "feedback": "Need clearer results"},
+                status.HTTP_201_CREATED,
+            ),
+            (
+                "missing_capability_create",
+                "post",
+                "missing_capabilities/",
+                {"goal": "debug surveys", "missing_capability": "Need an eligibility explainer"},
+                status.HTTP_201_CREATED,
+            ),
+            ("feedback_list", "get", "feedback/", None, status.HTTP_200_OK),
+            ("missing_capability_list", "get", "missing_capabilities/", None, status.HTTP_200_OK),
+        ]
+    )
+    def test_endpoints_do_not_require_any_feature_flag(
+        self, _name: str, method: str, path: str, payload: dict[str, str] | None, expected_status: int
+    ) -> None:
+        with patch("posthoganalytics.feature_enabled", return_value=False):
+            request = getattr(self.client, method)
+            response = request(f"/api/environments/{self.team.id}/mcp_analytics/{path}", payload, format="json")
+
+        assert response.status_code == expected_status
+
+    def test_create_feedback_submission(self) -> None:
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/mcp_analytics/feedback/",
+            {
+                "goal": "understand why feature flag releases keep failing",
+                "feedback": "I need a better explanation of rollout blast radius before changing a flag.",
+                "category": "results",
+                "attempted_tool": "feature_flag_get_all",
+                "mcp_client_name": "Claude Desktop",
+            },
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED
+        data = response.json()
+
+        assert data["kind"] == MCPAnalyticsSubmission.Kind.FEEDBACK
+        assert data["goal"] == "understand why feature flag releases keep failing"
+        assert data["summary"] == "I need a better explanation of rollout blast radius before changing a flag."
+        assert data["category"] == "results"
+        assert data["attempted_tool"] == "feature_flag_get_all"
+        assert data["mcp_client_name"] == "Claude Desktop"
+
+    @parameterized.expand(
+        [
+            ("missing_goal", {"feedback": "Need clearer results"}, "goal"),
+            (
+                "invalid_category",
+                {"goal": "understand usage", "feedback": "Need clearer results", "category": "bad"},
+                "category",
+            ),
+            ("goal_too_long", {"goal": "g" * 501, "feedback": "Need clearer results"}, "goal"),
+            ("feedback_too_long", {"goal": "understand usage", "feedback": "f" * 5001}, "feedback"),
+        ]
+    )
+    def test_feedback_validation_errors(self, _name: str, payload: dict[str, str], field: str) -> None:
+        response = self.client.post(f"/api/environments/{self.team.id}/mcp_analytics/feedback/", payload, format="json")
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["attr"] == field
+
+    @patch("products.mcp_analytics.backend.facade.api.capture_internal")
+    def test_create_missing_capability_submission_defaults_blocked(self, mock_capture_internal: MagicMock) -> None:
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/mcp_analytics/missing_capabilities/",
+            {
+                "goal": "debug why my survey is not showing",
+                "missing_capability": "I need a tool that explains survey eligibility for a specific user.",
+                "attempted_tool": "survey_get",
+                "mcp_session_id": "mcp-session-123",
+                "mcp_trace_id": "mcp-trace-456",
+            },
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED
+        data = response.json()
+
+        assert data["kind"] == MCPAnalyticsSubmission.Kind.MISSING_CAPABILITY
+        assert data["blocked"] is True
+        assert data["attempted_tool"] == "survey_get"
+
+        mock_capture_internal.assert_called_once_with(
+            token=self.team.api_token,
+            event_name="$mcp_missing_capability",
+            event_source="mcp_analytics_missing_capability",
+            distinct_id=self.user.distinct_id,
+            properties={
+                "submission_id": data["id"],
+                "kind": MCPAnalyticsSubmission.Kind.MISSING_CAPABILITY,
+                "attempted_tool_present": True,
+                "mcp_client_name_present": False,
+                "mcp_session_id_present": True,
+                "mcp_trace_id_present": True,
+                "$mcp_source": "posthog_mcp_analytics",
+                "$mcp_tool_name": "mcp-missing-capability-report",
+                "missing_capability_blocked": True,
+                "$mcp_session_id": "mcp-session-123",
+                "$mcp_trace_id": "mcp-trace-456",
+            },
+            event_uuid=data["id"],
+            process_person_profile=False,
+        )
+
+    @parameterized.expand(
+        [
+            ("missing_goal", {"missing_capability": "Need an eligibility explainer"}, "goal"),
+            ("goal_too_long", {"goal": "g" * 501, "missing_capability": "Need an eligibility explainer"}, "goal"),
+            (
+                "missing_capability_too_long",
+                {"goal": "debug surveys", "missing_capability": "m" * 5001},
+                "missing_capability",
+            ),
+        ]
+    )
+    def test_missing_capability_validation_errors(self, _name: str, payload: dict[str, str], field: str) -> None:
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/mcp_analytics/missing_capabilities/", payload, format="json"
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["attr"] == field
+
+    def test_intent_clusters_returns_empty_idle_when_no_snapshot(self) -> None:
+        with patch("posthoganalytics.feature_enabled", return_value=True):
+            response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/intent_clusters/")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["status"] == "idle"
+        assert data["clusters"] == []
+        assert data["last_computed_at"] is None
+        assert data["computed_with"] is None
+
+    @parameterized.expand(
+        [
+            ("snapshot", "get", "intent_clusters/"),
+            ("recompute", "post", "intent_clusters/recompute/"),
+        ]
+    )
+    def test_intent_clusters_require_intent_routing_feature_flag(self, _name: str, method: str, path: str) -> None:
+        with patch("posthoganalytics.feature_enabled", return_value=False):
+            request = getattr(self.client, method)
+            response = request(f"/api/environments/{self.team.id}/mcp_analytics/{path}", {}, format="json")
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_intent_clusters_returns_stored_snapshot(self) -> None:
+        MCPIntentClusterSnapshot.objects.create(
+            team=self.team,
+            status=MCPIntentClusterSnapshot.Status.IDLE,
+            clusters={
+                "clusters": [
+                    {
+                        "id": 0,
+                        "label": "check feature flag rollout",
+                        "intent_count": 2,
+                        "call_count": 14,
+                        "error_count": 1,
+                        "error_rate_pct": 7.1,
+                        "routing_entropy": 0.1,
+                        "tool_distribution": [
+                            {"tool": "feature_flag_get", "count": 12, "pct": 85.7, "errors": 1, "error_rate_pct": 8.3},
+                        ],
+                        "sample_intents": ["check feature flag rollout"],
+                    }
+                ],
+                "computed_with": {
+                    "distance_threshold": 0.2,
+                    "embedding_model": "text-embedding-3-small-1536",
+                    "n_intents": 2,
+                    "n_clusters": 1,
+                },
+            },
+        )
+
+        with patch("posthoganalytics.feature_enabled", return_value=True):
+            response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/intent_clusters/")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["status"] == "idle"
+        assert len(data["clusters"]) == 1
+        assert data["clusters"][0]["label"] == "check feature flag rollout"
+        assert data["computed_with"]["n_clusters"] == 1
+        # A pre-v2 blob (no version, no tool sections) must keep rendering:
+        # the pivot comes back empty and the coverage meta null, never a 500.
+        assert data["tools"] == []
+        assert data["tool_overlaps"] == []
+        assert data["computed_with"]["sampled_sessions"] is None
+        assert data["clusters"][0]["switches"] == []
+
+    def test_intent_clusters_returns_v2_tool_sections(self) -> None:
+        MCPIntentClusterSnapshot.objects.create(
+            team=self.team,
+            status=MCPIntentClusterSnapshot.Status.IDLE,
+            clusters={
+                "version": 2,
+                "clusters": [],
+                "tools": [
+                    {
+                        "tool": "feature_flag_get",
+                        "call_count": 12,
+                        "error_count": 1,
+                        "session_count": 4,
+                        "contested_score": 0.31,
+                        "advertised_sessions": 3,
+                        "called_when_advertised": 2,
+                        "discovery_rate_pct": None,
+                        "description": None,
+                        "n_clusters_served": 3,
+                        "clusters": [
+                            {
+                                "cluster_id": 0,
+                                "calls": 12,
+                                "capture_pct": 85.7,
+                                "rank": 1,
+                                "description_fit": None,
+                                "top_competitor": {"tool": "query_run", "pct": 14.3},
+                            }
+                        ],
+                    }
+                ],
+                "tool_overlaps": [
+                    {
+                        "tool_a": "feature_flag_get",
+                        "tool_b": "query_run",
+                        "contested_calls": 2,
+                        "sessions_with_both": 1,
+                        "sessions_with_either": 4,
+                        "top_cluster_id": 0,
+                    }
+                ],
+                "computed_with": {
+                    "distance_threshold": 0.2,
+                    "embedding_model": "text-embedding-3-small-1536",
+                    "n_intents": 2,
+                    "n_clusters": 1,
+                    "corpus": "per_call",
+                    "sampled_sessions": 5,
+                    "window_sessions": 100,
+                    "session_coverage_pct": 5.0,
+                    "intent_coverage_pct": 91.4,
+                },
+            },
+        )
+
+        with patch("posthoganalytics.feature_enabled", return_value=True):
+            response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/intent_clusters/")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        tool = data["tools"][0]
+        assert tool["tool"] == "feature_flag_get"
+        assert tool["contested_score"] == 0.31
+        # Nulls must survive the DTO + serializer round trip as null, not 0 or "".
+        assert tool["discovery_rate_pct"] is None
+        assert tool["description"] is None
+        assert tool["clusters"][0]["top_competitor"] == {"tool": "query_run", "pct": 14.3}
+        assert data["tool_overlaps"][0]["contested_calls"] == 2
+        assert data["computed_with"]["sampled_sessions"] == 5
+        assert data["computed_with"]["intent_coverage_pct"] == 91.4
+        # Coverage fields the blob omitted come back null rather than erroring.
+        assert data["computed_with"]["description_coverage_pct"] is None
+        # The entry list is capped, so the honest "how many intents does this serve"
+        # answer has to come off the pivot, not len(clusters).
+        assert tool["n_clusters_served"] == 3
+        assert len(tool["clusters"]) == 1
+
+    def test_intent_clusters_can_be_scoped_to_one_tool(self) -> None:
+        # The tool detail page renders a single tool's section. Unscoped, it pulls the
+        # whole snapshot — every cluster and every other tool's pivot — to do it.
+        MCPIntentClusterSnapshot.objects.create(
+            team=self.team,
+            status=MCPIntentClusterSnapshot.Status.IDLE,
+            clusters={
+                "version": 2,
+                "clusters": [
+                    _cluster_blob(0, "check feature flag rollout"),
+                    _cluster_blob(1, "run a query", switches=[{"from_tool": "query_run", "to_tool": "flag_get"}]),
+                    _cluster_blob(2, "unrelated intent"),
+                ],
+                "tools": [
+                    _tool_blob("flag_get", cluster_ids=[0]),
+                    _tool_blob("query_run", cluster_ids=[1, 2]),
+                ],
+                "tool_overlaps": [
+                    {
+                        "tool_a": "flag_get",
+                        "tool_b": "query_run",
+                        "contested_calls": 2,
+                        "sessions_with_both": 1,
+                        "sessions_with_either": 4,
+                        "top_cluster_id": 0,
+                    },
+                    {
+                        "tool_a": "docs_search",
+                        "tool_b": "query_run",
+                        "contested_calls": 1,
+                        "sessions_with_both": 0,
+                        "sessions_with_either": 2,
+                        "top_cluster_id": 2,
+                    },
+                ],
+                "computed_with": {
+                    "distance_threshold": 0.2,
+                    "embedding_model": "text-embedding-3-small-1536",
+                    "n_intents": 3,
+                    "n_clusters": 3,
+                },
+            },
+        )
+
+        with patch("posthoganalytics.feature_enabled", return_value=True):
+            response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/intent_clusters/?tool=flag_get")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert [tool["tool"] for tool in data["tools"]] == ["flag_get"]
+        # Cluster 0 because the pivot references it, cluster 1 because its switch
+        # names the tool — the detail panel renders both. Cluster 2 is neither.
+        assert sorted(cluster["id"] for cluster in data["clusters"]) == [0, 1]
+        assert [(o["tool_a"], o["tool_b"]) for o in data["tool_overlaps"]] == [("flag_get", "query_run")]
+        # Coverage meta stays whole-snapshot: it describes the run, not the tool.
+        assert data["computed_with"]["n_clusters"] == 3
+
+    def test_intent_clusters_scoped_to_an_unknown_tool_is_empty_not_an_error(self) -> None:
+        MCPIntentClusterSnapshot.objects.create(
+            team=self.team,
+            status=MCPIntentClusterSnapshot.Status.IDLE,
+            clusters={
+                "version": 2,
+                "clusters": [_cluster_blob(0, "check feature flag rollout")],
+                "tools": [_tool_blob("flag_get", cluster_ids=[0])],
+                "tool_overlaps": [],
+                "computed_with": {
+                    "distance_threshold": 0.2,
+                    "embedding_model": "text-embedding-3-small-1536",
+                    "n_intents": 1,
+                    "n_clusters": 1,
+                },
+            },
+        )
+
+        with patch("posthoganalytics.feature_enabled", return_value=True):
+            response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/intent_clusters/?tool=nope")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["tools"] == []
+        assert data["clusters"] == []
+
+    def test_intent_clusters_recompute_starts_workflow_and_returns_computing(self) -> None:
+        # Mock async_connect to return a client whose start_workflow is an
+        # AsyncMock — the facade awaits both inside asyncio.run. The
+        # synchronous COMPUTING write still runs against the real DB so
+        # the 202 body reflects the new state, not the stale pre-trigger one.
+        mock_client = MagicMock()
+        mock_client.start_workflow = AsyncMock(return_value=MagicMock())
+        with (
+            patch("posthog.temporal.common.client.async_connect", new=AsyncMock(return_value=mock_client)),
+            patch("posthoganalytics.feature_enabled", return_value=True),
+        ):
+            response = self.client.post(
+                f"/api/environments/{self.team.id}/mcp_analytics/intent_clusters/recompute/", {}, format="json"
+            )
+
+        assert response.status_code == status.HTTP_202_ACCEPTED
+        assert response.json()["status"] == "computing"
+        snapshot = MCPIntentClusterSnapshot.objects.get(team=self.team)
+        assert snapshot.status == MCPIntentClusterSnapshot.Status.COMPUTING
+        assert snapshot.last_computed_by_id == self.user.id
+        mock_client.start_workflow.assert_awaited_once()
+        call_args = mock_client.start_workflow.call_args
+        assert call_args.args[0] == WORKFLOW_NAME
+        assert call_args.args[1].team_id == self.team.id
+        assert call_args.args[1].user_id == self.user.id
+        # Deterministic per team so Temporal itself dedupes concurrent runs.
+        assert call_args.kwargs["id"] == f"{CHILD_WORKFLOW_ID_PREFIX}-{self.team.id}-adhoc"
+        # Without a bound, a dispatch onto a queue with no live worker sits
+        # pending forever and repeat clicks stack workflows behind it.
+        assert call_args.kwargs["execution_timeout"] == WORKFLOW_EXECUTION_TIMEOUT
+
+    def test_intent_clusters_recompute_already_running_workflow_is_not_an_error(self) -> None:
+        # A snapshot stale-swept past STALE_COMPUTING_THRESHOLD can belong to a
+        # workflow that is still live (the execution timeout is longer) —
+        # Temporal refuses the duplicate id. That is "already running", not a
+        # dispatch failure: the generic revert below it must not mark ERROR.
+        mock_client = MagicMock()
+        mock_client.start_workflow = AsyncMock(
+            side_effect=WorkflowAlreadyStartedError(f"{CHILD_WORKFLOW_ID_PREFIX}-1-adhoc", WORKFLOW_NAME)
+        )
+        with patch("posthog.temporal.common.client.async_connect", new=AsyncMock(return_value=mock_client)):
+            response = self.client.post(
+                f"/api/environments/{self.team.id}/mcp_analytics/intent_clusters/recompute/", {}, format="json"
+            )
+
+        assert response.status_code == status.HTTP_202_ACCEPTED
+        assert response.json()["status"] == "computing"
+        snapshot = MCPIntentClusterSnapshot.objects.get(team=self.team)
+        assert snapshot.status == MCPIntentClusterSnapshot.Status.COMPUTING
+        assert snapshot.error_message == ""
+
+    @parameterized.expand(
+        [
+            # A fresh COMPUTING run owns the snapshot: don't stack a duplicate workflow.
+            ("fresh_computing_skips_dispatch", timedelta(minutes=1), 0),
+            # A run stuck past the stale threshold is presumed dead: allow the retry through.
+            ("stale_computing_dispatches_again", STALE_COMPUTING_THRESHOLD + timedelta(minutes=1), 1),
+        ]
+    )
+    def test_intent_clusters_recompute_throttles_while_computing(
+        self, _name: str, computing_age: timedelta, expected_dispatches: int
+    ) -> None:
+        MCPIntentClusterSnapshot.objects.update_or_create(
+            team=self.team,
+            defaults={"status": MCPIntentClusterSnapshot.Status.COMPUTING},
+        )
+        # updated_at is auto_now — backdate it directly to position the run's age.
+        MCPIntentClusterSnapshot.objects.filter(team=self.team).update(updated_at=datetime.now(tz=UTC) - computing_age)
+
+        mock_client = MagicMock()
+        mock_client.start_workflow = AsyncMock(return_value=MagicMock())
+        with patch("posthog.temporal.common.client.async_connect", new=AsyncMock(return_value=mock_client)):
+            response = self.client.post(
+                f"/api/environments/{self.team.id}/mcp_analytics/intent_clusters/recompute/", {}, format="json"
+            )
+
+        assert response.status_code == status.HTTP_202_ACCEPTED
+        assert response.json()["status"] == "computing"
+        assert mock_client.start_workflow.await_count == expected_dispatches
+
+    def test_intent_clusters_recompute_dispatch_failure_reverts_to_error(self) -> None:
+        # If the workflow never starts, no activity will flip the status —
+        # the endpoint must revert its own COMPUTING write, not leave the
+        # snapshot stuck until the stale-COMPUTING sweep.
+        with (
+            patch(
+                "posthog.temporal.common.client.async_connect",
+                new=AsyncMock(side_effect=RuntimeError("temporal unreachable")),
+            ),
+            patch("posthoganalytics.feature_enabled", return_value=True),
+        ):
+            response = self.client.post(
+                f"/api/environments/{self.team.id}/mcp_analytics/intent_clusters/recompute/", {}, format="json"
+            )
+
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        snapshot = MCPIntentClusterSnapshot.objects.get(team=self.team)
+        assert snapshot.status == MCPIntentClusterSnapshot.Status.ERROR
+        assert snapshot.error_message == "Failed to start the intent clustering workflow"
+
+    def test_feedback_list_is_team_scoped(self) -> None:
+        MCPAnalyticsSubmission.objects.create(
+            team=self.team,
+            created_by=self.user,
+            kind=MCPAnalyticsSubmission.Kind.FEEDBACK,
+            goal="understand usage",
+            summary="Feedback for this team",
+        )
+        other_team = self.organization.teams.create(name="Other Team")
+        MCPAnalyticsSubmission.objects.create(
+            team=other_team,
+            created_by=self.user,
+            kind=MCPAnalyticsSubmission.Kind.FEEDBACK,
+            goal="other",
+            summary="Should not leak",
+        )
+
+        response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/feedback/")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()["results"]) == 1
+        assert response.json()["results"][0]["summary"] == "Feedback for this team"
+
+    def test_feedback_and_missing_capability_lists_are_split_by_kind(self) -> None:
+        MCPAnalyticsSubmission.objects.create(
+            team=self.team,
+            created_by=self.user,
+            kind=MCPAnalyticsSubmission.Kind.FEEDBACK,
+            goal="improve prompts",
+            summary="Feedback entry",
+        )
+        MCPAnalyticsSubmission.objects.create(
+            team=self.team,
+            created_by=self.user,
+            kind=MCPAnalyticsSubmission.Kind.MISSING_CAPABILITY,
+            goal="debug tool errors",
+            summary="Missing capability entry",
+            blocked=False,
+        )
+
+        feedback_response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/feedback/")
+        missing_response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/missing_capabilities/")
+
+        assert feedback_response.status_code == status.HTTP_200_OK
+        assert missing_response.status_code == status.HTTP_200_OK
+        assert [entry["kind"] for entry in feedback_response.json()["results"]] == [
+            MCPAnalyticsSubmission.Kind.FEEDBACK
+        ]
+        assert [entry["kind"] for entry in missing_response.json()["results"]] == [
+            MCPAnalyticsSubmission.Kind.MISSING_CAPABILITY
+        ]
+
+    def test_feedback_list_is_paginated(self) -> None:
+        for index in range(101):
+            MCPAnalyticsSubmission.objects.create(
+                team=self.team,
+                created_by=self.user,
+                kind=MCPAnalyticsSubmission.Kind.FEEDBACK,
+                goal=f"goal {index}",
+                summary=f"Feedback entry {index}",
+            )
+
+        response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/feedback/")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data["count"] == 101
+        assert len(data["results"]) == 100
+        assert data["next"] is not None
+
+
+class TestMCPCustomHarnessEndpoint(_MCPAnalyticsTeamScopedTestMixin, APIBaseTest):
+    def _url(self, suffix: str = "") -> str:
+        return f"/api/environments/{self.team.id}/mcp_analytics/custom_harnesses/{suffix}"
+
+    def test_create_lowercases_the_pattern_and_lists_it(self) -> None:
+        response = self.client.post(self._url(), {"name": "Acme Agent", "match_pattern": " Acme-Agent "}, format="json")
+
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.json()["match_pattern"] == "acme-agent"
+        listed = self.client.get(self._url()).json()
+        assert [(row["name"], row["match_pattern"]) for row in listed] == [("Acme Agent", "acme-agent")]
+
+    @parameterized.expand(
+        [
+            ("quote_in_name", {"name": "Bad'name", "match_pattern": "ok"}),
+            ("brace_in_name", {"name": "Bad{name}", "match_pattern": "ok"}),
+            ("quote_in_pattern", {"name": "Ok", "match_pattern": "bad'pattern"}),
+            ("empty_pattern", {"name": "Ok", "match_pattern": " "}),
+            ("reserved_other", {"name": "other", "match_pattern": "ok"}),
+            ("reserved_unidentified", {"name": "Unidentified client", "match_pattern": "ok"}),
+            ("built_in_harness_label", {"name": " cursor ", "match_pattern": "ok"}),
+            ("name_the_frontend_gives_a_mark", {"name": "Slack", "match_pattern": "ok"}),
+            ("icon_not_an_image", {"name": "Ok", "match_pattern": "ok", "icon": "data:text/plain;base64,aGk="}),
+        ]
+    )
+    def test_create_rejects_unsafe_values(self, _name: str, payload: dict[str, str]) -> None:
+        response = self.client.post(self._url(), payload, format="json")
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_create_rejects_duplicate_pattern_and_enforces_the_limit(self) -> None:
+        self.client.post(self._url(), {"name": "One", "match_pattern": "one"}, format="json")
+        duplicate = self.client.post(self._url(), {"name": "Again", "match_pattern": "ONE"}, format="json")
+        assert duplicate.status_code == status.HTTP_400_BAD_REQUEST
+
+        MCPCustomHarness.objects.bulk_create(
+            [MCPCustomHarness(team=self.team, name=f"H{i}", match_pattern=f"h{i}") for i in range(19)]
+        )
+        over_limit = self.client.post(self._url(), {"name": "Extra", "match_pattern": "extra"}, format="json")
+        assert over_limit.status_code == status.HTTP_400_BAD_REQUEST
+
+    @parameterized.expand(
+        [
+            ("same_case", "Acme", "Acme"),
+            ("other_case_and_spaces", "Acme", " ACME "),
+            ("first_name_sent_with_spaces", "Acme ", "acme"),
+        ]
+    )
+    def test_create_rejects_a_name_another_rule_uses(self, _name: str, first_name: str, duplicate_name: str) -> None:
+        self.client.post(self._url(), {"name": first_name, "match_pattern": "acme"}, format="json")
+
+        response = self.client.post(self._url(), {"name": duplicate_name, "match_pattern": "acme-cli"}, format="json")
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["attr"] == "name"
+
+    @parameterized.expand([("built_in_name", "Cursor"), ("name_another_rule_uses", "Acme")])
+    def test_update_accepts_an_unchanged_name_saved_before_names_were_checked(self, _name: str, name: str) -> None:
+        older, _ = MCPCustomHarness.objects.bulk_create(
+            [
+                MCPCustomHarness(team=self.team, name=name, match_pattern="one"),
+                MCPCustomHarness(team=self.team, name="Acme", match_pattern="two"),
+            ]
+        )
+
+        response = self.client.patch(self._url(f"{older.id}/"), {"name": name, "icon": ""}, format="json")
+
+        assert response.status_code == status.HTTP_200_OK
+
+    def test_update_keeps_its_own_name_but_cannot_take_another_rules_name(self) -> None:
+        first = self.client.post(self._url(), {"name": "Acme", "match_pattern": "acme"}, format="json").json()
+        self.client.post(self._url(), {"name": "Beta", "match_pattern": "beta"}, format="json")
+
+        same_name = self.client.patch(self._url(f"{first['id']}/"), {"name": "acme"}, format="json")
+        taken_name = self.client.patch(self._url(f"{first['id']}/"), {"name": "Beta"}, format="json")
+
+        assert same_name.status_code == status.HTTP_200_OK
+        assert taken_name.status_code == status.HTTP_400_BAD_REQUEST
+        assert taken_name.json()["attr"] == "name"
+
+    def test_a_redis_outage_falls_back_to_postgres_without_reporting_an_exception(self) -> None:
+        MCPCustomHarness.objects.create(team=self.team, name="One", match_pattern="one")
+        outage = Exception("redis is down")
+
+        with (
+            patch("posthoganalytics.api_key", "phc_test"),
+            patch("posthoganalytics.capture_exception") as capture_exception,
+        ):
+            with patch.object(cache, "get", side_effect=outage), patch.object(cache, "add", side_effect=outage):
+                rules = custom_harness_rules(self.team)
+            with self.captureOnCommitCallbacks() as on_commit_callbacks:
+                response = self.client.post(self._url(), {"name": "Two", "match_pattern": "two"}, format="json")
+            with patch.object(cache, "delete", side_effect=outage):
+                for callback in on_commit_callbacks:
+                    callback()
+
+        assert rules == (CustomHarnessRule(name="One", pattern="one"),)
+        assert response.status_code == status.HTTP_201_CREATED
+        capture_exception.assert_not_called()
+
+    def test_a_save_drops_rules_another_writer_cached_before_it_committed(self) -> None:
+        self.client.post(self._url(), {"name": "One", "match_pattern": "one"}, format="json")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(self._url(), {"name": "Two", "match_pattern": "two"}, format="json")
+            cache.set(f"mcp_analytics:custom_harness_rules:{self.team.pk}", (("One", "one"),))
+
+        assert custom_harness_rules(self.team) == (
+            CustomHarnessRule(name="One", pattern="one"),
+            CustomHarnessRule(name="Two", pattern="two"),
+        )
+
+    def test_create_returns_a_400_when_the_unique_constraint_wins_a_race(self) -> None:
+        with patch(
+            "products.mcp_analytics.backend.models.MCPCustomHarness.objects.create",
+            side_effect=IntegrityError("duplicate key"),
+        ):
+            response = self.client.post(self._url(), {"name": "One", "match_pattern": "one"}, format="json")
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["attr"] == "match_pattern"
+
+    def _breakdown_cache_key(self) -> str:
+        return MCPHarnessBreakdownQueryRunner(query=MCPHarnessBreakdownQuery(), team=self.team).get_cache_key()
+
+    def test_create_update_and_delete_refresh_the_cached_rules_and_query_cache_keys(self) -> None:
+        assert custom_harness_rules(self.team) == ()
+        cache_keys = [self._breakdown_cache_key()]
+
+        with self.captureOnCommitCallbacks(execute=True):
+            created = self.client.post(self._url(), {"name": "One", "match_pattern": "one"}, format="json").json()
+        assert custom_harness_rules(self.team) == (CustomHarnessRule(name="One", pattern="one"),)
+        with self.assertNumQueries(0):
+            assert custom_harness_rules(self.team) == (CustomHarnessRule(name="One", pattern="one"),)
+        cache_keys.append(self._breakdown_cache_key())
+
+        with self.captureOnCommitCallbacks(execute=True):
+            updated = self.client.patch(self._url(f"{created['id']}/"), {"name": "Uno"}, format="json")
+        assert updated.status_code == status.HTTP_200_OK
+        assert updated.json()["name"] == "Uno"
+        assert custom_harness_rules(self.team) == (CustomHarnessRule(name="Uno", pattern="one"),)
+        cache_keys.append(self._breakdown_cache_key())
+
+        with self.captureOnCommitCallbacks(execute=True):
+            deleted = self.client.delete(self._url(f"{created['id']}/"))
+        assert deleted.status_code == status.HTTP_204_NO_CONTENT
+        assert self.client.get(self._url()).json() == []
+        assert custom_harness_rules(self.team) == ()
+        cache_keys.append(self._breakdown_cache_key())
+
+        assert len(set(cache_keys[:3])) == 3
+        assert cache_keys[3] == cache_keys[0]
+
+    def test_a_longer_pattern_matches_before_a_shorter_one_it_contains(self) -> None:
+        self.client.post(self._url(), {"name": "Acme", "match_pattern": "acme"}, format="json")
+        self.client.post(self._url(), {"name": "Acme agent", "match_pattern": "acme-agent"}, format="json")
+
+        assert custom_harness_rules(self.team) == (
+            CustomHarnessRule(name="Acme agent", pattern="acme-agent"),
+            CustomHarnessRule(name="Acme", pattern="acme"),
+        )
+
+    def test_other_teams_harnesses_are_not_listed(self) -> None:
+        other_team = Team.objects.create(organization=self.organization, name="other-team")
+        MCPCustomHarness.objects.create(team=other_team, name="Elsewhere", match_pattern="elsewhere")
+
+        assert self.client.get(self._url()).json() == []
+
+    def test_child_environment_lists_and_deletes_the_rules_it_creates(self) -> None:
+        child = Team.objects.create(
+            organization=self.organization, project=self.team.project, parent_team=self.team, name="Child"
+        )
+        child_url = f"/api/environments/{child.id}/mcp_analytics/custom_harnesses/"
+
+        created = self.client.post(child_url, {"name": "Acme", "match_pattern": "acme"}, format="json").json()
+
+        assert [row["name"] for row in self.client.get(child_url).json()] == ["Acme"]
+        assert self.client.delete(f"{child_url}{created['id']}/").status_code == status.HTTP_204_NO_CONTENT
+
+
+class TestMCPSessionIntentEndpoint(_MCPAnalyticsTeamScopedTestMixin, APIBaseTest):
+    def _url(self, session_id: str) -> str:
+        return f"/api/environments/{self.team.id}/mcp_analytics/sessions/{session_id}/generate_intent/"
+
+    def test_requires_authentication(self) -> None:
+        self.client.logout()
+        response = self.client.post(self._url("abc"))
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_returns_cached_intent_in_response_shape(self) -> None:
+        session_id = "session-123"
+        MCPSession.objects.create(team=self.team, session_id=session_id, intent="A persisted summary.")
+
+        response = self.client.post(self._url(session_id))
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {"session_id": session_id, "intent": "A persisted summary."}
+
+    def test_generates_and_persists_when_empty(self) -> None:
+        session_id = "session-fresh"
+        # Mock the two primitives so the endpoint path runs without ClickHouse or a real LLM call.
+        with (
+            patch.object(intent_generation, "fetch_session_intents", return_value=["check the funnel"]),
+            patch.object(intent_generation, "summarize_intents", return_value="Generated summary."),
+        ):
+            response = self.client.post(self._url(session_id))
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == {"session_id": session_id, "intent": "Generated summary."}
+        assert MCPSession.objects.get(team=self.team, session_id=session_id).intent == "Generated summary."
+
+    def test_returns_503_when_generation_unavailable(self) -> None:
+        session_id = "session-unavailable"
+        with (
+            patch.object(intent_generation, "fetch_session_intents", return_value=["check the funnel"]),
+            patch.object(
+                intent_generation,
+                "summarize_intents",
+                side_effect=intent_generation.IntentGenerationUnavailable("LLM down"),
+            ),
+        ):
+            response = self.client.post(self._url(session_id))
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        # Nothing persisted when generation fails.
+        assert not MCPSession.objects.filter(team=self.team, session_id=session_id).exists()
+
+
+class TestMCPSessionToolCallsEndpoint(_MCPAnalyticsTeamScopedTestMixin, ClickhouseTestMixin, APIBaseTest):
+    """The detail event list is bounded by the session's aggregated session_start. Listing *all*
+    events hinges on that bound surviving the serialize -> query-param -> parse round-trip without
+    dropping the first event (the one at exactly session_start)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        cache.clear()
+
+    def test_tool_calls_bounded_by_session_start_returns_every_event(self) -> None:
+        session_id = str(uuid7())
+        now = datetime.now(tz=UTC)
+        events = [(now - timedelta(hours=2), "first_tool"), (now - timedelta(minutes=5), "last_tool")]
+        for timestamp, tool in events:
+            _create_event(
+                team=self.team,
+                event="$mcp_tool_call",
+                distinct_id="seed",
+                timestamp=timestamp,
+                properties={"$session_id": session_id, "$mcp_tool_name": tool},
+            )
+
+        listed = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/sessions/", {"date_from": "-7d"})
+        assert listed.status_code == status.HTTP_200_OK
+        session = next(s for s in listed.json()["results"] if s["session_id"] == session_id)
+        # Hand the serialized session_start straight back, exactly as the UI does.
+        response = self.client.get(
+            f"/api/environments/{self.team.id}/mcp_analytics/sessions/{session_id}/tool_calls/",
+            {"date_from": session["session_start"]},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        # The first event sits at exactly session_start; a `timestamp >= session_start` bound must
+        # still include it after the round-trip — otherwise we'd get just ["last_tool"].
+        assert [c["tool_name"] for c in response.json()["results"]] == ["first_tool", "last_tool"]
+
+        first_page = self.client.get(
+            f"/api/environments/{self.team.id}/mcp_analytics/sessions/{session_id}/tool_calls/",
+            {"date_from": session["session_start"], "limit": 1},
+        ).json()
+        second_page = self.client.get(first_page["next"]).json()
+        assert [c["tool_name"] for c in first_page["results"]] == ["first_tool"]
+        assert first_page["previous"] is None
+        assert [c["tool_name"] for c in second_page["results"]] == ["last_tool"]
+        assert second_page["next"] is None
+        assert second_page["has_next"] is False
+
+    @parameterized.expand(
+        [
+            ("sessions_list", "", {"date_from": "-7d"}),
+            ("tool_calls", "{session_id}/tool_calls/", {"date_from": "-7d"}),
+            ("activity_overview", "activity_overview/", {}),
+        ]
+    )
+    def test_shared_filters_reach_the_query(self, _name: str, suffix: str, extra: dict[str, str]) -> None:
+        session_id = str(uuid7())
+        for tool in ["kept_tool", "dropped_tool"]:
+            _create_event(
+                team=self.team,
+                event="$mcp_tool_call",
+                distinct_id="seed",
+                timestamp=datetime.now(tz=UTC) - timedelta(minutes=5),
+                properties={"$session_id": session_id, "$mcp_tool_name": tool},
+            )
+        path = f"/api/environments/{self.team.id}/mcp_analytics/sessions/{suffix.format(session_id=session_id)}"
+        properties = json.dumps(
+            [{"key": "$mcp_tool_name", "value": ["kept_tool"], "operator": "exact", "type": "event"}]
+        )
+
+        response = self.client.get(path, {**extra, "properties": properties})
+
+        assert response.status_code == status.HTTP_200_OK
+        assert "kept_tool" in response.content.decode()
+        assert "dropped_tool" not in response.content.decode()
+
+    @parameterized.expand(
+        [
+            ("sessions_list", "", {"date_from": "-7d"}),
+            ("tool_calls", "{session_id}/tool_calls/", {"date_from": "-7d"}),
+            ("activity_overview", "activity_overview/", {}),
+        ]
+    )
+    def test_property_restrictions_are_resolved_for_the_caller(
+        self, _name: str, suffix: str, extra: dict[str, str]
+    ) -> None:
+        path = f"/api/environments/{self.team.id}/mcp_analytics/sessions/{suffix.format(session_id=uuid7())}"
+        with patch(
+            "products.access_control.backend.property_access_control.get_restricted_properties_with_group_type_index_for_team",
+            return_value=set(),
+        ) as resolve_restrictions:
+            response = self.client.get(path, extra)
+
+        assert response.status_code == status.HTTP_200_OK
+        assert resolve_restrictions.call_count > 0
+        assert all(call.kwargs["user"] == self.user for call in resolve_restrictions.call_args_list)
+
+    def test_unparseable_properties_are_a_400(self) -> None:
+        response = self.client.get(
+            f"/api/environments/{self.team.id}/mcp_analytics/sessions/", {"properties": "{not json"}
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+class TestSharedFilterQueryParams(SimpleTestCase):
+    QUERY_SERIALIZERS = [
+        ("sessions_list", MCPSessionListQuerySerializer),
+        ("tool_calls", MCPSessionToolCallsQuerySerializer),
+        ("activity_overview", MCPActivityOverviewQuerySerializer),
+    ]
+
+    @parameterized.expand(QUERY_SERIALIZERS)
+    def test_shared_filters_default_to_off(self, _name: str, serializer_class: type[serializers.Serializer]) -> None:
+        serializer = serializer_class(data={})
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["properties"] == []
+        assert serializer.validated_data["filter_test_accounts"] is False
+
+    @parameterized.expand(QUERY_SERIALIZERS)
+    def test_properties_parse_into_schema_filters(
+        self, _name: str, serializer_class: type[serializers.Serializer]
+    ) -> None:
+        raw = json.dumps([{"key": "$mcp_tool_name", "value": ["query_run"], "operator": "exact", "type": "event"}])
+        serializer = serializer_class(data={"properties": raw})
+        assert serializer.is_valid(), serializer.errors
+        parsed = serializer.validated_data["properties"]
+        assert [(f.key, f.value) for f in parsed] == [("$mcp_tool_name", ["query_run"])]
+
+    @parameterized.expand(
+        [
+            ("not_json", "{definitely not json"),
+            ("not_a_list", '{"key": "$mcp_tool_name"}'),
+            ("unknown_filter_type", '[{"key": "a", "value": "b", "type": "nonsense"}]'),
+            ("hogql_filter", '[{"key": "1 = 1", "value": true, "type": "hogql"}]'),
+            ("cohort_filter", '[{"key": "id", "value": 1, "type": "cohort"}]'),
+        ]
+    )
+    def test_unparseable_properties_are_rejected(self, _name: str, raw: str) -> None:
+        serializer = MCPSessionListQuerySerializer(data={"properties": raw})
+        assert not serializer.is_valid()
+        assert "properties" in serializer.errors
+
+
+class TestMCPSessionListQuerySerializer(SimpleTestCase):
+    def test_defaults_when_pagination_params_omitted(self) -> None:
+        serializer = MCPSessionListQuerySerializer(data={})
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["limit"] == MCP_SESSION_LIST_DEFAULT_LIMIT
+        assert serializer.validated_data["offset"] == 0
+
+    @parameterized.expand(
+        [
+            ("limit_at_cap", {"limit": MCP_SESSION_LIST_MAX_LIMIT}, True, None),
+            ("limit_over_cap", {"limit": MCP_SESSION_LIST_MAX_LIMIT + 1}, False, "limit"),
+            ("limit_below_min", {"limit": 0}, False, "limit"),
+            ("offset_at_min", {"offset": 0}, True, None),
+            ("offset_negative", {"offset": -1}, False, "offset"),
+        ]
+    )
+    def test_pagination_bounds(
+        self, _name: str, data: dict[str, int], expected_valid: bool, error_field: str | None
+    ) -> None:
+        serializer = MCPSessionListQuerySerializer(data=data)
+        assert serializer.is_valid() is expected_valid, serializer.errors
+        if error_field is not None:
+            assert error_field in serializer.errors
+
+
+class TestMCPSessionToolCallsQuerySerializer(SimpleTestCase):
+    def test_defaults_when_pagination_params_omitted(self) -> None:
+        serializer = MCPSessionToolCallsQuerySerializer(data={})
+        assert serializer.is_valid(), serializer.errors
+        assert serializer.validated_data["limit"] == MCP_TOOL_CALLS_DEFAULT_LIMIT
+        assert serializer.validated_data["offset"] == 0
+
+    @parameterized.expand(
+        [
+            ("limit_at_cap", {"limit": MCP_TOOL_CALLS_MAX_LIMIT}, True, None),
+            ("limit_over_cap", {"limit": MCP_TOOL_CALLS_MAX_LIMIT + 1}, False, "limit"),
+            ("limit_below_min", {"limit": 0}, False, "limit"),
+            ("offset_at_min", {"offset": 0}, True, None),
+            ("offset_negative", {"offset": -1}, False, "offset"),
+        ]
+    )
+    def test_pagination_bounds(
+        self, _name: str, data: dict[str, int], expected_valid: bool, error_field: str | None
+    ) -> None:
+        serializer = MCPSessionToolCallsQuerySerializer(data=data)
+        assert serializer.is_valid() is expected_valid, serializer.errors
+        if error_field is not None:
+            assert error_field in serializer.errors
+
+    @parameterized.expand(
+        [
+            ("valid_iso", "2026-01-02T03:04:05Z", True),
+            ("unparseable", "not-a-date", None),
+        ]
+    )
+    def test_date_from_is_lenient(self, _name: str, raw: str, expect_datetime: bool | None) -> None:
+        # date_from is a scan-pruning hint: a bad value must fall back to None, not 400 the request.
+        serializer = MCPSessionToolCallsQuerySerializer(data={"date_from": raw})
+        assert serializer.is_valid(), serializer.errors
+        resolved = serializer.validated_data["date_from"]
+        if expect_datetime:
+            assert isinstance(resolved, datetime)
+        else:
+            assert resolved is None
+
+
+class TestMCPAnalyticsCrossTeamIsolation(_MCPAnalyticsTeamScopedTestMixin, APIBaseTest):
+    """Team A must never reach Team B's submissions. The submission endpoints are reachable by
+    every project, so pin the tenant boundary: another team's rows never appear in this team's list, and a user who is not a
+    member of another team's org is denied when hitting that team's URL.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # A team in a different organization that self.user is NOT a member of.
+        self.other_org = Organization.objects.create(name="other-org")
+        self.other_team = Team.objects.create(organization=self.other_org, name="other-team")
+
+        self.other_feedback = MCPAnalyticsSubmission.objects.create(
+            team=self.other_team,
+            created_by=self.user,
+            kind=MCPAnalyticsSubmission.Kind.FEEDBACK,
+            goal="team B goal",
+            summary="Team B feedback — must not leak",
+        )
+        self.other_missing_capability = MCPAnalyticsSubmission.objects.create(
+            team=self.other_team,
+            created_by=self.user,
+            kind=MCPAnalyticsSubmission.Kind.MISSING_CAPABILITY,
+            goal="team B goal",
+            summary="Team B missing capability — must not leak",
+            blocked=False,
+        )
+
+    @parameterized.expand(
+        [
+            ("feedback", "feedback/", "Team B feedback — must not leak"),
+            ("missing_capabilities", "missing_capabilities/", "Team B missing capability — must not leak"),
+        ]
+    )
+    def test_other_teams_submissions_never_appear_in_own_list(self, _name: str, path: str, leaked: str) -> None:
+        response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/{path}")
+
+        assert response.status_code == status.HTTP_200_OK
+        summaries = [entry["summary"] for entry in response.json()["results"]]
+        assert leaked not in summaries
+        assert summaries == []
+
+    @parameterized.expand(
+        [
+            ("feedback_list", "get", "feedback/", None),
+            ("missing_capability_list", "get", "missing_capabilities/", None),
+            (
+                "feedback_create",
+                "post",
+                "feedback/",
+                {"goal": "understand usage", "feedback": "Need clearer results"},
+            ),
+            (
+                "missing_capability_create",
+                "post",
+                "missing_capabilities/",
+                {"goal": "debug surveys", "missing_capability": "Need an eligibility explainer"},
+            ),
+        ]
+    )
+    def test_cannot_reach_another_orgs_team_endpoint(
+        self, _name: str, method: str, path: str, payload: dict[str, str] | None
+    ) -> None:
+        request = getattr(self.client, method)
+        response = request(f"/api/environments/{self.other_team.id}/mcp_analytics/{path}", payload, format="json")
+
+        # Not a member of the other org's team: the request is rejected before any data is read.
+        assert response.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND)
+
+    def test_creating_in_own_team_does_not_touch_other_team(self) -> None:
+        self.client.post(
+            f"/api/environments/{self.team.id}/mcp_analytics/feedback/",
+            {"goal": "understand usage", "feedback": "My team's feedback"},
+            format="json",
+        )
+
+        # The other team's submission count is untouched by writes to this team.
+        assert MCPAnalyticsSubmission.objects.filter(team=self.other_team).count() == 2
+        assert MCPAnalyticsSubmission.objects.filter(team=self.team).count() == 1
+
+
+class TestMCPAnalyticsPersonalAPIKeyAccess(_MCPAnalyticsTeamScopedTestMixin, APIBaseTest):
+    """The submission endpoints are now reachable by programmatic callers (Personal API
+    Keys / OAuth) via the mcp_analytics scope — the previous INTERNAL lock blocked that
+    entirely. Pin the scope mapping: the right scope works, the wrong/missing scope 403s.
+    The default test client uses force_login and skips the scope check, so this must drive
+    a real PAK to exercise the production auth path.
+    """
+
+    def _auth_with_pak(self, scopes: list[str]) -> None:
+        key = self.create_personal_api_key_with_scopes(scopes)
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {key}")
+
+    def test_read_scope_can_list_submissions(self) -> None:
+        self._auth_with_pak(["mcp_analytics:read"])
+        response = self.client.get(f"/api/environments/{self.team.id}/mcp_analytics/feedback/")
+        assert response.status_code == status.HTTP_200_OK, response.content
+
+    def test_write_scope_can_create_submission(self) -> None:
+        self._auth_with_pak(["mcp_analytics:write"])
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/mcp_analytics/feedback/",
+            {"goal": "understand usage", "feedback": "Need clearer results"},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.content
+
+    def test_read_scope_cannot_create_submission(self) -> None:
+        self._auth_with_pak(["mcp_analytics:read"])
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/mcp_analytics/feedback/",
+            {"goal": "understand usage", "feedback": "Need clearer results"},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN, response.content
+
+    @parameterized.expand(
+        [
+            ("list", "get", "feedback/", None),
+            (
+                "create",
+                "post",
+                "feedback/",
+                {"goal": "understand usage", "feedback": "Need clearer results"},
+            ),
+        ]
+    )
+    def test_missing_scope_is_forbidden(
+        self, _name: str, method: str, path: str, payload: dict[str, str] | None
+    ) -> None:
+        self._auth_with_pak(["insight:read"])
+        request = getattr(self.client, method)
+        response = request(f"/api/environments/{self.team.id}/mcp_analytics/{path}", payload, format="json")
+        assert response.status_code == status.HTTP_403_FORBIDDEN, response.content

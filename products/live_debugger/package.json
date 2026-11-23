@@ -1,0 +1,6 @@
+{
+    "name": "@posthog/products-live-debugger",
+    "scripts": {
+        "backend:test": "echo 'vestigial app — no tests'"
+    }
+}

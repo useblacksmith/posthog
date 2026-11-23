@@ -1,0 +1,1041 @@
+//! Internal batch flag evaluation endpoint for flag-driven static cohort generation.
+//!
+//! Django's `get_cohort_actors_for_feature_flag` Celery task drives this endpoint with
+//! strictly sequential, cursor-paged requests: each page scans a slice of a team's persons
+//! and evaluates a single (pinned-version) flag for every person, reusing the exact same
+//! `FeatureFlagMatcher` machinery as live `/flags` evaluation. The response carries the
+//! matched person UUIDs, which Django inserts into the static cohort.
+//!
+//! Deliberate differences from the live `/flags` pipeline:
+//! - Auth is the `INTERNAL_REQUEST_TOKEN` bearer token only — no SDK token, no team lookup
+//!   by token. The team is still loaded by id once per page to read its timezone and
+//!   property-matching version, matching live `/flags`.
+//! - The handler bypasses the `/flags` request pipeline entirely, so no billing or
+//!   flag-analytics counters are emitted, and dedicated `flags_batch_eval_*` ops metrics
+//!   track batch traffic. The per-person matcher still emits its own evaluation metrics
+//!   (`flags_evaluation_time`, dependency-graph build counters), which share the same
+//!   series as live `/flags`, so a large cohort run dominates those on its pod.
+//! - The matcher always runs with `skip_writes(true)`: experience-continuity hash key
+//!   overrides are read but never written.
+//! - The matcher compares dependency answers by match only for the target and for each
+//!   dependency that no evaluated flag reads by variant (`enabled_only_flag_keys`), because the
+//!   caller reads only the target's `enabled`.
+//! - Flags are always read fresh from Postgres (never the hypercache) so the
+//!   `expected_version` optimistic-lock check is meaningful.
+//!
+//! The paged scan walks `posthog_person.id` ascending across a live table, so the run sees
+//! a moving snapshot rather than a point-in-time one: persons inserted above the current
+//! cursor mid-run are included, persons inserted below it (or deleted) are not. Flag
+//! definitions and property-matching semantics are pinned, but person membership is eventually
+//! consistent with the table at the time each page is scanned. This matches the existing
+//! cohort-generation contract (a later refresh reconciles drift).
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use axum::{
+    body::Body,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use common_database::PostgresReader;
+use common_metrics::inc;
+use common_types::PersonId;
+use serde::{Deserialize, Serialize};
+use sqlx::{Acquire, FromRow};
+use tracing::warn;
+use uuid::Uuid;
+
+use crate::{
+    api::{
+        errors::{FlagError, CODE_DEPENDENCY_FAILED, CODE_FLAG_DATA_PARSING},
+        types::FlagsResponse,
+    },
+    database::{get_connection_with_metrics, PostgresRouter},
+    flags::{
+        cache_builder::compute_flag_dependencies_or_single_stage,
+        feature_flag_list::PreparedFlags,
+        flag_matching::FeatureFlagMatcher,
+        flag_models::{EvaluationMetadata, FeatureFlag, FeatureFlagId, FeatureFlagList},
+    },
+    handler::authentication::is_internal_request_inner,
+    metrics::consts::{
+        FLAG_BATCH_EVAL_PERSONS_COUNTER, FLAG_BATCH_EVAL_PERSON_RETRIES_COUNTER,
+        FLAG_BATCH_EVAL_REQUESTS_COUNTER, FLAG_BATCH_EVAL_TIME,
+    },
+    router,
+    team::team_models::{PropertyMatchingVersion, Team},
+};
+
+#[derive(Debug, Deserialize)]
+pub struct BatchFlagEvaluationRequest {
+    pub team_id: i32,
+    /// The project the flag belongs to. Accepted for contract parity with the Django
+    /// caller; flag lookup is team-scoped (matching live Rust evaluation), so this is
+    /// currently informational only.
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    pub flag_key: String,
+    /// Optimistic-lock pin: the flag `version` Django read before starting the run.
+    /// Nullable versions coerce to 0 on both sides, so JSON `null` is accepted and
+    /// treated as 0.
+    #[serde(default)]
+    pub expected_version: Option<i32>,
+    /// Optimistic-lock pin for the team's property matching semantics.
+    #[serde(default)]
+    pub expected_property_matching_version: Option<i16>,
+    /// Exclusive lower bound on `posthog_person.id`; 0 (default) starts from the beginning.
+    #[serde(default)]
+    pub cursor: i64,
+    /// Page size; defaults to `DEFAULT_LIMIT` (1000), capped by `BATCH_FLAG_EVAL_MAX_LIMIT`.
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BatchFlagEvaluationResponse {
+    pub matched_person_uuids: Vec<Uuid>,
+    /// Cursor for the next page, or `None` when this page was the last one.
+    pub next_cursor: Option<i64>,
+    /// Number of persons in this page whose evaluation failed (they are skipped, not matched).
+    pub errors_count: u64,
+    /// Matching semantics used for this page.
+    pub property_matching_version: i16,
+}
+
+const DEFAULT_LIMIT: i64 = 1_000;
+
+/// A page evaluates its persons one at a time under `BATCH_FLAG_EVAL_TIMEOUT_MS`. A retry of a
+/// person that timed out waits on the persons DB a second time. The cap keeps a sustained stall
+/// from spending the page timeout on retries.
+const MAX_PERSON_RETRIES_PER_PAGE: u32 = 20;
+
+#[derive(Debug)]
+pub enum BatchFlagEvaluationError {
+    Unauthorized,
+    InvalidRequest(String),
+    PayloadTooLarge,
+    FlagNotFound,
+    FlagInactive,
+    GroupAggregatedFlag,
+    UnsupportedConfigFormat,
+    VersionConflict { expected: i32, actual: i32 },
+    PropertyMatchingVersionConflict { expected: i16, actual: i16 },
+    Upstream(FlagError),
+}
+
+impl BatchFlagEvaluationError {
+    fn outcome_label(&self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::InvalidRequest(_) => "invalid_request",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::FlagNotFound => "flag_not_found",
+            Self::FlagInactive => "flag_inactive",
+            Self::GroupAggregatedFlag => "group_aggregated_flag",
+            Self::UnsupportedConfigFormat => "unsupported_config_format",
+            Self::VersionConflict { .. } => "version_conflict",
+            Self::PropertyMatchingVersionConflict { .. } => "property_matching_version_conflict",
+            Self::Upstream(_) => "upstream_error",
+        }
+    }
+}
+
+impl IntoResponse for BatchFlagEvaluationError {
+    fn into_response(self) -> Response {
+        let (status, error, detail, actual_version, actual_property_matching_version) = match self {
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Missing or invalid internal request token".to_string(),
+                None,
+                None,
+            ),
+            Self::InvalidRequest(detail) => {
+                (StatusCode::BAD_REQUEST, "invalid_request", detail, None, None)
+            }
+            Self::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                format!("Request body exceeds the {MAX_BATCH_BODY_BYTES}-byte limit"),
+                None,
+                None,
+            ),
+            Self::FlagNotFound => (
+                StatusCode::NOT_FOUND,
+                "flag_not_found",
+                "No flag with this key exists for this team".to_string(),
+                None,
+                None,
+            ),
+            Self::FlagInactive => (
+                StatusCode::BAD_REQUEST,
+                "flag_inactive",
+                "Flag is not active".to_string(),
+                None,
+                None,
+            ),
+            Self::GroupAggregatedFlag => (
+                StatusCode::BAD_REQUEST,
+                "group_aggregated_flag",
+                "Group-aggregated flags are not supported for batch evaluation".to_string(),
+                None,
+                None,
+            ),
+            Self::UnsupportedConfigFormat => (
+                StatusCode::BAD_REQUEST,
+                "unsupported_config_format",
+                "Flag is stored in a configuration format this service does not evaluate".to_string(),
+                None,
+                None,
+            ),
+            Self::VersionConflict { expected, actual } => (
+                StatusCode::CONFLICT,
+                "version_conflict",
+                format!("Flag version is {actual}, expected {expected}; the flag changed during cohort generation"),
+                Some(actual),
+                None,
+            ),
+            Self::PropertyMatchingVersionConflict { expected, actual } => (
+                StatusCode::CONFLICT,
+                "property_matching_version_conflict",
+                format!(
+                    "Property matching version is {actual}, expected {expected}; matching semantics changed during cohort generation"
+                ),
+                None,
+                Some(actual),
+            ),
+            Self::Upstream(e) => {
+                // Delegate status selection to FlagError's own mapping, but keep the
+                // JSON envelope consistent with the other variants.
+                let status = StatusCode::from_u16(e.status_code())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                (status, "upstream_error", e.to_string(), None, None)
+            }
+        };
+
+        let mut body = serde_json::json!({ "error": error, "detail": detail });
+        if let Some(actual) = actual_version {
+            body["actual_version"] = serde_json::json!(actual);
+        }
+        if let Some(actual) = actual_property_matching_version {
+            body["actual_property_matching_version"] = serde_json::json!(actual);
+        }
+        (status, Json(body)).into_response()
+    }
+}
+
+/// One row from the person page scan: the person plus its deterministic
+/// (minimum `posthog_persondistinctid.id`) distinct_id, when one exists.
+#[derive(Debug, FromRow)]
+struct PersonScanRow {
+    id: PersonId,
+    uuid: Uuid,
+    distinct_id: Option<String>,
+}
+
+/// Scans one page of a team's persons in `id` order, attaching the distinct_id with the
+/// lowest `posthog_persondistinctid.id` (a deterministic choice). Persons with no
+/// distinct_ids come back with `distinct_id = NULL` and still advance the cursor, so a
+/// run of distinct_id-less persons cannot stall paging.
+async fn scan_persons_page(
+    reader: PostgresReader,
+    team_id: i32,
+    cursor: i64,
+    limit: i64,
+    statement_timeout_ms: u64,
+) -> Result<Vec<PersonScanRow>, FlagError> {
+    let mut conn =
+        get_connection_with_metrics(&reader, "persons_reader", "batch_eval_person_scan").await?;
+    let scan_failed = |e: sqlx::Error| {
+        warn!(team_id, cursor, "Batch eval person scan failed: {e}");
+        let message = format!("person scan query failed: {e}");
+        FlagError::internal(anyhow::Error::new(e).context(message))
+    };
+
+    // SET LOCAL lasts only until the transaction ends, so the connection goes back to the
+    // pool with the pool's statement timeout.
+    let mut tx = conn.begin().await.map_err(scan_failed)?;
+    // SET does not accept a bind parameter. The value is a u64, so it cannot inject SQL.
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = {statement_timeout_ms}"
+    ))
+    .execute(&mut *tx)
+    .await
+    .map_err(scan_failed)?;
+
+    // Sort-free PK range scan on the partitioned persons table; the lateral subquery is
+    // covered by the existing person_id index on posthog_persondistinctid.
+    let query = r#"
+        SELECT p.id, p.uuid, d.distinct_id
+        FROM posthog_person p
+        LEFT JOIN LATERAL (
+            SELECT pd.distinct_id
+            FROM posthog_persondistinctid pd
+            WHERE pd.person_id = p.id
+              AND pd.team_id = p.team_id
+              AND pd.is_deleted = false
+            ORDER BY pd.id
+            LIMIT 1
+        ) d ON true
+        WHERE p.team_id = $1
+          AND p.id > $2
+          AND p.is_deleted = false
+        ORDER BY p.id
+        LIMIT $3
+    "#;
+
+    let rows = sqlx::query_as::<_, PersonScanRow>(query)
+        .bind(team_id)
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(scan_failed)?;
+    tx.commit().await.map_err(scan_failed)?;
+    Ok(rows)
+}
+
+/// Fetches the team's flags fresh from Postgres and locates the target flag by key.
+/// Returns the full flag set (needed for flag-dependency evaluation) and the target's index.
+async fn fetch_flags_with_target(
+    client: PostgresReader,
+    team_id: i32,
+    flag_key: &str,
+) -> Result<(Vec<FeatureFlag>, usize), BatchFlagEvaluationError> {
+    let flags = FeatureFlagList::from_pg(client, team_id)
+        .await
+        .map_err(BatchFlagEvaluationError::Upstream)?;
+    let target_index = flags
+        .iter()
+        .position(|f| f.key == flag_key)
+        .ok_or(BatchFlagEvaluationError::FlagNotFound)?;
+    Ok((flags, target_index))
+}
+
+/// The request is a small JSON object (~200 bytes typical), so 64 KiB is generous
+/// while protecting against oversized payloads.
+pub const MAX_BATCH_BODY_BYTES: usize = 64 * 1024;
+
+pub async fn batch_flag_evaluation(
+    State(state): State<router::State>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<BatchFlagEvaluationResponse>, BatchFlagEvaluationError> {
+    let timer = common_metrics::timing_guard(FLAG_BATCH_EVAL_TIME, &[]);
+
+    // Authenticate before reading the body so unauthenticated clients cannot
+    // tie up resources by streaming large or slow request bodies.
+    if !is_internal_request_inner(state.config.internal_request_token.as_deref(), &headers) {
+        let outcome = "unauthorized";
+        inc(
+            FLAG_BATCH_EVAL_REQUESTS_COUNTER,
+            &[("outcome".to_string(), outcome.to_string())],
+            1,
+        );
+        timer.label("outcome", outcome).fin();
+        return Err(BatchFlagEvaluationError::Unauthorized);
+    }
+
+    let result = match axum::body::to_bytes(body, MAX_BATCH_BODY_BYTES).await {
+        Ok(body_bytes) => handle_batch_flag_evaluation(&state, &body_bytes).await,
+        // `to_bytes` wraps the underlying http_body_util error; walk the full source
+        // chain (not just the first level) to classify an oversized body as 413, the
+        // same way `body_read_metrics::record_body_read` does for `/flags`.
+        Err(e) => {
+            let too_large = std::iter::successors(std::error::Error::source(&e), |s| s.source())
+                .any(|s| s.is::<http_body_util::LengthLimitError>());
+            Err(if too_large {
+                BatchFlagEvaluationError::PayloadTooLarge
+            } else {
+                BatchFlagEvaluationError::InvalidRequest(format!("body read error: {e}"))
+            })
+        }
+    };
+
+    let outcome = match &result {
+        Ok(_) => "success",
+        Err(e) => e.outcome_label(),
+    };
+    inc(
+        FLAG_BATCH_EVAL_REQUESTS_COUNTER,
+        &[("outcome".to_string(), outcome.to_string())],
+        1,
+    );
+    timer.label("outcome", outcome).fin();
+
+    result.map(Json)
+}
+
+/// Keys of the flags the matcher compares by match only: the target, and each of its dependencies
+/// that no evaluated flag reads by variant. A person joins the cohort on the target's `enabled`
+/// alone. A dependency that only `true` or `false` filters read cannot change that through its
+/// variant.
+fn enabled_only_flag_keys(
+    flags: &[FeatureFlag],
+    target_id: FeatureFlagId,
+    evaluation_metadata: &EvaluationMetadata,
+) -> HashSet<String> {
+    let dependency_ids = evaluation_metadata.transitive_deps.get(&target_id);
+    let evaluated: Vec<&FeatureFlag> = flags
+        .iter()
+        .filter(|flag| {
+            flag.id == target_id || dependency_ids.is_some_and(|ids| ids.contains(&flag.id))
+        })
+        .collect();
+    let read_by_variant: HashSet<FeatureFlagId> = evaluated
+        .iter()
+        .flat_map(|flag| flag.filters.flag_ids_read_by_variant())
+        .collect();
+    evaluated
+        .into_iter()
+        .filter(|flag| !read_by_variant.contains(&flag.id))
+        .map(|flag| flag.key.clone())
+        .collect()
+}
+
+fn failure_code(result: &Result<FlagsResponse, FlagError>, target_key: &str) -> Option<String> {
+    let response = match result {
+        Ok(response) => response,
+        Err(e) => return Some(e.evaluation_error_code()),
+    };
+    let target = response
+        .flags
+        .get(target_key)
+        .filter(|details| details.failed)?;
+    // `dependency_failed` does not say whether a retry can help, so report the code of a failed
+    // dependency. The request names only the target, so the other flags in the response are its
+    // dependencies. A retry helps only when no dependency failed permanently. Dependents of a flag
+    // with an unsupported format read it as false, so that failure cannot fail the target.
+    if target.reason.code == CODE_DEPENDENCY_FAILED {
+        let root_codes: Vec<&str> = response
+            .flags
+            .values()
+            .filter(|details| details.failed)
+            .map(|details| details.reason.code.as_str())
+            .filter(|code| *code != CODE_DEPENDENCY_FAILED && *code != CODE_FLAG_DATA_PARSING)
+            .collect();
+        if let Some(code) = root_codes
+            .iter()
+            .find(|code| !is_transient_failure(code))
+            .or(root_codes.first())
+        {
+            return Some(code.to_string());
+        }
+    }
+    Some(target.reason.code.clone())
+}
+
+/// Whether a failure code comes from a transient database fault or a timeout, which a second
+/// evaluation can fix. Other failures, such as a missing dependency, an unsupported filter, or a
+/// `database_error` from a query that cannot succeed, fail the same way on every attempt. An
+/// unknown code gets no retry, so a new kind of failure cannot double the load on the persons
+/// pools.
+fn is_transient_failure(code: &str) -> bool {
+    code.starts_with("timeout")
+        || matches!(
+            code,
+            "database_unavailable"
+                | "no_more_connections"
+                | "query_wait_timeout"
+                | "hash_key_override_error"
+        )
+}
+
+/// Evaluates a person a second time when the first evaluation fails with a transient code. The
+/// persons pools size their timeouts for /flags. Django leaves a failed person out of the cohort.
+/// Each retry uses one unit of `retries_left`. When the budget is empty, a failed person gets no
+/// second attempt, so a degraded replica cannot double the queries of a whole page.
+async fn evaluate_with_one_retry<F, Fut>(
+    target_key: &str,
+    retries_left: &mut u32,
+    mut evaluate: F,
+) -> Result<FlagsResponse, FlagError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<FlagsResponse, FlagError>>,
+{
+    let first = evaluate().await;
+    if *retries_left == 0
+        || !failure_code(&first, target_key).is_some_and(|code| is_transient_failure(&code))
+    {
+        return first;
+    }
+    *retries_left -= 1;
+
+    let second = evaluate().await;
+    let outcome = if failure_code(&second, target_key).is_some() {
+        "failed"
+    } else {
+        "recovered"
+    };
+    inc(
+        FLAG_BATCH_EVAL_PERSON_RETRIES_COUNTER,
+        &[("outcome".to_string(), outcome.to_string())],
+        1,
+    );
+    second
+}
+
+async fn handle_batch_flag_evaluation(
+    state: &router::State,
+    body: &[u8],
+) -> Result<BatchFlagEvaluationResponse, BatchFlagEvaluationError> {
+    let request: BatchFlagEvaluationRequest = serde_json::from_slice(body)
+        .map_err(|e| BatchFlagEvaluationError::InvalidRequest(format!("invalid JSON body: {e}")))?;
+
+    let max_limit = state.config.batch_flag_eval_max_limit;
+    let limit = request.limit.unwrap_or(DEFAULT_LIMIT.min(max_limit));
+    if limit < 1 || limit > max_limit {
+        return Err(BatchFlagEvaluationError::InvalidRequest(format!(
+            "limit must be between 1 and {max_limit}"
+        )));
+    }
+    if request.flag_key.is_empty() {
+        return Err(BatchFlagEvaluationError::InvalidRequest(
+            "flag_key must not be empty".to_string(),
+        ));
+    }
+    if request.cursor < 0 {
+        return Err(BatchFlagEvaluationError::InvalidRequest(
+            "cursor must not be negative".to_string(),
+        ));
+    }
+
+    // Read the flag set from the replica first; on a version mismatch, re-fetch from the
+    // primary to rule out replica lag before declaring a conflict. No evaluation happens
+    // under the wrong version.
+    let (mut flags_vec, mut target_index) = fetch_flags_with_target(
+        state.database_pools.non_persons_reader.clone(),
+        request.team_id,
+        &request.flag_key,
+    )
+    .await?;
+
+    let expected_version = request.expected_version.unwrap_or(0);
+    if flags_vec[target_index].version.unwrap_or(0) != expected_version {
+        (flags_vec, target_index) = fetch_flags_with_target(
+            state.database_pools.non_persons_writer.clone(),
+            request.team_id,
+            &request.flag_key,
+        )
+        .await?;
+        let actual = flags_vec[target_index].version.unwrap_or(0);
+        if actual != expected_version {
+            return Err(BatchFlagEvaluationError::VersionConflict {
+                expected: expected_version,
+                actual,
+            });
+        }
+    }
+
+    let target = &flags_vec[target_index];
+    // The Django caller already returns [] for group-aggregated and inactive flags
+    // without calling us; those two guards are defensive. The format check is not: nothing
+    // upstream filters a non-v1 stored config.
+    target
+        .filters
+        .require_v1()
+        .map_err(|_| BatchFlagEvaluationError::UnsupportedConfigFormat)?;
+    if target.get_group_type_index().is_some() {
+        return Err(BatchFlagEvaluationError::GroupAggregatedFlag);
+    }
+    if !target.active {
+        return Err(BatchFlagEvaluationError::FlagInactive);
+    }
+    let target_key = target.key.clone();
+
+    let expected_property_matching_version = request
+        .expected_property_matching_version
+        .unwrap_or(PropertyMatchingVersion::LEGACY.0);
+    let mut team = Team::from_pg_by_id(
+        state.database_pools.non_persons_reader.clone(),
+        request.team_id,
+    )
+    .await
+    .map_err(BatchFlagEvaluationError::Upstream)?;
+    if team.property_matching_version.0 != expected_property_matching_version {
+        team = Team::from_pg_by_id(
+            state.database_pools.non_persons_writer.clone(),
+            request.team_id,
+        )
+        .await
+        .map_err(BatchFlagEvaluationError::Upstream)?;
+        if team.property_matching_version.0 != expected_property_matching_version {
+            return Err(BatchFlagEvaluationError::PropertyMatchingVersionConflict {
+                expected: expected_property_matching_version,
+                actual: team.property_matching_version.0,
+            });
+        }
+    }
+
+    // Mirror the live pipeline's exclusion of inactive flags so dependency conditions on
+    // them pre-seed as false instead of evaluating.
+    let filtered_out_flag_ids: HashSet<i32> = flags_vec
+        .iter()
+        .filter(|f| !f.active)
+        .map(|f| f.id)
+        .collect();
+
+    let evaluation_metadata =
+        compute_flag_dependencies_or_single_stage(request.team_id, &flags_vec);
+    let enabled_only_flag_keys =
+        enabled_only_flag_keys(&flags_vec, flags_vec[target_index].id, &evaluation_metadata);
+
+    let flag_list = FeatureFlagList {
+        flags: PreparedFlags::seal(flags_vec),
+        filtered_out_flag_ids,
+        evaluation_metadata: Arc::new(evaluation_metadata),
+        cohorts: None,
+    };
+
+    // The service exposes no dedicated non-critical persons pool, so the scan shares the
+    // live persons reader.
+    let rows = scan_persons_page(
+        state.database_pools.persons_reader.clone(),
+        request.team_id,
+        request.cursor,
+        limit,
+        state.config.batch_flag_eval_scan_statement_timeout_ms,
+    )
+    .await
+    .map_err(BatchFlagEvaluationError::Upstream)?;
+
+    let next_cursor = if rows.len() as i64 == limit {
+        rows.last().map(|r| r.id)
+    } else {
+        None
+    };
+
+    let pg_router = PostgresRouter::new(
+        state.database_pools.persons_reader.clone(),
+        state.database_pools.persons_writer.clone(),
+        state.database_pools.non_persons_reader.clone(),
+        state.database_pools.non_persons_writer.clone(),
+    );
+    let enable_realtime_cohort_evaluation =
+        team.evaluates_realtime_cohorts(&state.config.realtime_cohort_evaluation_team_ids);
+    let use_explicit_exact_matching = team.property_matching_version.uses_explicit_matching();
+    let team_timezone = team.parsed_timezone();
+    let optimize_experience_continuity_lookups =
+        state.config.optimize_experience_continuity_lookups.0;
+
+    let mut matched_person_uuids: Vec<Uuid> = Vec::new();
+    let mut errors_count: u64 = 0;
+    let mut retries_left = MAX_PERSON_RETRIES_PER_PAGE;
+
+    for row in rows {
+        // Persons with zero distinct_ids (almost-deleted) are skipped.
+        let Some(distinct_id) = row.distinct_id else {
+            record_person_outcome("skipped_no_distinct_id");
+            continue;
+        };
+
+        let evaluate = || {
+            // Per-evaluation so each one is independently traceable in canonical logs.
+            let request_id = Uuid::new_v4();
+
+            let mut matcher = FeatureFlagMatcher::new(
+                distinct_id.clone(),
+                None,
+                request.team_id,
+                pg_router.clone(),
+                state.cohort_cache_manager.clone(),
+                state.group_type_cache_manager.clone(),
+                None,
+            )
+            .with_cohort_membership_provider(state.cohort_membership_provider.clone())
+            .with_realtime_cohort_evaluation(enable_realtime_cohort_evaluation)
+            .with_explicit_exact_matching(use_explicit_exact_matching)
+            .with_membership_stamp_policy(state.config.realtime_cohort_membership_stamp_policy)
+            .with_rayon_dispatcher(state.rayon_dispatcher.clone())
+            .with_parallel_eval_threshold(state.config.parallel_eval_threshold)
+            // Read-only: experience-continuity overrides are consulted but never written.
+            .with_skip_writes(true)
+            .with_enabled_only_flag_keys(enabled_only_flag_keys.clone())
+            .with_timezone(team_timezone)
+            // The deadline starts when the matcher is built. Building the matcher in this
+            // closure gives the retry in `evaluate_with_one_retry` its own deadline.
+            .with_persons_db_deadline(
+                state
+                    .config
+                    .persons_db_deadline(tokio::time::Instant::now(), None)
+                    .map(|deadline| deadline.at),
+            );
+
+            let flag_list = flag_list.clone();
+            let target_key = target_key.clone();
+            async move {
+                matcher
+                    .evaluate_all_feature_flags(
+                        flag_list,
+                        None,
+                        None,
+                        None,
+                        request_id,
+                        Some(vec![target_key]),
+                        optimize_experience_continuity_lookups,
+                    )
+                    .await
+            }
+        };
+        let evaluation = evaluate_with_one_retry(&target_key, &mut retries_left, evaluate).await;
+
+        match evaluation {
+            Ok(response) => match response.flags.get(&target_key) {
+                Some(details) if details.failed => {
+                    errors_count += 1;
+                    record_person_outcome("error");
+                }
+                Some(details) if details.enabled => {
+                    matched_person_uuids.push(row.uuid);
+                    record_person_outcome("matched");
+                }
+                Some(_) => record_person_outcome("not_matched"),
+                None => {
+                    warn!(
+                        team_id = request.team_id,
+                        flag_key = %target_key,
+                        person_uuid = %row.uuid,
+                        "Batch eval response missing the target flag"
+                    );
+                    errors_count += 1;
+                    record_person_outcome("error");
+                }
+            },
+            Err(e) => {
+                warn!(
+                    team_id = request.team_id,
+                    flag_key = %target_key,
+                    person_uuid = %row.uuid,
+                    "Batch eval failed for person: {e}"
+                );
+                errors_count += 1;
+                record_person_outcome("error");
+            }
+        }
+    }
+
+    Ok(BatchFlagEvaluationResponse {
+        matched_person_uuids,
+        next_cursor,
+        errors_count,
+        property_matching_version: team.property_matching_version.0,
+    })
+}
+
+fn record_person_outcome(result: &str) {
+    inc(
+        FLAG_BATCH_EVAL_PERSONS_COUNTER,
+        &[("result".to_string(), result.to_string())],
+        1,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::types::{FlagDetails, FromFeatureAndMatch};
+    use crate::config::DEFAULT_TEST_CONFIG;
+    use crate::flags::config_format::decode_filters;
+    use crate::flags::flag_match_reason::FeatureFlagMatchReason;
+    use crate::flags::flag_matching::FeatureFlagMatch;
+    use crate::mock;
+    use crate::utils::graph_utils::DependencyType;
+    use crate::utils::test_utils::{counter_total, TestContext};
+    use common_database::{get_pool_with_config, PoolConfig};
+    use metrics_util::debugging::DebuggingRecorder;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn enabled_only_flag_keys_skip_dependencies_read_by_variant() {
+        let flag = |id: i32, key: &str, properties: Value| {
+            mock!(FeatureFlag,
+                id: id,
+                key: key.to_string(),
+                filters: decode_filters(json!({"groups": [{"properties": properties}]})).unwrap()
+            )
+        };
+        let reads = |flag_id: i32, value: Value| json!({"key": flag_id.to_string(), "type": "flag", "value": value, "operator": "flag_evaluates_to"});
+        let flags = vec![
+            flag(1, "failed", json!([])),
+            flag(2, "read_by_match", json!([reads(1, json!(true))])),
+            flag(3, "read_by_variant", json!([reads(1, json!(true))])),
+            flag(
+                4,
+                "target",
+                json!([reads(2, json!(true)), reads(3, json!("control"))]),
+            ),
+            flag(5, "unrelated", json!([])),
+        ];
+        let metadata = compute_flag_dependencies_or_single_stage(1, &flags);
+
+        assert_eq!(
+            enabled_only_flag_keys(&flags, 4, &metadata),
+            HashSet::from(["failed", "read_by_match", "target"].map(String::from))
+        );
+    }
+
+    fn target_flag_response(details: FlagDetails) -> Result<FlagsResponse, FlagError> {
+        Ok(FlagsResponse::new(
+            false,
+            HashMap::from([("target".to_string(), details)]),
+            None,
+            Uuid::nil(),
+        ))
+    }
+
+    fn failed_target_flag(error: FlagError) -> Result<FlagsResponse, FlagError> {
+        let flag = mock!(FeatureFlag, key: "target".to_string());
+        target_flag_response(FlagDetails::create_error(&flag, &error, None))
+    }
+
+    fn target_with_failed_dependencies(errors: &[FlagError]) -> Result<FlagsResponse, FlagError> {
+        let target = mock!(FeatureFlag, key: "target".to_string());
+        let mut flags = HashMap::from([(
+            "target".to_string(),
+            FlagDetails::create_error(&target, &FlagError::DependencyFailed(2), None),
+        )]);
+        for (dependency_id, error) in (2..).zip(errors) {
+            let key = format!("dependency_{dependency_id}");
+            let dependency = mock!(FeatureFlag, id: dependency_id, key: key.clone());
+            flags.insert(key, FlagDetails::create_error(&dependency, error, None));
+        }
+        let healthy = mock!(FeatureFlag, id: 99, key: "healthy_dependency".to_string());
+        flags.insert(
+            "healthy_dependency".to_string(),
+            FlagDetails::create(
+                &healthy,
+                &FeatureFlagMatch {
+                    matches: false,
+                    variant: None,
+                    reason: FeatureFlagMatchReason::NoConditionMatch,
+                    condition_index: None,
+                    payload: None,
+                    evaluation_v2: None,
+                },
+            ),
+        );
+        Ok(FlagsResponse::new(true, flags, None, Uuid::nil()))
+    }
+
+    fn evaluated() -> Result<FlagsResponse, FlagError> {
+        let flag = mock!(FeatureFlag, key: "target".to_string());
+        target_flag_response(FlagDetails::create(
+            &flag,
+            &FeatureFlagMatch {
+                matches: false,
+                variant: None,
+                reason: FeatureFlagMatchReason::NoConditionMatch,
+                condition_index: None,
+                payload: None,
+                evaluation_v2: None,
+            },
+        ))
+    }
+
+    fn database_unavailable() -> Result<FlagsResponse, FlagError> {
+        Err(FlagError::DatabaseUnavailable)
+    }
+
+    #[rstest::rstest]
+    #[case::error(database_unavailable, evaluated, 1, false, Some("recovered"))]
+    #[case::transient_failed_flag(
+        || failed_target_flag(FlagError::DatabaseUnavailable),
+        evaluated,
+        1,
+        false,
+        Some("recovered")
+    )]
+    #[case::timeout_error(
+        || Err(FlagError::TimeoutError(Some("query_canceled".to_string()))),
+        evaluated,
+        1,
+        false,
+        Some("recovered")
+    )]
+    #[case::timeout_failed_flag(
+        || failed_target_flag(FlagError::TimeoutError(None)),
+        evaluated,
+        1,
+        false,
+        Some("recovered")
+    )]
+    #[case::missing_dependency_flag(
+        || failed_target_flag(FlagError::DependencyNotFound(DependencyType::Cohort, 1)),
+        evaluated,
+        1,
+        true,
+        None
+    )]
+    #[case::transient_failure_in_dependency(
+        || target_with_failed_dependencies(&[FlagError::TimeoutError(Some("pool_timeout".to_string()))]),
+        evaluated,
+        1,
+        false,
+        Some("recovered")
+    )]
+    #[case::permanent_failure_in_dependency(
+        || target_with_failed_dependencies(&[FlagError::DependencyNotFound(DependencyType::Cohort, 1)]),
+        evaluated,
+        1,
+        true,
+        None
+    )]
+    #[case::transient_and_permanent_failures_in_dependencies(
+        || target_with_failed_dependencies(&[
+            FlagError::TimeoutError(Some("pool_timeout".to_string())),
+            FlagError::DependencyNotFound(DependencyType::Cohort, 1),
+        ]),
+        evaluated,
+        1,
+        true,
+        None
+    )]
+    #[case::transient_failure_beside_unsupported_dependency(
+        || target_with_failed_dependencies(&[
+            FlagError::TimeoutError(Some("pool_timeout".to_string())),
+            FlagError::flag_data_parsing("unsupported feature flag configuration format"),
+        ]),
+        evaluated,
+        1,
+        false,
+        Some("recovered")
+    )]
+    #[case::database_error(
+        || Err(FlagError::DatabaseError(sqlx::Error::ColumnNotFound("id".to_string()), None)),
+        evaluated,
+        1,
+        true,
+        None
+    )]
+    #[case::evaluated(evaluated, evaluated, 1, false, None)]
+    #[case::retry_fails(database_unavailable, database_unavailable, 1, true, Some("failed"))]
+    #[case::budget_spent(database_unavailable, evaluated, 0, true, None)]
+    #[tokio::test]
+    async fn test_evaluate_with_one_retry(
+        #[case] first_attempt: fn() -> Result<FlagsResponse, FlagError>,
+        #[case] second_attempt: fn() -> Result<FlagsResponse, FlagError>,
+        #[case] retry_budget: u32,
+        #[case] expected_failed: bool,
+        #[case] expected_outcome: Option<&str>,
+    ) {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let attempts = AtomicUsize::new(0);
+        let mut retries_left = retry_budget;
+
+        let result = evaluate_with_one_retry("target", &mut retries_left, || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    first_attempt()
+                } else {
+                    second_attempt()
+                }
+            }
+        })
+        .await;
+
+        let attempts = attempts.load(Ordering::SeqCst);
+        assert_eq!(attempts, 1 + usize::from(expected_outcome.is_some()));
+        assert_eq!(retries_left, retry_budget + 1 - attempts as u32);
+        let failed = match result {
+            Ok(response) => response.flags["target"].failed,
+            Err(_) => true,
+        };
+        assert_eq!(failed, expected_failed);
+        for outcome in ["recovered", "failed"] {
+            assert_eq!(
+                counter_total(
+                    &snapshotter,
+                    FLAG_BATCH_EVAL_PERSON_RETRIES_COUNTER,
+                    &[("outcome", outcome)]
+                ),
+                u64::from(expected_outcome == Some(outcome)),
+                "{outcome}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_person_scan_outlasts_the_pool_statement_timeout() {
+        let context = TestContext::new(None).await;
+        let team = context.insert_new_team(None).await.unwrap();
+        context
+            .insert_person(team.id, "user".to_string(), None)
+            .await
+            .unwrap();
+
+        let reader: PostgresReader = Arc::new(
+            get_pool_with_config(
+                &DEFAULT_TEST_CONFIG.get_persons_read_database_url(),
+                PoolConfig {
+                    statement_timeout_ms: Some(100),
+                    max_connections: 1,
+                    ..PoolConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        let mut lock_conn = context.persons_writer.get_connection().await.unwrap();
+        let mut lock_tx = lock_conn.begin().await.unwrap();
+        sqlx::query("LOCK TABLE posthog_person IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock_tx)
+            .await
+            .unwrap();
+
+        let scan = tokio::spawn(scan_persons_page(reader.clone(), team.id, 0, 10, 10_000));
+
+        // Release the lock only after the scan query waits on it. Otherwise the scan can start
+        // after the rollback and pass without the SET LOCAL timeout.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            // pg_stat_activity keeps one snapshot for the whole transaction, so clear it
+            // before each read.
+            sqlx::query("SELECT pg_stat_clear_snapshot()")
+                .execute(&mut *lock_tx)
+                .await
+                .unwrap();
+            let scan_blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM pg_stat_activity
+                    WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))
+                      AND query LIKE '%JOIN LATERAL%'
+                )",
+            )
+            .fetch_one(&mut *lock_tx)
+            .await
+            .unwrap();
+            if scan_blocked {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the person scan never waited on the table lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Hold the lock for longer than the pool's 100ms statement timeout.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        lock_tx.rollback().await.unwrap();
+
+        let rows = scan.await.unwrap().unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // The pool has one connection, so this acquire returns the connection the scan used.
+        let mut conn = reader.get_connection().await.unwrap();
+        let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(statement_timeout, "100ms");
+    }
+}

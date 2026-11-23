@@ -1,0 +1,1215 @@
+from __future__ import annotations
+
+import re
+import json
+import hashlib
+import logging
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+from django.db import IntegrityError, transaction
+from django.utils import timezone
+
+import yaml
+
+from posthog.models.team.team import Team
+
+from products.signals.backend.models import SignalScoutConfig
+from products.signals.backend.scout_harness.deprecation import (
+    DEPRECATION_METADATA_KEY,
+    ScoutDeprecation,
+    ScoutDeprecationParseError,
+    deprecation_metadata_of,
+    parse_scout_deprecation,
+    retire_scout_configs,
+)
+from products.signals.backend.scout_harness.skill_loader import SIGNALS_SCOUT_SKILL_PREFIX
+from products.signals.backend.scout_harness.tags import slugify_tag
+from products.skills.backend.models.skills import LLMSkill, LLMSkillFile
+
+logger = logging.getLogger(__name__)
+
+# Canonical signals-scout-* skills live on disk under `products/signals/skills/` so they're
+# usable both as in-repo packaged skills (consumed by `hogli build:skills` for the AI plugin
+# and shipped via the dist/skills.zip release) and seeded into each team's LLMSkill namespace
+# by the headless harness. Single source of truth, two distribution paths.
+_SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
+
+# Companion canonical skills seeded per-team alongside the scout fleet. Not scouts — their
+# names don't carry the `signals-scout-` prefix, so the harness glob, `register_missing_configs`,
+# and the prune pass all ignore their rows — but agents that work on a team's fleet through the
+# skills store (e.g. the wizard's self-driving tailoring step reading the authoring guide
+# via `llma-skill-get`) can only see per-team rows, so the guide has to be mirrored like the
+# fleet is. Same divergence-aware sync; one caveat: removing a name from this tuple strands its
+# existing per-team rows (prune only reaps `signals-scout-*` rows), so retiring a companion
+# means cleaning up its rows out-of-band.
+_COMPANION_SKILL_DIRS = ("authoring-scouts",)
+
+# Companions that another product ships and maintains, seeded on the same terms as the ones above.
+# A scout is exactly the agent the companion rule is written for: it reads skills through
+# `llma-skill-get`, which only sees per-team rows, so a skill that lives solely in
+# `dist/skills.zip` is unreachable from a run no matter what the scout's prompt says. The
+# alternative — each product bundling a private copy onto every scout it creates — freezes the
+# copy at creation, so an edit to the source never reaches a scout already in rotation.
+# Cross-product by file path, not by import: the harness reads the markdown and never imports the
+# owning product. The stranding caveat above applies here too.
+_PRODUCTS_DIR = Path(__file__).resolve().parents[3]
+_EXTERNAL_COMPANION_SKILL_DIRS = (_PRODUCTS_DIR / "replay_vision" / "skills" / "exploring-replay-vision-observations",)
+
+# Mirrors the regex in `products/posthog_ai/scripts/build_skills/frontmatter.py` so frontmatter parsing
+# stays consistent across the two consumers. Keep these in sync if the skill spec evolves.
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+# Bundled subdirs walked recursively. Kept in lockstep with `_ALLOWED_SUBDIRS` in
+# `products/posthog_ai/scripts/build_skills/source_files.py` — diverging here means a file format
+# `hogli build:skills` ignores would silently land in the team's `LLMSkillFile` rows
+# (or vice versa). The agentskills.io spec also defines `assets/`; if we ever want to
+# support binary attachments, add to both consumers in the same change.
+_ALLOWED_BUNDLE_SUBDIRS = ("references", "scripts")
+_BYTECODE_CACHE_DIR = "__pycache__"
+# Mirror the per-skill contract limits enforced by the REST API at
+# `products/skills/backend/api/skill_services.py` (`MAX_SKILL_*`). The seed
+# bypasses the service layer (no "create from scratch with files" helper exists), so
+# these are inlined and checked at parse time. Inlined rather than imported because
+# `skill_services.py` pulls in Django app surface that triggers a circular import
+# from this module's call sites. Keep the values in sync with skill_services.py.
+_MAX_SKILL_BODY_BYTES = 1_000_000
+_MAX_SKILL_FILE_BYTES = 1_000_000
+_MAX_SKILL_FILE_COUNT = 200
+# Matches `LLMSkillFile.path` model `max_length` — checked at parse time so an oversized
+# canonical path fails with a clear error instead of a Postgres `value too long` DataError.
+_MAX_SKILL_FILE_PATH_LENGTH = 500
+
+# Stamped on `LLMSkill.metadata.seeded_by` for every harness-managed scout row. Its presence
+# is the single source of truth for "the harness owns this row": it gates which rows
+# `sync_canonical_skills` may update/prune, AND it's what distinguishes a canonical scout
+# (shipped in products/signals/skills, seeded here) from a team's hand-authored scout when
+# classifying a config's origin downstream. Keep reads of it pointed at this constant.
+HARNESS_SEEDED_BY = "signals_scout_harness"
+
+# Stamped on `LLMSkill.category` for every scout row so the skills surface can group scouts into
+# their own tab without knowing anything about the `signals-scout-*` naming convention. The skills
+# product treats `category` as an opaque string; this is the value the harness writes.
+SCOUT_SKILL_CATEGORY = "scout"
+
+ScoutRole = Literal["specialist", "operational"]
+
+SCOUT_ROLE_SPECIALIST: ScoutRole = "specialist"
+SCOUT_ROLE_OPERATIONAL: ScoutRole = "operational"
+SCOUT_ROLES: tuple[ScoutRole, ...] = (SCOUT_ROLE_SPECIALIST, SCOUT_ROLE_OPERATIONAL)
+
+
+@dataclass(frozen=True)
+class CanonicalSkillFile:
+    path: str
+    content: str
+    content_type: str = "text/plain"
+
+
+@dataclass(frozen=True)
+class CanonicalSkill:
+    """A canonical `signals-scout-*` skill discovered from `products/signals/skills/`.
+
+    `name` and `description` come from SKILL.md frontmatter. `body` is the markdown after the
+    frontmatter. `allowed_tools` is optional in frontmatter — defaults to empty (no narrowing).
+    The agentskills.io spec uses `allowed-tools` (hyphen); we accept both, preferring the
+    spec form. `files` is the recursive content of the `_ALLOWED_BUNDLE_SUBDIRS` directories
+    alongside SKILL.md. `config_tags` is the optional `scout-tags` frontmatter list, seeded onto
+    the scout's `SignalScoutConfig` when that row is first created. `role` is the optional
+    `scout-role` frontmatter value — what the harness is allowed to do to the scout.
+    `display_name` is the optional `scout-display-name` frontmatter value, the label the fleet
+    ships the scout under. `deprecation` is the optional retirement marker from `scout-status` /
+    `scout-deprecation`, set only on a scout PostHog is retiring.
+    `structured_output_schema` is the record contract a measurement scout ships, read from the
+    bundled file `scout-structured-output-schema` names. `precheck_query` is the optional
+    `scout-precheck-query` frontmatter value, the pre-check a scheduled run uses when the team set
+    none of its own.
+    """
+
+    name: str
+    description: str
+    body: str
+    allowed_tools: tuple[str, ...]
+    files: tuple[CanonicalSkillFile, ...]
+    source_path: Path
+    config_tags: tuple[str, ...] = ()
+    role: ScoutRole = SCOUT_ROLE_SPECIALIST
+    display_name: str = ""
+    deprecation: ScoutDeprecation | None = None
+    structured_output_schema: dict | None = None
+    precheck_query: str | None = None
+    preserve_trial_model: bool = False
+
+
+@dataclass(frozen=True)
+class SyncResult:
+    """Outcome of `sync_canonical_skills` for one team.
+
+    Each tuple lists the canonical skill names that fell into a particular branch:
+
+    - `created_skill_names`: rows that didn't exist on the team and were created from canonical.
+    - `updated_skill_names`: live rows whose stored hash matched their content (so the team had
+      not edited them) but whose content differed from the latest canonical — overwritten with
+      the latest canonical, version bumped, hash refreshed.
+    - `diverged_skill_names`: live rows we leave untouched — either a row we seeded whose
+      content hash no longer matches the stored `canonical_hash` (the team edited their copy),
+      or a row we never seeded (hand-authored, sharing a canonical name — no `seeded_by` tag).
+    - `tombstoned_skill_names`: rows that exist only as soft-deleted tombstones — the team
+      removed this skill from their rotation. Left untouched (no resurrection).
+    - `pruned_skill_names`: live `signals-scout-*` rows whose canonical skill was removed from
+      disk (no longer in the discovered fleet). Soft-deleted (`deleted=True`, `is_latest=False`)
+      so the coordinator stops dispatching a scout that's no longer part of the canonical fleet.
+      Unlike `tombstoned_skill_names` (a passive observation that the team already removed it),
+      this is an active reconciliation we perform.
+
+    A skill name appears in at most one tuple per call. `skipped_reason` is set when no per-skill
+    work was even attempted (e.g. the canonical dir is missing on disk in tests).
+
+    `retired_config_skill_names` is the one bucket that names configs rather than skill rows, and
+    a name may appear in it alongside `pruned_skill_names`: it lists the scouts whose
+    `SignalScoutConfig` this pass moved to a retired pause, so a scout that left the fleet leaves
+    no row that looks healthy and never runs.
+    """
+
+    created_skill_names: tuple[str, ...] = ()
+    updated_skill_names: tuple[str, ...] = ()
+    diverged_skill_names: tuple[str, ...] = ()
+    tombstoned_skill_names: tuple[str, ...] = ()
+    pruned_skill_names: tuple[str, ...] = ()
+    retired_config_skill_names: tuple[str, ...] = ()
+    skipped_reason: str | None = None
+
+
+# Backwards-compat alias. The first emit-only deploy returned `SeedResult`; downstream callers
+# may still import the old name. The new `SyncResult` is a strict superset (created_skill_names
+# + skipped_reason are present and behave the same), so the alias is safe.
+SeedResult = SyncResult
+
+
+class CanonicalSkillParseError(ValueError):
+    """A canonical SKILL.md on disk is malformed (missing frontmatter, bad YAML, etc.)."""
+
+
+def _parse_config_tags(frontmatter: dict, skill_file: Path, *, is_scout: bool) -> tuple[str, ...]:
+    """Read the optional `scout-tags` frontmatter list — the tags seeded onto the scout's config.
+
+    This is how a canonical scout claims a product surface's tag (e.g. `ai-observability`, which
+    is what puts a scout in AI observability's self-driving tab) without that product hardcoding
+    a skill name. Normalized through the same `slugify_tag` the config API uses, so a tag written
+    here means what a person typing it in the tag box would get, and bounded by the same caps —
+    a malformed value fails the parse rather than seeding a tag nobody can reproduce by hand.
+
+    Only scouts have a config to tag, so the key is rejected on a companion skill.
+    """
+    if "scout-tags" not in frontmatter:
+        return ()
+    if not is_scout:
+        raise CanonicalSkillParseError(f"Only a signals-scout-* skill may declare 'scout-tags': {skill_file}")
+    raw_tags = frontmatter["scout-tags"]
+    if not isinstance(raw_tags, list) or not all(isinstance(t, str) for t in raw_tags):
+        raise CanonicalSkillParseError(f"SKILL.md frontmatter 'scout-tags' must be a list of strings: {skill_file}")
+    tags: set[str] = set()
+    for raw in raw_tags:
+        tag = slugify_tag(raw)
+        if not tag:
+            raise CanonicalSkillParseError(
+                f"SKILL.md frontmatter tag {raw!r} is empty once normalized to a lowercase slug: {skill_file}"
+            )
+        if len(tag) > SignalScoutConfig.MAX_TAG_LENGTH:
+            raise CanonicalSkillParseError(
+                f"SKILL.md frontmatter tag {raw!r} is {len(tag)} characters once normalized, over the "
+                f"{SignalScoutConfig.MAX_TAG_LENGTH} limit: {skill_file}"
+            )
+        tags.add(tag)
+    # Counted after normalization, like the length cap above is measured on the slug: the cap is
+    # about what lands on the config, so spellings that collapse to one tag cost one tag.
+    if len(tags) > SignalScoutConfig.MAX_TAGS:
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter 'scout-tags' has {len(tags)} tags once normalized, over the "
+            f"{SignalScoutConfig.MAX_TAGS} limit: {skill_file}"
+        )
+    return tuple(sorted(tags))
+
+
+def _parse_scout_role(frontmatter: dict, skill_file: Path, *, is_scout: bool) -> ScoutRole:
+    """Read the optional `scout-role` frontmatter value — the posture the harness seeds the scout on.
+
+    A scout that watches the self-driving system itself declares `operational`, and the harness
+    stops treating its quiet as waste: it seeds enabled and exempt from the inactivity sweep, is
+    not gated by the launch allowlist, and is not blocked by the per-team cap. Everything else is
+    a `specialist` and keeps the normal posture, so the default is the safe one.
+
+    Only scouts have a config for the role to shape, so the key is rejected on a companion skill.
+    An unknown value fails the parse rather than falling back: a typo that silently downgraded an
+    operational scout to a specialist is exactly the silencing this role exists to prevent.
+    """
+    if "scout-role" not in frontmatter:
+        return SCOUT_ROLE_SPECIALIST
+    if not is_scout:
+        raise CanonicalSkillParseError(f"Only a signals-scout-* skill may declare 'scout-role': {skill_file}")
+    raw_role = frontmatter["scout-role"]
+    if raw_role == SCOUT_ROLE_OPERATIONAL:
+        return SCOUT_ROLE_OPERATIONAL
+    if raw_role == SCOUT_ROLE_SPECIALIST:
+        return SCOUT_ROLE_SPECIALIST
+    raise CanonicalSkillParseError(
+        f"SKILL.md frontmatter 'scout-role' must be one of {', '.join(SCOUT_ROLES)}: got {raw_role!r} in {skill_file}"
+    )
+
+
+def _parse_display_name(frontmatter: dict, skill_file: Path, *, is_scout: bool) -> str:
+    """Read the optional `scout-display-name` frontmatter value — the label the scout ships under.
+
+    A scout's skill name is a slug, and a slug sentence-cased at render time gets acronyms wrong:
+    `signals-scout-apm` reads as "Apm", `signals-scout-mcp-tool-calls` as "Mcp tool calls". Rather
+    than grow a table of capitalization fixes somewhere downstream, each canonical scout states its
+    own label here, and it is seeded onto the config's `display_name` where every surface already
+    reads it. Absent means the scout has no name of its own and clients derive one from the slug.
+
+    Only scouts have a config for the name to land on, so the key is rejected on a companion skill.
+    """
+    if "scout-display-name" not in frontmatter:
+        return ""
+    if not is_scout:
+        raise CanonicalSkillParseError(f"Only a signals-scout-* skill may declare 'scout-display-name': {skill_file}")
+    raw = frontmatter["scout-display-name"]
+    if not isinstance(raw, str) or not (display_name := raw.strip()):
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter 'scout-display-name' must be a non-empty string: {skill_file}"
+        )
+    if len(display_name) > SignalScoutConfig.MAX_DISPLAY_NAME_LENGTH:
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter 'scout-display-name' exceeds the "
+            f"{SignalScoutConfig.MAX_DISPLAY_NAME_LENGTH} character limit: {skill_file}"
+        )
+    return display_name
+
+
+def _parse_precheck_query(frontmatter: dict, skill_file: Path, *, is_scout: bool) -> str | None:
+    """Read the optional `scout-precheck-query` frontmatter value — the scout's default pre-check.
+
+    A scheduled run uses it when the team set no `precheck_query` of its own and did not turn the
+    pre-check off, and only for a team inside the skill's rollout (`precheck.resolve_effective_precheck`).
+    It is read from disk at evaluation time, not stamped on the config, so an edit reaches every
+    team on the next deploy. Validated here with the same parser the config API uses, so a broken
+    default fails the fleet sync once rather than erroring on every tick of every team.
+
+    Only scouts have a pre-check, so the key is rejected on a companion skill.
+    """
+    if "scout-precheck-query" not in frontmatter:
+        return None
+    if not is_scout:
+        raise CanonicalSkillParseError(f"Only a signals-scout-* skill may declare 'scout-precheck-query': {skill_file}")
+    raw = frontmatter["scout-precheck-query"]
+    if not isinstance(raw, str) or not (query := raw.strip()):
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter 'scout-precheck-query' must be a non-empty string: {skill_file}"
+        )
+    # Deferred: `precheck` reads the canonical default from this module.
+    from products.signals.backend.scout_harness.precheck import (  # noqa: PLC0415 — breaks a circular import
+        PRECHECK_MAX_QUERY_LENGTH,
+        parse_precheck_query,
+    )
+
+    if len(query) > PRECHECK_MAX_QUERY_LENGTH:
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter 'scout-precheck-query' exceeds the {PRECHECK_MAX_QUERY_LENGTH} "
+            f"character limit: {skill_file}"
+        )
+    try:
+        parse_precheck_query(query)
+    except Exception as error:
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter 'scout-precheck-query' is not a valid HogQL SELECT: {skill_file}: {error}"
+        ) from error
+    return query
+
+
+def _parse_structured_output_schema(
+    frontmatter: dict, files: list[CanonicalSkillFile], skill_file: Path, *, is_scout: bool
+) -> dict | None:
+    """Read the optional `scout-structured-output-schema` frontmatter value — the record contract
+    a measurement scout ships, seeded onto its config so the structured-output channel is on from
+    the first run.
+
+    The value names a bundled file rather than carrying the schema itself: a JSON Schema is a
+    document, not a frontmatter scalar. It is resolved against the already-read bundle, so the
+    schema file is read once, is covered by the same size and path caps as every other bundled
+    file, and cannot name anything outside `_ALLOWED_BUNDLE_SUBDIRS` — "not in the bundle" is the
+    one error, and there is no second path to keep in step with the first.
+
+    Being a bundled file also puts the schema in the content hash, so editing one bumps the skill
+    version and reaches each team's skill row like a body edit. That is the file, not the contract
+    the record endpoint enforces: that is the config column, seeded once and never overwritten (see
+    `config_registry.reconcile_canonical_structured_output_schemas`). A team already running the
+    scout keeps the schema it was seeded, so changing a shipped schema for existing teams needs a
+    migration rather than a frontmatter edit.
+
+    Validated here with the same `validate_structured_output_schema` the config API uses, so a
+    broken canonical schema fails the harness sync once rather than failing every run of the
+    scout on every team.
+
+    Only scouts have a config for the schema to land on, so the key is rejected on a companion
+    skill.
+    """
+    if "scout-structured-output-schema" not in frontmatter:
+        return None
+    if not is_scout:
+        raise CanonicalSkillParseError(
+            f"Only a signals-scout-* skill may declare 'scout-structured-output-schema': {skill_file}"
+        )
+    raw = frontmatter["scout-structured-output-schema"]
+    if not isinstance(raw, str) or not (rel_path := raw.strip()):
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter 'scout-structured-output-schema' must be a non-empty string: {skill_file}"
+        )
+    bundled = next((f for f in files if f.path == rel_path), None)
+    if bundled is None:
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter 'scout-structured-output-schema' must name a bundled file under "
+            f"{', '.join(f'{subdir}/' for subdir in _ALLOWED_BUNDLE_SUBDIRS)} so the schema rides in "
+            f"the skill bundle and its content hash: got {rel_path!r} in {skill_file}"
+        )
+    try:
+        schema = json.loads(bundled.content)
+    except json.JSONDecodeError as error:
+        raise CanonicalSkillParseError(
+            f"Structured-output schema '{rel_path}' is not valid JSON: {skill_file}: {error}"
+        ) from error
+    # Deferred: importing this reaches `tools/__init__`, whose report-check imports run through
+    # billing and `posthog.tasks`, which imports this module back through the signals billing
+    # helpers.
+    from products.signals.backend.scout_harness.tools.structured_output import (  # noqa: PLC0415 — breaks a circular import
+        StructuredOutputSchemaError,
+        validate_structured_output_schema,
+    )
+
+    try:
+        return validate_structured_output_schema(schema)
+    except StructuredOutputSchemaError as error:
+        raise CanonicalSkillParseError(
+            f"Structured-output schema '{rel_path}' is invalid: {skill_file}: {error}"
+        ) from error
+
+
+def _parse_canonical_skill(skill_dir: Path, *, is_scout: bool = True) -> CanonicalSkill:
+    skill_file = skill_dir / "SKILL.md"
+    raw = skill_file.read_text(encoding="utf-8")
+    match = _FRONTMATTER_RE.match(raw)
+    if not match:
+        raise CanonicalSkillParseError(f"SKILL.md missing YAML frontmatter: {skill_file}")
+    try:
+        frontmatter = yaml.safe_load(match.group(1))
+    except yaml.YAMLError as e:
+        raise CanonicalSkillParseError(f"SKILL.md frontmatter is not valid YAML: {skill_file}: {e}") from e
+    if not isinstance(frontmatter, dict):
+        raise CanonicalSkillParseError(f"SKILL.md frontmatter must be a mapping: {skill_file}")
+    name = frontmatter.get("name")
+    description = frontmatter.get("description")
+    if not isinstance(name, str) or not name:
+        raise CanonicalSkillParseError(f"SKILL.md frontmatter missing 'name': {skill_file}")
+    if not isinstance(description, str) or not description:
+        raise CanonicalSkillParseError(f"SKILL.md frontmatter missing 'description': {skill_file}")
+    if is_scout:
+        if not name.startswith(SIGNALS_SCOUT_SKILL_PREFIX):
+            raise CanonicalSkillParseError(
+                f"Canonical skill name must start with '{SIGNALS_SCOUT_SKILL_PREFIX}': got {name!r} in {skill_file}"
+            )
+    else:
+        # Companion skills must NOT look like scouts — a scout-prefixed name would get a
+        # `SignalScoutConfig` from `register_missing_configs` and be dispatched by the
+        # coordinator. Pinning name == directory name keeps the allowlist in
+        # `_COMPANION_SKILL_DIRS` authoritative over what actually lands per-team.
+        if name.startswith(SIGNALS_SCOUT_SKILL_PREFIX):
+            raise CanonicalSkillParseError(
+                f"Companion skill name must not start with '{SIGNALS_SCOUT_SKILL_PREFIX}': got {name!r} in {skill_file}"
+            )
+        if name != skill_dir.name:
+            raise CanonicalSkillParseError(
+                f"Companion skill name must match its directory: got {name!r} in {skill_file}"
+            )
+    # The agentskills.io spec uses `allowed-tools` (hyphen). We prefer the spec form, but accept
+    # the underscore form too — it predated the spec alignment in this codebase and is used by
+    # other PHS skills. Reject if both keys are set so a future divergence doesn't go unnoticed.
+    if "allowed-tools" in frontmatter and "allowed_tools" in frontmatter:
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter has both 'allowed-tools' and 'allowed_tools'; pick one: {skill_file}"
+        )
+    # Branch on key presence rather than truthiness: a falsy-but-invalid value
+    # (`allowed-tools:` / null, `false`, `""`) must fail validation, not silently
+    # fall back to `[]` — which means "no narrowing" and would broaden tool access.
+    if "allowed-tools" in frontmatter:
+        raw_allowed = frontmatter["allowed-tools"]
+    elif "allowed_tools" in frontmatter:
+        raw_allowed = frontmatter["allowed_tools"]
+    else:
+        raw_allowed = []
+    if not isinstance(raw_allowed, list) or not all(isinstance(t, str) for t in raw_allowed):
+        # Mention both accepted keys. The validator runs after we've merged the two forms
+        # above, so we can't tell which the author wrote — naming only the spec form would
+        # send authors using the underscore form looking for a key they didn't write.
+        raise CanonicalSkillParseError(
+            f"SKILL.md frontmatter 'allowed-tools'/'allowed_tools' must be a list of strings: {skill_file}"
+        )
+
+    preserve_trial_model = frontmatter.get("scout-preserve-trial-model", False)
+    if "scout-preserve-trial-model" in frontmatter and (not is_scout or not isinstance(preserve_trial_model, bool)):
+        raise CanonicalSkillParseError(
+            f"'scout-preserve-trial-model' must be a boolean on a signals-scout-* skill: {skill_file}"
+        )
+    config_tags = _parse_config_tags(frontmatter, skill_file, is_scout=is_scout)
+    role = _parse_scout_role(frontmatter, skill_file, is_scout=is_scout)
+    display_name = _parse_display_name(frontmatter, skill_file, is_scout=is_scout)
+    precheck_query = _parse_precheck_query(frontmatter, skill_file, is_scout=is_scout)
+    # A malformed marker is raised as a parse error like every other frontmatter fault, so the
+    # callers that degrade to an empty fleet keep one failure mode rather than two.
+    try:
+        deprecation = parse_scout_deprecation(frontmatter, skill_file, is_scout=is_scout)
+    except ScoutDeprecationParseError as error:
+        raise CanonicalSkillParseError(str(error)) from error
+
+    body = raw[match.end() :]
+    if len(body.encode("utf-8")) > _MAX_SKILL_BODY_BYTES:
+        raise CanonicalSkillParseError(f"SKILL.md body exceeds the {_MAX_SKILL_BODY_BYTES} byte limit: {skill_file}")
+
+    # Enforce the same per-skill limits the REST API uses (skill_services.py). The seed
+    # bypasses `create_skill_file` (no service-layer "create from scratch with files"
+    # helper exists), so bundled files must fail before a database write exceeds the
+    # documented capacity.
+    files: list[CanonicalSkillFile] = []
+    for subdir_name in _ALLOWED_BUNDLE_SUBDIRS:
+        subdir = skill_dir / subdir_name
+        if not subdir.is_dir():
+            continue
+        for file_path in sorted(subdir.rglob("*")):
+            if not file_path.is_file() or _BYTECODE_CACHE_DIR in file_path.relative_to(subdir).parts:
+                continue
+            rel_path = file_path.relative_to(skill_dir).as_posix()
+            if len(rel_path) > _MAX_SKILL_FILE_PATH_LENGTH:
+                raise CanonicalSkillParseError(
+                    f"Bundled file path '{rel_path}' exceeds the {_MAX_SKILL_FILE_PATH_LENGTH} char limit: {file_path}"
+                )
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as e:
+                raise CanonicalSkillParseError(f"Bundled skill file is not UTF-8 text: {file_path}: {e}") from e
+            if len(content.encode("utf-8")) > _MAX_SKILL_FILE_BYTES:
+                raise CanonicalSkillParseError(
+                    f"Bundled file '{rel_path}' exceeds the {_MAX_SKILL_FILE_BYTES} byte limit: {file_path}"
+                )
+            files.append(CanonicalSkillFile(path=rel_path, content=content))
+
+    if len(files) > _MAX_SKILL_FILE_COUNT:
+        raise CanonicalSkillParseError(
+            f"Canonical skill has {len(files)} bundled files, exceeding the {_MAX_SKILL_FILE_COUNT} limit: {skill_dir}"
+        )
+
+    # After the bundle, because the schema is resolved out of it rather than read again.
+    structured_output_schema = _parse_structured_output_schema(frontmatter, files, skill_file, is_scout=is_scout)
+
+    return CanonicalSkill(
+        name=name,
+        description=description.strip(),
+        body=body,
+        allowed_tools=tuple(raw_allowed),
+        files=tuple(files),
+        source_path=skill_dir,
+        config_tags=config_tags,
+        role=role,
+        display_name=display_name,
+        deprecation=deprecation,
+        structured_output_schema=structured_output_schema,
+        precheck_query=precheck_query,
+        preserve_trial_model=preserve_trial_model,
+    )
+
+
+def discover_canonical_skills(skills_dir: Path | None = None) -> tuple[CanonicalSkill, ...]:
+    """Walk `products/signals/skills/` and return the parsed manifest: every
+    `signals-scout-*` directory plus the `_COMPANION_SKILL_DIRS` allowlist.
+
+    Skipping a malformed canonical entry would mask author errors; instead we let
+    `CanonicalSkillParseError` propagate so the harness fails loud and the canonical source
+    gets fixed.
+
+    Frontmatter `name`s must be unique across the fleet. The sync reconciles per skill name,
+    so two directories declaring the same `name` with differing content would make each
+    coordinator tick rewrite the team's row to the first definition and then the second,
+    bumping versions forever. We reject the collision here so a misauthored fleet fails loud
+    on the first read instead of flapping silently.
+    """
+    base = skills_dir or _SKILLS_DIR
+    # `skills_dir` means "read this fleet in isolation", which is what the tests want; the
+    # cross-product companions belong to the real fleet only.
+    external = _EXTERNAL_COMPANION_SKILL_DIRS if skills_dir is None else ()
+    if not base.is_dir():
+        return ()
+    candidates: list[tuple[Path, bool]] = []
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir():
+            continue
+        is_scout = entry.name.startswith(SIGNALS_SCOUT_SKILL_PREFIX)
+        if is_scout or entry.name in _COMPANION_SKILL_DIRS:
+            candidates.append((entry, is_scout))
+    for entry in external:
+        if not (entry / "SKILL.md").is_file():
+            # Warn rather than raise: `canonical_skill_names` turns a parse error into an empty
+            # fleet, so a moved directory in another product would make every scout read as
+            # custom. The fleet lock in the tests is what fails loud on this.
+            logger.warning("discover_canonical_skills: external companion skill missing at %s", entry)
+            continue
+        candidates.append((entry, False))
+
+    discovered: list[CanonicalSkill] = []
+    by_name: dict[str, Path] = {}
+    for entry, is_scout in candidates:
+        if not (entry / "SKILL.md").is_file():
+            continue
+        skill = _parse_canonical_skill(entry, is_scout=is_scout)
+        if skill.name in by_name:
+            raise CanonicalSkillParseError(
+                f"Duplicate canonical skill name {skill.name!r}: declared in both {by_name[skill.name]} and {entry}"
+            )
+        by_name[skill.name] = entry
+        discovered.append(skill)
+    return tuple(discovered)
+
+
+@lru_cache(maxsize=1)
+def canonical_skill_names() -> frozenset[str]:
+    """Frontmatter names of the canonical `signals-scout-*` skills shipped on disk.
+
+    The single derived source of truth for "is this a scout the harness ships". Unlike a
+    hardcoded list it tracks the on-disk fleet automatically, so it never goes stale when a
+    canonical scout is added or removed. Cached for the process — the shipped fleet only
+    changes on deploy. A malformed canonical skill degrades to an empty set (everything reads
+    `custom`) rather than 500-ing read endpoints; the parse error still fails loud on the
+    harness's own sync path. See `scout_skill_origin` for the consumer.
+    """
+    try:
+        return frozenset(skill.name for skill in discover_canonical_skills())
+    except CanonicalSkillParseError:
+        logger.warning("canonical_skill_names: malformed canonical skill on disk; treating fleet as empty")
+        return frozenset()
+
+
+@lru_cache(maxsize=1)
+def _canonical_config_tags() -> dict[str, tuple[str, ...]]:
+    """`scout-tags` per canonical scout name, for the scouts that declare any.
+
+    Cached for the process like `canonical_skill_names` — the shipped fleet only changes on
+    deploy — and degrades to empty on a malformed canonical rather than failing config
+    registration, which the harness's own sync path already fails loud on.
+    """
+    try:
+        return {skill.name: skill.config_tags for skill in discover_canonical_skills() if skill.config_tags}
+    except CanonicalSkillParseError:
+        logger.warning("canonical_config_tags: malformed canonical skill on disk; seeding no tags")
+        return {}
+
+
+def canonical_config_tags_for(skill_name: str) -> tuple[str, ...]:
+    """Tags the canonical scout of this name declares, to stamp on its config at creation.
+
+    Empty for a custom scout, and for a canonical scout that claims no product surface. Callers
+    must confirm the name is canonical first — a team's own `signals-scout-*` skill can share a
+    canonical name, and it inherits nothing from disk.
+    """
+    return _canonical_config_tags().get(skill_name, ())
+
+
+@lru_cache(maxsize=1)
+def _canonical_display_names() -> dict[str, str]:
+    """`scout-display-name` per canonical scout name, for the scouts that declare one.
+
+    Cached for the process like `canonical_skill_names` — the shipped fleet only changes on
+    deploy — and degrades to empty on a malformed canonical rather than failing config
+    registration, which leaves clients deriving a label from the slug as they did before.
+    """
+    try:
+        return {skill.name: skill.display_name for skill in discover_canonical_skills() if skill.display_name}
+    except CanonicalSkillParseError:
+        logger.warning("canonical_display_names: malformed canonical skill on disk; seeding no display names")
+        return {}
+
+
+def canonical_display_name_for(skill_name: str) -> str:
+    """The label the canonical scout of this name ships under, to stamp on its config.
+
+    Empty for a custom scout, and for a canonical scout that states no label. Callers must confirm
+    the name is canonical first — a team's own `signals-scout-*` skill can share a canonical name,
+    and it inherits nothing from disk.
+    """
+    return _canonical_display_names().get(skill_name, "")
+
+
+@lru_cache(maxsize=1)
+def _canonical_structured_output_schemas() -> dict[str, dict]:
+    """The record contract per canonical scout name, for the scouts that ship one.
+
+    Cached for the process like `canonical_skill_names` — the shipped fleet only changes on
+    deploy — and degrades to empty on a malformed canonical rather than failing config
+    registration, which leaves the channel off rather than half-configured.
+    """
+    try:
+        return {
+            skill.name: skill.structured_output_schema
+            for skill in discover_canonical_skills()
+            if skill.structured_output_schema
+        }
+    except CanonicalSkillParseError:
+        logger.warning("canonical_structured_output_schemas: malformed canonical skill on disk; seeding no schemas")
+        return {}
+
+
+def canonical_structured_output_schema_for(skill_name: str) -> dict | None:
+    """The record contract the canonical scout of this name ships, to stamp on its config.
+
+    None for a custom scout, and for a canonical scout that records nothing. Callers must confirm
+    the name is canonical first — a team's own `signals-scout-*` skill can share a canonical name,
+    and it inherits nothing from disk.
+    """
+    return _canonical_structured_output_schemas().get(skill_name)
+
+
+@lru_cache(maxsize=1)
+def _canonical_precheck_queries() -> dict[str, str]:
+    """The default pre-check per canonical scout name, for the scouts that ship one.
+
+    Cached for the process like `canonical_skill_names` — the shipped fleet only changes on
+    deploy — and degrades to empty on a malformed canonical, which leaves every scout running on
+    every due tick as before.
+    """
+    try:
+        return {skill.name: skill.precheck_query for skill in discover_canonical_skills() if skill.precheck_query}
+    except CanonicalSkillParseError:
+        logger.warning("canonical_precheck_queries: malformed canonical skill on disk; reading no pre-check defaults")
+        return {}
+
+
+def canonical_precheck_query_for(skill_name: str) -> str | None:
+    """The default pre-check the canonical scout of this name ships, if any.
+
+    None for a custom scout, and for a canonical scout with no default. Callers must confirm the
+    name is canonical first — a team's own `signals-scout-*` skill can share a canonical name, and
+    it inherits nothing from disk.
+    """
+    return _canonical_precheck_queries().get(skill_name)
+
+
+def canonical_precheck_queries() -> dict[str, str]:
+    """The default pre-check of every canonical scout that ships one, keyed by scout name."""
+    return dict(_canonical_precheck_queries())
+
+
+@lru_cache(maxsize=1)
+def _canonical_deprecations() -> dict[str, ScoutDeprecation]:
+    """The retirement marker per canonical scout name, for the scouts PostHog is retiring.
+
+    Cached for the process like `canonical_skill_names` — the shipped fleet only changes on
+    deploy — and degrades to empty on a malformed canonical, which leaves every scout reading as
+    active rather than failing config registration.
+    """
+    try:
+        return {skill.name: skill.deprecation for skill in discover_canonical_skills() if skill.deprecation}
+    except CanonicalSkillParseError:
+        logger.warning("canonical_deprecations: malformed canonical skill on disk; reading no retirements")
+        return {}
+
+
+def canonical_deprecation_for(skill_name: str) -> ScoutDeprecation | None:
+    """The retirement PostHog announced for the canonical scout of this name, if any.
+
+    None for a custom scout, and for a canonical scout still in the fleet. Callers must confirm
+    the name is canonical first — a team's own `signals-scout-*` skill can share a canonical name,
+    and it inherits nothing from disk, least of all a retirement of somebody else's scout.
+    """
+    return _canonical_deprecations().get(skill_name)
+
+
+@lru_cache(maxsize=1)
+def _canonical_operational_scouts() -> frozenset[str]:
+    """Names of the canonical scouts that declare `scout-role: operational`.
+
+    Cached for the process like `canonical_skill_names` — the shipped fleet only changes on
+    deploy — and degrades to empty on a malformed canonical, which leaves every scout on the
+    specialist posture rather than failing config registration.
+    """
+    try:
+        return frozenset(skill.name for skill in discover_canonical_skills() if skill.role == SCOUT_ROLE_OPERATIONAL)
+    except CanonicalSkillParseError:
+        logger.warning("canonical_operational_scouts: malformed canonical skill on disk; seeding no operational roles")
+        return frozenset()
+
+
+@lru_cache(maxsize=1)
+def canonical_scouts_preserving_trial_model() -> frozenset[str]:
+    return frozenset(skill.name for skill in discover_canonical_skills() if skill.preserve_trial_model)
+
+
+def canonical_operational_scout_names() -> frozenset[str]:
+    """Names of every canonical scout that declares `scout-role: operational`."""
+    return _canonical_operational_scouts()
+
+
+def is_operational_scout(skill_name: str) -> bool:
+    """Whether the canonical scout of this name watches the self-driving system itself.
+
+    False for a custom scout, and for a canonical specialist. Callers must confirm the name is
+    canonical first — a team's own `signals-scout-*` skill can share a canonical name, and it
+    inherits nothing from disk, least of all a role that exempts it from the harness's controls.
+    For a scout config, use `operational.operational_config_q` or
+    `operational.unedited_operational_skill_names`, which make that check.
+    """
+    return skill_name in _canonical_operational_scouts()
+
+
+def reset_canonical_caches() -> None:
+    """Drop every process cache over the canonical fleet on disk.
+
+    The caches assume the fleet only changes on deploy, which holds in production and not in a
+    test that writes a fleet to a temporary directory or patches `discover_canonical_skills`: one
+    such test leaves the next reading a fleet that is not there. Kept here rather than in the
+    tests so a new cache is added to the list in the same edit that adds the cache.
+    """
+    for cache in (
+        canonical_skill_names,
+        _canonical_config_tags,
+        _canonical_display_names,
+        _canonical_operational_scouts,
+        canonical_scouts_preserving_trial_model,
+        _canonical_deprecations,
+        _canonical_structured_output_schemas,
+        _canonical_precheck_queries,
+    ):
+        cache.cache_clear()
+
+
+def scout_skill_origin(skill_name: str, metadata: dict | None) -> Literal["canonical", "custom"]:
+    """Classify a scout skill row as `"canonical"` or `"custom"` by who owns it.
+
+    A scout is `canonical` when the harness seeded its skill row (tagged
+    `metadata.seeded_by=HARNESS_SEEDED_BY`) **and** its name is one the harness actually ships
+    on disk (`products/signals/skills/`); otherwise it's a team's hand-authored `custom` scout.
+    Both halves matter: `duplicate_skill()` copies a source row's metadata verbatim — including
+    `seeded_by` — so a team fork of a bundled scout inherits the seed tag, but a fork can never
+    take a canonical name (the canonical row already owns it), so the name guard reclassifies it
+    as `custom`. The name set is derived from disk, so it never goes stale the way a hardcoded
+    list would.
+
+    Consumers: the config serializer's `scout_origin` field (`views._skill_info_for`), which is
+    metadata-only by design (one bulk query, no file contents), and — via the row-level
+    `scout_skill_row_origin` refinement below — the prompt builder's self-improvement gate
+    (`skill_loader.load_skill_for_run` → `prompt.py`).
+    """
+    is_harness_seeded = (metadata or {}).get("seeded_by") == HARNESS_SEEDED_BY
+    return "canonical" if is_harness_seeded and skill_name in canonical_skill_names() else "custom"
+
+
+def _compute_canonical_hash(canonical: CanonicalSkill) -> str:
+    """Stable content fingerprint for a canonical skill on disk.
+
+    Includes everything that could meaningfully change between revisions: description and body
+    text, the allowed-tools list (sorted so reordering doesn't invalidate), and the bundle
+    treated as a sorted list of `(path, content, content_type)` tuples. The bundle inclusion
+    means a references-only change (e.g. tweaking `references/calibration.md`) still triggers
+    an update — easy to forget if the hash only covered SKILL.md body.
+
+    SHA-256 is overkill cryptographically but content-addressable hashes are cheap and we want
+    no false positives.
+
+    Deliberately excludes `config_tags`, `role`, and `display_name`: the hash is compared against
+    `_compute_row_hash` over the team's `LLMSkill` row, which stores none of them (all three shape
+    the config instead), so folding them in here would make every seeded row read as diverged
+    forever. The structured-output schema is covered anyway, because it is a bundled file — which
+    is what keeps each team's copy of the file current, though not the config column the record
+    endpoint reads from (see `_parse_structured_output_schema`).
+    """
+    payload = {
+        "description": canonical.description,
+        "body": canonical.body,
+        "allowed_tools": sorted(canonical.allowed_tools),
+        "files": sorted([(f.path, f.content, f.content_type) for f in canonical.files]),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _compute_row_hash(skill: LLMSkill, files: list[LLMSkillFile]) -> str:
+    """Hash a team's `LLMSkill` row in the same shape as `_compute_canonical_hash` so the two
+    can be compared directly. Caller must pre-fetch `files` to avoid an N+1 inside the hash."""
+    payload = {
+        "description": skill.description,
+        "body": skill.body,
+        "allowed_tools": sorted(skill.allowed_tools or []),
+        "files": sorted([(f.path, f.content, f.content_type) for f in files]),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def scout_skill_row_origin(skill: LLMSkill) -> Literal["canonical", "custom"]:
+    """Row-level refinement of `scout_skill_origin`: a *diverged* seeded row classifies as custom.
+
+    `publish_skill_version()` carries `metadata.seeded_by` (and the stale `canonical_hash`)
+    forward when a team edits a canonical scout in place, so the metadata-only check keeps
+    reading such a row as canonical. But a diverged row is team-owned in every way that matters
+    here — upstream sync already leaves it alone, so inviting `improve:` suggestions on it risks
+    no new divergence. Mirror `sync_canonical_skills`' decision: the row is diverged when its
+    content hash no longer matches the `canonical_hash` stamped at seed time. A seeded row with
+    no stored hash (pre-hash-tracking legacy) is unprovable either way; unlike the sync — whose
+    conservative move is to not overwrite — the conservative move for the prompt gate is to NOT
+    invite edits, so it stays canonical.
+
+    Hashing needs the row's file *contents*, so keep this on the per-run load path
+    (`skill_loader.load_skill_for_run`); the bulk config-list path stays on the metadata-only
+    `scout_skill_origin`.
+    """
+    if scout_skill_origin(skill.name, skill.metadata) == "custom":
+        return "custom"
+    stored_hash = (skill.metadata or {}).get("canonical_hash")
+    if stored_hash is None:
+        return "canonical"
+    return "custom" if _compute_row_hash(skill, list(skill.files.all())) != stored_hash else "canonical"
+
+
+def scout_skill_row_is_proven_canonical(skill: LLMSkill) -> bool:
+    """`scout_skill_row_origin`, plus the baseline hash that makes the verdict provable.
+
+    The two disagree on one row: a seeded row carrying no `canonical_hash`. `scout_skill_row_origin`
+    keeps it canonical because its consumer (the self-improvement gate) is conservative in the
+    direction of not inviting edits. A caller that *grants* something on canonical origin is
+    conservative the other way, so it reads that row as `sync_canonical_skills` does — no baseline
+    hash, no claim.
+    """
+    return scout_skill_row_origin(skill) == "canonical" and (skill.metadata or {}).get("canonical_hash") is not None
+
+
+def _seed_metadata(canonical: CanonicalSkill, canonical_hash: str) -> dict:
+    """The harness-owned `LLMSkill.metadata` keys, as this canonical revision defines them.
+
+    The retirement marker rides here rather than in the content hash on purpose: a hash change
+    would bump the skill version on every team and read as a content edit, when what changed is
+    what PostHog says about the scout. `_reconcile_deprecation_metadata` is what carries a
+    marker-only change to rows whose content is already current.
+    """
+    return {
+        "seeded_by": HARNESS_SEEDED_BY,
+        "source": "products/signals/skills",
+        "canonical_hash": canonical_hash,
+        DEPRECATION_METADATA_KEY: canonical.deprecation.as_metadata() if canonical.deprecation else None,
+    }
+
+
+def _reconcile_deprecation_metadata(live: LLMSkill, canonical: CanonicalSkill) -> bool:
+    """Carry a marker-only frontmatter change onto a live row, and say whether it wrote.
+
+    Deprecating a scout changes no skill content, so the content hashes match and the update path
+    never fires — without this pass the marker would reach a team only on the scout's next real
+    edit. Written through `update()` rather than a version bump, because announcing a retirement
+    is not an edit to the skill anybody made. `updated_at` still moves: the marketplace plugin
+    version is `Max(updated_at)` over the team's rows, so a cached repo would otherwise keep
+    serving the row without its marker.
+
+    Caller must already have established that the sync owns this row and the team has not edited
+    it, which is what keeps a fork's marker its own.
+    """
+    desired = canonical.deprecation.as_metadata() if canonical.deprecation else None
+    if deprecation_metadata_of(live.metadata) == desired:
+        return False
+    metadata = dict(live.metadata or {})
+    metadata[DEPRECATION_METADATA_KEY] = desired
+    LLMSkill.objects.filter(pk=live.pk).update(metadata=metadata, updated_at=timezone.now())
+    return True
+
+
+def _create_skill_from_canonical(team: Team, canonical: CanonicalSkill, canonical_hash: str) -> None:
+    """Insert a brand-new row for a (team, canonical.name) that has no prior history.
+
+    Caller already verified no row exists. The unique constraint on
+    `(team, name, deleted=False, is_latest=True)` is our race guard — if two coordinator runs
+    fire for the same team at once, one wins and the other gets `IntegrityError`, which the
+    caller swallows.
+    """
+    with transaction.atomic():
+        skill = LLMSkill.objects.create(
+            team=team,
+            name=canonical.name,
+            description=canonical.description,
+            body=canonical.body,
+            allowed_tools=list(canonical.allowed_tools),
+            metadata=_seed_metadata(canonical, canonical_hash),
+            category=SCOUT_SKILL_CATEGORY,
+            version=1,
+            is_latest=True,
+        )
+        if canonical.files:
+            LLMSkillFile.objects.bulk_create(
+                [
+                    LLMSkillFile(
+                        skill=skill,
+                        path=f.path,
+                        content=f.content,
+                        content_type=f.content_type,
+                    )
+                    for f in canonical.files
+                ]
+            )
+
+
+def _update_skill_from_canonical(
+    team: Team, current_latest: LLMSkill, canonical: CanonicalSkill, canonical_hash: str
+) -> None:
+    """Replace the team's live row for this skill with the latest canonical content, bumping
+    the version. Mirrors the version-bump pattern a user-facing PHS edit would produce — old
+    rows aren't mutated; we mark them `is_latest=False` and create a new row at `version+1`.
+    The `metadata.seeded_by="signals_scout_harness"` tag distinguishes our updates from
+    user edits in the version-history view.
+
+    Concurrency: `select_for_update` on the existing latest row pins it for the duration of
+    the txn. If a user-edit racing us has already bumped to `version+1`, we observe their
+    write at lock acquisition and our subsequent insert at `version+1` collides with the
+    unique constraint — caller swallows the IntegrityError (their edit wins, we'll re-evaluate
+    next tick and find their content diverged).
+    """
+    with transaction.atomic():
+        # Re-fetch under FOR UPDATE so concurrent edits serialize behind us.
+        locked = LLMSkill.objects.select_for_update().get(pk=current_latest.pk)
+        new_version = locked.version + 1
+        locked.is_latest = False
+        locked.save(update_fields=["is_latest", "updated_at"])
+
+        new_metadata = dict(locked.metadata or {})
+        new_metadata.update(_seed_metadata(canonical, canonical_hash))
+
+        new_skill = LLMSkill.objects.create(
+            team=team,
+            name=canonical.name,
+            description=canonical.description,
+            body=canonical.body,
+            allowed_tools=list(canonical.allowed_tools),
+            metadata=new_metadata,
+            category=SCOUT_SKILL_CATEGORY,
+            version=new_version,
+            is_latest=True,
+        )
+        if canonical.files:
+            LLMSkillFile.objects.bulk_create(
+                [
+                    LLMSkillFile(
+                        skill=new_skill,
+                        path=f.path,
+                        content=f.content,
+                        content_type=f.content_type,
+                    )
+                    for f in canonical.files
+                ]
+            )
+
+
+def sync_canonical_skills(
+    team: Team, *, prune: bool = False, withheld_skill_names: frozenset[str] | set[str] | None = None
+) -> SyncResult:
+    """Reconcile a team's rows with the canonical skills on disk — the `signals-scout-*`
+    fleet plus the `_COMPANION_SKILL_DIRS` companions.
+
+    Walks each canonical skill in `products/signals/skills/` and decides per-skill whether
+    to create, update, leave-as-diverged, or leave-as-tombstone (plus prune, when enabled).
+    Only rows we seeded (`metadata.seeded_by="signals_scout_harness"`) are ever updated.
+    See `SyncResult` for the outcome buckets and the section comments below for the full
+    decision table.
+
+    `prune` (default off) additionally tombstones live `signals-scout-*` rows whose canonical
+    was removed from disk. It's a destructive reconciliation reserved for the deliberate paths
+    — the coordinator tick and the explicit `sync_signals_scout_skills` command. The runner's
+    cold-start sync leaves it off: a single ad-hoc run should only ensure its own skill exists
+    and is current, not reap the rest of the team's fleet.
+
+    `withheld_skill_names` is the per-team holdback denylist (resolved by the coordinator from
+    the `signals-scout` flag's `withheld_skills` key). A canonical skill named here is skipped
+    entirely for this team — not created, not updated — so an unreleased scout stays invisible
+    to every team not on its allowlist. Existing rows (a team previously allowed) are left
+    untouched rather than tombstoned: the coordinator's dispatch gate stops them running, and we
+    don't rewrite skill history on a flag flip. Withheld skills are still on disk, so the `prune`
+    pass never reaps them as orphans.
+
+    `prune` also drives the retirement half of the lifecycle, for the same reason: both are
+    reconciliations a deliberate caller asks for. A canonical scout whose `scout-deprecation`
+    sunset has passed has this team's config moved to a retired pause, and so does a scout the
+    prune just reaped, so a retirement that skipped the announcement leaves no ghost either. A row
+    the team edited is left out of both, so a fork keeps running.
+
+    Idempotent and safe to call on every coordinator tick — the only DB writes happen when
+    something actually needs to change, and IntegrityError on races is logged-and-swallowed.
+    """
+    canonicals = discover_canonical_skills()
+    if not canonicals:
+        return SyncResult(skipped_reason="no canonical signals-scout-* skills on disk")
+
+    withheld = withheld_skill_names or frozenset()
+    now = timezone.now()
+    created: list[str] = []
+    updated: list[str] = []
+    diverged: list[str] = []
+    tombstoned: list[str] = []
+    pruned: list[str] = []
+    remarked: list[str] = []
+    # Scouts whose config this pass should retire: a sunset that has passed, plus whatever the
+    # prune reaps below. Collected rather than retired inline so one pass writes each config once.
+    retire_targets: set[str] = set()
+
+    for canonical in canonicals:
+        if canonical.name in withheld:
+            continue
+        canonical_hash = _compute_canonical_hash(canonical)
+
+        # Pull every row for this (team, name), live or tombstoned. Existence of any row —
+        # including soft-deleted — counts as "team has seen this skill name before"; we
+        # never resurrect tombstones.
+        rows = list(LLMSkill.objects.filter(team=team, name=canonical.name).order_by("-version"))
+
+        if not rows:
+            # Brand-new for this team. Either a freshly-enabled team, or a specialist
+            # added to the canonical fleet after this team was first seeded.
+            try:
+                _create_skill_from_canonical(team, canonical, canonical_hash)
+                created.append(canonical.name)
+            except IntegrityError:
+                logger.info(
+                    "signals_scout: concurrent create lost the race; skipping",
+                    extra={"team_id": team.id, "skill_name": canonical.name},
+                )
+            continue
+
+        live = next((r for r in rows if not r.deleted and r.is_latest), None)
+        if live is None:
+            # All rows for this name are deleted or non-latest archives. Treat as
+            # tombstoned: the team explicitly removed this skill from their rotation.
+            tombstoned.append(canonical.name)
+            continue
+
+        # Only manage rows we seeded. A team can hand-author a signals-scout-* skill that
+        # shares a canonical name — no seeded_by tag — and we must never touch it.
+        if (live.metadata or {}).get("seeded_by") != HARNESS_SEEDED_BY:
+            diverged.append(canonical.name)
+            continue
+
+        live_files = list(live.files.all())
+        live_hash = _compute_row_hash(live, live_files)
+        stored_hash = (live.metadata or {}).get("canonical_hash")
+
+        if stored_hash is None:
+            # One of our rows with no baseline hash — only reachable for a row seeded before
+            # hash tracking (e.g. an existing dogfood team). Can't tell if the team edited it,
+            # so leave it alone rather than risk clobbering; a re-seed adopts it cleanly.
+            diverged.append(canonical.name)
+            continue
+
+        at_latest = live_hash == canonical_hash
+        if not at_latest and live_hash != stored_hash:
+            # Team edited their copy since our last write → leave it alone.
+            diverged.append(canonical.name)
+            continue
+
+        # From here the row is ours and carries no team edit, so what disk says about the scout
+        # is this team's too. A fork never reaches this point, which is what keeps its copy
+        # running through a retirement.
+        if _reconcile_deprecation_metadata(live, canonical):
+            remarked.append(canonical.name)
+        if prune and canonical.deprecation is not None and canonical.deprecation.is_past_sunset(now):
+            retire_targets.add(canonical.name)
+
+        if at_latest:
+            continue  # already at the latest canonical content
+
+        # Unedited since our last write but canonical changed → safe to overwrite.
+        try:
+            _update_skill_from_canonical(team, live, canonical, canonical_hash)
+            updated.append(canonical.name)
+        except IntegrityError:
+            logger.info(
+                "signals_scout: concurrent update lost the race; skipping",
+                extra={"team_id": team.id, "skill_name": canonical.name},
+            )
+
+    if prune:
+        # Reverse reconciliation: tombstone live `signals-scout-*` rows whose canonical was
+        # removed from disk. The per-canonical loop above only visits skills still present in
+        # the discovered fleet, so a scout deleted from `products/signals/skills/` would
+        # otherwise leave orphaned live rows the coordinator keeps dispatching. Soft-delete them —
+        # never hard-delete (run history + audit). The `scout_canonical_names` guard below
+        # (and the `not canonicals` early-return above) means a broken/empty disk read —
+        # including one that surfaced only companion skills — can't reach the reap and
+        # tombstone the whole fleet.
+        #
+        # Restrict to rows WE seeded (`metadata.seeded_by == "signals_scout_harness"`, stamped by
+        # `_create_skill_from_canonical` / `_update_skill_from_canonical`). A team is free to
+        # hand-author its own `signals-scout-*` skill; pruning by name+prefix alone would
+        # silently soft-delete it every coordinator tick. We only reap our own seeded orphans.
+        #
+        # And only reap rows the team hasn't edited: an edited fork (hash diverged from the
+        # stored `canonical_hash`, or no baseline hash to compare) is left alone, same as the
+        # update path above. Retiring a canonical must not delete a scout the team customized.
+        scout_canonical_names = {c.name for c in canonicals if c.name.startswith(SIGNALS_SCOUT_SKILL_PREFIX)}
+        orphan_rows = (
+            LLMSkill.objects.filter(
+                team=team,
+                deleted=False,
+                is_latest=True,
+                name__startswith=SIGNALS_SCOUT_SKILL_PREFIX,
+                metadata__seeded_by=HARNESS_SEEDED_BY,
+            ).exclude(name__in=scout_canonical_names)
+            if scout_canonical_names
+            else LLMSkill.objects.none()
+        )
+        for row in orphan_rows:
+            stored_hash = (row.metadata or {}).get("canonical_hash")
+            if stored_hash is None or _compute_row_hash(row, list(row.files.all())) != stored_hash:
+                diverged.append(row.name)
+                continue
+            # Re-scope the soft-delete to seeded rows too, so a team-authored row sharing the
+            # name is never caught by the bulk update. `updated_at=now` matters: queryset updates
+            # bypass auto_now, and the marketplace plugin version is Max(updated_at) over ALL team
+            # rows — without the bump the cached repo keeps serving the pruned skill.
+            LLMSkill.objects.filter(
+                team=team, name=row.name, deleted=False, metadata__seeded_by=HARNESS_SEEDED_BY
+            ).update(deleted=True, is_latest=False, updated_at=timezone.now())
+            pruned.append(row.name)
+            retire_targets.add(row.name)
+
+    # Finish the retirement the skill rows only started. A tombstoned skill leaves its config
+    # enabled behind it, and dispatch is gated on a live skill, so the scout silently stops while
+    # its roster row still reads as healthy — the ghost this pass exists to prevent.
+    retired_configs = retire_scout_configs(team.id, retire_targets)
+
+    if created or updated or pruned or remarked or retired_configs:
+        logger.info(
+            "signals_scout: synced canonical skills",
+            extra={
+                "team_id": team.id,
+                "created_skills": created,
+                "updated_skills": updated,
+                "diverged_skills": diverged,
+                "tombstoned_skills": tombstoned,
+                "pruned_skills": pruned,
+                "remarked_skills": remarked,
+                "retired_configs": list(retired_configs),
+            },
+        )
+
+    return SyncResult(
+        created_skill_names=tuple(created),
+        updated_skill_names=tuple(updated),
+        diverged_skill_names=tuple(diverged),
+        tombstoned_skill_names=tuple(tombstoned),
+        pruned_skill_names=tuple(pruned),
+        retired_config_skill_names=retired_configs,
+    )
+
+
+def seed_canonical_skills(team: Team) -> SyncResult:
+    """Backwards-compat alias for `sync_canonical_skills`.
+
+    Older callsites and tests reference this name; they get the richer sync semantics for free.
+    Prefer `sync_canonical_skills` in new code — the name reflects what it actually does.
+    """
+    return sync_canonical_skills(team)

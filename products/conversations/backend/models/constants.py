@@ -1,0 +1,71 @@
+from django.db import models
+
+AUTOMATED_UPDATE_SLACK_CHANNEL_IDS = "automated_update_slack_channel_ids"
+
+
+class Channel(models.TextChoices):
+    WIDGET = "widget", "Widget"
+    EMAIL = "email", "Email"
+    SLACK = "slack", "Slack"
+    TEAMS = "teams", "Microsoft Teams"
+    GITHUB = "github", "GitHub"
+
+
+class ChannelDetail(models.TextChoices):
+    # Slack sub-types
+    SLACK_CHANNEL_MESSAGE = "slack_channel_message", "Channel message"
+    SLACK_BOT_MENTION = "slack_bot_mention", "Bot mention"
+    SLACK_EMOJI_REACTION = "slack_emoji_reaction", "Emoji reaction"
+    # Teams sub-types
+    TEAMS_CHANNEL_MESSAGE = "teams_channel_message", "Teams channel message"
+    TEAMS_BOT_MENTION = "teams_bot_mention", "Teams bot mention"
+    # Widget sub-types
+    WIDGET_EMBEDDED = "widget_embedded", "Widget"
+    WIDGET_API = "widget_api", "API"
+    # GitHub sub-types
+    GITHUB_ISSUE = "github_issue", "GitHub issue"
+
+
+class TicketStatus(models.TextChoices):
+    NEW = "new", "New"
+    OPEN = "open", "Open"
+    PENDING = "pending", "Pending"
+    ON_HOLD = "on_hold", "On hold"
+    RESOLVED = "resolved", "Resolved"
+
+
+# The class name feeds the derived OpenAPI component name TicketStatusEnum.
+# Status is an alias for the many callers that import the short name.
+Status = TicketStatus
+
+
+class Priority(models.TextChoices):
+    LOW = "low", "Low"
+    MEDIUM = "medium", "Medium"
+    HIGH = "high", "High"
+    CRITICAL = "critical", "Critical"
+
+
+class TicketMessageType(models.TextChoices):
+    CUSTOMER_MESSAGE = "customer_message", "Customer message"
+    SENT_REPLY = "sent_reply", "Sent reply"
+    INTERNAL_NOTE = "internal_note", "Internal note"
+    AI_DRAFT = "ai_draft", "AI draft"
+
+
+class OrganizationIdSource(models.TextChoices):
+    PERSON = "person", "Requester identity"
+    SLACK_CHANNEL_ACCOUNT = "slack_channel_account", "Slack channel account"
+
+
+class RuleType(models.TextChoices):
+    TONE = "tone", "Tone"
+    ESCALATION = "escalation", "Escalation"
+
+
+# Workflow "Send message" posts with no PostHog user. Delivery treats this like an AI reply
+# (outbound, no created_by). The name is what agents see on the ticket; channel delivery
+# uses the support identity instead, so a customer never sees this label.
+WORKFLOW_AUTHOR_TYPE = "workflow"
+WORKFLOW_AUTHOR_NAME = "Workflow"
+WORKFLOW_DISPATCH_KEY = "workflow_dispatch_key"

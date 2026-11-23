@@ -1,0 +1,361 @@
+// NOTE: PostIngestionEvent is our context event - it should never be sent directly to an output, but rather transformed into a lightweight schema
+import { DateTime } from 'luxon'
+import { Counter } from 'prom-client'
+
+import { UUIDT } from '~/common/utils/utils'
+
+import type { HogFlow } from '../schema/hogflow'
+import type { HogInputsService } from '../services/hog-inputs.service'
+import {
+    CyclotronJobInvocation,
+    CyclotronJobInvocationHogFlow,
+    CyclotronJobInvocationHogFunction,
+    CyclotronJobInvocationResult,
+    HogFunctionFilterGlobals,
+    HogFunctionInvocationGlobals,
+    HogFunctionInvocationGlobalsWithInputs,
+    InvocationBuildFailure,
+    LogEntry,
+    MinimalAppMetric,
+} from '../types'
+import { HogFunctionMappingType, HogFunctionType } from '../types'
+import {
+    getConfiguredSensitiveValues,
+    isLegacyPluginHogFunction,
+    isNativeHogFunction,
+    isSegmentPluginHogFunction,
+    logEntry,
+    sanitizeLogMessage,
+} from '../utils'
+import { currentRuntimeContractHash } from './filter-runtime'
+import { bytecodeContractOf, classifyHogError } from './hog-error-classification'
+import { convertToHogFunctionFilterGlobal, filterFunctionInstrumented } from './hog-function-filtering'
+import { rebuildableInputsSource } from './rebuildable-inputs'
+
+/** The inputs step of the dead-letter pipeline. Read next to cdp_hog_function_filter_error. */
+const hogFunctionInputsErrors = new Counter({
+    name: 'cdp_hog_function_inputs_error',
+    help: 'Building the inputs for an invocation threw, so no invocation was created',
+    labelNames: ['type', 'class'],
+})
+
+export function createInvocation(
+    globals: HogFunctionInvocationGlobalsWithInputs,
+    hogFunction: HogFunctionType
+): CyclotronJobInvocationHogFunction {
+    return {
+        id: new UUIDT().toString(),
+        state: {
+            globals,
+            timings: [],
+            attempts: 0,
+        },
+        teamId: hogFunction.team_id,
+        functionId: hogFunction.id,
+        hogFunction,
+        queue: 'hog',
+        queuePriority: 0,
+    }
+}
+
+// The native, segment and legacy plugin executors read the inputs from the state and cannot build them again.
+const canRebuildInputs = (hogFunction: HogFunctionType): boolean =>
+    !isNativeHogFunction(hogFunction) &&
+    !isLegacyPluginHogFunction(hogFunction) &&
+    !isSegmentPluginHogFunction(hogFunction)
+
+/**
+ * Matches a batch of hog functions against one event's globals and builds an invocation per match,
+ * resolving each one's inputs. Filter metrics/logs come back alongside for the caller to queue, as
+ * do the functions that matched but produced no invocation, which the caller dead-letters.
+ *
+ * Set `markInputsRebuildable` only when the functions are the stored configs, which is what the worker loads
+ * when it builds the inputs again.
+ */
+export async function buildHogFunctionInvocations(
+    hogInputsService: HogInputsService,
+    hogFunctions: HogFunctionType[],
+    triggerGlobals: HogFunctionInvocationGlobals,
+    { markInputsRebuildable = false }: { markInputsRebuildable?: boolean } = {}
+): Promise<{
+    invocations: CyclotronJobInvocationHogFunction[]
+    metrics: MinimalAppMetric[]
+    logs: LogEntry[]
+    buildFailures: InvocationBuildFailure[]
+}> {
+    const metrics: MinimalAppMetric[] = []
+    const logs: LogEntry[] = []
+    const invocations: CyclotronJobInvocationHogFunction[] = []
+    const buildFailures: InvocationBuildFailure[] = []
+
+    // TRICKY: The frontend generates filters matching the Clickhouse event type so we are converting back
+    const filterGlobals = convertToHogFunctionFilterGlobal(triggerGlobals)
+
+    const _filterHogFunction = async (
+        hogFunction: HogFunctionType,
+        filters: HogFunctionType['filters'],
+        filterGlobals: HogFunctionFilterGlobals
+    ): Promise<boolean> => {
+        const filterResults = await filterFunctionInstrumented({
+            caller: 'build_hog_function_invocations',
+            fn: hogFunction,
+            filters,
+            filterGlobals,
+        })
+
+        // Add any generated metrics and logs to our collections
+        metrics.push(...filterResults.metrics)
+        logs.push(...filterResults.logs)
+
+        // Checked against undefined, not for truthiness: a thrown error whose message is empty is
+        // still a failure, and treating it as success drops the event with no record of it.
+        if (filterResults.error !== undefined) {
+            buildFailures.push({
+                sourceId: hogFunction.id,
+                sourceKind: 'hog_function',
+                step: 'filter',
+                error: String(filterResults.error),
+                errorClass: filterResults.errorClass,
+            })
+        }
+
+        return filterResults.match
+    }
+
+    const _buildInvocation = async (
+        hogFunction: HogFunctionType,
+        mapping?: HogFunctionMappingType
+    ): Promise<CyclotronJobInvocationHogFunction | null> => {
+        try {
+            const globalsWithSource = {
+                ...triggerGlobals,
+                source: {
+                    id: hogFunction.id,
+                    name: hogFunction.name ?? `Hog function: ${hogFunction.id}`,
+                    url: `${triggerGlobals.project.url}/functions/${hogFunction.id}/configuration/`,
+                },
+            }
+
+            const globalsWithInputs = await hogInputsService.buildInputsWithGlobals(
+                hogFunction,
+                globalsWithSource,
+                mapping ? (mapping.inputs ?? {}) : undefined
+            )
+
+            const invocation = createInvocation(globalsWithInputs, hogFunction)
+            if (markInputsRebuildable && canRebuildInputs(hogFunction)) {
+                invocation.state.inputsSource = rebuildableInputsSource(hogFunction, mapping)
+            }
+            return invocation
+        } catch (error) {
+            // A dependency outage, such as Postgres refusing an integration lookup, is not this
+            // function's fault. Rethrowing fails the batch, so the offsets stay put and it retries.
+            if (error?.isRetriable === true) {
+                throw error
+            }
+            const errorClass = classifyHogError(error, {
+                bytecodeContract: bytecodeContractOf(error),
+                runtimeContract: currentRuntimeContractHash(),
+            })
+
+            buildFailures.push({
+                sourceId: hogFunction.id,
+                sourceKind: 'hog_function',
+                step: 'inputs',
+                // The VM quotes the argument it choked on, and an argument can be a secret input.
+                // This message leaves the process as a header on the parked record.
+                error: sanitizeLogMessage([error.message], getConfiguredSensitiveValues(hogFunction)),
+                errorClass,
+            })
+
+            logs.push({
+                team_id: hogFunction.team_id,
+                log_source: 'hog_function',
+                log_source_id: hogFunction.id,
+                instance_id: new UUIDT().toString(), // random UUID, like it would be for an invocation
+                // logEntry truncates: the message carries the VM's text, which can quote a value.
+                // The VM can quote an argument, and an argument can be a secret input.
+                ...logEntry(
+                    'error',
+                    sanitizeLogMessage(
+                        [`Error building inputs for event ${triggerGlobals.event.uuid}: ${error.message}`],
+                        getConfiguredSensitiveValues(hogFunction)
+                    )
+                ),
+            })
+
+            hogFunctionInputsErrors.inc({ type: hogFunction.type, class: errorClass })
+
+            metrics.push({
+                team_id: hogFunction.team_id,
+                app_source_id: hogFunction.id,
+                metric_kind: 'failure',
+                metric_name: 'inputs_failed',
+                count: 1,
+            })
+
+            return null
+        }
+    }
+
+    await Promise.all(
+        hogFunctions.map(async (hogFunction) => {
+            // We always check the top level filters
+            if (!(await _filterHogFunction(hogFunction, hogFunction.filters, filterGlobals))) {
+                return
+            }
+
+            // Check for non-mapping functions first
+            if (!hogFunction.mappings) {
+                const invocation = await _buildInvocation(hogFunction)
+                if (!invocation) {
+                    return
+                }
+
+                invocations.push(invocation)
+                return
+            }
+
+            await Promise.all(
+                hogFunction.mappings.map(async (mapping) => {
+                    if (!(await _filterHogFunction(hogFunction, mapping.filters, filterGlobals))) {
+                        return
+                    }
+
+                    const invocation = await _buildInvocation(hogFunction, mapping)
+                    if (!invocation) {
+                        return
+                    }
+
+                    invocations.push(invocation)
+                })
+            )
+        })
+    )
+
+    return {
+        invocations,
+        metrics,
+        logs,
+        buildFailures,
+    }
+}
+
+/**
+ * Clones an invocation, removing all queue related values
+ */
+
+export function cloneInvocation<T extends CyclotronJobInvocation>(
+    invocation: T,
+    params: Pick<
+        Partial<CyclotronJobInvocation>,
+        'queue' | 'queuePriority' | 'queueMetadata' | 'queueScheduledAt' | 'queueParameters'
+    > = {}
+): T {
+    return {
+        ...invocation,
+        // The target queue is typically the same as the source but can be overridden
+        queue: params.queue ?? invocation.queue,
+        // The source is kept from the invocation always as it is important for the job queue router
+        queueSource: invocation.queueSource,
+        // Metadata is only used from the invocation if the queue is staying the same
+        queueMetadata:
+            params.queueMetadata ?? (invocation.queue === params.queue ? invocation.queueMetadata : undefined),
+
+        // Below params are always reset unless provided as overrides
+        queueScheduledAt: params.queueScheduledAt ?? undefined,
+        queuePriority: params.queuePriority ?? 0,
+        queueParameters: params.queueParameters ?? undefined,
+    }
+}
+
+export function createInputsFailureResult(
+    hogFunction: HogFunctionType,
+    globals: HogFunctionInvocationGlobals,
+    error: Error,
+    invocationId?: string
+): CyclotronJobInvocationResult<CyclotronJobInvocationHogFunction> {
+    const invocation = createInvocation({ ...globals, inputs: {} }, hogFunction)
+    if (invocationId) {
+        invocation.id = invocationId
+    }
+    return createInvocationResult<CyclotronJobInvocationHogFunction>(
+        invocation,
+        {},
+        {
+            error: error.message,
+            logs: [{ level: 'error', timestamp: DateTime.now(), message: `Error building inputs: ${error.message}` }],
+        }
+    )
+}
+
+/**
+ * Safely creates an invocation result from an invocation, cloning it and resetting the relevant queue parameters
+ */
+export function createInvocationResult<T extends CyclotronJobInvocation>(
+    invocation: CyclotronJobInvocation,
+    invocationParams: Pick<
+        Partial<CyclotronJobInvocation>,
+        'queue' | 'queuePriority' | 'queueMetadata' | 'queueScheduledAt' | 'queueParameters'
+    > = {},
+    resultParams: Pick<
+        Partial<CyclotronJobInvocationResult>,
+        | 'finished'
+        | 'capturedPostHogEvents'
+        | 'warehouseWebhookPayloads'
+        | 'messageAssets'
+        | 'conversionWatchers'
+        | 'logs'
+        | 'metrics'
+        | 'error'
+        | 'execResult'
+        | 'emailSendResult'
+    > = {}
+): CyclotronJobInvocationResult<T> {
+    return {
+        // Clone the invocation for the result cleaned
+        finished: true,
+        capturedPostHogEvents: [],
+        warehouseWebhookPayloads: [],
+        messageAssets: [],
+        conversionWatchers: [],
+        logs: [],
+        metrics: [],
+        ...resultParams,
+        invocation: cloneInvocation(invocation, invocationParams) as T,
+    }
+}
+
+/**
+ * Terminate an invocation as canceled through the normal result pipeline, so the
+ * terminal lifecycle row, app metric, and run log all land. A bare cyclotron
+ * status flip would leave the run showing 'running' in the Invocations UI forever.
+ */
+export function createCanceledInvocationResult(
+    item: CyclotronJobInvocation,
+    message: string,
+    hogFlow?: HogFlow
+): CyclotronJobInvocationResult {
+    // The monitoring services identify a workflow result by the presence of `hogFlow`, and use
+    // it to key the terminal lifecycle row as `hog_flow` and to fill the row's trigger fields.
+    // Without it the row keys as `hog_function`; because `function_kind` is part of the
+    // ReplacingMergeTree key, that row could never collapse the `running` row (written as
+    // `hog_flow`), leaving the run stuck at 'running' in the Invocations tab. When the live flow
+    // is gone (deleted, or its lookup failed) we still know its id, which is `item.functionId`,
+    // so attach a minimal stub carrying just that so the row still keys as `hog_flow`. Only `id`
+    // is read off this object on the cancellation path.
+    const resolvedFlow = hogFlow ?? ({ id: item.functionId } as HogFlow)
+    const invocation = { ...item, hogFlow: resolvedFlow }
+    const result = createInvocationResult(invocation, {}, { finished: true })
+    result.canceled = true
+    result.logs.push({ level: 'info', timestamp: DateTime.now(), message })
+    result.metrics.push({
+        team_id: item.teamId,
+        app_source_id: item.parentRunId ?? item.functionId,
+        instance_id: (item.state as CyclotronJobInvocationHogFlow['state'] | null)?.currentAction?.id,
+        metric_kind: 'other',
+        metric_name: 'canceled',
+        count: 1,
+    })
+    return result
+}

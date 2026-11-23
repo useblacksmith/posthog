@@ -1,0 +1,21 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+        "id": {
+            "description": "A UUID string identifying this external data source.",
+            "type": "string"
+        },
+        "inputs": {
+            "additionalProperties": {
+                "type": "string"
+            },
+            "description": "Webhook input values keyed by the source's declared webhook field names, for example `{\"signing_secret\": \"...\"}`. Only keys the source type declares as webhook fields are accepted, and a required field cannot be blank.",
+            "propertyNames": {
+                "type": "string"
+            },
+            "type": "object"
+        }
+    },
+    "required": ["id", "inputs"],
+    "type": "object"
+}

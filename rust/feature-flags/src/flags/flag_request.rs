@@ -1,0 +1,1344 @@
+use std::collections::{HashMap, HashSet};
+
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use common_cookieless::COOKIELESS_SENTINEL_VALUE;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+
+use crate::api::errors::{ClientFacingError, FlagError};
+use crate::handler::flags::EvaluationRuntime;
+use crate::properties::property_matching::is_person_metadata_key;
+use crate::utils::bounded_json5;
+
+/// Maximum length for distinct_id values.
+/// This limit ensures compatibility with batch export destinations (Redshift, Postgres)
+/// which use VARCHAR(200). The main persons tables allow up to 400 chars.
+pub const MAX_DISTINCT_ID_LEN: usize = 200;
+
+const MAX_LIB_LEN: usize = 64;
+
+/// Maximum number of keys in `person_property_keys_known_absent`, and in each group type's list
+/// in `group_property_keys_known_absent`. Duplicates count toward the limit.
+pub const MAX_KNOWN_ABSENT_KEYS: usize = 1000;
+
+/// Property keys a request lists as known absent, validated. Group sets are keyed by group type
+/// name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KnownAbsentProperties {
+    pub person: HashSet<String>,
+    pub groups: HashMap<String, HashSet<String>>,
+}
+
+fn bad_request(msg: String) -> FlagError {
+    FlagError::ClientFacing(ClientFacingError::BadRequest(msg))
+}
+
+/// Reads an array of at most `MAX_KNOWN_ABSENT_KEYS` strings, or returns a 400 with one of the
+/// given messages.
+fn known_absent_keys(
+    value: &Value,
+    wrong_type_msg: impl Fn() -> String,
+    too_long_msg: impl FnOnce() -> String,
+) -> Result<HashSet<String>, FlagError> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| bad_request(wrong_type_msg()))?;
+    if items.len() > MAX_KNOWN_ABSENT_KEYS {
+        return Err(bad_request(too_long_msg()));
+    }
+    items
+        .iter()
+        .map(|item| item.as_str().map(str::to_string))
+        .collect::<Option<_>>()
+        .ok_or_else(|| bad_request(wrong_type_msg()))
+}
+
+fn deserialize_distinct_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNumber {
+        String(String),
+        Number(serde_json::Number),
+    }
+
+    let opt = Option::<StringOrNumber>::deserialize(deserializer)?;
+    Ok(opt.map(|val| match val {
+        StringOrNumber::String(s) => s,
+        StringOrNumber::Number(n) => n.to_string(),
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
+pub enum FlagRequestType {
+    Decide,
+    FlagDefinitions,
+    /// A `/flags/definitions` poll answered with 304, billed at the `/flags` rate.
+    FlagDefinitionsNotModified,
+}
+
+impl FlagRequestType {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            FlagRequestType::Decide => "decide",
+            FlagRequestType::FlagDefinitions => "flag_definitions",
+            FlagRequestType::FlagDefinitionsNotModified => "flag_definitions_not_modified",
+        }
+    }
+}
+
+#[derive(Default, Debug, Deserialize, Serialize)]
+pub struct FlagRequest {
+    #[serde(
+        alias = "$token",
+        alias = "api_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub token: Option<String>,
+    #[serde(
+        alias = "$distinct_id",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_distinct_id",
+        default
+    )]
+    pub distinct_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<DateTime<Utc>>,
+    /// Skips the MaxMind lookup that adds `$geoip_*` properties to `person_properties`.
+    /// Only affects keys the request didn't send, since request-supplied `$geoip_*` values take
+    /// precedence over the lookup either way. With the lookup skipped, a flag targeting
+    /// `$geoip_*` falls back to the person's stored properties rather than matching on nothing.
+    /// See `docs/internal/feature-flags/rust-service-overview.md`.
+    pub geoip_disable: Option<bool>,
+    // Web and mobile clients can configure this parameter to disable flags for a request.
+    // It's mostly used for folks who want to save money on flag evaluations while still using
+    // `/flags` to load the rest of their PostHog configuration.
+    pub disable_flags: Option<bool>,
+    #[serde(default, alias = "$properties")]
+    pub person_properties: Option<HashMap<String, Value>>,
+    #[serde(default, alias = "$groups")]
+    pub groups: Option<HashMap<String, Value>>,
+    #[serde(default, alias = "$group_properties")]
+    pub group_properties: Option<HashMap<String, HashMap<String, Value>>>,
+    /// Person property keys the caller knows the person doesn't have, as an array of at most
+    /// `MAX_KNOWN_ABSENT_KEYS` strings. Evaluation treats each listed key as absent, even when
+    /// the stored person, `person_properties`, or a value the service adds (such as `$geoip_*`)
+    /// has one. The field is a raw `Value` so that a wrong type reaches
+    /// `known_absent_properties`, which names the field in its 400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_property_keys_known_absent: Option<Value>,
+    /// Group property keys the caller knows are absent, as an object that maps a group type name
+    /// to an array of at most `MAX_KNOWN_ABSENT_KEYS` strings. Group type names the team doesn't
+    /// have are ignored. Otherwise this follows `person_property_keys_known_absent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_property_keys_known_absent: Option<Value>,
+    #[serde(alias = "$anon_distinct_id", skip_serializing_if = "Option::is_none")]
+    pub anon_distinct_id: Option<String>,
+    #[serde(alias = "$device_id", skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    pub ip_address: Option<String>,
+    #[serde(default, alias = "flag_keys_to_evaluate")]
+    pub flag_keys: Option<Vec<String>>,
+    #[serde(default)]
+    pub timezone: Option<String>,
+    #[serde(default)]
+    pub cookieless_hash_extra: Option<String>,
+    #[serde(default, alias = "evaluation_environments")]
+    pub evaluation_contexts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_runtime: Option<EvaluationRuntime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_flags_definitions: Option<HashMap<String, Value>>,
+}
+
+impl FlagRequest {
+    pub fn resolve_sent_at(&self, query_sent_at: Option<i64>) -> Option<u64> {
+        self.sent_at
+            .as_ref()
+            .map(DateTime::timestamp_millis)
+            .and_then(|sent_at| u64::try_from(sent_at).ok())
+            .or_else(|| query_sent_at.and_then(|sent_at| u64::try_from(sent_at).ok()))
+    }
+
+    /// Takes a request payload and tries to read it.
+    /// Only supports base64 encoded payloads or uncompressed utf-8 as json.
+    pub fn from_bytes(bytes: Bytes) -> Result<FlagRequest, FlagError> {
+        // Handle UTF-8 conversion more gracefully, similar to form data handling
+        let payload = match String::from_utf8(bytes.to_vec()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "Invalid UTF-8 in request body, using lossy conversion: {}",
+                    e
+                );
+                // Use lossy conversion as fallback - this handles Android clients that might
+                // send malformed UTF-8 sequences after decompression
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+        };
+
+        // Use json5 to parse, which handles NaN/Infinity natively
+        let mut value: Value = match bounded_json5::from_str(&payload) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("failed to parse JSON: {}", e);
+                return Err(FlagError::RequestDecodingError(String::from(
+                    "invalid JSON",
+                )));
+            }
+        };
+
+        Self::clean_non_finite_values(&mut value);
+
+        // Deserialize the cleaned value into FlagRequest
+        match serde_json::from_value::<FlagRequest>(value) {
+            Ok(request) => Ok(request),
+            Err(e) => {
+                tracing::warn!("failed to parse JSON: {}", e);
+                Err(FlagError::RequestDecodingError(String::from(
+                    "invalid JSON",
+                )))
+            }
+        }
+    }
+
+    /// Replaces non-finite numbers (NaN, Infinity, -Infinity) with null in a JSON Value
+    /// This matches Python decide endpoint behavior: parse_constant=lambda x: None
+    fn clean_non_finite_values(value: &mut Value) {
+        match value {
+            Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    if !f.is_finite() {
+                        *value = Value::Null;
+                    }
+                }
+            }
+            Value::Object(map) => {
+                for (_, v) in map.iter_mut() {
+                    Self::clean_non_finite_values(v);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr.iter_mut() {
+                    Self::clean_non_finite_values(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn person_property_str(&self, key: &str) -> Option<&str> {
+        self.person_properties.as_ref()?.get(key)?.as_str()
+    }
+
+    fn extract_person_property_string(&self, key: &str) -> Option<String> {
+        self.person_property_str(key)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn extract_lib(&self) -> Option<String> {
+        self.extract_person_property_string("$lib")
+            .map(|lib| lib.chars().take(MAX_LIB_LEN).collect())
+    }
+
+    pub fn extract_lib_version(&self) -> Option<String> {
+        self.extract_person_property_string("$lib_version")
+            .map(|version| version.chars().take(MAX_LIB_LEN).collect())
+    }
+
+    /// Extracts the token from the request.
+    /// If the token is missing or empty, an error is returned.
+    pub fn extract_token(&self) -> Result<String, FlagError> {
+        match &self.token {
+            Some(token) if !token.is_empty() => Ok(token.clone()),
+            _ => Err(FlagError::NoTokenError),
+        }
+    }
+
+    /// Extracts the distinct_id from the request.
+    /// If the distinct_id is missing or empty, an error is returned.
+    pub fn extract_distinct_id(&self) -> Result<String, FlagError> {
+        let distinct_id = match &self.distinct_id {
+            None => {
+                tracing::warn!("Missing distinct_id in request");
+                return Err(FlagError::MissingDistinctId);
+            }
+            Some(id) => id,
+        };
+
+        match distinct_id.len() {
+            0..=MAX_DISTINCT_ID_LEN => Ok(distinct_id.to_owned()),
+            _ => Ok(distinct_id.chars().take(MAX_DISTINCT_ID_LEN).collect()),
+        }
+    }
+
+    /// Extracts the properties from the request.
+    /// If the request contains person_properties, they are returned.
+    pub fn extract_properties(&self) -> HashMap<String, Value> {
+        if let Some(person_properties) = &self.person_properties {
+            let mut properties = HashMap::with_capacity(person_properties.len());
+            properties.extend(person_properties.clone());
+            properties
+        } else {
+            HashMap::new()
+        }
+    }
+
+    /// Extracts device_id from the request.
+    /// Checks the top-level device_id field first, then falls back to
+    /// person_properties.$device_id for SDKs that only send it as a property.
+    pub fn extract_device_id(&self) -> Option<String> {
+        self.device_id
+            .as_deref()
+            .filter(|device_id| !device_id.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.extract_person_property_string("$device_id"))
+    }
+
+    /// The `$anon_distinct_id` values the request carried, top level first. Backend SDKs set it
+    /// in person_properties instead of at the top level.
+    fn anon_distinct_id_candidates(&self) -> impl Iterator<Item = &str> {
+        self.anon_distinct_id
+            .as_deref()
+            .into_iter()
+            .chain(self.person_property_str("$anon_distinct_id"))
+    }
+
+    /// Extracts the raw `$anon_distinct_id` the request carried. It can differ from the hash key
+    /// the evaluation uses.
+    pub fn extract_anon_distinct_id(&self) -> Option<String> {
+        self.anon_distinct_id_candidates()
+            .next()
+            .map(str::to_string)
+    }
+
+    /// Extracts the experience continuity hash key. The cookieless sentinel is never a hash key,
+    /// because every cookieless visitor shares it. A sentinel at the top level therefore falls
+    /// back to the person property.
+    pub fn extract_hash_key_override(&self) -> Option<String> {
+        self.anon_distinct_id_candidates()
+            .find(|id| *id != COOKIELESS_SENTINEL_VALUE)
+            .map(str::to_string)
+    }
+
+    /// Validates `person_property_keys_known_absent` and `group_property_keys_known_absent`.
+    /// A field that is missing or JSON null lists nothing. A wrong type or a list over
+    /// `MAX_KNOWN_ABSENT_KEYS` returns a 400 that names the field. Person keys with the person
+    /// metadata prefix are dropped, because known absence applies to person properties and not
+    /// to persons-table columns such as `created_at`.
+    pub fn known_absent_properties(&self) -> Result<KnownAbsentProperties, FlagError> {
+        const PERSON_FIELD: &str = "person_property_keys_known_absent";
+        const GROUP_FIELD: &str = "group_property_keys_known_absent";
+        let group_wrong_type =
+            || format!("{GROUP_FIELD} must be an object whose values are arrays of strings");
+
+        let mut person = match &self.person_property_keys_known_absent {
+            None | Some(Value::Null) => HashSet::new(),
+            Some(value) => known_absent_keys(
+                value,
+                || format!("{PERSON_FIELD} must be an array of strings"),
+                || format!("{PERSON_FIELD} allows at most {MAX_KNOWN_ABSENT_KEYS} keys"),
+            )?,
+        };
+        person.retain(|key| !is_person_metadata_key(key));
+
+        let groups = match &self.group_property_keys_known_absent {
+            None | Some(Value::Null) => HashMap::new(),
+            Some(value) => {
+                let entries = value
+                    .as_object()
+                    .ok_or_else(|| bad_request(group_wrong_type()))?;
+                let mut groups = HashMap::with_capacity(entries.len());
+                for (group_type, keys) in entries {
+                    let keys = known_absent_keys(keys, group_wrong_type, || {
+                        format!(
+                            "{GROUP_FIELD} allows at most {MAX_KNOWN_ABSENT_KEYS} keys per group type"
+                        )
+                    })?;
+                    groups.insert(group_type.clone(), keys);
+                }
+                groups
+            }
+        };
+
+        Ok(KnownAbsentProperties { person, groups })
+    }
+
+    /// Checks if feature flags should be disabled for this request.
+    /// Returns true if disable_flags is explicitly set to true.
+    pub fn is_flags_disabled(&self) -> bool {
+        matches!(self.disable_flags, Some(true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use std::sync::Arc;
+
+    use crate::api::errors::{ClientFacingError, FlagError};
+
+    use crate::flags::flag_definitions_cache::FlagDefinitionsCache;
+    use crate::flags::flag_request::{
+        FlagRequest, KnownAbsentProperties, MAX_DISTINCT_ID_LEN, MAX_LIB_LEN,
+    };
+    use crate::flags::flag_service::FlagService;
+    use crate::utils::bounded_json5::MAX_NESTING_DEPTH;
+    use crate::utils::test_utils::{
+        insert_new_team_in_redis, setup_hypercache_reader, setup_pg_reader_client,
+        setup_redis_client, setup_team_hypercache_reader,
+    };
+    use bytes::Bytes;
+    use common_cache::NegativeCache;
+    use rstest::rstest;
+    use serde_json::json;
+    use serde_json::Value;
+
+    #[rstest]
+    #[case::top_level_wins(
+        Some("anon123"),
+        Some(json!({"$anon_distinct_id": "anon456"})),
+        Some("anon123"),
+        Some("anon123")
+    )]
+    #[case::falls_back_to_person_properties(
+        None,
+        Some(json!({"$anon_distinct_id": "anon456"})),
+        Some("anon456"),
+        Some("anon456")
+    )]
+    #[case::not_present(None, None, None, None)]
+    #[case::person_properties_without_the_key(
+        None,
+        Some(json!({"other_property": "value"})),
+        None,
+        None
+    )]
+    #[case::non_string_person_property(
+        None,
+        Some(json!({"$anon_distinct_id": 123})),
+        None,
+        None
+    )]
+    #[case::cookieless_sentinel_top_level(
+        Some("$posthog_cookieless"),
+        None,
+        Some("$posthog_cookieless"),
+        None
+    )]
+    #[case::cookieless_sentinel_person_property(
+        None,
+        Some(json!({"$anon_distinct_id": "$posthog_cookieless"})),
+        Some("$posthog_cookieless"),
+        None
+    )]
+    #[case::cookieless_sentinel_top_level_falls_back_to_person_property(
+        Some("$posthog_cookieless"),
+        Some(json!({"$anon_distinct_id": "anon456"})),
+        Some("$posthog_cookieless"),
+        Some("anon456")
+    )]
+    fn test_hash_key_override(
+        #[case] top_level: Option<&str>,
+        #[case] person_properties: Option<Value>,
+        #[case] expected_raw: Option<&str>,
+        #[case] expected_hash_key: Option<&str>,
+    ) {
+        let request = FlagRequest {
+            anon_distinct_id: top_level.map(str::to_string),
+            person_properties: person_properties.map(|v| {
+                serde_json::from_value(v).expect("person_properties case must be a JSON object")
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            request.extract_anon_distinct_id(),
+            expected_raw.map(str::to_string)
+        );
+        assert_eq!(
+            request.extract_hash_key_override(),
+            expected_hash_key.map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn empty_distinct_id_is_accepted() {
+        let json = json!({
+            "distinct_id": "",
+            "token": "my_token1",
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        match flag_payload.extract_distinct_id() {
+            Ok(distinct_id) => assert_eq!(distinct_id, ""),
+            Err(e) => panic!("expected empty distinct_id to be accepted, got error: {e}"),
+        };
+    }
+
+    #[test]
+    fn too_large_distinct_id_is_truncated() {
+        let json = json!({
+            "distinct_id": "a".repeat(MAX_DISTINCT_ID_LEN + 10),
+            "token": "my_token1",
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        assert_eq!(
+            flag_payload.extract_distinct_id().unwrap().len(),
+            MAX_DISTINCT_ID_LEN
+        );
+    }
+
+    #[test]
+    fn test_nan_infinity_handling() {
+        // Test unquoted NaN/Infinity values are replaced with null
+        let json_str = r#"{
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "person_properties": {
+                "score": NaN,
+                "max_value": Infinity,
+                "min_value": -Infinity,
+                "valid_number": 42.5,
+                "text_with_nan": "NaN is not a number",
+                "text_with_infinity": "Infinity stones"
+            }
+        }"#;
+        let bytes = Bytes::from(json_str);
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        // Check that NaN/Infinity were replaced with null
+        let props = flag_payload.person_properties.unwrap();
+        assert_eq!(props.get("score"), Some(&serde_json::Value::Null));
+        assert_eq!(props.get("max_value"), Some(&serde_json::Value::Null));
+        assert_eq!(props.get("min_value"), Some(&serde_json::Value::Null));
+
+        // Check that valid number is preserved
+        assert_eq!(props.get("valid_number"), Some(&json!(42.5)));
+
+        // Check that strings containing "NaN" and "Infinity" are preserved
+        assert_eq!(
+            props.get("text_with_nan"),
+            Some(&json!("NaN is not a number"))
+        );
+        assert_eq!(
+            props.get("text_with_infinity"),
+            Some(&json!("Infinity stones"))
+        );
+    }
+
+    #[test]
+    fn test_nested_nan_infinity_handling() {
+        // Test deeply nested NaN/Infinity values are also replaced
+        let json_str = r#"{
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "group_properties": {
+                "company": {
+                    "metrics": {
+                        "revenue": NaN,
+                        "growth": Infinity,
+                        "nested_array": [1, 2, NaN, Infinity, -Infinity, 3],
+                        "payload": "{'foo': NaN}"
+                    }
+                }
+            }
+        }"#;
+        let bytes = Bytes::from(json_str);
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        // Check nested replacements
+        let group_props = flag_payload.group_properties.unwrap();
+        let company = group_props.get("company").unwrap();
+        let metrics = company.get("metrics").unwrap().as_object().unwrap();
+
+        assert_eq!(metrics.get("revenue"), Some(&serde_json::Value::Null));
+        assert_eq!(metrics.get("growth"), Some(&serde_json::Value::Null));
+
+        // Check array values
+        let array = metrics.get("nested_array").unwrap().as_array().unwrap();
+        assert_eq!(array[0], json!(1));
+        assert_eq!(array[1], json!(2));
+        assert_eq!(array[2], serde_json::Value::Null); // NaN
+        assert_eq!(array[3], serde_json::Value::Null); // Infinity
+        assert_eq!(array[4], serde_json::Value::Null); // -Infinity
+        assert_eq!(array[5], json!(3));
+
+        // Check that string containing "NaN" is preserved
+        assert_eq!(metrics.get("payload"), Some(&json!("{'foo': NaN}")));
+    }
+
+    #[test]
+    fn test_nesting_past_depth_limit_is_rejected() {
+        // The request object and person_properties are the first two levels.
+        let levels = MAX_NESTING_DEPTH - 1;
+        let json_str = format!(
+            r#"{{"distinct_id": "user123", "token": "my_token1", "person_properties": {{"v": {}{}}}}}"#,
+            "[".repeat(levels),
+            "]".repeat(levels)
+        );
+
+        let result = FlagRequest::from_bytes(Bytes::from(json_str));
+
+        assert!(
+            matches!(result, Err(FlagError::RequestDecodingError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_id_is_returned_correctly() {
+        let json = json!({
+            "$distinct_id": "alakazam",
+            "token": "my_token1",
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        match flag_payload.extract_distinct_id() {
+            Ok(id) => assert_eq!(id, "alakazam"),
+            _ => panic!("expected distinct id"),
+        };
+    }
+
+    #[test]
+    fn numeric_distinct_id_is_returned_correctly() {
+        let json = json!({
+            "$distinct_id": 8675309,
+            "token": "my_token1",
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        match flag_payload.extract_distinct_id() {
+            Ok(id) => assert_eq!(id, "8675309"),
+            _ => panic!("expected distinct id"),
+        };
+    }
+
+    #[test]
+    fn missing_distinct_id_is_handled_correctly() {
+        let json = json!({
+            "token": "my_token1",
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        // First verify the field is None
+        assert_eq!(flag_payload.distinct_id, Option::<String>::None);
+    }
+
+    #[test]
+    fn float_distinct_id_is_handled_correctly() {
+        let json = json!({
+            "$distinct_id": 123.45,
+            "token": "my_token1",
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        assert_eq!(flag_payload.distinct_id, Some("123.45".to_string()));
+    }
+
+    #[test]
+    fn test_extract_device_id() {
+        struct Case {
+            name: &'static str,
+            device_id: Option<String>,
+            person_properties: Option<HashMap<String, Value>>,
+            expected: Option<String>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "returns top-level device_id",
+                device_id: Some("top-level-device".to_string()),
+                person_properties: None,
+                expected: Some("top-level-device".to_string()),
+            },
+            Case {
+                name: "falls back to person_properties device_id",
+                device_id: None,
+                person_properties: Some(HashMap::from([(
+                    "$device_id".to_string(),
+                    json!("prop-device"),
+                )])),
+                expected: Some("prop-device".to_string()),
+            },
+            // top-level takes precedence
+            Case {
+                name: "prefers top-level device_id over person_properties",
+                device_id: Some("top-level-device".to_string()),
+                person_properties: Some(HashMap::from([(
+                    "$device_id".to_string(),
+                    json!("prop-device"),
+                )])),
+                expected: Some("top-level-device".to_string()),
+            },
+            // absent entirely
+            Case {
+                name: "returns none when device_id is absent everywhere",
+                device_id: None,
+                person_properties: Some(HashMap::from([(
+                    "other_prop".to_string(),
+                    json!("value"),
+                )])),
+                expected: None,
+            },
+            // empty string in person_properties → None
+            Case {
+                name: "ignores empty string in person_properties device_id",
+                device_id: None,
+                person_properties: Some(HashMap::from([("$device_id".to_string(), json!(""))])),
+                expected: None,
+            },
+            // non-string device_id in person_properties is ignored
+            Case {
+                name: "ignores non-string person_properties device_id",
+                device_id: None,
+                person_properties: Some(HashMap::from([("$device_id".to_string(), json!(12345))])),
+                expected: None,
+            },
+            // empty string at top level → should also return None / fall through
+            Case {
+                name: "falls through when top-level device_id is empty",
+                device_id: Some("".to_string()),
+                person_properties: Some(HashMap::from([(
+                    "$device_id".to_string(),
+                    json!("prop-device"),
+                )])),
+                expected: Some("prop-device".to_string()),
+            },
+        ];
+
+        for case in cases {
+            let flag_request = FlagRequest {
+                device_id: case.device_id,
+                person_properties: case.person_properties,
+                ..Default::default()
+            };
+            assert_eq!(
+                flag_request.extract_device_id(),
+                case.expected,
+                "Failed: {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_sent_at_prefers_body_and_falls_back_to_query() {
+        assert_eq!(
+            FlagRequest {
+                sent_at: Some("2023-11-14T22:13:20Z".parse().unwrap()),
+                ..Default::default()
+            }
+            .resolve_sent_at(Some(1_600_000_000_000)),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            FlagRequest::default().resolve_sent_at(Some(1_600_000_000_000)),
+            Some(1_600_000_000_000)
+        );
+        assert_eq!(
+            FlagRequest {
+                sent_at: Some("1969-12-31T23:59:59Z".parse().unwrap()),
+                ..Default::default()
+            }
+            .resolve_sent_at(Some(1_600_000_000_000)),
+            Some(1_600_000_000_000)
+        );
+        assert_eq!(FlagRequest::default().resolve_sent_at(Some(-1)), None);
+    }
+
+    #[test]
+    fn test_extract_properties() {
+        let flag_request = FlagRequest {
+            person_properties: Some(HashMap::from([
+                ("key1".to_string(), json!("value1")),
+                ("key2".to_string(), json!(42)),
+            ])),
+            ..Default::default()
+        };
+
+        let properties = flag_request.extract_properties();
+        assert_eq!(properties.len(), 2);
+        assert_eq!(properties.get("key1").unwrap(), &json!("value1"));
+        assert_eq!(properties.get("key2").unwrap(), &json!(42));
+    }
+
+    #[test]
+    fn test_extract_token() {
+        let json = json!({
+            "distinct_id": "alakazam",
+            "token": "my_token1",
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        match flag_payload.extract_token() {
+            Ok(token) => assert_eq!(token, "my_token1"),
+            _ => panic!("expected token"),
+        };
+
+        let json = json!({
+            "distinct_id": "alakazam",
+            "token": "",
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        match flag_payload.extract_token() {
+            Err(FlagError::NoTokenError) => (),
+            _ => panic!("expected empty token error"),
+        };
+
+        let json = json!({
+            "distinct_id": "alakazam",
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        match flag_payload.extract_token() {
+            Err(FlagError::NoTokenError) => (),
+            _ => panic!("expected no token error"),
+        };
+    }
+
+    #[test]
+    fn test_disable_flags() {
+        // Test with disable_flags: true
+        let json = json!({
+            "distinct_id": "test_id",
+            "token": "test_token",
+            "disable_flags": true
+        });
+        let bytes = Bytes::from(json.to_string());
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        assert!(flag_payload.is_flags_disabled());
+
+        // Test with disable_flags: false
+        let json = json!({
+            "distinct_id": "test_id",
+            "token": "test_token",
+            "disable_flags": false
+        });
+        let bytes = Bytes::from(json.to_string());
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        assert!(!flag_payload.is_flags_disabled());
+
+        // Test without disable_flags field
+        let json = json!({
+            "distinct_id": "test_id",
+            "token": "test_token"
+        });
+        let bytes = Bytes::from(json.to_string());
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        assert!(!flag_payload.is_flags_disabled());
+    }
+
+    #[tokio::test]
+    async fn token_is_returned_correctly() {
+        let redis_client = setup_redis_client(None).await;
+        let pg_client = setup_pg_reader_client(None);
+        let team = insert_new_team_in_redis(redis_client.clone())
+            .await
+            .expect("Failed to insert new team in Redis");
+
+        let json = json!({
+            "$distinct_id": "alakazam",
+            "token": team.api_token,
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        let token = flag_payload
+            .extract_token()
+            .expect("failed to extract token");
+
+        let team_hypercache_reader = setup_team_hypercache_reader(redis_client.clone()).await;
+        let hypercache_reader = setup_hypercache_reader(redis_client.clone()).await;
+
+        let flag_service = FlagService::new(
+            redis_client.clone(),
+            pg_client.clone(),
+            team_hypercache_reader,
+            hypercache_reader,
+            Arc::new(FlagDefinitionsCache::disabled()),
+            NegativeCache::new(100, 300),
+            false,
+        );
+
+        match flag_service.verify_token_and_get_team(&token).await {
+            Ok(verified_team) => assert_eq!(verified_team.api_token, team.api_token),
+            Err(e) => panic!("Failed to extract and verify token: {e:?}"),
+        };
+    }
+
+    #[tokio::test]
+    async fn test_error_cases() {
+        let redis_client = setup_redis_client(None).await;
+        let pg_client = setup_pg_reader_client(None);
+        let team_hypercache_reader = setup_team_hypercache_reader(redis_client.clone()).await;
+        let hypercache_reader = setup_hypercache_reader(redis_client.clone()).await;
+
+        // Test invalid token
+        let flag_request = FlagRequest {
+            token: Some("invalid_token".to_string()),
+            ..Default::default()
+        };
+        let result = flag_request
+            .extract_token()
+            .expect("failed to extract token");
+
+        let flag_service = FlagService::new(
+            redis_client.clone(),
+            pg_client.clone(),
+            team_hypercache_reader,
+            hypercache_reader,
+            Arc::new(FlagDefinitionsCache::disabled()),
+            NegativeCache::new(100, 300),
+            false,
+        );
+        assert!(matches!(
+            flag_service.verify_token_and_get_team(&result).await,
+            Err(FlagError::TokenValidationError)
+        ));
+
+        // Test missing distinct_id
+        let flag_request = FlagRequest {
+            token: Some("valid_token".to_string()),
+            distinct_id: None,
+            ..Default::default()
+        };
+        let result = flag_request.extract_distinct_id();
+        assert!(matches!(result, Err(FlagError::MissingDistinctId)));
+    }
+
+    #[test]
+    fn test_flag_keys_field_accepts_flag_keys() {
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "flag_keys": ["flag1", "flag2", "flag3"]
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        assert!(flag_payload.flag_keys.is_some());
+        let flag_keys = flag_payload.flag_keys.unwrap();
+        assert_eq!(flag_keys.len(), 3);
+        assert_eq!(flag_keys[0], "flag1");
+        assert_eq!(flag_keys[1], "flag2");
+        assert_eq!(flag_keys[2], "flag3");
+    }
+
+    #[test]
+    fn test_flag_keys_field_accepts_flag_keys_to_evaluate() {
+        // This test should fail until we add the alias
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "flag_keys_to_evaluate": ["flag1", "flag2", "flag3"]
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        // This assertion should fail because flag_keys_to_evaluate is not recognized
+        assert!(
+            flag_payload.flag_keys.is_some(),
+            "flag_keys_to_evaluate should be parsed into flag_keys field"
+        );
+        let flag_keys = flag_payload.flag_keys.unwrap();
+        assert_eq!(flag_keys.len(), 3);
+        assert_eq!(flag_keys[0], "flag1");
+        assert_eq!(flag_keys[1], "flag2");
+        assert_eq!(flag_keys[2], "flag3");
+    }
+
+    #[test]
+    fn test_evaluation_runtime_field() {
+        use crate::handler::flags::EvaluationRuntime;
+
+        // Test with evaluation_runtime: "server"
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "evaluation_runtime": "server"
+        });
+        let bytes = Bytes::from(json.to_string());
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        assert_eq!(
+            flag_payload.evaluation_runtime,
+            Some(EvaluationRuntime::Server)
+        );
+
+        // Test with evaluation_runtime: "client"
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "evaluation_runtime": "client"
+        });
+        let bytes = Bytes::from(json.to_string());
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        assert_eq!(
+            flag_payload.evaluation_runtime,
+            Some(EvaluationRuntime::Client)
+        );
+
+        // Test with evaluation_runtime: "all"
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "evaluation_runtime": "all"
+        });
+        let bytes = Bytes::from(json.to_string());
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        assert_eq!(
+            flag_payload.evaluation_runtime,
+            Some(EvaluationRuntime::All)
+        );
+
+        // Test without evaluation_runtime field
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1"
+        });
+        let bytes = Bytes::from(json.to_string());
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        assert_eq!(flag_payload.evaluation_runtime, None);
+
+        // Test with invalid evaluation_runtime value - should default to "all" with warning
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "evaluation_runtime": "invalid_value"
+        });
+        let bytes = Bytes::from(json.to_string());
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        // Invalid values default to "all" per our custom deserializer
+        assert_eq!(
+            flag_payload.evaluation_runtime,
+            Some(EvaluationRuntime::All)
+        );
+
+        // Test with case-insensitive values
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "evaluation_runtime": "CLIENT"
+        });
+        let bytes = Bytes::from(json.to_string());
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+        assert_eq!(
+            flag_payload.evaluation_runtime,
+            Some(EvaluationRuntime::Client)
+        );
+    }
+
+    #[test]
+    fn test_groups_field_accepts_groups() {
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "groups": {
+                "organization": "org_123",
+                "company": "company_456"
+            }
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        assert!(flag_payload.groups.is_some());
+        let groups = flag_payload.groups.unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.get("organization").unwrap(), &json!("org_123"));
+        assert_eq!(groups.get("company").unwrap(), &json!("company_456"));
+    }
+
+    #[test]
+    fn test_groups_field_accepts_dollar_groups_for_backwards_compatibility() {
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "$groups": {
+                "organization": "org_123",
+                "company": "company_456"
+            }
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        assert!(flag_payload.groups.is_some());
+        let groups = flag_payload.groups.unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.get("organization").unwrap(), &json!("org_123"));
+        assert_eq!(groups.get("company").unwrap(), &json!("company_456"));
+    }
+
+    #[test]
+    fn test_person_properties_field_accepts_dollar_properties_for_backwards_compatibility() {
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "$properties": {
+                "email": "user@example.com",
+                "age": 25
+            }
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        assert!(flag_payload.person_properties.is_some());
+        let props = flag_payload.person_properties.unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(props.get("email").unwrap(), &json!("user@example.com"));
+        assert_eq!(props.get("age").unwrap(), &json!(25));
+    }
+
+    #[test]
+    fn test_sdk_info_is_extracted_from_person_properties() {
+        let flag_payload = FlagRequest::from_bytes(Bytes::from(
+            json!({
+                "distinct_id": "user123",
+                "token": "my_token1",
+                "person_properties": {
+                    "$lib": "web",
+                    "$lib_version": "1.2.3"
+                }
+            })
+            .to_string(),
+        ))
+        .expect("failed to parse request");
+
+        assert_eq!(flag_payload.extract_lib().as_deref(), Some("web"));
+        assert_eq!(flag_payload.extract_lib_version().as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn test_sdk_info_is_truncated() {
+        let flag_payload = FlagRequest {
+            person_properties: Some(HashMap::from([
+                ("$lib".to_string(), json!("a".repeat(MAX_LIB_LEN + 1))),
+                (
+                    "$lib_version".to_string(),
+                    json!("🦔".repeat(MAX_LIB_LEN + 1)),
+                ),
+            ])),
+            ..Default::default()
+        };
+
+        let expected_lib = "a".repeat(MAX_LIB_LEN);
+        assert_eq!(
+            flag_payload.extract_lib().as_deref(),
+            Some(expected_lib.as_str())
+        );
+        assert_eq!(
+            flag_payload
+                .extract_lib_version()
+                .expect("expected lib version")
+                .chars()
+                .count(),
+            MAX_LIB_LEN
+        );
+    }
+
+    #[test]
+    fn test_group_properties_field_accepts_dollar_group_properties_for_backwards_compatibility() {
+        let json = json!({
+            "distinct_id": "user123",
+            "token": "my_token1",
+            "$group_properties": {
+                "organization": {
+                    "name": "ACME Corp",
+                    "size": 100
+                }
+            }
+        });
+        let bytes = Bytes::from(json.to_string());
+
+        let flag_payload = FlagRequest::from_bytes(bytes).expect("failed to parse request");
+
+        assert!(flag_payload.group_properties.is_some());
+        let group_props = flag_payload.group_properties.unwrap();
+        assert_eq!(group_props.len(), 1);
+        let org_props = group_props.get("organization").unwrap();
+        assert_eq!(org_props.get("name").unwrap(), &json!("ACME Corp"));
+        assert_eq!(org_props.get("size").unwrap(), &json!(100));
+    }
+
+    const PERSON_WRONG_TYPE: &str = "person_property_keys_known_absent must be an array of strings";
+    const PERSON_OVER_LIMIT: &str = "person_property_keys_known_absent allows at most 1000 keys";
+    const GROUP_WRONG_TYPE: &str =
+        "group_property_keys_known_absent must be an object whose values are arrays of strings";
+    const GROUP_OVER_LIMIT: &str =
+        "group_property_keys_known_absent allows at most 1000 keys per group type";
+
+    fn numbered_keys(prefix: &str, count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    fn known_absent(person: &[&str], groups: &[(&str, &[&str])]) -> KnownAbsentProperties {
+        KnownAbsentProperties {
+            person: person.iter().map(|key| key.to_string()).collect(),
+            groups: groups
+                .iter()
+                .map(|(group_type, keys)| {
+                    (
+                        group_type.to_string(),
+                        keys.iter().map(|key| key.to_string()).collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[rstest]
+    #[case::fields_absent(json!({}), Ok(KnownAbsentProperties::default()))]
+    #[case::person_null(
+        json!({"person_property_keys_known_absent": null}),
+        Ok(KnownAbsentProperties::default())
+    )]
+    #[case::group_null(
+        json!({"group_property_keys_known_absent": null}),
+        Ok(KnownAbsentProperties::default())
+    )]
+    #[case::person_empty_array(
+        json!({"person_property_keys_known_absent": []}),
+        Ok(KnownAbsentProperties::default())
+    )]
+    #[case::person_duplicates(
+        json!({"person_property_keys_known_absent": ["a", "a"]}),
+        Ok(known_absent(&["a"], &[]))
+    )]
+    #[case::group_empty_object(
+        json!({"group_property_keys_known_absent": {}}),
+        Ok(KnownAbsentProperties::default())
+    )]
+    #[case::group_empty_list(
+        json!({"group_property_keys_known_absent": {"company": []}}),
+        Ok(known_absent(&[], &[("company", &[])]))
+    )]
+    #[case::person_and_group_lists(
+        json!({
+            "person_property_keys_known_absent": ["plan"],
+            "group_property_keys_known_absent": {"company": ["tier"], "project": ["name", "tier"]}
+        }),
+        Ok(known_absent(&["plan"], &[("company", &["tier"]), ("project", &["name", "tier"])]))
+    )]
+    #[case::person_at_limit(
+        json!({"person_property_keys_known_absent": numbered_keys("p", 1000)}),
+        Ok(KnownAbsentProperties {
+            person: numbered_keys("p", 1000).into_iter().collect(),
+            ..Default::default()
+        })
+    )]
+    #[case::two_group_types_each_at_limit(
+        json!({"group_property_keys_known_absent": {
+            "company": numbered_keys("c", 1000),
+            "project": numbered_keys("p", 1000)
+        }}),
+        Ok(KnownAbsentProperties {
+            groups: HashMap::from([
+                ("company".to_string(), numbered_keys("c", 1000).into_iter().collect::<HashSet<_>>()),
+                ("project".to_string(), numbered_keys("p", 1000).into_iter().collect()),
+            ]),
+            ..Default::default()
+        })
+    )]
+    #[case::person_metadata_key_dropped(
+        json!({"person_property_keys_known_absent": ["__posthog_person_metadata__created_at", "plan"]}),
+        Ok(known_absent(&["plan"], &[]))
+    )]
+    #[case::person_string(json!({"person_property_keys_known_absent": "a"}), Err(PERSON_WRONG_TYPE))]
+    #[case::person_number_element(
+        json!({"person_property_keys_known_absent": [1]}),
+        Err(PERSON_WRONG_TYPE)
+    )]
+    #[case::person_null_after_string(
+        json!({"person_property_keys_known_absent": ["a", null]}),
+        Err(PERSON_WRONG_TYPE)
+    )]
+    #[case::person_over_limit(
+        json!({"person_property_keys_known_absent": numbered_keys("p", 1001)}),
+        Err(PERSON_OVER_LIMIT)
+    )]
+    #[case::person_over_limit_with_duplicates(
+        json!({"person_property_keys_known_absent": vec!["a"; 1001]}),
+        Err(PERSON_OVER_LIMIT)
+    )]
+    #[case::group_array(json!({"group_property_keys_known_absent": []}), Err(GROUP_WRONG_TYPE))]
+    #[case::group_list_is_null(
+        json!({"group_property_keys_known_absent": {"company": null}}),
+        Err(GROUP_WRONG_TYPE)
+    )]
+    #[case::group_number_element(
+        json!({"group_property_keys_known_absent": {"company": [1]}}),
+        Err(GROUP_WRONG_TYPE)
+    )]
+    #[case::group_null_after_string(
+        json!({"group_property_keys_known_absent": {"company": ["a", null]}}),
+        Err(GROUP_WRONG_TYPE)
+    )]
+    #[case::second_group_type_over_limit(
+        json!({"group_property_keys_known_absent": {
+            "company": numbered_keys("c", 1000),
+            "project": numbered_keys("p", 1001)
+        }}),
+        Err(GROUP_OVER_LIMIT)
+    )]
+    #[case::group_over_limit_with_duplicates(
+        json!({"group_property_keys_known_absent": {"company": vec!["a"; 1001]}}),
+        Err(GROUP_OVER_LIMIT)
+    )]
+    fn test_known_absent_properties_validation(
+        #[case] fields: Value,
+        #[case] expected: Result<KnownAbsentProperties, &str>,
+    ) {
+        let mut body = json!({"token": "my_token1", "distinct_id": "user123"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        // A wrong shape must survive parsing, so the field-specific 400 reaches the client
+        // instead of the generic "invalid JSON" error.
+        let request = FlagRequest::from_bytes(Bytes::from(body.to_string()))
+            .expect("a known-absent field of any shape must parse");
+
+        let result = request.known_absent_properties();
+
+        match (result, expected) {
+            (Ok(actual), Ok(expected)) => assert_eq!(actual, expected),
+            (
+                Err(FlagError::ClientFacing(ClientFacingError::BadRequest(message))),
+                Err(expected),
+            ) => {
+                assert_eq!(message, expected)
+            }
+            (actual, expected) => panic!("expected {expected:?}, got {actual:?}"),
+        }
+    }
+}

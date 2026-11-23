@@ -1,0 +1,780 @@
+import { MOCK_TEAM_ID } from 'lib/api.mock'
+
+import { combineUrl, router } from 'kea-router'
+import { expectLogic, partial } from 'kea-test-utils'
+import posthog from 'posthog-js'
+
+import { addProjectIdIfMissing } from 'lib/utils/kea-router'
+import { parseURLFilters, parseURLVariables } from 'scenes/dashboard/dashboardUtils'
+import { insightDataLogic } from 'scenes/insights/insightDataLogic'
+import { insightSceneLogic } from 'scenes/insights/insightSceneLogic'
+import { insightUsageLogic } from 'scenes/insights/insightUsageLogic'
+import { sceneLogic } from 'scenes/sceneLogic'
+import { Scene } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { useMocks } from '~/mocks/jest'
+import { cohortsModel } from '~/models/cohortsModel'
+import { dashboardsModel } from '~/models/dashboardsModel'
+import { examples } from '~/queries/examples'
+import { dataNodeLogic } from '~/queries/nodes/DataNode/dataNodeLogic'
+import { insightVizDataNodeKey } from '~/queries/nodes/InsightViz/insightVizKeys'
+import { setLatestVersionsOnQuery } from '~/queries/schema/query-versions'
+import { DashboardFilter, HogQLVariable, InsightVizNode, NodeKind, ProductKey } from '~/queries/schema/schema-general'
+import { initKeaTests } from '~/test/init'
+import { ActivityScope, CohortType, DashboardType, InsightShortId, InsightType, ItemMode } from '~/types'
+
+// The logic preloads the chart renderers on mount. No test here draws one, and loading them takes seconds.
+jest.mock('~/queries/Query/queryNodeRenderers')
+
+const Insight12 = '12' as InsightShortId
+const Insight42 = '42' as InsightShortId
+
+describe('insightSceneLogic', () => {
+    let logic: ReturnType<typeof insightSceneLogic.build>
+    beforeEach(async () => {
+        useMocks({
+            get: {
+                '/api/environments/:team_id/insights/trend/': { result: ['result from api'] },
+                '/api/environments/:team_id/insights/': {
+                    results: [{ id: 42, short_id: Insight42, result: ['result from api'] }],
+                },
+            },
+            post: {
+                '/api/environments/:team_id/insights/funnel/': { result: ['result from api'] },
+                '/api/environments/:team_id/insights/': async ({ request }) => [
+                    200,
+                    { id: 12, short_id: Insight12, ...((await request.json()) as any) },
+                ],
+                '/api/environments/:team_id/query/upgrade/': { query: {} },
+            },
+        })
+        initKeaTests()
+        sceneLogic.mount()
+    })
+
+    it('captures an insight start after the logic unmounts during the debounce', async () => {
+        const capture = jest.spyOn(posthog, 'capture').mockImplementation()
+        jest.useFakeTimers()
+        try {
+            router.actions.push(urls.insightNew())
+            logic = insightSceneLogic()
+            logic.mount()
+            await jest.advanceTimersByTimeAsync(0)
+
+            expect(capture.mock.calls.filter(([event]) => event === 'insight started')).toHaveLength(0)
+            logic.unmount()
+            expect(logic.isMounted()).toBe(false)
+            await jest.advanceTimersByTimeAsync(499)
+            expect(capture.mock.calls.filter(([event]) => event === 'insight started')).toHaveLength(0)
+            await jest.advanceTimersByTimeAsync(1)
+
+            const insightStarts = capture.mock.calls.filter(([event]) => event === 'insight started')
+            expect(insightStarts).toEqual([
+                ['insight started', expect.objectContaining({ source: 'web', uses_data_warehouse_source: false })],
+            ])
+        } finally {
+            jest.useRealTimers()
+            capture.mockRestore()
+        }
+    })
+
+    it('keeps url /insight/new', async () => {
+        router.actions.push(urls.insightNew())
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+        await expectLogic(router)
+            .delay(1)
+            .toMatchValues({
+                location: partial({ pathname: addProjectIdIfMissing(urls.insightNew(), MOCK_TEAM_ID) }),
+            })
+    })
+
+    it.each([false, true])(
+        'releases scene-owned insight logics on navigation (shared owner: %s)',
+        async (sharedOwner) => {
+            router.actions.push(urls.insightNew())
+            logic = insightSceneLogic()
+            const unmountScene = logic.mount()
+            await expectLogic(logic).toFinishAllListeners()
+
+            const insight = logic.values.insightLogicRef!.logic
+            const data = logic.values.insightDataLogicRef!.logic
+            const releaseSharedInsight = sharedOwner ? insight.mount() : undefined
+            const releaseSharedData = sharedOwner ? data.mount() : undefined
+
+            unmountScene()
+
+            expect(logic.isMounted()).toBe(false)
+            expect(insight.isMounted()).toBe(sharedOwner)
+            expect(data.isMounted()).toBe(sharedOwner)
+
+            releaseSharedInsight?.()
+            releaseSharedData?.()
+            expect(insight.isMounted()).toBe(false)
+            expect(data.isMounted()).toBe(false)
+        }
+    )
+
+    it('updates the generated breadcrumb when cohort names arrive after the query', async () => {
+        router.actions.push(urls.insightNew())
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        logic.values.insightDataLogicRef!.logic.actions.setQuery({
+            kind: NodeKind.InsightVizNode,
+            source: {
+                kind: NodeKind.TrendsQuery,
+                series: [{ kind: NodeKind.EventsNode, event: '$pageview', math: 'total' }],
+                breakdownFilter: { breakdown_type: 'cohort', breakdown: [987] },
+            },
+        } as InsightVizNode)
+        expect(logic.values.breadcrumbs.at(-1)?.name).toContain('ID 987')
+
+        cohortsModel.actions.cacheCohort({ id: 987, name: 'Returning users' } as CohortType)
+
+        expect(logic.values.breadcrumbs.at(-1)?.name).toContain('Returning users')
+        expect(logic.values.breadcrumbs.at(-1)?.name).not.toContain('ID 987')
+    })
+
+    it('names the breadcrumb after the dashboard the insight opens from', async () => {
+        dashboardsModel.mount()
+        dashboardsModel.actions.addDashboardSuccess({ id: 7, name: 'Weekly review' } as DashboardType)
+        router.actions.push(urls.insightNew(), { dashboard: 7 })
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.dashboardName).toEqual('Weekly review')
+    })
+
+    it('reports a view only for the scene insight when another unsaved insight mounts', async () => {
+        const capture = jest.spyOn(posthog, 'capture')
+        router.actions.push(urls.insightNew())
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        const query: InsightVizNode = {
+            kind: NodeKind.InsightVizNode,
+            source: { kind: NodeKind.TrendsQuery, series: [{ kind: NodeKind.EventsNode, event: '$pageview' }] },
+        }
+        const previewProps = { dashboardItemId: 'new-AdHoc.preview' as InsightShortId, query, doNotLoad: true }
+        dataNodeLogic({ key: insightVizDataNodeKey(previewProps), query: query.source, doNotLoad: true }).mount()
+        insightDataLogic(previewProps).mount()
+        await expectLogic(insightUsageLogic(previewProps)).toFinishAllListeners()
+        await expectLogic(insightUsageLogic(logic.values.insightLogicRef!.logic.props)).toFinishAllListeners()
+
+        expect(capture.mock.calls.filter(([event]) => event === 'insight viewed')).toHaveLength(1)
+    })
+
+    it('disables discussions for an unsaved insight so comments do not leak across the team', async () => {
+        // A new insight has no numeric id yet. The side panel context must still declare the Insight
+        // scope (so sidePanelContextLogic does not fall back to the URL guesser and drop item_id, which
+        // would list every Insight-scoped comment in the team) but mark discussions disabled.
+        router.actions.push(urls.insightNew())
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.insight?.id).toBeUndefined()
+        expect(logic.values.sidePanelContext).toEqual({
+            activity_scope: ActivityScope.INSIGHT,
+            discussions_disabled: true,
+        })
+
+        // Once saved, the context carries the concrete item_id and discussions become enabled.
+        logic.values.insightLogicRef?.logic.actions.setInsight(
+            { id: 42, short_id: Insight42, result: ['some result'] },
+            { fromPersistentApi: true, overrideQuery: true }
+        )
+
+        expect(logic.values.sidePanelContext).toMatchObject({
+            activity_scope: ActivityScope.INSIGHT,
+            activity_item_id: '42',
+        })
+        expect(logic.values.sidePanelContext?.discussions_disabled).toBeUndefined()
+    })
+
+    it('redirects maintaining url params when opening /insight/new with insight type in theurl', async () => {
+        router.actions.push(urls.insightNew({ type: InsightType.FUNNELS }))
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect((logic.values.insightLogicRef?.logic.values.insight.query as InsightVizNode).source?.kind).toEqual(
+            'FunnelsQuery'
+        )
+    })
+
+    it('tags new default insights with product_analytics productKey', async () => {
+        router.actions.push(urls.insightNew())
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        const query = logic.values.insightLogicRef?.logic.values.insight.query as InsightVizNode
+        expect(query.source?.tags?.productKey).toEqual(ProductKey.PRODUCT_ANALYTICS)
+    })
+
+    it('tags new typed insights with product_analytics productKey', async () => {
+        router.actions.push(urls.insightNew({ type: InsightType.FUNNELS }))
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        const query = logic.values.insightLogicRef?.logic.values.insight.query as InsightVizNode
+        expect(query.source?.tags?.productKey).toEqual(ProductKey.PRODUCT_ANALYTICS)
+    })
+
+    it('does not overwrite existing productKey tags on queries from URL', async () => {
+        router.actions.push(
+            urls.insightNew({
+                query: {
+                    kind: NodeKind.InsightVizNode,
+                    source: {
+                        ...examples.InsightTrendsQuery,
+                        tags: { productKey: ProductKey.WEB_ANALYTICS },
+                    },
+                } as InsightVizNode,
+            })
+        )
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        const query = logic.values.insightLogicRef?.logic.values.insight.query as InsightVizNode
+        expect(query.source?.tags?.productKey).toEqual(ProductKey.WEB_ANALYTICS)
+    })
+
+    it('redirects maintaining url params when opening /insight/new with query in the url', async () => {
+        router.actions.push(
+            urls.insightNew({
+                query: {
+                    kind: NodeKind.InsightVizNode,
+                    source: examples.InsightPathsQuery,
+                } as InsightVizNode,
+            })
+        )
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toDispatchActions(['upgradeQuery']).toFinishAllListeners()
+    })
+
+    const sqlChart = {
+        kind: NodeKind.DataVisualizationNode,
+        source: { kind: NodeKind.HogQLQuery, query: 'SELECT 1' },
+        display: 'ActionsTable',
+    }
+    const sqlWithFilters = {
+        kind: NodeKind.HogQLQuery,
+        query: 'SELECT 1',
+        filters: { dateRange: { date_from: '-7d' } },
+    }
+    it.each([
+        ['a SQL chart', sqlChart, sqlChart],
+        [
+            'a bare SQL query with filters',
+            sqlWithFilters,
+            { kind: NodeKind.DataVisualizationNode, source: sqlWithFilters },
+        ],
+        [
+            'a SQL table with column settings',
+            {
+                kind: NodeKind.DataTableNode,
+                source: { kind: NodeKind.HogQLQuery, query: 'SELECT 1' },
+                columns: ['a', 'b'],
+                hiddenColumns: ['b'],
+            },
+            {
+                kind: NodeKind.DataVisualizationNode,
+                source: { kind: NodeKind.HogQLQuery, query: 'SELECT 1' },
+                display: 'ActionsTable',
+                tableSettings: { columns: [{ column: 'a' }] },
+            },
+        ],
+    ])('sends a hand-built /insights/new link holding %s to the SQL editor', async (_, query, expectedOpenQuery) => {
+        router.actions.push(combineUrl('/insights/new', { dashboard: 5 }, { q: JSON.stringify(query) }).url)
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(router.values.location.pathname).toEqual(addProjectIdIfMissing('/sql', MOCK_TEAM_ID))
+        expect(router.values.searchParams).toEqual({ dashboard: 5, open_query: expectedOpenQuery })
+    })
+
+    it('retains the #q= query hash after navigating to /insights/new (persons modal drill-down)', async () => {
+        // Mirrors PersonsModal's "View events" / "Open as new insight" navigation: a DataTableNode
+        // query encoded in the #q= hash must survive the post-load URL sync, otherwise both buttons
+        // collapse onto the same default insight page.
+        const dataTableQuery = {
+            kind: NodeKind.DataTableNode,
+            source: {
+                kind: NodeKind.EventsQuery,
+                select: ['*'],
+            },
+        }
+        router.actions.push(urls.insightNew({ query: dataTableQuery as any }))
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        await expectLogic(router)
+            .delay(1)
+            .toMatchValues({
+                hashParams: partial({ q: JSON.stringify(dataTableQuery) }),
+            })
+    })
+
+    it('tags a DataTableNode drill-down query on cold load via the upgrade path', async () => {
+        // The persons-modal "View events" button opens in a new tab, so the scene cold-loads with the
+        // query already in the URL (initial navigation -> upgradeQuery). A DataTableNode's source query
+        // is executed directly, so without a productKey tag ClickHouse rejects it as untagged — the
+        // upgrade path must tag the source when materializing the new insight.
+        const dataTableQuery = {
+            kind: NodeKind.DataTableNode,
+            source: {
+                kind: NodeKind.ActorsQuery,
+                select: ['person'],
+            },
+        }
+        router.actions.push(urls.insightNew({ query: dataTableQuery as any }))
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toDispatchActions(['upgradeQuery']).toFinishAllListeners()
+
+        const query = logic.values.insightLogicRef?.logic.values.insight.query as any
+        expect(query.kind).toEqual(NodeKind.DataTableNode)
+        expect(query.source?.tags?.productKey).toEqual(ProductKey.PRODUCT_ANALYTICS)
+    })
+
+    it('tags a DataTableNode drill-down query on in-app navigation', async () => {
+        // The "Open as new insight" button navigates in-app (router PUSH, not an initial load), which
+        // routes through urlToAction's PUSH branch rather than upgradeQuery. That path must tag too.
+        const dataTableQuery = {
+            kind: NodeKind.DataTableNode,
+            source: {
+                kind: NodeKind.ActorsQuery,
+                select: ['person'],
+            },
+        }
+
+        // Settle a new-insight scene first, then navigate in-app to the drill-down query
+        router.actions.push(urls.insightNew())
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        router.actions.push(urls.insightNew({ query: dataTableQuery as any }))
+        await expectLogic(logic).toFinishAllListeners()
+
+        const query = logic.values.insightLogicRef?.logic.values.insight.query as any
+        expect(query.kind).toEqual(NodeKind.DataTableNode)
+        expect(query.source?.tags?.productKey).toEqual(ProductKey.PRODUCT_ANALYTICS)
+    })
+
+    it("applies a shared link's #q= query to a saved insight on in-app navigation", async () => {
+        // Opening a shared link inside the app is a router PUSH, not a cold load, so it misses the
+        // upgradeQuery path.
+        const savedQuery = setLatestVersionsOnQuery({
+            kind: NodeKind.InsightVizNode,
+            source: {
+                kind: NodeKind.TrendsQuery,
+                series: [],
+                dateRange: { date_from: '-7d' },
+                interval: 'day',
+            },
+        }) as InsightVizNode
+        const sharedQuery = setLatestVersionsOnQuery({
+            kind: NodeKind.InsightVizNode,
+            source: {
+                kind: NodeKind.TrendsQuery,
+                series: [],
+                dateRange: { date_from: '-30d' },
+                interval: 'week',
+            },
+        }) as InsightVizNode
+
+        useMocks({
+            get: {
+                '/api/environments/:team_id/insights/': {
+                    results: [{ id: 42, short_id: Insight42, result: ['result from api'], query: savedQuery }],
+                },
+            },
+        })
+
+        router.actions.push(urls.insightView(Insight42))
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        router.actions.push(combineUrl(urls.insightView(Insight42), {}, { q: JSON.stringify(sharedQuery) }).url)
+        await expectLogic(logic).toFinishAllListeners()
+
+        const dataLogic = logic.values.insightDataLogicRef
+        expect(dataLogic).not.toBeNull()
+        expect(dataLogic!.logic.values.query).toEqual(sharedQuery)
+    })
+
+    it('does not overwrite an existing productKey on a DataTableNode drill-down query', async () => {
+        // A drill-down query that already declares its product (e.g. web analytics) must keep it.
+        const dataTableQuery = {
+            kind: NodeKind.DataTableNode,
+            source: {
+                kind: NodeKind.ActorsQuery,
+                select: ['person'],
+                tags: { productKey: ProductKey.WEB_ANALYTICS },
+            },
+        }
+        router.actions.push(urls.insightNew({ query: dataTableQuery as any }))
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        const query = logic.values.insightLogicRef?.logic.values.insight.query as any
+        expect(query.source?.tags?.productKey).toEqual(ProductKey.WEB_ANALYTICS)
+    })
+
+    it('does not inject tags into a DataTableNode with an EventsNode source', async () => {
+        // EventsNode forbids extra keys in its schema, so tagging it would produce an invalid query.
+        // The source must be left untouched (no tags field added).
+        const dataTableQuery = {
+            kind: NodeKind.DataTableNode,
+            source: {
+                kind: NodeKind.EventsNode,
+                event: '$pageview',
+            },
+        }
+        router.actions.push(urls.insightNew({ query: dataTableQuery as any }))
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        const query = logic.values.insightLogicRef?.logic.values.insight.query as any
+        expect(query.source.kind).toEqual(NodeKind.EventsNode)
+        expect(query.source.tags).toBeUndefined()
+    })
+
+    it('persists edit mode in the url', async () => {
+        logic = insightSceneLogic()
+        logic.mount()
+        const viewUrl = combineUrl(urls.insightView(Insight42))
+        const editUrl = combineUrl(urls.insightEdit(Insight42))
+
+        router.actions.push(viewUrl.url)
+        await expectLogic(logic).toMatchValues({
+            insightId: Insight42,
+            insightMode: ItemMode.View,
+        })
+
+        router.actions.push(editUrl.url)
+        await expectLogic(logic).toMatchValues({
+            insightId: Insight42,
+            insightMode: ItemMode.Edit,
+        })
+    })
+
+    it('resets insight state when navigating to /insights/new again after previous visit', async () => {
+        router.actions.push(urls.insightNew({ type: InsightType.TRENDS, dashboardId: 6 }))
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+
+        // Simulate having saved the insight by setting the insight with an id
+        logic.values.insightLogicRef?.logic.actions.setInsight(
+            {
+                id: 99,
+                short_id: '12345678' as InsightShortId,
+                name: 'Saved insight',
+                dashboards: [6],
+                result: ['some result'],
+            },
+            { fromPersistentApi: true, overrideQuery: true }
+        )
+
+        expect(logic.values.insightLogicRef?.logic.values.insight.id).toEqual(99)
+
+        // Simulate the Insight scene being active so the early-return guard in urlToAction fires
+        sceneLogic.actions.setExportedScene(
+            { logic: insightSceneLogic, component: () => null as any },
+            Scene.Insight,
+            'insightNew',
+            { params: {}, searchParams: {}, hashParams: {} }
+        )
+        sceneLogic.actions.setScene(
+            Scene.Insight,
+            'insightNew',
+            { params: {}, searchParams: {}, hashParams: {} },
+            false
+        )
+
+        router.actions.push(urls.insightNew({ type: InsightType.RETENTION, dashboardId: 6 }))
+        await expectLogic(logic).toFinishAllListeners()
+
+        // The insight should be reset - no id means it's a new unsaved insight
+        expect(logic.values.insightLogicRef?.logic.values.insight.id).toBeUndefined()
+        expect(logic.values.insightLogicRef?.logic.values.insight.dashboards).toEqual([6])
+    })
+
+    const VARIABLE_ID = '00000000-0000-0000-0000-00000000beef'
+
+    it.each([true, false])('saving from a dashboard respects redirect=%s', async (redirect) => {
+        let savedDescription: string | undefined
+        useMocks({
+            patch: {
+                '/api/environments/:team_id/insights/42/': async ({ request }) => {
+                    const body = (await request.json()) as { description?: string }
+                    savedDescription = body.description
+                    return [200, { id: 42, short_id: Insight42, ...body }]
+                },
+            },
+        })
+        router.actions.push(urls.insightEdit(Insight42, 6))
+        logic = insightSceneLogic()
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+        sceneLogic.actions.setExportedScene(
+            { logic: insightSceneLogic, component: () => null as any },
+            Scene.Insight,
+            'insightEdit',
+            { params: {}, searchParams: {}, hashParams: {} }
+        )
+        sceneLogic.actions.setScene(
+            Scene.Insight,
+            'insightEdit',
+            { params: {}, searchParams: {}, hashParams: {} },
+            false
+        )
+        const insight = logic.values.insightLogicRef!.logic
+        insight.actions.setInsightMetadataLocal({ description: 'Updated review notes' })
+
+        await expectLogic(insight, () => insight.actions.saveInsight(redirect)).toFinishAllListeners()
+
+        expect(savedDescription).toEqual('Updated review notes')
+        expect(router.values.location.pathname).toEqual(
+            addProjectIdIfMissing(redirect ? urls.dashboard(6) : urls.insightEdit(Insight42), MOCK_TEAM_ID)
+        )
+    })
+
+    const CARD_NAME_OVERRIDE: Record<string, HogQLVariable> = {
+        [VARIABLE_ID]: {
+            variableId: VARIABLE_ID,
+            code_name: 'card_name',
+            value: 'Polukranos, Unchained',
+            isNull: false,
+        },
+    }
+
+    it.each<
+        [
+            string,
+            Record<string, HogQLVariable> | undefined,
+            DashboardFilter | undefined,
+            Record<string, any>,
+            DashboardFilter,
+        ]
+    >([
+        ['a variable value', CARD_NAME_OVERRIDE, undefined, { card_name: 'Polukranos, Unchained' }, {}],
+        ['a filter that clears a saved one', undefined, { properties: [] }, {}, { properties: [] }],
+    ])(
+        'points the dashboard breadcrumb back at the dashboard with %s',
+        async (_name, variablesOverride, filtersOverride, expectedVariables, expectedFilters) => {
+            router.actions.push(urls.insightView(Insight42, 6, variablesOverride, filtersOverride))
+            logic = insightSceneLogic()
+            logic.mount()
+            await expectLogic(logic).toFinishAllListeners()
+
+            const dashboardBreadcrumb = logic.values.breadcrumbs.find(
+                (breadcrumb) => breadcrumb.key === Scene.Dashboard
+            )
+            const { pathname, searchParams } = combineUrl(dashboardBreadcrumb?.path ?? '')
+
+            expect(pathname).toEqual(urls.dashboard(6))
+            expect(parseURLVariables(searchParams)).toEqual(expectedVariables)
+            expect(parseURLFilters(searchParams)).toEqual(expectedFilters)
+        }
+    )
+
+    it('remounts when URL insight id disagrees with dashboard tile id on the mounted editor (save-as regression)', async () => {
+        useMocks({
+            get: {
+                '/api/environments/:team_id/insights/trend/': { result: ['result from api'] },
+                '/api/environments/:team_id/insights/': ({ request }) => {
+                    const shortId = new URL(request.url).searchParams.get('short_id') || ''
+                    const id = shortId === '12' ? 12 : 42
+                    const sid = (shortId === '12' ? Insight12 : Insight42) as InsightShortId
+                    return [
+                        200,
+                        {
+                            results: [
+                                {
+                                    id,
+                                    short_id: sid,
+                                    result: ['result from api'],
+                                    name: shortId === '12' ? 'copy' : 'original',
+                                },
+                            ],
+                        },
+                    ]
+                },
+            },
+            post: {
+                '/api/environments/:team_id/insights/funnel/': { result: ['result from api'] },
+                '/api/environments/:team_id/insights/': async ({ request }) => [
+                    200,
+                    { id: 12, short_id: Insight12, ...((await request.json()) as any) },
+                ],
+                '/api/environments/:team_id/query/upgrade/': { query: {} },
+            },
+        })
+
+        logic = insightSceneLogic()
+        logic.mount()
+
+        router.actions.push(urls.insightEdit(Insight42))
+        await expectLogic(logic).toFinishAllListeners()
+
+        const refBefore = logic.values.insightLogicRef
+        expect(refBefore?.logic.props.dashboardItemId).toBe(Insight42)
+        expect(refBefore?.logic.values.insight.short_id).toBe(Insight42)
+
+        // Stale state from the old save-as flow: copy loaded in the editor while props still target the tile.
+        refBefore?.logic.actions.setInsight(
+            {
+                id: 12,
+                short_id: Insight12,
+                name: 'copy',
+                query: examples.InsightFunnels,
+                result: [],
+            },
+            { fromPersistentApi: true, overrideQuery: true }
+        )
+
+        expect(refBefore?.logic.values.insight.short_id).toBe(Insight12)
+
+        router.actions.push(urls.insightEdit(Insight12))
+        await expectLogic(logic).toFinishAllListeners()
+        await expectLogic(logic).toDispatchActions(['setInsightLogicRef']).toFinishAllListeners()
+
+        const refAfter = logic.values.insightLogicRef
+        expect(refAfter).not.toBe(refBefore)
+        expect(refAfter?.logic.props.dashboardItemId).toBe(Insight12)
+        await expectLogic(refAfter!.logic).toFinishAllListeners()
+        expect(refAfter?.logic.values.insight.short_id).toBe(Insight12)
+    })
+
+    it('reloads insight when navigating back to the same insight via PUSH', async () => {
+        const insightApiCall = jest
+            .fn()
+            .mockReturnValue([200, { results: [{ id: 42, short_id: Insight42, result: ['result from api'] }] }])
+        useMocks({
+            get: {
+                '/api/environments/:team_id/insights/': insightApiCall,
+            },
+            post: {
+                '/api/environments/:team_id/query/upgrade/': { query: {} },
+            },
+        })
+
+        logic = insightSceneLogic()
+        logic.mount()
+
+        router.actions.push(urls.insightView(Insight42))
+        await expectLogic(logic).toMatchValues({ insightId: Insight42 })
+        await expectLogic(logic).delay(150) // wait for loadInsight debounce
+
+        // Simulate the Insight scene being active so the early-return guard fires,
+        // just like in production when the user is already viewing an insight
+        sceneLogic.actions.setExportedScene(
+            { logic: insightSceneLogic, component: () => null as any },
+            Scene.Insight,
+            'insightView',
+            { params: {}, searchParams: {}, hashParams: {} }
+        )
+        sceneLogic.actions.setScene(
+            Scene.Insight,
+            'insightView',
+            { params: {}, searchParams: {}, hashParams: {} },
+            false
+        )
+
+        const callCountAfterInitialLoad = insightApiCall.mock.calls.length
+
+        // Simulate navigating away and back to the same insight (e.g. from insights list)
+        router.actions.push(urls.insightView(Insight42))
+        await expectLogic(logic).delay(150)
+
+        // Should have reloaded the insight since this is a PUSH navigation,
+        // even though activeSceneId is already Scene.Insight with the same insightId
+        expect(insightApiCall.mock.calls.length).toBeGreaterThan(callCountAfterInitialLoad)
+    })
+
+    it.each([
+        ['new subscription', 'new', null],
+        ['a specific subscription', '5', 5],
+    ])(
+        'updates itemId when navigating from subscriptions list to %s',
+        async (_label, subscriptionId, expectedItemId) => {
+            logic = insightSceneLogic()
+            logic.mount()
+
+            router.actions.push(urls.insightSubcriptions(Insight42))
+            await expectLogic(logic).toMatchValues({
+                insightId: Insight42,
+                insightMode: ItemMode.Subscriptions,
+                itemId: null,
+            })
+
+            sceneLogic.actions.setExportedScene(
+                { logic: insightSceneLogic, component: () => null as any },
+                Scene.Insight,
+                'insightSubcriptions',
+                { params: {}, searchParams: {}, hashParams: {} }
+            )
+            sceneLogic.actions.setScene(
+                Scene.Insight,
+                'insightSubcriptions',
+                { params: {}, searchParams: {}, hashParams: {} },
+                false
+            )
+
+            router.actions.push(urls.insightSubcription(Insight42, subscriptionId))
+            await expectLogic(logic).toMatchValues({
+                insightId: Insight42,
+                insightMode: ItemMode.Subscriptions,
+                itemId: expectedItemId,
+            })
+        }
+    )
+
+    it('does not reload insight when only the URL hash changes', async () => {
+        const insightApiCall = jest
+            .fn()
+            .mockReturnValue([200, { results: [{ id: 42, short_id: Insight42, result: ['result from api'] }] }])
+        useMocks({
+            get: {
+                '/api/environments/:team_id/insights/': insightApiCall,
+            },
+            post: {
+                '/api/environments/:team_id/query/upgrade/': { query: {} },
+            },
+        })
+
+        logic = insightSceneLogic()
+        logic.mount()
+
+        router.actions.push(urls.insightView(Insight42))
+        await expectLogic(logic).toMatchValues({ insightId: Insight42 })
+        await expectLogic(logic).delay(150) // wait for loadInsight debounce
+
+        const callCountAfterInitialLoad = insightApiCall.mock.calls.length
+
+        // Simulate opening the side panel (hash-only URL change)
+        router.actions.replace(urls.insightView(Insight42), {}, { panel: 'info' })
+        await expectLogic(logic).delay(150)
+
+        expect(insightApiCall.mock.calls.length).toEqual(callCountAfterInitialLoad)
+    })
+})

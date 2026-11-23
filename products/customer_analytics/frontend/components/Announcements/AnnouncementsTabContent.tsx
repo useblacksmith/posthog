@@ -1,0 +1,293 @@
+import { useActions, useValues } from 'kea'
+
+import {
+    LemonBanner,
+    LemonButton,
+    LemonDialog,
+    LemonInputSelect,
+    LemonSegmentedButton,
+    LemonSnack,
+    LemonTable,
+    LemonTableColumns,
+    LemonTag,
+    LemonTextArea,
+    Link,
+} from '@posthog/lemon-ui'
+
+import { TZLabel } from 'lib/components/TZLabel'
+import { pluralize } from 'lib/utils/strings'
+import { urls } from 'scenes/urls'
+
+import { AnnouncementSendAsEnumApi } from '../../generated/api.schemas'
+import type { AnnouncementApi, AnnouncementDeliveryApi } from '../../generated/api.schemas'
+import { AnnouncementAccountFilters } from './AnnouncementAccountFilters'
+import { announcementsLogic } from './announcementsLogic'
+
+type TagType = 'success' | 'primary' | 'warning' | 'danger' | 'default'
+
+function announcementStatusTag(status: AnnouncementApi['status']): { type: TagType; label: string } {
+    switch (status) {
+        case 'sent':
+            return { type: 'success', label: 'Sent' }
+        case 'sending':
+            return { type: 'primary', label: 'Sending' }
+        case 'partially_failed':
+            return { type: 'warning', label: 'Partially failed' }
+        case 'failed':
+            return { type: 'danger', label: 'Failed' }
+        default:
+            return { type: 'default', label: 'Pending' }
+    }
+}
+
+function ConfirmSendContent({
+    message,
+    channelLabels,
+    senderLabel,
+}: {
+    message: string
+    channelLabels: string[]
+    senderLabel: string
+}): JSX.Element {
+    return (
+        <div className="flex flex-col gap-2 max-w-[500px]">
+            <p className="m-0">
+                This message will be posted to {pluralize(channelLabels.length, 'customer channel')} as{' '}
+                <strong>{senderLabel}</strong>. Sending cannot be undone.
+            </p>
+            <div className="border rounded p-2 bg-surface-secondary whitespace-pre-wrap max-h-40 overflow-y-auto">
+                {message}
+            </div>
+            <div className="flex flex-wrap gap-1 max-h-32 overflow-y-auto">
+                {channelLabels.map((label) => (
+                    <LemonSnack key={label}>{label}</LemonSnack>
+                ))}
+            </div>
+        </div>
+    )
+}
+
+function AnnouncementComposer(): JSX.Element {
+    const {
+        messageDraft,
+        selectedChannelIds,
+        selectedChannelLabels,
+        channelOptions,
+        memberChannelsLoading,
+        submitting,
+        submitDisabledReason,
+        sendAs,
+        senderName,
+        senderDisabledReason,
+    } = useValues(announcementsLogic)
+    const { setMessage, setSelectedChannelIds, setSendAs, submitAnnouncement, loadMemberChannels } =
+        useActions(announcementsLogic)
+
+    const senderLabel = sendAs === AnnouncementSendAsEnumApi.User ? senderName : 'SupportHog'
+
+    const confirmSend = (): void => {
+        LemonDialog.open({
+            title: `Send this announcement to ${pluralize(selectedChannelLabels.length, 'channel')}?`,
+            content: (
+                <ConfirmSendContent
+                    message={messageDraft.trim()}
+                    channelLabels={selectedChannelLabels}
+                    senderLabel={senderLabel}
+                />
+            ),
+            primaryButton: {
+                children: 'Send',
+                onClick: submitAnnouncement,
+                'data-attr': 'confirm-send-announcement',
+            },
+            secondaryButton: {
+                children: 'Cancel',
+            },
+        })
+    }
+
+    return (
+        <div className="flex flex-col gap-2 max-w-[800px]">
+            <div className="flex items-center gap-2">
+                <span className="text-secondary">Send as</span>
+                <LemonSegmentedButton
+                    size="small"
+                    value={sendAs}
+                    onChange={setSendAs}
+                    options={[
+                        {
+                            value: AnnouncementSendAsEnumApi.Bot,
+                            label: 'SupportHog',
+                            'data-attr': 'announcement-send-as-bot',
+                        },
+                        {
+                            value: AnnouncementSendAsEnumApi.User,
+                            label: senderName,
+                            disabledReason: senderDisabledReason,
+                            tooltip:
+                                'Posts under your Slack name and photo, matched by your PostHog email. Slack still marks the message as an app.',
+                            'data-attr': 'announcement-send-as-user',
+                        },
+                    ]}
+                />
+            </div>
+            <LemonTextArea
+                value={messageDraft}
+                onChange={setMessage}
+                placeholder="Write a message to send to the selected customer channels…"
+                minRows={4}
+            />
+            <AnnouncementAccountFilters />
+            <div className="flex gap-2 items-center">
+                <LemonInputSelect
+                    mode="multiple"
+                    value={selectedChannelIds}
+                    options={channelOptions}
+                    onChange={setSelectedChannelIds}
+                    loading={memberChannelsLoading}
+                    placeholder="Select customer channels"
+                    className="flex-1"
+                />
+                <LemonButton
+                    type="secondary"
+                    size="small"
+                    onClick={loadMemberChannels}
+                    disabledReason={memberChannelsLoading ? 'Loading channels…' : undefined}
+                >
+                    Refresh
+                </LemonButton>
+            </div>
+            <div>
+                <LemonButton
+                    type="primary"
+                    onClick={confirmSend}
+                    loading={submitting}
+                    disabledReason={submitDisabledReason}
+                    data-attr="send-announcement"
+                >
+                    Send announcement
+                </LemonButton>
+            </div>
+        </div>
+    )
+}
+
+function DeliveriesTable({ deliveries }: { deliveries: readonly AnnouncementDeliveryApi[] }): JSX.Element {
+    const columns: LemonTableColumns<AnnouncementDeliveryApi> = [
+        {
+            title: 'Channel',
+            key: 'channel',
+            render: (_, delivery) =>
+                delivery.slack_channel_name ? `#${delivery.slack_channel_name}` : delivery.slack_channel_id,
+        },
+        {
+            title: 'Status',
+            key: 'status',
+            render: (_, delivery) => (
+                <LemonTag
+                    type={delivery.status === 'sent' ? 'success' : delivery.status === 'failed' ? 'danger' : 'default'}
+                >
+                    {delivery.status}
+                </LemonTag>
+            ),
+        },
+        {
+            title: 'Error',
+            key: 'error',
+            render: (_, delivery) =>
+                delivery.error ? <span className="text-danger text-xs">{delivery.error}</span> : '—',
+        },
+    ]
+    return <LemonTable embedded dataSource={[...deliveries]} rowKey="id" columns={columns} />
+}
+
+function AnnouncementHistory(): JSX.Element {
+    const { announcements, announcementsLoading } = useValues(announcementsLogic)
+    const { loadAnnouncements } = useActions(announcementsLogic)
+
+    const columns: LemonTableColumns<AnnouncementApi> = [
+        {
+            title: 'Message',
+            key: 'message',
+            render: (_, announcement) => <span className="truncate max-w-md inline-block">{announcement.message}</span>,
+        },
+        {
+            title: 'Status',
+            key: 'status',
+            render: (_, announcement) => {
+                const tag = announcementStatusTag(announcement.status)
+                return <LemonTag type={tag.type}>{tag.label}</LemonTag>
+            },
+        },
+        {
+            title: 'Delivered',
+            key: 'sent_count',
+            render: (_, announcement) => `${announcement.sent_count}/${announcement.total_channels}`,
+        },
+        {
+            title: 'Failed',
+            key: 'failed_count',
+            render: (_, announcement) => announcement.failed_count || '—',
+        },
+        {
+            title: 'Created',
+            key: 'created_at',
+            render: (_, announcement) => <TZLabel time={announcement.created_at} />,
+        },
+        {
+            title: 'By',
+            key: 'created_by',
+            render: (_, announcement) => announcement.created_by?.first_name || announcement.created_by?.email || '—',
+        },
+        {
+            title: 'Sent as',
+            key: 'send_as',
+            render: (_, announcement) =>
+                announcement.send_as === AnnouncementSendAsEnumApi.User
+                    ? announcement.sender_display_name || '—'
+                    : 'SupportHog',
+        },
+    ]
+
+    return (
+        <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+                <h3 className="m-0">Sent announcements</h3>
+                <LemonButton type="secondary" size="small" onClick={loadAnnouncements} loading={announcementsLoading}>
+                    Refresh
+                </LemonButton>
+            </div>
+            <LemonTable<AnnouncementApi>
+                dataSource={announcements}
+                loading={announcementsLoading}
+                rowKey="id"
+                columns={columns}
+                expandable={{
+                    expandedRowRender: (announcement) => <DeliveriesTable deliveries={announcement.deliveries} />,
+                    rowExpandable: (announcement) => announcement.deliveries.length > 0,
+                }}
+                emptyState="No announcements sent yet"
+            />
+        </div>
+    )
+}
+
+export function AnnouncementsTabContent(): JSX.Element {
+    const { slackConnected } = useValues(announcementsLogic)
+
+    if (!slackConnected) {
+        return (
+            <LemonBanner type="warning">
+                Connect the SupportHog Slack bot in <Link to={urls.supportSettings()}>Support settings</Link> to send
+                announcements to customer channels.
+            </LemonBanner>
+        )
+    }
+
+    return (
+        <div className="flex flex-col gap-6">
+            <AnnouncementComposer />
+            <AnnouncementHistory />
+        </div>
+    )
+}

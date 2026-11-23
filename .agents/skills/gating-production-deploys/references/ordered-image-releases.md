@@ -1,0 +1,150 @@
+# Ordered image releases
+
+Use this reference when reusing the common ordered alias helper or the shared-image policy and binding APIs. A common Git repository or registry does not establish a shared artifact.
+
+## Current capability
+
+The common alias uses `.github/scripts/ordered-image-release.sh`. `.github/actions/paths-filter` owns canonical manifest schema loading in `src/shared-image-policy.ts` and legacy projection. `.github/actions/shared-image-releases` owns `inspect`, `publish`, source publication bindings, the interval adapter and fingerprint APIs. It imports the loader and vendored matcher from paths-filter. The new action has no Depot mirror. Channels are added only through separately reviewed activation; manifest entries name provisioned origin repositories.
+
+## Common ordered alias
+
+After a successful default-branch build, reuse the helper under the repository-owner, `CD_DEPLOY_ENABLED` and `ORDERED_IMAGE_ALIAS_PAUSED` gates from `ordered_image_alias` in `.github/workflows/container-images-cd.yml`. A deliberate pause skips the alias job through its own `if:`. Keep one active production publisher during switchover or rollback.
+
+Run `bash .github/scripts/ordered-image-release.sh tag` in the executing checkout with `GITHUB_SHA` equal to the built revision. It writes `tag` to `GITHUB_OUTPUT`, preserving first-parent ordering and `r<12-digit ordinal>-<sha6>`. Use a full-history blobless checkout (`fetch-depth: 0`, `filter: blob:none`) with non-cone sparse checkout of `.github`. A shallow checkout yields a warning and no tag; surface that result as the common caller does.
+
+Install the pinned, checksum-verified client with `bash .github/scripts/ordered-image-release.sh install "$RUNNER_TEMP/regctl"`. After approved registry authentication, run the helper's `publish` command:
+
+| Environment                      | Meaning                                                                 |
+| -------------------------------- | ----------------------------------------------------------------------- |
+| `REGCTL`                         | Checksum-verified copy client path                                      |
+| `EXPECTED_DIGEST`                | Exact successful-build digest                                           |
+| `ECR_REGISTRY`, `ECR_REPO`       | Approved destination and ECR readback repository                        |
+| `SOURCE_REGISTRY`, `SOURCE_REPO` | Supply both for an approved source, or omit both to use the destination |
+| `ORDERED_ALIAS`                  | Computed ordered tag                                                    |
+| `GITHUB_OUTPUT`                  | Required `outcome` for the final alias check                            |
+
+The helper skips publication with a warning if the build digest, destination registry or destination repository is empty, or if only one source coordinate is supplied. The caller authenticates for the approved account and region. Pinned regctl `image copy` preserves single manifests, indexes and in-index attestations without listing external referrers. Exact ECR readback queries the destination account, repository and alias tag. The common caller retains its 40-second copy/readback defaults and five-minute job budget. Selective publication supplies separately measured `COPY_TIMEOUT_SECONDS` and `READBACK_TIMEOUT_SECONDS`; both require positive integer seconds up to 999.
+
+The helper's `read` operation prints the resolved digest and emits the same outcome as publication through one ECR readback function. Only `present-at-expected-digest` establishes publication. `absent`, `integrity-mismatch` and `unknown` do not. A copy error can reconcile to exact presence; a successful copy can have unknown readback. A green fail-soft job or an annotation does not prove publication. Same-digest reruns reconcile, while immutable conflicts retain their mismatch outcome. Never copy publisher/readback shell per service.
+
+Set `id: publish-alias` on the publish step. End every alias job with `bash .github/scripts/ordered-image-release.sh require TAG OUTCOME`, passing the computed tag and the publish step's `outcome`. A missing tag fails as `tag-unavailable`. With a tag, an empty outcome fails as `outcome-not-reported`.
+
+When adding a publisher, add its workflow and job to the lane table in `.github/scripts/ordered-image-alias-alerts.js` and its workflow to the trigger list in `.github/workflows/ordered-image-alias-alerts.yml`. Include the new workflow file in the name contract test and the Script tests path list. The name contract test fails if either registration is missing or its names differ from the workflow.
+
+Image annotations and consumer `source.repo` keep canonical `PostHog/posthog` identity. History and policy evaluation use the actual workflow checkout and built SHA. Fetch missing policy blobs from that checkout's configured origin, never from an endpoint derived from the canonical annotation. Missing executing history is an explicit failure, not unrelated input. Images built in their own repositories retain their existing publisher family.
+
+## Canonical policy and origin bindings
+
+Move each reused filter into `.github/shared-image-releases.yaml` once. The legacy action's `shared-image-policy` input calls `loadPolicy(text)` and `projectLegacyFilters(policy, inlineYaml)`. Preserve legacy endpoint comparisons, output names, ordering and compound dispatch conditions, including Python dependency analysis and coverage-added checks.
+
+Keep a `dataWarehouse: null` reference at that rule's original inline position. The projection fills it from the manifest while preserving every non-null inline rule. Unresolved references fail; nonempty duplicate definitions are rejected. `dataWarehouseMetadata` is an active channel filter, distinct from the broader `dataWarehouse` rule that still gates two legacy workers, with its `bootstrapPolicyDigest` pinned at adoption.
+
+Version 1 has `version`, `filters` and `images`; images contain `channels`. Each channel has `repository`, `filter` and optional `bootstrapPolicyDigest`. `loadPolicy` validates the closed shape, references, positive patterns and nonempty channel status qualifiers limited to `added`, `modified` and `deleted`. The vendored matcher owns extglob/negation semantics; legacy-only veto and status rules retain prior behavior. Structural validation does not authorize publication.
+
+`bindChannels(policy, sourceRepository)` validates the configured build input, rejects duplicate origin repositories and rejects a destination equal to the common source. The canonical loader validates repository paths against the supported ECR grammar. The resolved map is keyed by image and channel, with `{repository}` values. There is no destinations map, publisher owner label or replica list. IAM authorizes writes to provisioned repositories; the publisher does not create them.
+
+Run `.github/actions/shared-image-releases` with `shared-image-operation: inspect` and `shared-image-repository` from the workflow's common build repository. `shared-image-policy` defaults to `.github/shared-image-releases.yaml`; `working-directory` selects the executing checkout. Inspect runs offline and emits the `channels` flag and repository-only `bindings` map. It does not parse force or bootstrap requests. Empty channels skip the tag, credentials, login and publish steps. Nonempty channels authenticate with the selective role, then ECR login supplies `shared-image-registry` to publish. That authenticated hostname identifies both the source registry and the origin registry. Repository paths come from policy; no repository variables configure destinations or registry hostnames.
+
+The publisher checks repository existence and access through the existing paginated frontier lookup. A missing repository, denied lookup or unknown failure blocks the named channel and repository; independent channels continue. A successful empty listing still requires explicit bootstrap. There are no repository-description, replication-discovery or destination-replica calls. A qualifying release copies once to the US origin and verifies its digest; ECR handles replication.
+
+The Charts migration helper owns consumer binding for new-service onboarding and existing-service migration. Hand source identity, policy and destination coordinates to Charts. Charts checks resolved regional repositories against source policy and provisioned infrastructure, together with owner, lane, image group and inherited Git filters. Kargo checks regional tag, revision and digest agreement. An origin receipt cannot establish regional readiness; retain first-Freight verification before activation.
+
+Temporal worker release repositories use descriptive provisioned paths under `posthog-temporal-workers/`, such as `posthog-temporal-workers/data-warehouse-metadata`; `posthog-temporal-workers/batch-exports-sync` is the reserved sibling example. Preserve domain words and omit redundant `temporal-worker-` prefixes. Other workload classes choose their own namespace; the publisher does not infer workload identity from that prefix. Preserve bare tags, full revision/digest identity and source annotations. Changing repositories changes workload image strings and causes a rollout even at an equal digest.
+
+## Channel filters and the shared worker base
+
+A channel filter lists the code its worker runs. A change that no row matches is not lost. The publisher compares every file changed since the channel's last publication, so the next build that matches the filter qualifies the channel. A qualified channel publishes an image that also carries the earlier change when the source image identity check, the copy and its readback succeed. Review each row with two questions: does the worker run this code, and is the wait for a change the filter does not list acceptable? Do not review a filter for completeness.
+
+Every channel filter starts with the `sharedWorkerBase` alias and continues with the worker's own rows. A new worker's filter has the same shape:
+
+```yaml
+filters:
+  sharedWorkerBase: &sharedWorkerBase
+    - Dockerfile
+    - 'posthog/settings/**'
+  newWorker:
+    - *sharedWorkerBase
+    - 'products/new_worker/backend/**'
+```
+
+`sharedWorkerBase` holds what every Temporal worker process runs or reads, whatever its task queue:
+
+- the image build inputs and the entry point: `Dockerfile`, `.dockerignore`, `pyproject.toml`, `uv.lock`, the workspace members that `uv sync` reads (`tools/hogli/pyproject.toml`; the `owners-yaml` manifest and the files its wheel build reads, `owners_yaml/**`, `LICENSE` and `README.md`; and `packages/personhog-proto/**`), `manage.py` and `bin/temporal-django-worker`;
+- the settings and database wiring the process loads;
+- `start_temporal_worker` and what it executes for every queue, including the `ready()` hooks, the system checks and the feature flag definition poll;
+- the values the start reads for every queue: the product `facade/temporal.py` declarations and the metric, interceptor and internal log modules they name;
+- the models and the clients every worker builds or uses: Kafka, Redis, storage, ClickHouse and the person client with its protobuf package;
+- the Django and ClickHouse migration directories and the two commands the deploy's migration checks run, `migrate.py` and `migrate_clickhouse.py`. Do not narrow these rows. A worker that is not republished keeps an image whose check, migrations and their imports all come from one commit, so its check behaves as before, while a new or changed migration matches these rows and qualifies every channel whose filter uses the base. What the migrations and commands import is ordinary code under the rule above, even where the base already lists it.
+
+Code that only some workers run goes in those workers' own rows. A row lives in the base or in a filter's own rows, never in both. An own row does not repeat a base row or name a file that a base wildcard already matches. An own wildcard may also match base rows: keep it, because removing it narrows the filter. The base has no `!` rows: an exclude vetoes a path in every filter that uses the alias, wherever the row sits. `dataWarehouse` does not use the base, because the legacy data warehouse worker's deploy trigger reads it and no channel binds it.
+
+Find a worker's own rows from its task queue:
+
+1. List the workflows and activities registered for the queue: its `QueueBinding` entries in the products' `facade/temporal.py` declarations, and its entry in `_task_queue_specs` in `posthog/management/commands/start_temporal_worker.py`.
+2. Add the modules those workflows and activities call.
+3. Add the production modules that the worker's tests exercise, not the test files themselves.
+
+Stop at code the base lists and at code the worker does not run. The base lists what every worker runs at start. It does not list every module a worker loads.
+
+The table shows the waits on 2026-11-19 at `master` tip `adf1f847400`. It covers the 20,643 first-parent commits on `master` in the previous 90 days. For each commit that no row matches, the wait is the committer time from that commit to the next commit that a row matches. Unmatched commits after the last matching commit have no wait and are left out, 20 of them for the base alone. The table measures the time to the next matching commit, not the time to a publication.
+
+| Filter                              | Commits that match | Median wait | 90th percentile | 99th percentile | Longest wait |
+| ----------------------------------- | -----------------: | ----------: | --------------: | --------------: | -----------: |
+| `sharedWorkerBase` alone            |              12.5% |      21 min |           1.9 h |          17.1 h |       37.9 h |
+| `dataWarehouseMetadata`             |              32.5% |       9 min |           1.2 h |          10.2 h |       25.5 h |
+| `experimentsRecalculationActivity`  |              17.9% |      14 min |           1.5 h |          11.4 h |       37.9 h |
+| `wizardWorker`                      |              18.4% |      13 min |           1.4 h |          13.2 h |       37.9 h |
+| `genericWorker`                     |              19.9% |      12 min |           1.4 h |          12.0 h |       33.1 h |
+| `alertsPlatformSharedOrchestration` |              17.3% |      15 min |           1.5 h |          13.1 h |       32.8 h |
+| `alertsPlatformEvaluation`          |              40.5% |       6 min |          52 min |           6.3 h |       21.0 h |
+| `alertsPlatformDelivery`            |              25.4% |       9 min |           1.1 h |           7.8 h |       27.3 h |
+
+When a change must reach a worker now, force its channel. Run `container-images-cd.yml` through `workflow_dispatch` on the default branch, with `shared-image-force` set to a JSON array of channel keys, for example `["posthog-cloud/wizard"]`. Force qualifies a newer build that the publication job evaluates when no row matches. The publisher's frontier, image identity and newer-revision checks still apply, as for any publication (see [Selective publication](#selective-publication)). A force dispatch runs the CD workflow under its manual-dispatch conditions, which skip the image boot check, so a successful force is not evidence that the image passed that check. No scheduled job forces a publication.
+
+A changed filter changes its policy fingerprint, the hash of the filter's effective rows in order after the alias is flattened. A changed fingerprint satisfies the filter gate for a newer build that the publisher evaluates against a frontier from before the change, even when no changed file matches. A change to `sharedWorkerBase` does this for every filter that uses the alias. Before that gate, the publisher lists the channel's repository and takes its greatest ordered tag as the frontier, reads the frontier back, checks its image identity and that its revision's ordered alias is the frontier tag, and compares the revisions. An empty or unreadable frontier, or a failed check, blocks the channel before any fingerprint comparison; a build older than the frontier is skipped; an equal revision returns the frontier readback without comparing policy: `present` when the frontier holds the build's digest, `blocked` otherwise. The publication job runs only when the run is not cancelled, the build job succeeded, the repository owner is `PostHog`, `CD_DEPLOY_ENABLED` is `true`, `ORDERED_IMAGE_ALIAS_PAUSED` is not `true` and the ref is the default branch, and it continues on error. Confirm publication from the channel results of that run (`shared-image-releases/results.json`), not from a green build. When that file is missing, the publish step failed or did not run; treat every channel as not confirmed. Never edit the `bootstrapPolicyDigest` of a seeded channel: the publisher blocks a channel whose `bootstrapPolicyDigest` differs from the value in its history. A new channel still needs its one reviewed seed (see [Bootstrap and activation](#bootstrap-and-activation)).
+
+## Interval and fingerprint APIs
+
+The internal `.github/actions/shared-image-releases/src/shared-image.ts` entry point exports `intervalFiles`, `Filter` and the policy/binding APIs. Call `intervalFiles(base, revision, git)` with the asynchronous Git runner owned by `SourceHistory`; it applies measured command deadlines, output bounds and `GIT_NO_LAZY_FETCH=1`. The adapter and publisher share `assertFirstParent` and checkout validation. Reuse paths-filter's dependency-free Git diff parser; importing its process helpers also imports their action dependencies. Keep Git asynchronous so history comparisons cannot stall registry timers or output draining. The interval adapter validates the executing checkout and complete history, bounds first-parent membership to the interval, includes merge deltas, treats renames as add/delete and maps Git typechanges to modified. Missing history, invalid frontiers and exhausted bounds fail explicitly. Match the returned files with `Filter.match`; legacy dispatch still compares endpoints. Newline filenames remain intact, although the pinned engine does not match them with `worker/**`.
+
+Use `serializePolicy` and `policyDigest` for one fingerprint format. Canonical UTF-8 JSON retains authored array order, status objects, vetoes, Unicode and literal `<>&`, with sorted object keys and no trailing newline. Reordering a list changes its fingerprint. A digest does not authorize a destination binding.
+
+## Selective publication
+
+Keep the common ordered alias attempt first. The selective job depends on its completion and the successful build, so an earlier common-job failure does not silently suppress channel work. Preserve the repository-owner, default-branch, `CD_DEPLOY_ENABLED` and existing pause gates. A failed or skipped build never invokes the publisher. When channels exist but no ordered tag is generated, the selective job emits an error and fails within its existing fail-soft job boundary; inspect the tag step before retrying.
+
+For each resolved channel destination, list every registry page and select the greatest visible tag matching the complete bare ordered-alias grammar. Resolve its digest and full canonical source revision, then validate its ordinal and executing first-parent membership. Malformed identity or missing history blocks that channel. Never use the common repository frontier, push boundary, build marker or deployed revision as the channel baseline. Older builds skip; equal-revision reruns report `present` at the expected digest and block with `integrity-mismatch` at a different digest.
+
+Before comparing paths, require complete history with trees in the executing checkout; missing trees block publication without fetching. Batch-fetch only missing policy blobs from its configured origin, with up to three attempts and 5 and 15 second waits inside the existing fetch budget. Match every entry after the channel frontier through the successful build with that channel's filter at the build revision. This recovers relevant changes from failed or skipped earlier builds. Compare effective policy fingerprints at every policy change in the interval, including reverted changes. Other channels' changes do not qualify this channel, and historical destination rebinding is rejected.
+
+A qualifying channel copies the exact built digest from the common source to its origin repository in the authenticated registry with the existing helper. Results persist in `shared-image-releases/results.json` and per-channel logs. Each run attempt uploads evidence as `shared-image-releases-${{ github.run_attempt }}`. `published` records a new verified publication; `present` records an existing exact publication. Only `present-at-expected-digest` establishes a baseline. `absent`, `integrity-mismatch` and `unknown` remain blocked, and helper crashes, timeouts or missing outcome lines retain their primary reason. One blocked channel does not stop other workers.
+
+Invoke `container-images-cd.yml` through `workflow_dispatch` on the default branch. Supply `shared-image-force` as a JSON array of configured image/channel keys, or `shared-image-bootstrap` as the reviewed seed object described below. Force qualifies unmatched paths but cannot bypass image identity, history or destination rules. Request validation belongs to `publish`. Force and bootstrap dispatches run on the repository with `CD_DEPLOY_ENABLED`, which is `PostHog/posthog-private` today, because the publisher executes only where deploys do.
+
+## Bootstrap and activation
+
+Ordinary publication refuses an empty ordered frontier. Review one seed revision and exact digest, then supply `shared-image-bootstrap` as a JSON object with `channel`, `revision` and `digest`. Bootstrap and force cannot be combined, and a seed newer than the executing revision is refused. A bootstrap or force `workflow_dispatch` runs the CD workflow for the current master HEAD under its manual-dispatch conditions, including its Charts and worker deploy dispatches, and skips the push-only image boot check. This is expected and idempotent for an already-deployed HEAD. Exact readback writes a bootstrap receipt with origin registry and repository, current policy revision and fingerprint, seed revision, ordinal, tag, digest and outcome. It omits owner and replicas and proves origin publication only, not EU availability.
+
+Retry the same seed after newer aliases arrive. The seed must still exist at its expected digest; a missing seed in a repository with an ordered release or a conflicting digest fails. Untagged manifests and non-ordered tags alone do not block a verified seed copy. When the seed predates the channel policy, carry `bootstrapPolicyDigest` in the channel and verify it equals the reviewed current fingerprint before seeding. Preserve that adoption fingerprint across later policy changes.
+
+Before adding the first channel, review the selective role, source reads, origin writes and listing, immutable tags, ECR replication, retention and bootstrap evidence. Onboarding another worker needs its infrastructure entry and policy entry, with no workflow edit while the channel count stays within the workflow's [channel budget](#bound-work-before-activation). Obtain the Charts consumer-binding check and verify consumer pulls and release selection separately. Adding a repository can cause a rollout even at the same digest. This publisher makes no consumer or Charts changes.
+
+## Bound work before activation
+
+The workflow allows forty channels and eight concurrent registry workers. The time bound covers only sixteen channels that all publish in one build at the full channel registry work bound, in two waves of eight. With more channels publishing that slowly, the action total ends the run and blocks every remaining channel: a channel not yet started makes no copy, a channel cut short may already have written its tag, and the next build re-evaluates each from the frontier it finds. The action's tests publish to forty channels with at most eight in progress and refuse a forty-one-channel policy before any registry command; they measure fixture work, not production upload throughput. Recheck these bounds before raising the channel budget or concurrency, or enabling an origin with slower copy or readback behavior.
+
+| Work                           | Bound              |
+| ------------------------------ | ------------------ |
+| Policy-blob fetching           | 60 seconds         |
+| Retry waits within fetching    | 5 and 15 seconds   |
+| History comparison             | 30 seconds         |
+| Combined command output        | 64 MiB             |
+| Registry operation             | 15 seconds         |
+| Selective copy and readback    | 120 and 30 seconds |
+| Channel registry work          | 300 seconds        |
+| Action total                   | 720 seconds        |
+| Publish step and selective job | 13 and 18 minutes  |
+
+Commands kill their process group on timeout or output exhaustion; the helper's copy and readback stay in the caller's process group so a supervising runner's cancellation reaches them. The helper's own timeout then signals only the client; its descendants remain bounded by the caller's group kill or the step timeout. Bounded policy-blob fetching, unavailable trees and registry timeouts must leave blocked channels unadvanced. The independent common job retains its own attempt and budget. Activation must verify real fallback copy times, replica visibility, quiet intervals and retained rollback images.
+
+This guidance grants no publication, infrastructure apply, cluster operation or rollout authority.

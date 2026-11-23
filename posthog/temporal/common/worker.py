@@ -1,0 +1,484 @@
+import socket
+import typing
+import asyncio
+import datetime as dt
+import itertools
+import collections.abc
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
+from django.conf import settings
+
+from prometheus_client import REGISTRY
+from temporalio.client import Plugin
+from temporalio.contrib.opentelemetry import OpenTelemetryPlugin
+from temporalio.runtime import PrometheusConfig, Runtime, TelemetryConfig
+from temporalio.worker import (
+    Interceptor,
+    PollerBehaviorAutoscaling,
+    ResourceBasedSlotConfig,
+    UnsandboxedWorkflowRunner,
+    Worker,
+    WorkerTuner,
+)
+
+from posthog.dataclasses import frozen
+from posthog.temporal.ai_observability.eval_reports.metrics import (
+    EVAL_REPORTS_LATENCY_HISTOGRAM_BUCKETS,
+    EVAL_REPORTS_LATENCY_HISTOGRAM_METRICS,
+    EvalReportsMetricsInterceptor,
+)
+from posthog.temporal.ai_observability.metrics import EvalsMetricsInterceptor
+from posthog.temporal.ai_observability.trace_clustering.metrics import (
+    CLUSTERING_LATENCY_HISTOGRAM_BUCKETS,
+    CLUSTERING_LATENCY_HISTOGRAM_METRICS,
+    ClusteringMetricsInterceptor,
+)
+from posthog.temporal.ai_observability.trace_summarization.metrics import SummarizationMetricsInterceptor
+from posthog.temporal.common.client import connect
+from posthog.temporal.common.combined_metrics_server import CombinedMetricsServer
+from posthog.temporal.common.interceptor import is_task_queue_supported
+from posthog.temporal.common.liveness_tracker import LivenessInterceptor
+from posthog.temporal.common.logger import get_write_only_logger
+from posthog.temporal.common.posthog_client import PostHogClientInterceptor
+from posthog.temporal.common.registration import combined_registration
+from posthog.temporal.common.shutdown import DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT
+from posthog.temporal.common.slo_interceptor import SloInterceptor
+from posthog.temporal.common.utils import configure_asyncify_executor, shutdown_asyncify_executor
+from posthog.temporal.mcp_analytics.intent_clustering.metrics import (
+    MCPA_CLUSTERING_LATENCY_HISTOGRAM_BUCKETS,
+    MCPA_CLUSTERING_LATENCY_HISTOGRAM_METRICS,
+    MCPAClusteringMetricsInterceptor,
+)
+from posthog.temporal.session_replay.delete_recordings.metrics import (
+    DELETE_RECORDINGS_LATENCY_HISTOGRAM_BUCKETS,
+    DELETE_RECORDINGS_LATENCY_HISTOGRAM_METRICS,
+    DeleteRecordingsMetricsInterceptor,
+)
+from posthog.temporal.usage_report.metrics import (
+    USAGE_REPORTS_LATENCY_HISTOGRAM_BUCKETS,
+    USAGE_REPORTS_LATENCY_HISTOGRAM_METRICS,
+)
+
+logger = get_write_only_logger()
+
+
+BATCH_EXPORTS_LATENCY_HISTOGRAM_METRICS = (
+    "batch_exports_activity_execution_latency",
+    "batch_exports_activity_succeed_endtoend_latency",
+    "batch_exports_workflow_endtoend_latency",
+    "batch_exports_activity_interval_execution_latency",
+    "batch_exports_workflow_interval_execution_latency",
+)
+# Unit: ms
+BATCH_EXPORTS_LATENCY_HISTOGRAM_BUCKETS = [
+    1_000.0,
+    30_000.0,  # 30 seconds
+    60_000.0,  # 1 minute
+    300_000.0,  # 5 minutes
+    900_000.0,  # 15 minutes
+    1_800_000.0,  # 30 minutes
+    3_600_000.0,  # 1 hour
+    21_600_000.0,  # 6 hours
+    43_200_000.0,  # 12 hours
+    86_400_000.0,  # 24 hours
+]
+
+BATCH_EXPORTS_FAST_LATENCY_HISTOGRAM_METRICS = ("batch_exports_queue_wait_time",)
+# Unit: ns
+BATCH_EXPORTS_FAST_LATENCY_HISTOGRAM_BUCKETS = [
+    1_000_000.0,  # 1 ms
+    5_000_000.0,  # 5 ms
+    10_000_000.0,  # 10 ms
+    100_000_000.0,  # 100 ms
+    500_000_000.0,  # 500 ms
+    1_000_000_000.0,  # 1 s
+    5_000_000_000.0,  # 5 s
+    10_000_000_000.0,  # 10 s
+    30_000_000_000.0,  # 30 s
+    60_000_000_000.0,  # 1 min
+    300_000_000_000.0,  # 5 min
+    600_000_000_000.0,  # 10 min
+]
+
+EVALS_LATENCY_HISTOGRAM_METRICS = (
+    "llma_eval_activity_execution_latency",
+    "llma_eval_workflow_execution_latency",
+    "llma_eval_activity_schedule_to_start_latency",
+)
+EVALS_LATENCY_HISTOGRAM_BUCKETS = [
+    100.0,  # 100ms
+    500.0,  # 500ms
+    1_000.0,  # 1 second
+    2_000.0,  # 2 seconds
+    5_000.0,  # 5 seconds
+    10_000.0,  # 10 seconds
+    30_000.0,  # 30 seconds
+    60_000.0,  # 1 minute
+    120_000.0,  # 2 minutes
+    300_000.0,  # 5 minutes
+]
+
+SUMMARIZATION_LATENCY_HISTOGRAM_METRICS = (
+    "llma_summarization_activity_execution_latency",
+    "llma_summarization_activity_schedule_to_start_latency",
+    "llma_summarization_workflow_execution_latency",
+)
+SUMMARIZATION_LATENCY_HISTOGRAM_BUCKETS = [
+    500.0,  # 500ms
+    1_000.0,  # 1 second
+    5_000.0,  # 5 seconds
+    10_000.0,  # 10 seconds
+    30_000.0,  # 30 seconds
+    60_000.0,  # 1 minute
+    120_000.0,  # 2 minutes
+    300_000.0,  # 5 minutes
+    600_000.0,  # 10 minutes
+    900_000.0,  # 15 minutes
+    1_800_000.0,  # 30 minutes
+]
+
+
+ALL_INTERCEPTOR_CLASSES = [
+    LivenessInterceptor,
+    PostHogClientInterceptor,
+    SloInterceptor,
+    DeleteRecordingsMetricsInterceptor,
+    EvalsMetricsInterceptor,
+    SummarizationMetricsInterceptor,
+    ClusteringMetricsInterceptor,
+    MCPAClusteringMetricsInterceptor,
+    EvalReportsMetricsInterceptor,
+]
+
+
+def interceptor_classes() -> list[type[Interceptor]]:
+    return [*ALL_INTERCEPTOR_CLASSES, *combined_registration().interceptors]
+
+
+def with_declared_histograms(task_queue: str, core_buckets: dict[str, list[float]]) -> dict[str, list[float]]:
+    # Core's buckets win, so a product declaration cannot change the buckets of a core metric.
+    declared = {
+        histogram.metric_name: list(histogram.buckets)
+        for histogram in combined_registration().histograms
+        if histogram.applies_to(task_queue)
+    }
+    return declared | core_buckets
+
+
+def histogram_buckets_for_queue(task_queue: str) -> dict[str, list[float]]:
+    histogram_bucket_overrides: dict[str, list[float]] = (
+        dict(
+            zip(
+                BATCH_EXPORTS_LATENCY_HISTOGRAM_METRICS,
+                itertools.repeat(BATCH_EXPORTS_LATENCY_HISTOGRAM_BUCKETS),
+            )
+        )
+        | dict(
+            zip(
+                BATCH_EXPORTS_FAST_LATENCY_HISTOGRAM_METRICS,
+                itertools.repeat(BATCH_EXPORTS_FAST_LATENCY_HISTOGRAM_BUCKETS),
+            )
+        )
+        | dict(zip(EVALS_LATENCY_HISTOGRAM_METRICS, itertools.repeat(EVALS_LATENCY_HISTOGRAM_BUCKETS)))
+        | dict(zip(SUMMARIZATION_LATENCY_HISTOGRAM_METRICS, itertools.repeat(SUMMARIZATION_LATENCY_HISTOGRAM_BUCKETS)))
+        | dict(zip(CLUSTERING_LATENCY_HISTOGRAM_METRICS, itertools.repeat(CLUSTERING_LATENCY_HISTOGRAM_BUCKETS)))
+        | dict(
+            zip(
+                MCPA_CLUSTERING_LATENCY_HISTOGRAM_METRICS,
+                itertools.repeat(MCPA_CLUSTERING_LATENCY_HISTOGRAM_BUCKETS),
+            )
+        )
+        | dict(
+            zip(
+                EVAL_REPORTS_LATENCY_HISTOGRAM_METRICS,
+                itertools.repeat(EVAL_REPORTS_LATENCY_HISTOGRAM_BUCKETS),
+            )
+        )
+        | dict(
+            zip(
+                DELETE_RECORDINGS_LATENCY_HISTOGRAM_METRICS,
+                itertools.repeat(DELETE_RECORDINGS_LATENCY_HISTOGRAM_BUCKETS),
+            )
+        )
+        | dict(zip(USAGE_REPORTS_LATENCY_HISTOGRAM_METRICS, itertools.repeat(USAGE_REPORTS_LATENCY_HISTOGRAM_BUCKETS)))
+        | {"batch_exports_activity_attempt": [1.0, 5.0, 10.0, 100.0]}
+    )
+    return with_declared_histograms(task_queue, histogram_bucket_overrides)
+
+
+@frozen
+class ActivityWorkerConfig:
+    task_queue: str
+    activities: collections.abc.Sequence[typing.Callable]
+    max_concurrent_activities: int
+
+
+@dataclass(frozen=False)
+class ManagedWorker:
+    """A Temporal worker bundled with its associated resources for unified lifecycle management."""
+
+    worker: Worker
+    metrics_server: CombinedMetricsServer | None = None
+    activity_workers: tuple[Worker, ...] = ()
+
+    async def run(self) -> None:
+        if self.metrics_server:
+            await self.metrics_server.start()
+        if not self.activity_workers:
+            await self.worker.run()
+            return
+        # A failed poller must stop its siblings so the pod restarts with all queues served.
+        async with asyncio.TaskGroup() as group:
+            for worker in (self.worker, *self.activity_workers):
+                group.create_task(worker.run())
+
+    def is_shutdown(self) -> bool:
+        return all(worker.is_shutdown for worker in (self.worker, *self.activity_workers))
+
+    async def shutdown(self) -> None:
+        await asyncio.gather(*(worker.shutdown() for worker in (self.worker, *self.activity_workers)))
+        if self.metrics_server:
+            await self.metrics_server.stop()
+        shutdown_asyncify_executor()
+
+
+DEFAULT_MAX_CONCURRENT_TASKS = 50
+
+
+def max_heartbeat_throttle_interval() -> dt.timedelta:
+    """The SDK sends heartbeats every min(0.8 * heartbeat_timeout, this)."""
+    return dt.timedelta(seconds=settings.TEMPORAL_MAX_HEARTBEAT_THROTTLE_SECONDS)
+
+
+def build_poller_autoscaling(
+    task_type: str, minimum: int | None, maximum: int | None
+) -> PollerBehaviorAutoscaling | None:
+    """Return an autoscaling poller behavior, or None to keep the SDK default when maximum is unset."""
+    if maximum is None:
+        if minimum is not None:
+            logger.warning(
+                "poller_autoscaling_minimum_ignored",
+                task_type=task_type,
+                minimum=minimum,
+                reason="maximum is not set, so the SDK default poller behavior is used",
+            )
+        return None
+    effective_minimum = PollerBehaviorAutoscaling.minimum if minimum is None else minimum
+    if effective_minimum < 1:
+        raise ValueError(f"{task_type} poller autoscaling minimum must be at least 1, got {effective_minimum}")
+    if maximum < effective_minimum:
+        raise ValueError(
+            f"{task_type} poller autoscaling maximum ({maximum}) must be at least the minimum ({effective_minimum})"
+        )
+    return PollerBehaviorAutoscaling(minimum=effective_minimum, maximum=maximum, initial=effective_minimum)
+
+
+async def create_worker(
+    host: str,
+    port: int,
+    metrics_port: int,
+    namespace: str,
+    task_queue: str,
+    workflows: collections.abc.Sequence[type],
+    activities: collections.abc.Sequence[typing.Callable],
+    server_root_ca_cert: str | None = None,
+    client_cert: str | None = None,
+    client_key: str | None = None,
+    graceful_shutdown_timeout: dt.timedelta | None = None,
+    max_concurrent_workflow_tasks: int | None = None,
+    max_concurrent_activities: int | None = None,
+    metric_prefix: str | None = None,
+    use_pydantic_converter: bool = False,
+    target_memory_usage: float | None = None,
+    target_cpu_usage: float | None = None,
+    activity_ramp_throttle: dt.timedelta | None = None,
+    enable_combined_metrics_server: bool = True,
+    enable_open_telemetry_plugin: bool = False,
+    activity_worker_configs: collections.abc.Sequence[ActivityWorkerConfig] = (),
+) -> ManagedWorker:
+    """Connect to Temporal server and return a ManagedWorker containing the Worker and metrics server.
+
+    Arguments:
+        host: The Temporal Server host.
+        port: The Temporal Server port.
+        metrics_port: Port used to serve Prometheus metrics.
+        namespace: The Temporal namespace to connect to.
+        task_queue: The task queue the worker will listen on.
+        workflows: Workflows the worker is configured to run.
+        activities: Activities the worker is configured to run.
+        server_root_ca_cert: Root CA to validate the server certificate against.
+        client_cert: Client certificate for TLS.
+        client_key: Client private key for TLS.
+        graceful_shutdown_timeout: Time to wait (in seconds) for graceful shutdown.
+            By default we will wait 5 minutes. This should be always less than any
+            timeouts used by deployment orchestrators.
+        max_concurrent_workflow_tasks: Maximum number of concurrent workflow tasks
+            the worker can handle. Defaults to 50.
+        max_concurrent_activities: Maximum number of concurrent activity tasks the
+            worker can handle. Defaults to 50.
+        metric_prefix: Prefix to apply to metrics emitted by this worker, if
+            left unset (`None`) Temporal will default to "temporal_".
+        use_pydantic_converter: Flag to enable Pydantic data converter
+        target_memory_usage: Fraction of available memory to use, between 0.0 and 1.0.
+            If not set, worker will use max_concurrent_{activities, workflow_tasks} to dictate number of slots.
+        target_cpu_usage: Fraction of available CPU to use, between 0.0 and 1.0.
+            Defaults to 1.0. Only takes effect if target_memory_usage is set.
+        activity_ramp_throttle: Minimum interval between two activity slot issues.
+            Defaults to the SDK value of 50 ms. Only takes effect if target_memory_usage is set.
+        enable_combined_metrics_server: Whether to start the combined metrics server. Defaults to True.
+            Set to False to disable the metrics server (useful when it causes GIL contention issues).
+        enable_open_telemetry_plugin: Whether to trace execution with OTel spans. Requires initialize_otel.
+        activity_worker_configs: Additional activity queues with independent fixed concurrency limits,
+            sharing this process, client, metrics server, and shutdown lifecycle.
+    """
+
+    metrics_server: CombinedMetricsServer | None = None
+
+    if enable_combined_metrics_server:
+        # Use an internal port for Temporal SDK metrics, which the combined metrics server
+        # will fetch from and merge with prometheus_client metrics on the main metrics port.
+        temporal_metrics_port = get_free_port()
+        temporal_metrics_bind_address = f"127.0.0.1:{temporal_metrics_port}"
+
+        metrics_server = CombinedMetricsServer(
+            port=metrics_port,
+            temporal_metrics_url=f"http://{temporal_metrics_bind_address}/metrics",
+            registry=REGISTRY,
+        )
+    else:
+        # Expose Temporal SDK metrics directly on the public metrics port.
+        temporal_metrics_bind_address = f"0.0.0.0:{metrics_port}"
+
+    histogram_bucket_overrides = histogram_buckets_for_queue(task_queue)
+
+    runtime = Runtime(
+        telemetry=TelemetryConfig(
+            metric_prefix=metric_prefix,
+            metrics=PrometheusConfig(
+                bind_address=temporal_metrics_bind_address,
+                durations_as_seconds=False,
+                # Units are u64 milliseconds in sdk-core,
+                # given that the `duration_as_seconds` is `False`.
+                # But in Python we still need to pass floats due to type hints.
+                histogram_bucket_overrides=histogram_bucket_overrides,
+            ),
+        )
+    )
+    # Register the OpenTelemetryPlugin on the client, not the worker, following the SDK's guidance
+    # (temporalio/contrib/opentelemetry/README.md).
+    plugins: collections.abc.Sequence[Plugin] = (
+        (OpenTelemetryPlugin(add_temporal_spans=True),) if enable_open_telemetry_plugin else ()
+    )
+
+    client = await connect(
+        host,
+        port,
+        namespace,
+        server_root_ca_cert=server_root_ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        runtime=runtime,
+        use_pydantic_converter=use_pydantic_converter,
+        # This worker traces activity/workflow execution through the OpenTelemetryPlugin above.
+        # Keeping the client-level TracingInterceptor as well would emit a second, duplicate span
+        # for every activity and workflow, so drop it here.
+        add_otel_tracing_interceptor=False,
+        plugins=plugins,
+    )
+    supported_interceptors = [
+        interceptor() for interceptor in interceptor_classes() if is_task_queue_supported(task_queue, interceptor)
+    ]
+
+    # `activity_executor` below only serves sync activity functions, so `@asyncify` coroutines need their own.
+    configure_asyncify_executor(
+        min(max_concurrent_activities or DEFAULT_MAX_CONCURRENT_TASKS, settings.ASYNCIFY_MAX_WORKERS)
+    )
+
+    poller_kwargs: dict[str, typing.Any] = {}
+    activity_poller_behavior = build_poller_autoscaling(
+        "activity",
+        settings.TEMPORAL_ACTIVITY_POLLER_AUTOSCALING_MIN,
+        settings.TEMPORAL_ACTIVITY_POLLER_AUTOSCALING_MAX,
+    )
+    if activity_poller_behavior is not None:
+        poller_kwargs["activity_task_poller_behavior"] = activity_poller_behavior
+    workflow_poller_behavior = build_poller_autoscaling(
+        "workflow",
+        settings.TEMPORAL_WORKFLOW_POLLER_AUTOSCALING_MIN,
+        settings.TEMPORAL_WORKFLOW_POLLER_AUTOSCALING_MAX,
+    )
+    if workflow_poller_behavior is not None:
+        poller_kwargs["workflow_task_poller_behavior"] = workflow_poller_behavior
+
+    if target_memory_usage is not None:
+        worker = Worker(
+            client,
+            task_queue=task_queue,
+            workflows=workflows,
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+            graceful_shutdown_timeout=graceful_shutdown_timeout or DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT,
+            interceptors=supported_interceptors,
+            activity_executor=ThreadPoolExecutor(max_workers=max_concurrent_activities or DEFAULT_MAX_CONCURRENT_TASKS),
+            tuner=WorkerTuner.create_resource_based(
+                target_memory_usage=target_memory_usage,
+                target_cpu_usage=target_cpu_usage or 1.0,
+                workflow_config=ResourceBasedSlotConfig(
+                    maximum_slots=max_concurrent_workflow_tasks or DEFAULT_MAX_CONCURRENT_TASKS
+                ),
+                activity_config=ResourceBasedSlotConfig(
+                    maximum_slots=max_concurrent_activities or DEFAULT_MAX_CONCURRENT_TASKS,
+                    ramp_throttle=activity_ramp_throttle,
+                ),
+            ),
+            max_heartbeat_throttle_interval=max_heartbeat_throttle_interval(),
+            **poller_kwargs,
+        )
+    else:
+        worker = Worker(
+            client,
+            task_queue=task_queue,
+            workflows=workflows,
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+            graceful_shutdown_timeout=graceful_shutdown_timeout or DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT,
+            interceptors=supported_interceptors,
+            activity_executor=ThreadPoolExecutor(max_workers=max_concurrent_activities or DEFAULT_MAX_CONCURRENT_TASKS),
+            max_concurrent_activities=max_concurrent_activities or DEFAULT_MAX_CONCURRENT_TASKS,
+            max_concurrent_workflow_tasks=max_concurrent_workflow_tasks or DEFAULT_MAX_CONCURRENT_TASKS,
+            max_heartbeat_throttle_interval=max_heartbeat_throttle_interval(),
+            **poller_kwargs,
+        )
+
+    activity_workers = tuple(
+        Worker(
+            client,
+            task_queue=config.task_queue,
+            activities=config.activities,
+            max_concurrent_activities=config.max_concurrent_activities,
+            activity_executor=ThreadPoolExecutor(max_workers=config.max_concurrent_activities),
+            graceful_shutdown_timeout=graceful_shutdown_timeout or DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT,
+            interceptors=[
+                interceptor()
+                for interceptor in interceptor_classes()
+                if is_task_queue_supported(config.task_queue, interceptor)
+            ],
+            max_heartbeat_throttle_interval=max_heartbeat_throttle_interval(),
+            **poller_kwargs,
+        )
+        for config in activity_worker_configs
+    )
+    return ManagedWorker(worker=worker, metrics_server=metrics_server, activity_workers=activity_workers)
+
+
+def get_free_port() -> int:
+    """Find an available port on localhost.
+
+    Note: There's a small race window between this returning and binding.
+    Acceptable for localhost internal ports where collisions are rare,
+    and would fail fast with a port-in-use exception if it occurs.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]

@@ -1,0 +1,1534 @@
+use std::{
+    collections::HashSet,
+    io::{self, Write},
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+use anyhow::Error;
+use async_trait::async_trait;
+use common_posthog::capture_outcomes::{event_outcome, request_outcome, EventOutcome};
+use common_types::{InternallyCapturedEvent, RawEvent};
+use metrics::counter;
+use posthog::{
+    CaptureCompression, CaptureSummary, Client, ClientOptions, ClientOptionsBuilder,
+    Error as PosthogError, Event, EventStatus,
+};
+use tracing::{info, warn};
+use uuid::Uuid;
+
+use super::{Emitter, Transaction};
+use crate::error::UserError;
+
+pub fn client_options(api_key: String, host: &str) -> Result<ClientOptions, Error> {
+    ClientOptionsBuilder::default()
+        .api_key(api_key)
+        .host(host)
+        .request_timeout_seconds(30u64)
+        .max_capture_attempts(6u32)
+        .retry_initial_backoff_ms(1000u64)
+        .retry_max_backoff_ms(30000u64)
+        .capture_compression(CaptureCompression::Zstd)
+        .build()
+        .map_err(|e| Error::msg(format!("Failed to build capture client options: {e}")))
+}
+
+pub struct CaptureEmitter {
+    client: Client,
+    send_rate: u64,
+}
+
+pub struct CaptureTransaction<'a> {
+    client: &'a Client,
+    send_rate: u64,
+    start: Instant,
+    events: Mutex<Vec<Event>>,
+    // Capture's V1 endpoint keeps only the first event per UUID in one request, and a source
+    // export can repeat a UUID across requests too. Track UUIDs across the whole transaction so
+    // each UUID is sent to capture once.
+    seen_uuids: Mutex<HashSet<Uuid>>,
+}
+
+impl CaptureEmitter {
+    pub fn new(client: Client, send_rate: u64) -> Self {
+        Self { client, send_rate }
+    }
+}
+
+#[async_trait]
+impl Emitter for CaptureEmitter {
+    fn set_send_rate(&mut self, send_rate: u64) {
+        if send_rate != self.send_rate {
+            info!(old = self.send_rate, new = send_rate, "send rate changed");
+            self.send_rate = send_rate;
+        }
+    }
+
+    async fn begin_write<'a>(&'a mut self) -> Result<Box<dyn Transaction<'a> + 'a>, Error> {
+        Ok(Box::new(CaptureTransaction {
+            client: &self.client,
+            send_rate: self.send_rate,
+            start: Instant::now(),
+            events: Mutex::new(Vec::new()),
+            seen_uuids: Mutex::new(HashSet::new()),
+        }))
+    }
+}
+
+fn convert_event(ice: &InternallyCapturedEvent) -> Result<Event, Error> {
+    let raw: RawEvent = serde_json::from_str(&ice.inner.data)?;
+
+    let mut event = Event::new(&ice.inner.event, &ice.inner.distinct_id);
+
+    event.set_uuid(ice.inner.uuid);
+    event
+        .set_timestamp(ice.inner.timestamp)
+        .map_err(|e| Error::msg(e.to_string()))?;
+
+    for (key, value) in &raw.properties {
+        event
+            .insert_prop(key, value)
+            .map_err(|e| Error::msg(e.to_string()))?;
+    }
+
+    if let Some(set) = &raw.set {
+        event
+            .insert_prop("$set", set)
+            .map_err(|e| Error::msg(e.to_string()))?;
+    }
+
+    if let Some(set_once) = &raw.set_once {
+        event
+            .insert_prop("$set_once", set_once)
+            .map_err(|e| Error::msg(e.to_string()))?;
+    }
+
+    event
+        .insert_prop("$geoip_disable", true)
+        .map_err(|e| Error::msg(e.to_string()))?;
+
+    Ok(event)
+}
+
+#[async_trait]
+impl<'a> Transaction<'a> for CaptureTransaction<'a> {
+    async fn emit(&self, data: &[InternallyCapturedEvent]) -> Result<(), Error> {
+        let mut seen = self
+            .seen_uuids
+            .lock()
+            .map_err(|e| Error::msg(format!("seen_uuids lock poisoned: {e}")))?;
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|e| Error::msg(format!("events lock poisoned: {e}")))?;
+
+        let mut duplicates: u64 = 0;
+        for captured in data {
+            // Drop repeat UUIDs so each one reaches capture once, even across requests.
+            if seen.contains(&captured.inner.uuid) {
+                duplicates += 1;
+                continue;
+            }
+            // Record the UUID only after a successful conversion, so a convert error never
+            // leaves a UUID marked seen with no corresponding event.
+            let event = convert_event(captured)?;
+            seen.insert(captured.inner.uuid);
+            events.push(event);
+        }
+        drop(events);
+        drop(seen);
+
+        if duplicates > 0 {
+            warn!(
+                duplicates,
+                "dropped events with duplicate uuids before sending to capture"
+            );
+            counter!("capture_batch_duplicate_uuids_total").increment(duplicates);
+        }
+
+        Ok(())
+    }
+
+    async fn commit_write(self: Box<Self>) -> Result<Duration, Error> {
+        let events = self
+            .events
+            .into_inner()
+            .map_err(|e| Error::msg(format!("events lock poisoned: {e}")))?;
+        let count = events.len();
+
+        if count == 0 {
+            info!("skipping capture send for empty event batch");
+            return Ok(Duration::ZERO);
+        }
+
+        let min_duration = get_min_txn_duration(self.send_rate, count);
+        let txn_elapsed = self.start.elapsed();
+        let to_sleep = min_duration.saturating_sub(txn_elapsed);
+
+        // Split into sub-batches under `MAX_BATCH_PAYLOAD_BYTES`. Capture rejects an
+        // over-limit batch without producing anything to Kafka, so the size failure this
+        // prevents never half-commits a chunk. Capture does not dedupe by UUID alone (events
+        // without a source id get a fresh UUID per parse): if a later sub-batch fails after
+        // earlier ones were accepted, the offset rollback re-sends the whole chunk and
+        // re-delivers the accepted events — bounded over-delivery we accept over skipping data.
+        let batches = split_into_byte_limited_batches(events)?;
+        let num_batches = batches.len();
+
+        info!(
+            count,
+            batches = num_batches,
+            ?txn_elapsed,
+            ?min_duration,
+            ?to_sleep,
+            "sending events to capture"
+        );
+
+        for batch in batches {
+            let batch_count = batch.len();
+            let e = match self.client.capture_batch_immediate(batch, true).await {
+                Ok(summary) => {
+                    record_summary(&summary);
+                    // The SDK already re-sent these events until its attempts ran out. Fail the
+                    // chunk so the job pauses instead of committing events capture never stored.
+                    // Drops are not retried: capture rejects the same events the same way.
+                    let unpersisted = retry_count(&summary);
+                    if unpersisted == 0 {
+                        continue;
+                    }
+                    counter!("capture_batch_events_total", "outcome" => "failure", "reason" => "unpersisted")
+                        .increment(unpersisted as u64);
+                    counter!("capture_batch_requests_total", "outcome" => "failure", "reason" => "unpersisted")
+                        .increment(1);
+                    return Err(Error::msg(format!(
+                        "capture did not persist {unpersisted} events after all retry attempts"
+                    )));
+                }
+                Err(e) => e,
+            };
+            record_request_failure(&e);
+            // `reason` lets alerts exclude expected quota (402) failures.
+            let reason = failure_reason(&e);
+            counter!("capture_batch_events_total", "outcome" => "failure", "reason" => reason)
+                .increment(batch_count as u64);
+            counter!("capture_batch_requests_total", "outcome" => "failure", "reason" => reason)
+                .increment(1);
+            let user_msg = user_message(&e);
+            let err = Error::new(e).context("capture batch failed");
+            return Err(match user_msg {
+                Some(msg) => err.context(UserError::new(msg)),
+                None => err,
+            });
+        }
+
+        // Count success once per fully-committed chunk. A mid-chunk failure rolls the offset
+        // back and re-sends the whole chunk on retry, so counting per sub-batch would inflate
+        // the success total across retries. The request counter follows the same rule: only
+        // the fully-committed chunk's sub-batches are counted as successful requests.
+        counter!("capture_batch_events_total", "outcome" => "success").increment(count as u64);
+        counter!("capture_batch_requests_total", "outcome" => "success")
+            .increment(num_batches as u64);
+
+        info!(count, "successfully sent batch to capture");
+        Ok(to_sleep)
+    }
+}
+
+/// Maps a posthog-rs capture error to a bounded `&'static str` failure reason for
+/// metrics. The split is what makes worker-side alerting actionable: `quota` (HTTP
+/// 402) is expected billing enforcement and is excluded from alerts, while
+/// transport / server / bad_request failures are real ingestion problems. The
+/// `_` arm is required because `posthog::Error` is `#[non_exhaustive]`.
+fn failure_reason(err: &PosthogError) -> &'static str {
+    match err {
+        PosthogError::BillingLimitExceeded(_) => "quota", // 402
+        PosthogError::BadRequest(_) => "bad_request",     // 400 / 413 (malformed / oversize)
+        PosthogError::ServerError { .. } => "server_error", // 5xx
+        PosthogError::RateLimit => "rate_limited",        // 429
+        PosthogError::Unauthorized => "unauthorized",     // 401
+        PosthogError::Connection(_) => "transport",       // network / unexpected status
+        PosthogError::Serialization(_) => "serialization", // local encode failure
+        _ => "other",
+    }
+}
+
+const BILLING_LIMIT_USER_MESSAGE: &str = "Import paused because this project reached its billing \
+    limit. Raise or remove the billing limit, or wait for it to reset at the start of the next \
+    billing period, then resume the import.";
+
+fn user_message(err: &PosthogError) -> Option<&'static str> {
+    match err {
+        PosthogError::BillingLimitExceeded(_) => Some(BILLING_LIMIT_USER_MESSAGE),
+        _ => None,
+    }
+}
+
+const EVENT_RESULTS: &str = "capture_batch_event_results_total";
+
+const REQUEST_RESULTS: &str = "capture_batch_request_results_total";
+
+fn record_summary(summary: &CaptureSummary) {
+    let results = summary.event_results();
+    let mut duplicate_copies = 0usize;
+    for result in results.values() {
+        count_event(event_outcome(result), 1);
+        let copies = result.duplicates_dropped.unwrap_or(0) as usize;
+        if copies > 0 {
+            count_event(EventOutcome::DUPLICATE_COPY, copies);
+            duplicate_copies += copies;
+        }
+    }
+    let unaccounted = summary
+        .submitted()
+        .saturating_sub(results.len() + duplicate_copies);
+    if unaccounted > 0 {
+        count_event(EventOutcome::UNACCOUNTED, unaccounted);
+    }
+
+    let outcome = if summary.all_persisted() {
+        "all_persisted"
+    } else if summary.not_persisted() >= summary.submitted() {
+        "none_persisted"
+    } else {
+        "partial"
+    };
+    counter!(REQUEST_RESULTS, "outcome" => outcome, "status" => "200", "error" => "none")
+        .increment(1);
+}
+
+fn retry_count(summary: &CaptureSummary) -> usize {
+    summary
+        .event_results()
+        .values()
+        .filter(|result| result.result == EventStatus::Retry)
+        .count()
+}
+
+fn record_request_failure(err: &PosthogError) {
+    let outcome = request_outcome(err);
+    counter!(
+        REQUEST_RESULTS,
+        "outcome" => "failed",
+        "status" => outcome.status,
+        "error" => outcome.error,
+    )
+    .increment(1);
+}
+
+fn count_event(outcome: EventOutcome, events: usize) {
+    counter!(
+        EVENT_RESULTS,
+        "result" => outcome.result,
+        "class" => outcome.class,
+        "detail" => outcome.detail,
+    )
+    .increment(events as u64);
+}
+
+fn get_min_txn_duration(send_rate: u64, count: usize) -> Duration {
+    let max_send_rate = send_rate as f64;
+    let batch_size = count as f64;
+    Duration::from_secs_f64(batch_size / max_send_rate)
+}
+
+/// Uncompressed budget per request (capture v1 allows 10 MiB compressed, 50 MiB decompressed).
+const MAX_BATCH_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
+
+/// Overhead capture adds per event beyond its own JSON (injected `api_key`, `$lib*`
+/// properties and separators). Counted toward every event so a flood of tiny events
+/// can't accumulate past the wire limit.
+const PER_EVENT_OVERHEAD_BYTES: usize = 256;
+
+/// Greedily pack events into batches whose estimated serialized size stays under
+/// [`MAX_BATCH_PAYLOAD_BYTES`], preserving order. A single event larger than the budget
+/// gets its own batch — best effort, since capture may still reject it, but that is a
+/// genuinely oversized event rather than an aggregation problem.
+fn split_into_byte_limited_batches(events: Vec<Event>) -> Result<Vec<Vec<Event>>, Error> {
+    let mut batches: Vec<Vec<Event>> = Vec::new();
+    let mut current: Vec<Event> = Vec::new();
+    let mut current_bytes: usize = 0;
+
+    for event in events {
+        let event_bytes = serialized_len(&event)?.saturating_add(PER_EVENT_OVERHEAD_BYTES);
+
+        if !current.is_empty()
+            && current_bytes.saturating_add(event_bytes) > MAX_BATCH_PAYLOAD_BYTES
+        {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+
+        if event_bytes > MAX_BATCH_PAYLOAD_BYTES {
+            warn!(
+                event_bytes,
+                limit = MAX_BATCH_PAYLOAD_BYTES,
+                "single event exceeds capture batch size limit; sending it in its own request"
+            );
+        }
+
+        current.push(event);
+        current_bytes = current_bytes.saturating_add(event_bytes);
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    Ok(batches)
+}
+
+/// Serialized JSON byte length of `event`, measured without retaining the bytes:
+/// `serde_json::to_writer` into a counting sink, so sizing a multi-MB event doesn't
+/// allocate a multi-MB buffer just to read its length.
+fn serialized_len(event: &Event) -> Result<usize, Error> {
+    let mut counter = ByteCountWriter(0);
+    serde_json::to_writer(&mut counter, event)
+        .map_err(|e| Error::msg(format!("failed to size event for batching: {e}")))?;
+    Ok(counter.0)
+}
+
+struct ByteCountWriter(usize);
+
+impl Write for ByteCountWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use common_types::CapturedEvent;
+    use uuid::Uuid;
+
+    fn make_internally_captured_event(
+        event_name: &str,
+        distinct_id: &str,
+        properties: serde_json::Value,
+        set: Option<serde_json::Value>,
+        set_once: Option<serde_json::Value>,
+    ) -> InternallyCapturedEvent {
+        let mut raw = serde_json::json!({
+            "event": event_name,
+            "properties": properties,
+        });
+        if let Some(s) = set {
+            raw["$set"] = s;
+        }
+        if let Some(s) = set_once {
+            raw["$set_once"] = s;
+        }
+
+        InternallyCapturedEvent {
+            inner: CapturedEvent {
+                uuid: Uuid::now_v7(),
+                distinct_id: distinct_id.to_string(),
+                session_id: None,
+                ip: "127.0.0.1".to_string(),
+                data: serde_json::to_string(&raw).unwrap(),
+                now: "2023-10-15T14:30:00+00:00".to_string(),
+                sent_at: None,
+                token: "test_token".to_string(),
+                event: event_name.to_string(),
+                timestamp: DateTime::parse_from_rfc3339("2023-10-15T14:30:00+00:00")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                is_cookieless_mode: false,
+                historical_migration: true,
+                options: None,
+            },
+            team_id: 1,
+        }
+    }
+
+    /// V1 capture returns a JSON body with per-event results. An empty results
+    /// map means all events are silently accepted (dropped from retry tracking).
+    const V1_OK_BODY: &str = r#"{"results":{}}"#;
+
+    #[test]
+    fn test_convert_event_basic_properties() {
+        let ice = make_internally_captured_event(
+            "test_event",
+            "user123",
+            serde_json::json!({"color": "red", "count": 42}),
+            None,
+            None,
+        );
+
+        let event = convert_event(&ice).unwrap();
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(json["event"], "test_event");
+        assert_eq!(json["distinct_id"], "user123");
+        assert_eq!(json["properties"]["color"], "red");
+        assert_eq!(json["properties"]["count"], 42);
+        assert_eq!(json["properties"]["$geoip_disable"], true);
+    }
+
+    #[test]
+    fn test_convert_event_with_set_and_set_once() {
+        let ice = make_internally_captured_event(
+            "$identify",
+            "user456",
+            serde_json::json!({}),
+            Some(serde_json::json!({"email": "test@example.com"})),
+            Some(serde_json::json!({"created_at": "2023-01-01"})),
+        );
+
+        let event = convert_event(&ice).unwrap();
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(json["properties"]["$set"]["email"], "test@example.com");
+        assert_eq!(json["properties"]["$set_once"]["created_at"], "2023-01-01");
+    }
+
+    #[test]
+    fn test_convert_event_always_disables_geoip() {
+        let ice = make_internally_captured_event(
+            "pageview",
+            "user789",
+            serde_json::json!({}),
+            None,
+            None,
+        );
+
+        let event = convert_event(&ice).unwrap();
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(json["properties"]["$geoip_disable"], true);
+    }
+
+    #[test]
+    fn test_get_min_txn_duration() {
+        assert_eq!(get_min_txn_duration(1000, 500), Duration::from_millis(500));
+        assert_eq!(get_min_txn_duration(1000, 1000), Duration::from_secs(1));
+        assert_eq!(get_min_txn_duration(500, 1000), Duration::from_secs(2));
+    }
+
+    async fn make_client(base_url: &str) -> Client {
+        let options = posthog::ClientOptionsBuilder::default()
+            .api_key("test_api_key".to_string())
+            .host(base_url)
+            .max_capture_attempts(1u32)
+            .build()
+            .unwrap();
+        posthog::client(options).await
+    }
+
+    async fn make_client_with_retries(base_url: &str, attempts: u32) -> Client {
+        let options = posthog::ClientOptionsBuilder::default()
+            .api_key("test_api_key".to_string())
+            .host(base_url)
+            .max_capture_attempts(attempts)
+            .retry_initial_backoff_ms(1u64)
+            .retry_max_backoff_ms(1u64)
+            .build()
+            .unwrap();
+        posthog::client(options).await
+    }
+
+    fn make_transaction(client: &Client) -> Box<CaptureTransaction<'_>> {
+        let mut event = Event::new("test", "user1");
+        event.insert_prop("key", "value").unwrap();
+
+        Box::new(CaptureTransaction {
+            client,
+            send_rate: 10_000,
+            start: Instant::now(),
+            events: Mutex::new(vec![event]),
+            seen_uuids: Mutex::new(HashSet::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_batch_payload_preserves_uuid_and_lib_properties() {
+        let expected_uuid = Uuid::parse_str("019c7d2c-5f84-7000-dd7f-9295cfe7993f").unwrap();
+        let mut ice = make_internally_captured_event(
+            "test_event",
+            "user123",
+            serde_json::json!({
+                "$lib": "posthog-python",
+                "$lib_version": "3.0.0",
+                "custom_prop": "hello"
+            }),
+            None,
+            None,
+        );
+        ice.inner.uuid = expected_uuid;
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "batch": [{
+                    "uuid": expected_uuid.to_string(),
+                    "event": "test_event",
+                    "distinct_id": "user123",
+                    "properties": {
+                        "$lib": "posthog-python",
+                        "$lib_version": "3.0.0",
+                        "custom_prop": "hello",
+                        "$geoip_disable": true
+                    }
+                }]
+            })))
+            .with_status(200)
+            .with_body(V1_OK_BODY)
+            .expect(1)
+            .create();
+
+        let client = make_client(&server.url()).await;
+        let mut emitter = CaptureEmitter::new(client, 10_000);
+        let txn = emitter.begin_write().await.unwrap();
+        txn.emit(&[ice]).await.unwrap();
+        txn.commit_write().await.unwrap();
+
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_outbound_event_shape_for_an_import_without_lib_and_with_legacy_options() {
+        let ice = make_internally_captured_event(
+            "signed_up",
+            "user123",
+            serde_json::json!({
+                "custom_prop": 1,
+                "$session_id": "session-1",
+                "$process_person_profile": false,
+                "$ignore_sent_at": true,
+            }),
+            Some(serde_json::json!({ "plan": "pro" })),
+            None,
+        );
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = captured.clone();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .match_request(move |request| {
+                *sink.lock().unwrap() = request.body().ok().cloned();
+                true
+            })
+            .with_status(200)
+            .with_body(V1_OK_BODY)
+            .expect(1)
+            .create();
+
+        let client = make_client(&server.url()).await;
+        let mut emitter = CaptureEmitter::new(client, 10_000);
+        let txn = emitter.begin_write().await.unwrap();
+        txn.emit(&[ice]).await.unwrap();
+        txn.commit_write().await.unwrap();
+        mock.assert();
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("capture received a body");
+        let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(batch["historical_migration"], true);
+        let event = &batch["batch"][0];
+        assert_eq!(event["session_id"], "session-1");
+        assert_eq!(
+            event["options"],
+            serde_json::json!({ "process_person_profile": false, "disable_skew_correction": true })
+        );
+
+        let properties = event["properties"].as_object().unwrap();
+        let prop = |key: &str| properties.get(key).cloned();
+        assert_eq!(prop("custom_prop"), Some(serde_json::json!(1)));
+        assert_eq!(prop("$set"), Some(serde_json::json!({ "plan": "pro" })));
+        assert_eq!(prop("$geoip_disable"), Some(serde_json::json!(true)));
+        assert_eq!(prop("$lib"), Some(serde_json::json!("posthog-rs")));
+        assert!(
+            prop("$lib_version").is_some_and(|v| v.as_str().is_some_and(|v| v.starts_with("1.")))
+        );
+        assert_eq!(prop("$lib_version__major"), Some(serde_json::json!(1)));
+        assert!(prop("$lib_version__minor").is_some());
+        assert!(prop("$lib_version__patch").is_some());
+        assert!(prop("$os").is_some_and(|v| v.is_string()));
+        assert!(prop("$os_version").is_some_and(|v| v.is_string()));
+        assert_eq!(prop("$is_server"), Some(serde_json::json!(true)));
+        for moved in ["$session_id", "$process_person_profile", "$ignore_sent_at"] {
+            assert!(
+                !properties.contains_key(moved),
+                "{moved} must leave properties"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_production_client_sends_zstd_bodies_capture_can_decode() {
+        let uuid = Uuid::now_v7();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .match_header("content-encoding", "zstd")
+            .match_request(move |request| {
+                let Ok(body) = request.body() else {
+                    return false;
+                };
+                let Ok(json) = zstd::stream::decode_all(&body[..]) else {
+                    return false;
+                };
+                let batch: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                batch["historical_migration"] == true
+                    && batch["batch"][0]["uuid"] == uuid.to_string()
+            })
+            .with_status(200)
+            .with_body(V1_OK_BODY)
+            .expect(1)
+            .create();
+
+        let options = client_options("test_api_key".to_string(), &server.url()).unwrap();
+        let client = posthog::client(options).await;
+        let mut event = Event::new("test", "user1");
+        event.set_uuid(uuid);
+        let txn = Box::new(CaptureTransaction {
+            client: &client,
+            send_rate: 10_000,
+            start: Instant::now(),
+            events: Mutex::new(vec![event]),
+            seen_uuids: Mutex::new(HashSet::new()),
+        });
+        txn.commit_write().await.unwrap();
+
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_commit_write_skips_http_on_empty_batch() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .expect(0)
+            .create();
+
+        let client = make_client(&server.url()).await;
+        let txn = Box::new(CaptureTransaction {
+            client: &client,
+            send_rate: 10_000,
+            start: Instant::now(),
+            events: Mutex::new(vec![]),
+            seen_uuids: Mutex::new(HashSet::new()),
+        });
+
+        let result = txn.commit_write().await;
+        assert!(
+            result.is_ok(),
+            "expected Ok for empty batch, got {result:?}"
+        );
+        assert_eq!(
+            result.unwrap(),
+            Duration::ZERO,
+            "empty batch should return zero sleep"
+        );
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_commit_write_succeeds_on_first_try() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(200)
+            .with_body(V1_OK_BODY)
+            .expect(1)
+            .create();
+
+        let client = make_client(&server.url()).await;
+        let txn = make_transaction(&client);
+
+        let result = txn.commit_write().await;
+        assert!(result.is_ok());
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_commit_write_retries_on_500_then_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        let fail_mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(500)
+            .with_body("internal error")
+            .expect(2)
+            .create();
+        let success_mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(200)
+            .with_body(V1_OK_BODY)
+            .expect(1)
+            .create();
+
+        let client = make_client_with_retries(&server.url(), 3).await;
+        let txn = make_transaction(&client);
+
+        let result = txn.commit_write().await;
+        assert!(result.is_ok());
+        fail_mock.assert();
+        success_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_commit_write_fails_immediately_on_400() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(400)
+            .with_body("bad request")
+            .expect(1)
+            .create();
+
+        let client = make_client(&server.url()).await;
+        let txn = make_transaction(&client);
+
+        let result = txn.commit_write().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("capture batch failed"));
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_commit_write_fails_on_402_billing_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(402)
+            .with_body("billing limit exceeded")
+            .expect(1)
+            .create();
+
+        let client = make_client(&server.url()).await;
+        let txn = make_transaction(&client);
+
+        let err = txn.commit_write().await.unwrap_err();
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("Billing Limit Exceeded"),
+            "expected billing error, got: {err_msg}"
+        );
+        assert_eq!(
+            crate::error::get_user_message(&err),
+            BILLING_LIMIT_USER_MESSAGE
+        );
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_commit_write_exhausts_retries_on_persistent_500() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(500)
+            .with_body("internal error")
+            .expect(6)
+            .create();
+
+        let client = make_client_with_retries(&server.url(), 6).await;
+        let txn = make_transaction(&client);
+
+        let result = txn.commit_write().await;
+        assert!(result.is_err());
+        mock.assert();
+    }
+
+    fn padded_event(pad_bytes: usize) -> Event {
+        let mut event = Event::new("big", "user1");
+        event.insert_prop("pad", "x".repeat(pad_bytes)).unwrap();
+        event
+    }
+
+    fn batch_bytes(batch: &[Event]) -> usize {
+        batch
+            .iter()
+            .map(|e| serde_json::to_vec(e).unwrap().len() + PER_EVENT_OVERHEAD_BYTES)
+            .sum()
+    }
+
+    #[test]
+    fn test_split_empty_returns_no_batches() {
+        assert!(split_into_byte_limited_batches(vec![]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_split_keeps_small_events_in_one_batch() {
+        let events = vec![padded_event(10), padded_event(10), padded_event(10)];
+        let batches = split_into_byte_limited_batches(events).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 3);
+    }
+
+    #[test]
+    fn test_split_breaks_oversized_chunk_into_multiple_batches() {
+        // Five ~2.5 MiB events against a 9 MiB budget must span more than one batch.
+        let events: Vec<Event> = (0..5).map(|_| padded_event(2_500_000)).collect();
+        let total = events.len();
+
+        let batches = split_into_byte_limited_batches(events).unwrap();
+
+        assert!(batches.len() > 1, "expected multiple batches");
+        let mut seen = 0;
+        for batch in &batches {
+            assert!(
+                batch_bytes(batch) <= MAX_BATCH_PAYLOAD_BYTES,
+                "batch exceeds capture limit"
+            );
+            seen += batch.len();
+        }
+        assert_eq!(seen, total, "no events may be dropped while splitting");
+    }
+
+    #[test]
+    fn test_split_isolates_single_oversized_event() {
+        let events = vec![padded_event(10 * 1024 * 1024), padded_event(10)];
+        let batches = split_into_byte_limited_batches(events).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 1, "oversized event sent on its own");
+        assert_eq!(batches[1].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_write_splits_oversized_chunk_across_requests() {
+        let events: Vec<Event> = (0..5).map(|_| padded_event(2_500_000)).collect();
+        let expected_requests = split_into_byte_limited_batches(events.clone())
+            .unwrap()
+            .len();
+        assert!(
+            expected_requests > 1,
+            "test must exercise multiple requests"
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(200)
+            .with_body(V1_OK_BODY)
+            .expect(expected_requests)
+            .create();
+
+        let client = make_client(&server.url()).await;
+        let txn = Box::new(CaptureTransaction {
+            client: &client,
+            send_rate: 10_000,
+            start: Instant::now(),
+            events: Mutex::new(events),
+            seen_uuids: Mutex::new(HashSet::new()),
+        });
+
+        let result = txn.commit_write().await;
+        assert!(result.is_ok(), "got {result:?}");
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_emit_drops_duplicate_uuids_within_and_across_batches() {
+        let dup = Uuid::now_v7();
+        let unique = Uuid::now_v7();
+        let mut a = make_internally_captured_event("e", "u", serde_json::json!({}), None, None);
+        let mut b = make_internally_captured_event("e", "u", serde_json::json!({}), None, None);
+        let mut c = make_internally_captured_event("e", "u", serde_json::json!({}), None, None);
+        let mut d = make_internally_captured_event("e", "u", serde_json::json!({}), None, None);
+        a.inner.uuid = dup;
+        b.inner.uuid = dup; // duplicate within the first emit
+        c.inner.uuid = unique;
+        d.inner.uuid = dup; // duplicate across emit calls
+
+        let client = make_client("http://localhost:1").await;
+        let txn = CaptureTransaction {
+            client: &client,
+            send_rate: 10_000,
+            start: Instant::now(),
+            events: Mutex::new(Vec::new()),
+            seen_uuids: Mutex::new(HashSet::new()),
+        };
+        txn.emit(&[a, b]).await.unwrap();
+        txn.emit(&[c, d]).await.unwrap();
+
+        let events = txn.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "only the first event per uuid is kept");
+    }
+
+    // --- failure-reason labeling + per-request counters ---
+
+    #[test]
+    fn failure_reason_maps_every_variant() {
+        // The exact tag for each variant is a metric contract consumed by the
+        // dashboard/alerts (quota MUST be separable from actionable failures).
+        let cases: &[(PosthogError, &str)] = &[
+            (PosthogError::BillingLimitExceeded("x".into()), "quota"),
+            (PosthogError::BadRequest("x".into()), "bad_request"),
+            (
+                PosthogError::ServerError {
+                    status: 503,
+                    message: "x".into(),
+                },
+                "server_error",
+            ),
+            (PosthogError::RateLimit, "rate_limited"),
+            (PosthogError::Unauthorized, "unauthorized"),
+            (PosthogError::Connection("x".into()), "transport"),
+            (PosthogError::Serialization("x".into()), "serialization"),
+            // A variant capture_batch_immediate never returns still maps safely via the
+            // non_exhaustive catch-all rather than panicking.
+            (PosthogError::NotInitialized, "other"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(failure_reason(err), *expected, "reason for {err:?}");
+        }
+    }
+
+    /// Runs `f` under a local metrics recorder and returns every counter that
+    /// fired, as (name, labels, value). current_thread flavor keeps the
+    /// thread-local recorder visible across awaits.
+    async fn counters_after<F, Fut>(
+        f: F,
+    ) -> Vec<(String, std::collections::HashMap<String, String>, u64)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        f().await;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| match value {
+                DebugValue::Counter(c) => {
+                    let labels = key
+                        .key()
+                        .labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect();
+                    Some((key.key().name().to_string(), labels, c))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn counter_value(
+        snap: &[(String, std::collections::HashMap<String, String>, u64)],
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<u64> {
+        snap.iter()
+            .find(|(n, got, _)| {
+                n == name
+                    // Exact label-set match (not subset): a future stray label on a
+                    // counter must not silently satisfy a narrower query.
+                    && got.len() == labels.len()
+                    && labels
+                        .iter()
+                        .all(|(k, v)| got.get(*k).map(String::as_str) == Some(*v))
+            })
+            .map(|(_, _, c)| *c)
+    }
+
+    async fn commit_against_status(
+        status: usize,
+        body: &str,
+    ) -> Vec<(String, std::collections::HashMap<String, String>, u64)> {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(status)
+            .with_body(body)
+            .create();
+
+        counters_after(|| async {
+            let client = make_client(&server.url()).await;
+            let txn = make_transaction(&client);
+            assert!(
+                txn.commit_write().await.is_err(),
+                "status {status} must fail the commit"
+            );
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bad_request_failure_labels_events_and_requests() {
+        // 400/413 -> bad_request on BOTH the per-event and per-request counters;
+        // events charged the full sub-batch (here 1), requests charged once.
+        let snap = commit_against_status(400, "bad request").await;
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "failure"), ("reason", "bad_request")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_requests_total",
+                &[("outcome", "failure"), ("reason", "bad_request")]
+            ),
+            Some(1)
+        );
+        // No success was recorded for a failed chunk.
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "success")]
+            ),
+            None
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_request_results_total",
+                &[
+                    ("outcome", "failed"),
+                    ("status", "400"),
+                    ("error", "bad_request")
+                ]
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unmapped_status_is_labeled_from_the_sdk_error_message() {
+        let snap = commit_against_status(404, r#"{"error":"not_found"}"#).await;
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_request_results_total",
+                &[
+                    ("outcome", "failed"),
+                    ("status", "404"),
+                    ("error", "unexpected_status")
+                ]
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quota_failure_is_separable_from_actionable_failures() {
+        // The alerting-critical case: 402 must surface as reason="quota" so it
+        // can be excluded from actionable-failure alerts.
+        let snap = commit_against_status(402, "billing limit exceeded").await;
+        // capture_batch_events_total is the primary per-event-loss metric, so the
+        // quota split has to hold there too — not just on the request counter.
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "failure"), ("reason", "quota")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "failure"), ("reason", "bad_request")]
+            ),
+            None
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_requests_total",
+                &[("outcome", "failure"), ("reason", "quota")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_requests_total",
+                &[("outcome", "failure"), ("reason", "bad_request")]
+            ),
+            None
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_request_results_total",
+                &[
+                    ("outcome", "failed"),
+                    ("status", "402"),
+                    ("error", "billing_limit_exceeded")
+                ]
+            ),
+            Some(1)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_event_results_in_a_2xx_are_counted_by_detail() {
+        let uuids: Vec<Uuid> = (0..5).map(|_| Uuid::now_v7()).collect();
+        let events: Vec<Event> = uuids
+            .iter()
+            .map(|uuid| {
+                let mut event = Event::new("test", "user1");
+                event.set_uuid(*uuid);
+                event
+            })
+            .collect();
+        // uuids[4] is missing from the response, so it counts as unaccounted.
+        let body = serde_json::json!({ "results": {
+            uuids[0].to_string(): { "result": "ok" },
+            uuids[1].to_string(): { "result": "drop", "details": "invalid_options" },
+            uuids[2].to_string(): { "result": "warning", "details": "person_processing_disabled" },
+            uuids[3].to_string(): { "result": "retry", "details": "not_persisted" },
+        }})
+        .to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(200)
+            .with_body(body)
+            .create();
+
+        let snap = counters_after(|| async {
+            let client = make_client(&server.url()).await;
+            let txn = Box::new(CaptureTransaction {
+                client: &client,
+                send_rate: 10_000,
+                start: Instant::now(),
+                events: Mutex::new(events),
+                seen_uuids: Mutex::new(HashSet::new()),
+            });
+            assert!(
+                txn.commit_write().await.is_err(),
+                "a retry left after the last attempt must fail the chunk"
+            );
+        })
+        .await;
+
+        let event = |labels: &[(&str, &str)]| {
+            counter_value(&snap, "capture_batch_event_results_total", labels)
+        };
+        assert_eq!(
+            event(&[("result", "ok"), ("class", "none"), ("detail", "none")]),
+            Some(1)
+        );
+        assert_eq!(
+            event(&[
+                ("result", "drop"),
+                ("class", "validation"),
+                ("detail", "invalid_options")
+            ]),
+            Some(1)
+        );
+        assert_eq!(
+            event(&[
+                ("result", "warning"),
+                ("class", "warning"),
+                ("detail", "person_processing_disabled")
+            ]),
+            Some(1)
+        );
+        assert_eq!(
+            event(&[
+                ("result", "retry"),
+                ("class", "retry"),
+                ("detail", "not_persisted")
+            ]),
+            Some(1)
+        );
+        assert_eq!(
+            event(&[
+                ("result", "unaccounted"),
+                ("class", "other"),
+                ("detail", "none")
+            ]),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_request_results_total",
+                &[("outcome", "partial"), ("status", "200"), ("error", "none")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "failure"), ("reason", "unpersisted")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_requests_total",
+                &[("outcome", "failure"), ("reason", "unpersisted")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "success")]
+            ),
+            None
+        );
+    }
+
+    fn events_with_uuids(uuids: &[Uuid]) -> Vec<Event> {
+        uuids
+            .iter()
+            .map(|uuid| {
+                let mut event = Event::new("test", "user1");
+                event.set_uuid(*uuid);
+                event
+            })
+            .collect()
+    }
+
+    /// Commits `events` against a capture that answers request N with `bodies[N]` (status 200),
+    /// with one SDK attempt per body. Returns whether the commit succeeded and the counters.
+    async fn commit_against_v1_bodies(
+        events: Vec<Event>,
+        bodies: &[serde_json::Value],
+    ) -> (
+        bool,
+        Vec<(String, std::collections::HashMap<String, String>, u64)>,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let mocks: Vec<_> = bodies
+            .iter()
+            .map(|body| {
+                server
+                    .mock("POST", "/i/v1/analytics/events")
+                    .with_status(200)
+                    .with_body(body.to_string())
+                    .expect(1)
+                    .create()
+            })
+            .collect();
+
+        let mut committed = false;
+        let snap = counters_after(|| async {
+            let client = make_client_with_retries(&server.url(), bodies.len() as u32).await;
+            let txn = Box::new(CaptureTransaction {
+                client: &client,
+                send_rate: 10_000,
+                start: Instant::now(),
+                events: Mutex::new(events),
+                seen_uuids: Mutex::new(HashSet::new()),
+            });
+            committed = txn.commit_write().await.is_ok();
+        })
+        .await;
+        for mock in mocks {
+            mock.assert();
+        }
+        (committed, snap)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drops_in_a_2xx_commit_the_chunk_even_when_every_event_is_dropped() {
+        let details = [
+            "invalid_options",
+            "events_over_quota",
+            "event_restriction_drop",
+            "non_historical_import_drop",
+        ];
+        let uuids: Vec<Uuid> = details.iter().map(|_| Uuid::now_v7()).collect();
+        let results: serde_json::Map<String, serde_json::Value> = uuids
+            .iter()
+            .zip(details)
+            .map(|(uuid, detail)| {
+                (
+                    uuid.to_string(),
+                    serde_json::json!({ "result": "drop", "details": detail }),
+                )
+            })
+            .collect();
+
+        let (committed, snap) = commit_against_v1_bodies(
+            events_with_uuids(&uuids),
+            &[serde_json::json!({ "results": results })],
+        )
+        .await;
+
+        assert!(committed, "drops are counted and skipped, never paused on");
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_request_results_total",
+                &[
+                    ("outcome", "none_persisted"),
+                    ("status", "200"),
+                    ("error", "none")
+                ]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_event_results_total",
+                &[
+                    ("result", "drop"),
+                    ("class", "restriction"),
+                    ("detail", "non_historical_import_drop")
+                ]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "success")]
+            ),
+            Some(details.len() as u64)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retry_that_the_sdk_resend_persists_commits_the_chunk() {
+        let uuids = [Uuid::now_v7(), Uuid::now_v7()];
+        let first = serde_json::json!({ "results": {
+            uuids[0].to_string(): { "result": "ok" },
+            uuids[1].to_string(): { "result": "retry", "details": "not_persisted" },
+        }});
+        let second = serde_json::json!({ "results": {
+            uuids[1].to_string(): { "result": "ok" },
+        }});
+
+        let (committed, snap) =
+            commit_against_v1_bodies(events_with_uuids(&uuids), &[first, second]).await;
+
+        assert!(committed, "the SDK's own resend stored the event");
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "failure"), ("reason", "unpersisted")]
+            ),
+            None
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "success")]
+            ),
+            Some(2)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retry_left_after_every_sdk_attempt_fails_the_chunk() {
+        let uuids = [Uuid::now_v7(), Uuid::now_v7()];
+        let first = serde_json::json!({ "results": {
+            uuids[0].to_string(): { "result": "ok" },
+            uuids[1].to_string(): { "result": "retry", "details": "not_persisted" },
+        }});
+        let second = serde_json::json!({ "results": {
+            uuids[1].to_string(): { "result": "retry", "details": "not_persisted" },
+        }});
+
+        let (committed, snap) =
+            commit_against_v1_bodies(events_with_uuids(&uuids), &[first, second]).await;
+
+        assert!(!committed, "the job must pause rather than lose the event");
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "failure"), ("reason", "unpersisted")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_requests_total",
+                &[("outcome", "failure"), ("reason", "unpersisted")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "success")]
+            ),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn success_counts_events_total_and_requests_per_subbatch() {
+        // A chunk that splits into >1 sub-batch must count success once per event
+        // (count) and once per sub-batch request (num_batches), not per event for
+        // both — proving the request counter tracks requests, not events.
+        let events: Vec<Event> = (0..5).map(|_| padded_event(2_500_000)).collect();
+        let expected_requests = split_into_byte_limited_batches(events.clone())
+            .unwrap()
+            .len();
+        assert!(
+            expected_requests > 1,
+            "test must exercise multiple requests"
+        );
+        let total = events.len() as u64;
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/i/v1/analytics/events")
+            .with_status(200)
+            .with_body(V1_OK_BODY)
+            .expect(expected_requests)
+            .create();
+
+        let snap = counters_after(|| async {
+            let client = make_client(&server.url()).await;
+            let txn = Box::new(CaptureTransaction {
+                client: &client,
+                send_rate: 10_000,
+                start: Instant::now(),
+                events: Mutex::new(events),
+                seen_uuids: Mutex::new(HashSet::new()),
+            });
+            txn.commit_write().await.unwrap();
+        })
+        .await;
+
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_events_total",
+                &[("outcome", "success")]
+            ),
+            Some(total)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "capture_batch_requests_total",
+                &[("outcome", "success")]
+            ),
+            Some(expected_requests as u64)
+        );
+    }
+}

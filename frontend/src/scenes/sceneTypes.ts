@@ -1,0 +1,535 @@
+import { LogicWrapper } from 'kea'
+
+import type { SceneProductEmptyState } from 'lib/components/ProductEmptyState/types'
+
+import type { FileSystemIconType, ProductKey } from '~/queries/schema/schema-general'
+import { AccessControlResourceType, ActivityScope } from '~/types'
+
+// The enum here has to match the first and only exported component of the scene.
+// If so, we can preload the scene's required chunks in parallel with the scene itself.
+
+export enum Scene {
+    Action = 'Action',
+    Actions = 'Actions',
+    AdvancedActivityLogs = 'AdvancedActivityLogs',
+    AgenticAccountMismatch = 'AgenticAccountMismatch',
+    AgenticAuthorize = 'AgenticAuthorize',
+    Alerts = 'Alerts',
+    PlatformAlerts = 'PlatformAlerts',
+    PlatformAlert = 'PlatformAlert',
+    Annotations = 'Annotations',
+    Autoresearch = 'Autoresearch',
+    AutoresearchNew = 'AutoresearchNew',
+    AutoresearchPipeline = 'AutoresearchPipeline',
+    Approval = 'Approval',
+    AsyncMigrations = 'AsyncMigrations',
+    BatchExport = 'BatchExport',
+    BatchExportNew = 'BatchExportNew',
+    Billing = 'Billing',
+    BillingAuthorizationStatus = 'BillingAuthorizationStatus',
+    BillingSection = 'BillingSection',
+    BusinessIntelligence = 'BusinessIntelligence',
+    Canvas = 'Canvas',
+    WorkloadTrustPolicyRequest = 'WorkloadTrustPolicyRequest',
+    CLIAuthorize = 'CLIAuthorize',
+    OAuthDeviceAuthorize = 'OAuthDeviceAuthorize',
+    CLILive = 'CLILive',
+    Cohort = 'Cohort',
+    CohortCalculationHistory = 'CohortCalculationHistory',
+    Cohorts = 'Cohorts',
+    CustomCss = 'CustomCss',
+    CustomerAnalytics = 'CustomerAnalytics',
+    CustomerAnalyticsAccount = 'CustomerAnalyticsAccount',
+    CustomerAnalyticsConfiguration = 'CustomerAnalyticsConfiguration',
+    CustomerJourneyBuilder = 'CustomerJourneyBuilder',
+    Dashboard = 'Dashboard',
+    DashboardV2 = 'DashboardV2',
+    Dashboards = 'Dashboards',
+    DashboardTemplateCopy = 'DashboardTemplateCopy',
+    DataDeletionRequestNew = 'DataDeletionRequestNew',
+    DataManagement = 'DataManagement',
+    DataPipelinesNew = 'DataPipelinesNew',
+    DataOps = 'DataOps',
+    DataWarehouseRedirect = 'DataWarehouseRedirect',
+    DataWarehouseSource = 'DataWarehouseSource',
+    DataWarehouseSourceConnect = 'DataWarehouseSourceConnect',
+    DataWarehouseMigrationConnect = 'DataWarehouseMigrationConnect',
+    DataWarehouseSourceNew = 'DataWarehouseSourceNew',
+    DataWarehouseSourceSchema = 'DataWarehouseSourceSchema',
+    DeadLetterQueue = 'DeadLetterQueue',
+    Destinations = 'Destinations',
+    DebugHog = 'DebugHog',
+    ProjectFiles = 'ProjectFiles',
+    DebugQuery = 'DebugQuery',
+    Terminal = 'Terminal',
+    EarlyAccessFeatures = 'EarlyAccessFeatures',
+    Error404 = '404',
+    ErrorAccessDenied = 'AccessDenied',
+    ErrorNetwork = '4xx',
+    ErrorProjectAccessDenied = 'ProjectAccessDenied',
+    ErrorProjectUnavailable = 'ProjectUnavailable',
+    ErrorSceneLoad = 'SceneLoadError',
+    ErrorTracking = 'ErrorTracking',
+    ErrorTrackingFingerprint = 'ErrorTrackingFingerprint',
+    ErrorTrackingIssue = 'ErrorTrackingIssue',
+    EventDefinition = 'EventDefinition',
+    EventDefinitions = 'EventDefinitions',
+    EventDefinitionEdit = 'EventDefinitionEdit',
+    Experiment = 'Experiment',
+    Experiments = 'Experiments',
+    Exports = 'Exports',
+    Subscriptions = 'Subscriptions',
+    Subscription = 'Subscription',
+    ExperimentsSharedMetric = 'ExperimentsSharedMetric',
+    ExperimentsSharedMetrics = 'ExperimentsSharedMetrics',
+    ExploreEvents = 'ExploreEvents',
+    ExploreSessions = 'ExploreSessions',
+    ExploreFlagCalls = 'ExploreFlagCalls',
+    FeatureFlag = 'FeatureFlag',
+    FeatureFlags = 'FeatureFlags',
+    Game368 = 'Game368',
+    Group = 'Group',
+    Groups = 'Groups',
+    GroupsNew = 'GroupsNew',
+    Heatmaps = 'Heatmaps',
+    Heatmap = 'Heatmap',
+    Inbox = 'Inbox',
+    HeatmapNew = 'HeatmapNew',
+    HeatmapRecording = 'HeatmapRecording',
+    HogFunction = 'HogFunction',
+    Insight = 'Insight',
+    InsightQuickStart = 'InsightQuickStart',
+    IntegrationsRedirect = 'IntegrationsRedirect',
+    IntegrationsLanding = 'IntegrationsLanding',
+    StripeConfirmInstall = 'StripeConfirmInstall',
+    IngestionWarnings = 'IngestionWarnings',
+    IdentityProviderConfig = 'IdentityProviderConfig',
+    InviteSignup = 'InviteSignup',
+    BusinessKnowledge = 'BusinessKnowledge',
+    BusinessKnowledgeLibraries = 'BusinessKnowledgeLibraries',
+    BusinessKnowledgeLibrary = 'BusinessKnowledgeLibrary',
+    BusinessKnowledgePlayground = 'BusinessKnowledgePlayground',
+    BusinessKnowledgeSettings = 'BusinessKnowledgeSettings',
+    BusinessKnowledgeSource = 'BusinessKnowledgeSource',
+    BusinessKnowledgeUsage = 'BusinessKnowledgeUsage',
+    LegacyPlugin = 'LegacyPlugin',
+    LegalDocuments = 'LegalDocuments',
+    LegalDocumentNew = 'LegalDocumentNew',
+    Library = 'Library',
+    AnalyticsList = 'AnalyticsList',
+    AnalyticsSpaces = 'AnalyticsSpaces',
+    Tools = 'Tools',
+    Activity = 'Activity',
+    LiveEvents = 'LiveEvents',
+    Login = 'Login',
+    Login2FA = 'Login2FA',
+    MaterializedColumns = 'MaterializedColumns',
+    Max = 'Max',
+    McpGateway = 'McpGateway',
+    McpGatewayAgent = 'McpGatewayAgent',
+    McpGatewayMember = 'McpGatewayMember',
+    McpGatewayServer = 'McpGatewayServer',
+    Models = 'Models',
+    NodeDetail = 'NodeDetail',
+    MoveToPostHogCloud = 'MoveToPostHogCloud',
+    NewTab = 'NewTab',
+    Notebook = 'Notebook',
+    Notebooks = 'Notebooks',
+    OAuthAuthorize = 'OAuthAuthorize',
+    Onboarding = 'Onboarding',
+    OnboardingCoupon = 'OnboardingCoupon',
+    OnboardingWelcome = 'OnboardingWelcome',
+    OrganizationCreateFirst = 'OrganizationCreate',
+    OrganizationCreationConfirm = 'OrganizationCreationConfirm',
+    PasswordReset = 'PasswordReset',
+    PasswordResetComplete = 'PasswordResetComplete',
+    TwoFactorReset = 'TwoFactorReset',
+    Person = 'Person',
+    Persons = 'Persons',
+    AccountConnected = 'AccountConnected',
+    CredentialReview = 'CredentialReview',
+    Pipeline = 'Pipeline',
+    PipelineStatus = 'PipelineStatus',
+    PipelineNode = 'PipelineNode',
+    PipelineNodeNew = 'PipelineNodeNew',
+    PreflightCheck = 'PreflightCheck',
+    ProductTour = 'ProductTour',
+    ProductTours = 'ProductTours',
+    ProjectCreateFirst = 'ProjectCreate',
+    ProjectHomepage = 'ProjectHomepage',
+    PropertyDefinition = 'PropertyDefinition',
+    PropertyDefinitions = 'PropertyDefinitions',
+    PropertyDefinitionEdit = 'PropertyDefinitionEdit',
+    Replay = 'Replay',
+    ReplayFilePlayback = 'ReplayFilePlayback',
+    ReplayPlaylist = 'ReplayPlaylist',
+    ReplaySettings = 'ReplaySettings',
+    ReplaySingle = 'ReplaySingle',
+    ReplayKiosk = 'ReplayKiosk',
+    ReplayVision = 'ReplayVision',
+    ReplayVisionScanner = 'ReplayVisionScanner',
+    ReplayVisionScannerEditor = 'ReplayVisionScannerEditor',
+    ReplayVisionObservation = 'ReplayVisionObservation',
+    ResourceTransfer = 'ResourceTransfer',
+    RealTimeUsage = 'RealTimeUsage',
+    SqlVariableEdit = 'SqlVariableEdit',
+    SQLEditor = 'SQLEditor',
+    SavedInsights = 'SavedInsights',
+    ProductAnalyticsHomeTab = 'ProductAnalyticsHomeTab',
+    Health = 'Health',
+    HealthCategoryDetail = 'HealthCategoryDetail',
+    HealthAlerts = 'HealthAlerts',
+    SdkHealth = 'SdkHealth',
+    SessionAttributionExplorer = 'SessionAttributionExplorer',
+    SessionSummaries = 'SessionSummaries',
+    SessionProfile = 'SessionProfile',
+    Settings = 'Settings',
+    Signup = 'Signup',
+    Site = 'Site',
+    Skill = 'Skill',
+    Skills = 'Skills',
+    Coupons = 'Coupons',
+    PipelineOverview = 'PipelineOverview',
+    Sources = 'Sources',
+    StartupProgram = 'StartupProgram',
+    Survey = 'Survey',
+    SurveyWizard = 'SurveyWizard',
+    SurveyFormBuilder = 'SurveyFormBuilder',
+    SupportTickets = 'SupportTickets',
+    Surveys = 'Surveys',
+    SystemStatus = 'SystemStatus',
+    ToolbarLaunch = 'ToolbarLaunch',
+    Tracing = 'Tracing',
+    TracingRetentionNew = 'TracingRetentionNew',
+    TracingRetentionDetail = 'TracingRetentionDetail',
+    Metrics = 'Metrics',
+    Transformations = 'Transformations',
+    EventFiltering = 'EventFiltering',
+    Unsubscribe = 'Unsubscribe',
+    CodeCanvasLink = 'CodeCanvasLink',
+    CodeChannelLink = 'CodeChannelLink',
+    CodeTaskLink = 'CodeTaskLink',
+    CodeLoopLink = 'CodeLoopLink',
+    VercelConnect = 'VercelConnect',
+    VercelLinkError = 'VercelLinkError',
+    VerifyEmail = 'VerifyEmail',
+    WarehouseDestinations = 'WarehouseDestinations',
+    WarehouseDestinationConnect = 'WarehouseDestinationConnect',
+    WarehouseProperties = 'WarehouseProperties',
+    WebAnalytics = 'WebAnalytics',
+    WebAnalyticsPageReports = 'WebAnalyticsPageReports',
+    WebAnalyticsWebVitals = 'WebAnalyticsWebVitals',
+    WebAnalyticsHealth = 'WebAnalyticsHealth',
+    WebAnalyticsLive = 'WebAnalyticsLive',
+    WebAnalyticsRecap = 'WebAnalyticsRecap',
+    WebScripts = 'WebScripts',
+    Endpoints = 'Endpoints',
+    Endpoint = 'Endpoint',
+    Workflow = 'Workflow',
+    Broadcasts = 'Broadcasts',
+    Transactional = 'Transactional',
+    TransactionalEmailLogEntry = 'TransactionalEmailLogEntry',
+    TransactionalCodeEmail = 'TransactionalCodeEmail',
+    Workflows = 'Workflows',
+    Broadcast = 'Broadcast',
+    WorkflowsEmailDomain = 'WorkflowsEmailDomain',
+    Wizard = 'Wizard',
+    EarlyAccessFeature = 'EarlyAccessFeature',
+    ReleaseAll = 'ReleaseAll',
+    ReleaseCalendar = 'ReleaseCalendar',
+    Releases = 'Releases',
+    Release = 'Release',
+    EndpointsScene = 'EndpointsScene',
+    Game368Hedgehogs = 'Game368Hedgehogs',
+    AIObservability = 'AIObservability',
+    AIObservabilityCluster = 'AIObservabilityCluster',
+    AIObservabilityClusters = 'AIObservabilityClusters',
+    AIObservabilityDataset = 'AIObservabilityDataset',
+    AIObservabilityDatasets = 'AIObservabilityDatasets',
+    AIObservabilityEvaluation = 'AIObservabilityEvaluation',
+    AIObservabilityEvaluations = 'AIObservabilityEvaluations',
+    AIObservabilityScorers = 'AIObservabilityScorers',
+    AIObservabilityScorer = 'AIObservabilityScorer',
+    AIObservabilityOfflineExperiments = 'AIObservabilityOfflineExperiments',
+    AIObservabilityOfflineExperiment = 'AIObservabilityOfflineExperiment',
+    AIObservabilityOfflineScorerHistory = 'AIObservabilityOfflineScorerHistory',
+    AIObservabilityEvaluationTemplates = 'AIObservabilityEvaluationTemplates',
+    AIObservabilityPlayground = 'AIObservabilityPlayground',
+    AIObservabilityTag = 'AIObservabilityTag',
+    AIObservabilityTags = 'AIObservabilityTags',
+    AIObservabilityTrace = 'AIObservabilityTrace',
+    AIObservabilityUsers = 'AIObservabilityUsers',
+    Logs = 'Logs',
+    MCPAnalytics = 'MCPAnalytics',
+    MCPAnalyticsToolDetail = 'MCPAnalyticsToolDetail',
+    LogsAlertDetail = 'LogsAlertDetail',
+    LogsAlertNotificationDetail = 'LogsAlertNotificationDetail',
+    LogsSamplingNew = 'LogsSamplingNew',
+    LogsSamplingDetail = 'LogsSamplingDetail',
+    LogsRetentionNew = 'LogsRetentionNew',
+    LogsRetentionDetail = 'LogsRetentionDetail',
+    ManagedMigration = 'ManagedMigration',
+    ManagedMigrationNew = 'ManagedMigrationNew',
+    MarketingAnalytics = 'MarketingAnalytics',
+    MarketingAnalyticsSettings = 'MarketingAnalyticsSettings',
+    MessagingLibraryTemplate = 'MessagingLibraryTemplate',
+    NewAction = 'NewAction',
+    TaskTracker = 'TaskTracker',
+    SlackTaskContext = 'SlackTaskContext',
+    TaskNewSession = 'TaskNewSession',
+    TaskSpace = 'TaskSpace',
+    TaskSpaces = 'TaskSpaces',
+    OrganizationDeactivated = 'OrganizationDeactivated',
+    OrganizationPendingDeletion = 'OrganizationPendingDeletion',
+    ProjectPendingDeletion = 'ProjectPendingDeletion',
+    CustomerJourneyTemplates = 'CustomerJourneyTemplates',
+    SupportTicketDetail = 'SupportTicketDetail',
+    SupportSettings = 'SupportSettings',
+    SupportOverview = 'SupportOverview',
+}
+
+export type SceneComponent<T> = (props: T) => JSX.Element | null
+export type SceneProps = Record<string, any>
+
+export interface SceneExport<T = SceneProps> {
+    /** component to render for this scene */
+    component: SceneComponent<T>
+    /** logic to mount for this scene */
+    logic?: LogicWrapper
+    /** product key associated with this scene - used for Quick Start setup tracking */
+    productKey?: ProductKey
+    /**
+     * Declare this to have the app shell gate the scene behind the product's
+     * setup empty state until the product has received data (skippable, driven
+     * by real data detection). See lib/components/ProductEmptyState.
+     */
+    emptyState?: SceneProductEmptyState
+    /** convert URL parameters from scenes.ts into logic props */
+    paramsToProps?: (params: SceneParams) => T
+    /** when was the scene last touched, unix timestamp for sortability */
+    lastTouch?: number
+}
+
+// KLUDGE: LoadedScene is used in a logic and therefore cannot accept generics
+// we use an untyped SceneProps to satisfy the types
+export interface LoadedScene extends SceneExport<SceneProps> {
+    id: string
+    sceneParams: SceneParams
+}
+
+export interface SceneTab {
+    id: string
+    pathname: string
+    search: string
+    hash: string
+    title: string
+    customTitle?: string
+    iconType: FileSystemIconType | 'loading' | 'blank'
+
+    sceneId?: string
+    sceneKey?: string
+    sceneParams?: SceneParams
+}
+
+export interface SceneParams {
+    params: Record<string, any>
+    searchParams: Record<string, any>
+    hashParams: Record<string, any>
+}
+
+export interface Params {
+    [param: string]: any
+}
+
+export interface SceneConfig {
+    /** Custom name for the scene */
+    name?: string
+    /** Optional static description of the scene or product. Used both in the UI and by Max AI as context on what the scene is for */
+    description?: string
+    /** Link to this product's page on posthog.com/docs. Shown next to the product in sidebar settings */
+    docsHref?: string
+    /** Route should only be accessed when logged out (N.B. should be added to posthog/urls.py too) */
+    onlyUnauthenticated?: boolean
+    /** Route **can** be accessed when logged out (i.e. can be accessed when logged in too; should be added to posthog/urls.py too) */
+    allowUnauthenticated?: boolean
+    /**
+     * If `app`, navigation is shown, and the scene has default padding.
+     * If `app-full-scene-height`, navigation is shown, and the scene has default padding and wrapper takes full screen height.
+     * If `app-raw`, navigation is shown, but the scene has no padding.
+     * If `app-container`, navigation is shown, and the scene is centered with a max width.
+     * If `plain`, there's no navigation present, and the scene has no padding.
+     *
+     * @default 'app'
+     */
+    layout?: 'app' | 'app-raw' | 'app-container' | 'app-raw-no-header' | 'plain' | 'app-full-scene-height'
+    deferSceneMeasurementsDuringResize?: boolean
+    /** Hides project notice (ProjectNotice.tsx). */
+    hideProjectNotice?: boolean
+    /** Personal account management (used e.g. by breadcrumbs) */
+    personal?: boolean
+    /** Instance management (used e.g. by breadcrumbs) */
+    instanceLevel?: boolean
+    /** Route requires organization access (used e.g. by breadcrumbs) */
+    organizationBased?: boolean
+    /** Route requires project access (used e.g. by breadcrumbs). `true` implies also `organizationBased` */
+    projectBased?: boolean
+    /** Set the scope of the activity (affects activity and discussion panel) */
+    activityScope?: ActivityScope | string
+    /** Component import, used only in manifests */
+    import?: () => Promise<any>
+    /** Custom icon for the tabs */
+    iconType?: FileSystemIconType
+    /** If true, uses canvas background (--color-bg-surface-primary) for the scene and its tab */
+    canvasBackground?: boolean
+    /** Self-hosted installs open the Move to PostHog Cloud page instead, and the scene's logic never mounts */
+    cloudOnly?: boolean
+}
+
+// Map scenes to their access control resource types
+export const sceneToAccessControlResourceType: Partial<
+    Record<Scene, AccessControlResourceType | AccessControlResourceType[]>
+> = {
+    // Actions
+    [Scene.Action]: AccessControlResourceType.Action,
+    [Scene.Actions]: AccessControlResourceType.Action,
+
+    // Feature flags
+    [Scene.FeatureFlag]: AccessControlResourceType.FeatureFlag,
+    [Scene.FeatureFlags]: AccessControlResourceType.FeatureFlag,
+
+    // Dashboards
+    [Scene.Dashboard]: AccessControlResourceType.Dashboard,
+    [Scene.DashboardV2]: AccessControlResourceType.Dashboard,
+    [Scene.Dashboards]: AccessControlResourceType.Dashboard,
+    [Scene.DashboardTemplateCopy]: AccessControlResourceType.Dashboard,
+
+    // Insights
+    [Scene.Insight]: AccessControlResourceType.Insight,
+    [Scene.SavedInsights]: AccessControlResourceType.Insight,
+
+    // Heatmaps
+    [Scene.Heatmaps]: AccessControlResourceType.Heatmap,
+    [Scene.Heatmap]: AccessControlResourceType.Heatmap,
+    [Scene.HeatmapNew]: AccessControlResourceType.Heatmap,
+
+    // Notebooks
+    [Scene.Notebook]: AccessControlResourceType.Notebook,
+    [Scene.Notebooks]: AccessControlResourceType.Notebook,
+
+    // Session recording
+    [Scene.Replay]: AccessControlResourceType.SessionRecording,
+    [Scene.ReplaySingle]: AccessControlResourceType.SessionRecording,
+    [Scene.ReplayPlaylist]: AccessControlResourceType.SessionRecording,
+
+    // Replay vision
+    [Scene.ReplayVision]: AccessControlResourceType.ReplayScanner,
+    [Scene.ReplayVisionScanner]: AccessControlResourceType.ReplayScanner,
+    [Scene.ReplayVisionScannerEditor]: AccessControlResourceType.ReplayScanner,
+    [Scene.ReplayVisionObservation]: AccessControlResourceType.ReplayScanner,
+
+    // Toolbar
+    [Scene.ToolbarLaunch]: AccessControlResourceType.Toolbar,
+
+    // Web Analytics
+    [Scene.WebAnalytics]: AccessControlResourceType.WebAnalytics,
+    [Scene.WebAnalyticsPageReports]: AccessControlResourceType.WebAnalytics,
+    [Scene.WebAnalyticsWebVitals]: AccessControlResourceType.WebAnalytics,
+    [Scene.WebAnalyticsHealth]: AccessControlResourceType.WebAnalytics,
+    [Scene.WebAnalyticsRecap]: AccessControlResourceType.WebAnalytics,
+
+    // Marketing Analytics
+    [Scene.MarketingAnalytics]: AccessControlResourceType.MarketingAnalytics,
+    [Scene.MarketingAnalyticsSettings]: AccessControlResourceType.MarketingAnalytics,
+
+    // Metrics
+    [Scene.Metrics]: AccessControlResourceType.Metrics,
+
+    // Error tracking
+    [Scene.ErrorTracking]: AccessControlResourceType.ErrorTracking,
+    [Scene.ErrorTrackingFingerprint]: AccessControlResourceType.ErrorTracking,
+    [Scene.ErrorTrackingIssue]: AccessControlResourceType.ErrorTracking,
+
+    // Surveys
+    [Scene.Survey]: AccessControlResourceType.Survey,
+    [Scene.Surveys]: AccessControlResourceType.Survey,
+
+    // Support (conversations)
+    [Scene.SupportTickets]: AccessControlResourceType.Ticket,
+    [Scene.SupportOverview]: AccessControlResourceType.Ticket,
+    [Scene.SupportTicketDetail]: AccessControlResourceType.Ticket,
+
+    // Business knowledge
+    [Scene.BusinessKnowledge]: AccessControlResourceType.BusinessKnowledge,
+    [Scene.BusinessKnowledgeLibraries]: AccessControlResourceType.BusinessKnowledge,
+    [Scene.BusinessKnowledgeLibrary]: AccessControlResourceType.BusinessKnowledge,
+    [Scene.BusinessKnowledgePlayground]: AccessControlResourceType.BusinessKnowledge,
+    [Scene.BusinessKnowledgeSettings]: AccessControlResourceType.BusinessKnowledge,
+    [Scene.BusinessKnowledgeSource]: AccessControlResourceType.BusinessKnowledge,
+    [Scene.BusinessKnowledgeUsage]: AccessControlResourceType.BusinessKnowledge,
+
+    // Endpoints
+    [Scene.EndpointsScene]: AccessControlResourceType.Endpoint,
+
+    // Workflows
+    [Scene.Workflow]: AccessControlResourceType.Workflow,
+    [Scene.Broadcasts]: AccessControlResourceType.Workflow,
+    [Scene.Transactional]: AccessControlResourceType.Workflow,
+    [Scene.TransactionalEmailLogEntry]: AccessControlResourceType.Workflow,
+    [Scene.TransactionalCodeEmail]: AccessControlResourceType.Workflow,
+    [Scene.Workflows]: AccessControlResourceType.Workflow,
+    [Scene.Broadcast]: AccessControlResourceType.Workflow,
+    [Scene.WorkflowsEmailDomain]: AccessControlResourceType.Workflow,
+
+    // Product Tours
+    [Scene.ProductTour]: AccessControlResourceType.ProductTour,
+    [Scene.ProductTours]: AccessControlResourceType.ProductTour,
+
+    // Experiments
+    [Scene.Experiment]: AccessControlResourceType.Experiment,
+    [Scene.Experiments]: AccessControlResourceType.Experiment,
+
+    // Exports
+    [Scene.Exports]: AccessControlResourceType.Export,
+
+    // Early access features
+    [Scene.EarlyAccessFeature]: AccessControlResourceType.EarlyAccessFeature,
+    [Scene.EarlyAccessFeatures]: AccessControlResourceType.EarlyAccessFeature,
+
+    // Customer analytics (only journey scenes — configuration uses project-level admin)
+    [Scene.CustomerJourneyBuilder]: AccessControlResourceType.CustomerAnalytics,
+    [Scene.CustomerJourneyTemplates]: AccessControlResourceType.CustomerAnalytics,
+
+    // AI observability
+    [Scene.AIObservability]: AccessControlResourceType.LlmAnalytics,
+    [Scene.AIObservabilityCluster]: AccessControlResourceType.AiObservabilityClusters,
+    [Scene.AIObservabilityClusters]: AccessControlResourceType.AiObservabilityClusters,
+    [Scene.AIObservabilityDataset]: AccessControlResourceType.LlmAnalytics,
+    [Scene.AIObservabilityDatasets]: AccessControlResourceType.LlmAnalytics,
+    [Scene.AIObservabilityEvaluation]: AccessControlResourceType.Evaluation,
+    [Scene.AIObservabilityEvaluations]: [AccessControlResourceType.Evaluation, AccessControlResourceType.LlmAnalytics],
+    [Scene.AIObservabilityScorers]: AccessControlResourceType.LlmAnalytics,
+    [Scene.AIObservabilityScorer]: AccessControlResourceType.LlmAnalytics,
+    [Scene.AIObservabilityOfflineExperiments]: [
+        AccessControlResourceType.Evaluation,
+        AccessControlResourceType.LlmAnalytics,
+    ],
+    [Scene.AIObservabilityOfflineExperiment]: AccessControlResourceType.Evaluation,
+    [Scene.AIObservabilityOfflineScorerHistory]: AccessControlResourceType.Evaluation,
+    [Scene.AIObservabilityEvaluationTemplates]: AccessControlResourceType.Evaluation,
+    [Scene.AIObservabilityPlayground]: AccessControlResourceType.LlmPlayground,
+    [Scene.AIObservabilityTag]: AccessControlResourceType.Tagger,
+    [Scene.AIObservabilityTags]: AccessControlResourceType.Tagger,
+    [Scene.AIObservabilityTrace]: AccessControlResourceType.LlmAnalytics,
+    [Scene.AIObservabilityUsers]: AccessControlResourceType.LlmAnalytics,
+
+    // MCP analytics
+    [Scene.MCPAnalytics]: AccessControlResourceType.McpAnalytics,
+    [Scene.MCPAnalyticsToolDetail]: AccessControlResourceType.McpAnalytics,
+
+    // Skills
+    [Scene.Skill]: AccessControlResourceType.LlmSkill,
+    [Scene.Skills]: AccessControlResourceType.LlmSkill,
+
+    // Data warehouse sources - not included here because self-managed sources don't have access control.
+    // Managed sources handle access control at the logic level via SIDE_PANEL_CONTEXT_KEY.
+}

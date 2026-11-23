@@ -1,0 +1,1739 @@
+//! End-to-end tests for the backfill seed path against a **real** Kafka broker: the keyed
+//! `cohort_stream_seed_events` produce, the assignment-mirrored seed follower (5-topic
+//! co-assignment), the apply fence, and the worker-affined tile apply with `origin` tagging —
+//! wired like `main.rs` with the seed gate on.
+//!
+//! `#[ignore]`d by default (group joins and `incremental_assign` semantics the in-process
+//! `MockCluster` does not exercise faithfully). All topics are created with the production
+//! partition count (64) because the routing invariant is the thing under test. Run against a local
+//! stack serially:
+//!
+//! ```sh
+//! cargo test -p cohort-stream-processor --test seed_consumer -- --ignored --test-threads=1
+//! ```
+
+mod support;
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::num::{NonZeroU16, NonZeroU32};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use chrono_tz::UTC;
+use cohort_core::seed::{
+    BehavioralShapeHash, ClaimEpoch, ConditionHash, CoverageStartMs, ReconcileMarker,
+    ReconcileScope, ReconcileTile, RunBoundaryMs, RunId, SChunkMs, SeedTile, WithheldReason,
+};
+use cohort_stream_processor::config::Config;
+use cohort_stream_processor::consumers::{
+    CascadeRoute, CohortStreamEventsConsumer, EventDispatcher, FollowerConsumer, MergeRoute,
+    SeedFollowerConsumer, TransferRoute,
+};
+use cohort_stream_processor::filters::{
+    CatalogHandle, CohortId, FilterCatalog, TeamFiltersBuilder, TeamId,
+};
+use cohort_stream_processor::observability::disk::SharedDiskUtilization;
+use cohort_stream_processor::partitions::{
+    merge_partition_key, partition_for, partition_of, AdmittedSplit, ClaimedSplit,
+    CohortConsumerContext, ConsumerPauser, Follower, FollowerSet, InputGroups, LiveWatermarks,
+    OffsetTracker, PartitionOwnership, PartitionPauser, PartitionRouter, SeedPacingConfig,
+    SplitClaim, COHORT_PARTITION_COUNT,
+};
+use cohort_stream_processor::producer::{
+    CascadeSink, ChangeOrigin, CohortMembershipChange, KafkaCascadeSink, KafkaMembershipSink,
+    KafkaReconcileMarkerSink, KafkaSeedTileSink, KafkaStreamEventSink, KafkaTransferSink,
+    MembershipSink, MembershipStatus, ReconcileMarkerSink, SeedTileSink, StreamEventSink,
+    TransferSink,
+};
+use cohort_stream_processor::stage1::bucket_tz::day_idx_in_tz;
+use cohort_stream_processor::stage2::state::Stage2State;
+use cohort_stream_processor::store::durability::PodOrdinal;
+use cohort_stream_processor::store::{
+    CohortStore, OffloadConfig, OffloadMode, ReadLane, Stage2Key, StagedBatch, StoreConfig,
+    StoreHandle,
+};
+use cohort_stream_processor::workers::{
+    CascadeConfig, MergeWorkerDeps, ReconcileBacklog, ReconcileDeps, TransferRetryPolicy,
+    DEFAULT_MERGE_GC_SCAN_LIMIT,
+};
+use common_kafka::config::KafkaConfig;
+use envconfig::Envconfig;
+use futures::FutureExt;
+use lifecycle::{ComponentOptions, Handle, Manager};
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
+use rdkafka::consumer::{Consumer, ConsumerContext, StreamConsumer};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
+use rdkafka::{ClientConfig, Offset, TopicPartitionList};
+use serde_json::json;
+use tempfile::TempDir;
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+use support::{bootstrap_servers, consume_all};
+
+const TEAM: i32 = 7;
+const COHORT: i32 = 1;
+const FILTERS_HASH: &str = "0123456789abcdef";
+const NUM_PARTITIONS: i32 = COHORT_PARTITION_COUNT as i32;
+const COMMIT_INTERVAL: Duration = Duration::from_millis(250);
+const RECV_TIMEOUT: Duration = Duration::from_millis(200);
+/// Effectively never: the idle probe must not open a fence behind an assertion's back.
+const PROBE_NEVER: Duration = Duration::from_secs(3_600);
+
+/// One single-leaf behavioral cohort sharing the tile's condition hash.
+fn seed_catalog() -> CatalogHandle {
+    let leaf = json!({
+        "type": "behavioral", "value": "performed_event", "key": "$pageview",
+        "time_value": 7, "time_interval": "day",
+        "conditionHash": FILTERS_HASH,
+        "bytecode": ["_H", 1, 32, "$pageview", 32, "event", 1, 1, 11],
+    });
+    let mut builder = TeamFiltersBuilder::default();
+    builder
+        .add_cohort(
+            CohortId(COHORT),
+            TeamId(TEAM),
+            &json!({ "properties": { "type": "AND", "values": [leaf] } }),
+        )
+        .expect("add cohort");
+    builder.set_behavioral_shape_hash(
+        CohortId(COHORT),
+        BehavioralShapeHash::parse(FILTERS_HASH).expect("valid test behavioral hash"),
+    );
+    CatalogHandle::from_catalog(FilterCatalog::from_teams([(
+        TeamId(TEAM),
+        builder.freeze(UTC),
+    )]))
+}
+
+async fn create_topic(topic: &str, partitions: i32) {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap_servers())
+        .create()
+        .expect("create admin client");
+    let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    let results = admin
+        .create_topics(&[new_topic], &opts)
+        .await
+        .expect("create_topics");
+    for result in results {
+        match result {
+            Ok(_) | Err((_, rdkafka::types::RDKafkaErrorCode::TopicAlreadyExists)) => {}
+            Err((name, err)) => panic!("failed to create topic {name}: {err:?}"),
+        }
+    }
+    let verifier: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap_servers())
+        .set("group.id", format!("metadata-verifier-{}", Uuid::new_v4()))
+        .create()
+        .expect("create metadata verifier");
+    let start = Instant::now();
+    loop {
+        let ready = verifier
+            .fetch_metadata(Some(topic), Duration::from_secs(5))
+            .ok()
+            .is_some_and(|metadata| {
+                metadata.topics().iter().any(|meta| {
+                    meta.name() == topic
+                        && meta.error().is_none()
+                        && meta.partitions().len() == partitions as usize
+                })
+            });
+        if ready {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "timed out waiting for topic {topic} metadata to propagate",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn delete_topics(topics: &[&str]) {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap_servers())
+        .create()
+        .expect("create admin client");
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    if let Err(err) = admin.delete_topics(topics, &opts).await {
+        eprintln!("topic cleanup failed; leaked {topics:?}: {err}");
+    }
+}
+
+async fn with_topics_cleanup<F: Future<Output = ()>>(topics: &[&str], body: F) {
+    let result = AssertUnwindSafe(body).catch_unwind().await;
+    delete_topics(topics).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn producer_kafka_config() -> KafkaConfig {
+    KafkaConfig {
+        kafka_hosts: bootstrap_servers(),
+        kafka_tls: false,
+        kafka_client_rack: String::new(),
+        kafka_client_id: String::new(),
+        kafka_compression_codec: "none".to_string(),
+        kafka_producer_partitioner: Some("murmur2_random".to_string()),
+        kafka_producer_linger_ms: 20,
+        kafka_producer_queue_mib: 400,
+        kafka_producer_queue_messages: 10_000_000,
+        kafka_message_timeout_ms: 20_000,
+        kafka_producer_batch_size: None,
+        kafka_producer_batch_num_messages: None,
+        kafka_producer_enable_idempotence: None,
+        kafka_producer_max_in_flight_requests_per_connection: None,
+        kafka_producer_topic_metadata_refresh_interval_ms: None,
+        kafka_producer_message_max_bytes: None,
+        kafka_producer_sticky_partitioning_linger_ms: None,
+        kafka_producer_acks: None,
+        kafka_producer_retries: None,
+    }
+}
+
+fn murmur2_producer() -> FutureProducer {
+    ClientConfig::new()
+        .set("bootstrap.servers", bootstrap_servers())
+        .set("message.timeout.ms", "10000")
+        .set("partitioner", "murmur2_random")
+        .create()
+        .expect("create murmur2 producer")
+}
+
+fn events_client_config(group: &str) -> ClientConfig {
+    let mut config = ClientConfig::new();
+    config
+        .set("bootstrap.servers", bootstrap_servers())
+        .set("group.id", group)
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "earliest");
+    config
+}
+
+fn follower_client_config(group: &str) -> ClientConfig {
+    let mut config = ClientConfig::new();
+    config
+        .set("bootstrap.servers", bootstrap_servers())
+        .set("group.id", group)
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("socket.timeout.ms", "10000");
+    config
+}
+
+fn topic_message_count(topic: &str) -> i64 {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap_servers())
+        .set("group.id", format!("watermark-verifier-{}", Uuid::new_v4()))
+        .create()
+        .expect("create watermark verifier");
+    (0..NUM_PARTITIONS)
+        .map(|partition| {
+            let (low, high) = consumer
+                .fetch_watermarks(topic, partition, Duration::from_secs(10))
+                .expect("fetch watermarks");
+            high - low
+        })
+        .sum()
+}
+
+fn split_records(
+    records: Vec<(i32, Vec<u8>)>,
+) -> (Vec<CohortMembershipChange>, Vec<ReconcileMarker>) {
+    let mut changes = Vec::new();
+    let mut markers = Vec::new();
+    for (_, payload) in records {
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        if value.get("type").is_some() {
+            markers.push(serde_json::from_slice::<ReconcileMarker>(&payload).unwrap());
+        } else {
+            changes.push(serde_json::from_slice::<CohortMembershipChange>(&payload).unwrap());
+        }
+    }
+    (changes, markers)
+}
+
+/// Drain the membership topic, proving it carries exactly `expected` membership rows and nothing
+/// else. The count catches an extra record appearing at all; the marker arm catches that record
+/// being a `reconcile_complete` — the poison pill the dedicated marker topic exists to keep off this
+/// topic, and which its ClickHouse and CDP consumers cannot survive.
+async fn drain_membership_only(topic: &str, expected: usize) -> Vec<CohortMembershipChange> {
+    assert_eq!(
+        topic_message_count(topic),
+        expected as i64,
+        "the membership topic must carry membership rows only",
+    );
+    let (changes, markers) =
+        split_records(consume_all(topic, expected, Duration::from_secs(30)).await);
+    assert!(
+        markers.is_empty(),
+        "a completion marker on the membership topic poisons its consumers",
+    );
+    changes
+}
+
+/// Drain `expected` reconcile markers off the dedicated marker topic.
+async fn drain_markers(topic: &str, expected: usize) -> Vec<ReconcileMarker> {
+    let (changes, markers) =
+        split_records(consume_all(topic, expected, Duration::from_secs(30)).await);
+    assert!(changes.is_empty(), "the marker topic carries markers only");
+    markers
+}
+
+/// A day ahead, so it follows the start of every slice in a store these tests create.
+fn boundary_after_slices_began() -> RunBoundaryMs {
+    RunBoundaryMs(chrono::Utc::now().timestamp_millis() + 86_400_000)
+}
+
+async fn wait_for(what: &str, deadline: Duration, mut condition: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !condition() {
+        assert!(
+            start.elapsed() < deadline,
+            "timed out after {deadline:?} waiting for {what}",
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn part(person: Uuid) -> u16 {
+    partition_of(TeamId(TEAM), &person, COHORT_PARTITION_COUNT) as u16
+}
+
+/// The seed group's committed next-offset for `partition`, read without joining the group.
+fn seed_group_committed(group: &str, topic: &str, partition: i32) -> Option<i64> {
+    seed_group_committed_offsets(group, topic)
+        .get(&partition)
+        .copied()
+}
+
+/// Every concrete committed next-offset for the seed topic, read in one coordinator request.
+fn seed_group_committed_offsets(group: &str, topic: &str) -> HashMap<i32, i64> {
+    let consumer: StreamConsumer = follower_client_config(group)
+        .create()
+        .expect("create committed-offset verifier");
+    let mut tpl = TopicPartitionList::new();
+    for partition in 0..NUM_PARTITIONS {
+        tpl.add_partition(topic, partition);
+    }
+    let committed = consumer
+        .committed_offsets(tpl, Duration::from_secs(10))
+        .expect("query seed-group committed offsets");
+    committed
+        .elements_for_topic(topic)
+        .iter()
+        .filter_map(|elem| match elem.offset() {
+            Offset::Offset(next) => Some((elem.partition(), next)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A name-mismatched warm-up event: folds (advancing the watermark) without flipping anything.
+fn warm_envelope(person: Uuid, source_offset: i64) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "team_id": TEAM,
+        "person_id": person.to_string(),
+        "distinct_id": "d",
+        "uuid": Uuid::from_u128(0xE0_0000 + source_offset as u128).to_string(),
+        "event": "$warm",
+        "timestamp": "2026-06-10 12:34:56.789000",
+        "properties": "{}",
+        "person_properties": null,
+        "elements_chain": null,
+        "source_offset": source_offset,
+        "source_partition": 0,
+    }))
+    .expect("serialize envelope")
+}
+
+async fn produce_warm_event(
+    producer: &FutureProducer,
+    topic: &str,
+    person: Uuid,
+    offset: i64,
+    broker_timestamp_ms: i64,
+) {
+    let key = merge_partition_key(TeamId(TEAM), &person);
+    let payload = warm_envelope(person, offset);
+    let (partition, _) = producer
+        .send(
+            FutureRecord::to(topic)
+                .key(&key)
+                .payload(&payload)
+                .timestamp(broker_timestamp_ms),
+            Timeout::After(Duration::from_secs(10)),
+        )
+        .await
+        .expect("produce warm event");
+    assert_eq!(partition as u16, part(person), "event must co-partition");
+}
+
+fn tile(person: Uuid, s_chunk_ms: i64) -> SeedTile {
+    SeedTile::new(
+        TeamId(TEAM),
+        person,
+        ConditionHash::parse("0123456789abcdef").unwrap(),
+        NonZeroU32::new(2).unwrap(),
+        day_idx_in_tz(chrono::Utc::now().timestamp_millis(), UTC),
+        SChunkMs(s_chunk_ms),
+        RunId(Uuid::from_u128(0xBF)),
+        ClaimEpoch(1),
+    )
+}
+
+/// Produce a tile through the production sink (the same keying the seeder and the re-key path use).
+async fn produce_tile(seed_sink: &KafkaSeedTileSink, produced: SeedTile) {
+    let acks = seed_sink.produce(vec![produced]).await;
+    assert!(acks.iter().all(Result::is_ok), "tile produce must ack");
+}
+
+async fn produce_reconcile(
+    producer: &FutureProducer,
+    topic: &str,
+    partition: i32,
+    tile: &ReconcileTile,
+) -> i64 {
+    let key = format!("reconcile:{TEAM}:{COHORT}:{partition}");
+    let payload = serde_json::to_vec(tile).expect("serialize reconcile control");
+    let (ack_partition, offset) = producer
+        .send(
+            FutureRecord::to(topic)
+                .partition(partition)
+                .key(&key)
+                .payload(&payload),
+            Timeout::After(Duration::from_secs(10)),
+        )
+        .await
+        .expect("produce reconcile control");
+    assert_eq!(
+        ack_partition, partition,
+        "broker acked the targeted partition"
+    );
+    offset
+}
+
+fn open_store(dir: &TempDir) -> CohortStore {
+    open_store_as(dir, PartitionOwnership::single(NUM_PARTITIONS as u16))
+}
+
+fn open_store_as(dir: &TempDir, ownership: PartitionOwnership) -> CohortStore {
+    CohortStore::open(&StoreConfig {
+        path: dir.path().join("db"),
+        ownership,
+        ..StoreConfig::default()
+    })
+    .expect("open store")
+}
+
+struct Topics {
+    events: String,
+    merges: String,
+    transfers: String,
+    cascade: String,
+    seeds: String,
+    shadow: String,
+    markers: String,
+}
+
+impl Topics {
+    fn unique(suffix: &Uuid) -> Self {
+        Self {
+            events: format!("cohort_stream_events_seed_{suffix}"),
+            merges: format!("person_merge_events_{suffix}"),
+            transfers: format!("cohort_merge_state_transfer_{suffix}"),
+            cascade: format!("cohort_cascade_events_{suffix}"),
+            seeds: format!("cohort_stream_seed_events_{suffix}"),
+            shadow: format!("cohort_membership_changed_{suffix}"),
+            markers: format!("cohort_reconcile_markers_{suffix}"),
+        }
+    }
+
+    async fn create(&self) {
+        for topic in self.names() {
+            create_topic(topic, NUM_PARTITIONS).await;
+        }
+    }
+
+    fn names(&self) -> [&str; 7] {
+        [
+            &self.events,
+            &self.merges,
+            &self.transfers,
+            &self.cascade,
+            &self.seeds,
+            &self.shadow,
+            &self.markers,
+        ]
+    }
+}
+
+struct Groups {
+    events: String,
+    merges: String,
+    transfers: String,
+    cascade: String,
+    seeds: String,
+}
+
+impl Groups {
+    fn unique(suffix: &Uuid) -> Self {
+        Self {
+            events: format!("cohort-stream-processor-{suffix}"),
+            merges: format!("cohort-stream-merges-{suffix}"),
+            transfers: format!("cohort-stream-merge-apply-{suffix}"),
+            cascade: format!("cohort-stream-cascade-{suffix}"),
+            seeds: format!("cohort-stream-seeds-{suffix}"),
+        }
+    }
+
+    /// The processor config that reads `topics` through these groups.
+    fn config(&self, topics: &Topics) -> Config {
+        let mut config = Config::init_from_hashmap(&HashMap::new()).expect("default config");
+        config.kafka_hosts = bootstrap_servers();
+        config.cohort_stream_events_topic = topics.events.clone();
+        config.kafka_consumer_group = self.events.clone();
+        config.person_merge_events_topic = topics.merges.clone();
+        config.kafka_merge_consumer_group = self.merges.clone();
+        config.cohort_merge_state_transfer_topic = topics.transfers.clone();
+        config.kafka_merge_apply_consumer_group = self.transfers.clone();
+        config.cohort_cascade_enabled = true;
+        config.cohort_cascade_events_topic = topics.cascade.clone();
+        config.kafka_cascade_consumer_group = self.cascade.clone();
+        config.cohort_seed_consumer_enabled = true;
+        config.cohort_stream_seed_events_topic = topics.seeds.clone();
+        config.kafka_seed_consumer_group = self.seeds.clone();
+        config
+    }
+}
+
+/// Admits and claims `ownership` through the ownership fence on the groups `config` names, as the
+/// processor does at boot.
+async fn claim(config: Config, ownership: PartitionOwnership) -> ClaimedSplit {
+    let claim = SplitClaim::new(ownership, None).expect("a split outside a reshard");
+    tokio::task::spawn_blocking(move || {
+        let groups = InputGroups::new(&config);
+        AdmittedSplit::try_admit(claim, &groups)
+            .expect("the fence admits the split")
+            .claim(&groups)
+            .expect("claim the owned partitions")
+    })
+    .await
+    .expect("the claim panicked")
+}
+
+fn register_instance(manager: &mut Manager) -> [Handle; 5] {
+    let options = || ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(15));
+    [
+        manager.register("consumer", options()),
+        manager.register("merge-follower", options()),
+        manager.register("transfer-follower", options()),
+        manager.register("cascade-follower", options()),
+        manager.register("seed-follower", options()),
+    ]
+}
+
+struct Instance {
+    dispatcher: Arc<EventDispatcher>,
+    store: StoreHandle,
+    reconcile_backlog: Arc<ReconcileBacklog>,
+    seed_tracker: Arc<OffsetTracker>,
+    seed_consumer: Arc<StreamConsumer>,
+    live_watermarks: Arc<LiveWatermarks>,
+    /// The partitions each input's consumer is assigned: events, merges, transfers, cascades and
+    /// seeds, in that order.
+    assignments: [Vec<i32>; 5],
+    tasks: Vec<JoinHandle<()>>,
+}
+
+fn assigned<C: ConsumerContext>(consumer: &StreamConsumer<C>) -> Vec<i32> {
+    let mut partitions: Vec<i32> = consumer
+        .assignment()
+        .expect("read the consumer's assignment")
+        .elements()
+        .iter()
+        .map(|elem| elem.partition())
+        .collect();
+    partitions.sort_unstable();
+    partitions
+}
+
+impl Instance {
+    fn owned(&self) -> HashSet<i32> {
+        self.dispatcher.owned_partitions().into_iter().collect()
+    }
+
+    async fn put_stage2(&self, key: &Stage2Key, state: &Stage2State) {
+        let mut staged = StagedBatch::default();
+        staged.put_stage2(key, &state.encode());
+        self.store
+            .commit(staged)
+            .await
+            .expect("write test Stage 2 state");
+    }
+
+    async fn stage2(&self, key: &Stage2Key) -> Stage2State {
+        let bytes = self
+            .store
+            .get_stage2(key, ReadLane::Maintenance)
+            .await
+            .expect("read test Stage 2 state")
+            .expect("test Stage 2 row exists");
+        Stage2State::decode(&bytes).expect("decode test Stage 2 state")
+    }
+
+    fn seed_committable(&self, partition: u16) -> Option<i64> {
+        self.seed_tracker
+            .committable_offsets()
+            .get(&(partition as i32))
+            .copied()
+    }
+
+    fn seed_position(&self, topic: &str, partition: u16) -> Option<i64> {
+        let positions = self
+            .seed_consumer
+            .position()
+            .expect("query seed-consumer positions");
+        positions
+            .elements_for_topic(topic)
+            .iter()
+            .find(|elem| elem.partition() == partition as i32)
+            .and_then(|elem| match elem.offset() {
+                Offset::Offset(next) => Some(next),
+                _ => None,
+            })
+    }
+
+    fn live_watermark(&self, partition: u16) -> Option<i64> {
+        self.live_watermarks
+            .get(partition as i32)
+            .map(|watermark| watermark.0)
+    }
+
+    async fn join(self) {
+        for task in self.tasks {
+            task.await.expect("instance task panicked");
+        }
+    }
+}
+
+/// `membership` replaces the Kafka membership sink, so a test can reach an ack shape a healthy
+/// broker never produces; `None` keeps the production wiring.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_instance(
+    topics: &Topics,
+    groups: &Groups,
+    store: CohortStore,
+    catalog: CatalogHandle,
+    handles: [Handle; 5],
+    ownership: PartitionOwnership,
+    fence_margin_ms: i64,
+    membership: Option<Arc<dyn MembershipSink>>,
+) -> Instance {
+    let [events_handle, merge_handle, transfer_handle, cascade_handle, seed_handle] = handles;
+    let kafka_config = producer_kafka_config();
+    let store = StoreHandle::new(
+        store,
+        OffloadConfig {
+            mode: OffloadMode::All,
+            event_read_permits: 16,
+            maintenance_permits: 6,
+        },
+    );
+    let reconcile_backlog = Arc::new(ReconcileBacklog::default());
+    let seed_tracker = Arc::new(OffsetTracker::new());
+    let live_watermarks = Arc::new(LiveWatermarks::new());
+
+    let transfer_sink: Arc<dyn TransferSink> = Arc::new(
+        KafkaTransferSink::new(&kafka_config, topics.transfers.clone())
+            .await
+            .expect("create transfer sink"),
+    );
+    let stream_event_sink: Arc<dyn StreamEventSink> = Arc::new(
+        KafkaStreamEventSink::new(&kafka_config, topics.events.clone())
+            .await
+            .expect("create re-key sink"),
+    );
+    let cascade_sink: Arc<dyn CascadeSink> = Arc::new(
+        KafkaCascadeSink::new(&kafka_config, topics.cascade.clone())
+            .await
+            .expect("create cascade sink"),
+    );
+    let seed_tile_sink: Arc<dyn SeedTileSink> = Arc::new(
+        KafkaSeedTileSink::new(&kafka_config, topics.seeds.clone())
+            .await
+            .expect("create seed re-key sink"),
+    );
+    let membership_sink: Arc<dyn MembershipSink> = match membership {
+        Some(sink) => sink,
+        None => Arc::new(
+            KafkaMembershipSink::new(&kafka_config, topics.shadow.clone())
+                .await
+                .expect("create membership sink"),
+        ),
+    };
+    let marker_sink: Arc<dyn ReconcileMarkerSink> = Arc::new(
+        KafkaReconcileMarkerSink::new(&kafka_config, topics.markers.clone())
+            .await
+            .expect("create reconcile marker sink"),
+    );
+    let merge_deps = Arc::new(MergeWorkerDeps {
+        transfer_sink,
+        stream_event_sink,
+        merge_tracker: Arc::new(OffsetTracker::new()),
+        transfer_tracker: Arc::new(OffsetTracker::new()),
+        retry: TransferRetryPolicy::default(),
+        gc_scan_limit: DEFAULT_MERGE_GC_SCAN_LIMIT,
+        stage2_orphan_gc_enabled: true,
+        cascade_sink,
+        cascade_tracker: Arc::new(OffsetTracker::new()),
+        cascade: CascadeConfig::default(),
+        partition_count: COHORT_PARTITION_COUNT,
+        seed_tile_sink,
+        seed_tracker: seed_tracker.clone(),
+        live_watermarks: live_watermarks.clone(),
+        register_transfer_enabled: false,
+        reconcile: ReconcileDeps {
+            enabled: true,
+            scan_page: 1,
+            backlog: reconcile_backlog.clone(),
+            marker_sink,
+        },
+        person_seed: cohort_stream_processor::workers::PersonSeedDeps::default(),
+        seed_budget: cohort_stream_processor::workers::seed_run::RunBudget::default(),
+    });
+
+    let dispatcher = Arc::new(EventDispatcher::new(
+        PartitionRouter::new(64),
+        Arc::new(OffsetTracker::new()),
+        store.clone(),
+        Arc::new(catalog),
+        membership_sink,
+        merge_deps,
+    ));
+
+    let merges_consumer: Arc<StreamConsumer> = Arc::new(
+        follower_client_config(&groups.merges)
+            .create()
+            .expect("create merges follower consumer"),
+    );
+    let transfers_consumer: Arc<StreamConsumer> = Arc::new(
+        follower_client_config(&groups.transfers)
+            .create()
+            .expect("create transfers follower consumer"),
+    );
+    let cascade_consumer: Arc<StreamConsumer> = Arc::new(
+        follower_client_config(&groups.cascade)
+            .create()
+            .expect("create cascade follower consumer"),
+    );
+    let seeds_consumer: Arc<StreamConsumer> = Arc::new(
+        follower_client_config(&groups.seeds)
+            .create()
+            .expect("create seed follower consumer"),
+    );
+    let claimed = claim(groups.config(topics), ownership).await;
+    FollowerSet::new([
+        Follower::new(merges_consumer.clone(), topics.merges.clone()),
+        Follower::new(transfers_consumer.clone(), topics.transfers.clone()),
+        Follower::new(cascade_consumer.clone(), topics.cascade.clone()),
+        Follower::new(seeds_consumer.clone(), topics.seeds.clone()),
+    ])
+    .assign(&claimed)
+    .expect("assign the followers");
+    let follower_assignments = [
+        assigned(&merges_consumer),
+        assigned(&transfers_consumer),
+        assigned(&cascade_consumer),
+        assigned(&seeds_consumer),
+    ];
+
+    let events_client: StreamConsumer<CohortConsumerContext> = events_client_config(&groups.events)
+        .create_with_context(CohortConsumerContext)
+        .expect("create events consumer");
+    let events_client = Arc::new(events_client);
+
+    let mut tasks = Vec::new();
+
+    let merge_follower = FollowerConsumer::<MergeRoute>::new(
+        merges_consumer,
+        topics.merges.clone(),
+        claimed.stamp(),
+        dispatcher.clone(),
+        merge_handle,
+        100,
+        RECV_TIMEOUT,
+        COMMIT_INTERVAL,
+    );
+    tasks.push(tokio::spawn(merge_follower.process()));
+
+    let transfer_follower = FollowerConsumer::<TransferRoute>::new(
+        transfers_consumer,
+        topics.transfers.clone(),
+        claimed.stamp(),
+        dispatcher.clone(),
+        transfer_handle,
+        100,
+        RECV_TIMEOUT,
+        COMMIT_INTERVAL,
+    );
+    tasks.push(tokio::spawn(transfer_follower.process()));
+
+    let cascade_follower = FollowerConsumer::<CascadeRoute>::new(
+        cascade_consumer,
+        topics.cascade.clone(),
+        claimed.stamp(),
+        dispatcher.clone(),
+        cascade_handle,
+        100,
+        RECV_TIMEOUT,
+        COMMIT_INTERVAL,
+    );
+    tasks.push(tokio::spawn(cascade_follower.process()));
+
+    let seed_pauser: Arc<dyn PartitionPauser> = Arc::new(ConsumerPauser::new(
+        seeds_consumer.clone(),
+        topics.seeds.clone(),
+    ));
+    let seed_follower = SeedFollowerConsumer::new(
+        seeds_consumer.clone(),
+        topics.seeds.clone(),
+        claimed.stamp(),
+        events_client.clone(),
+        topics.events.clone(),
+        dispatcher.clone(),
+        seed_handle,
+        seed_pauser,
+        100,
+        RECV_TIMEOUT,
+        COMMIT_INTERVAL,
+        fence_margin_ms,
+        PROBE_NEVER,
+        // Both pacing triggers disabled: these tests pin fence and holdover behavior.
+        SeedPacingConfig::default(),
+        Arc::new(SharedDiskUtilization::new(Duration::MAX)),
+    );
+    tasks.push(tokio::spawn(seed_follower.process()));
+
+    let events_probe = events_client.clone();
+    let events_consumer = CohortStreamEventsConsumer::new(
+        events_client,
+        topics.events.clone(),
+        dispatcher.clone(),
+        events_handle,
+        100,
+        RECV_TIMEOUT,
+        COMMIT_INTERVAL,
+        &claimed,
+        None,
+    )
+    .expect("assign cohort_stream_events");
+    tasks.push(tokio::spawn(events_consumer.process()));
+    let [merges, transfers, cascades, seeds] = follower_assignments;
+
+    Instance {
+        dispatcher,
+        store,
+        reconcile_backlog,
+        seed_tracker,
+        seed_consumer: seeds_consumer,
+        live_watermarks,
+        assignments: [assigned(&events_probe), merges, transfers, cascades, seeds],
+        tasks,
+    }
+}
+
+/// Two pods at N=2 each own one residue class of every input, so no partition of any input belongs
+/// to both, and the dispatcher owns the same class the consumers fetch.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker (KAFKA_HOSTS); run with --ignored against a local stack"]
+async fn two_pods_own_disjoint_residue_classes_on_all_five_inputs() {
+    let suffix = Uuid::new_v4();
+    let topics = Topics::unique(&suffix);
+    let groups = Groups::unique(&suffix);
+    with_topics_cleanup(&topics.names(), async {
+        topics.create().await;
+
+        let pods = NonZeroU16::new(2).unwrap();
+        let mut pods_running = Vec::new();
+        for ordinal in 0..pods.get() {
+            let mut manager = Manager::builder(format!("seed-split-itest-{ordinal}"))
+                .with_trap_signals(false)
+                .build();
+            let handles = register_instance(&mut manager);
+            let shutdown = handles[0].clone();
+            let monitor = manager.monitor_background();
+            let dir = TempDir::new().unwrap();
+            let ownership =
+                PartitionOwnership::new(pods, PodOrdinal::from(ordinal), NUM_PARTITIONS as u16)
+                    .unwrap();
+            let instance = spawn_instance(
+                &topics,
+                &groups,
+                open_store_as(&dir, ownership),
+                seed_catalog(),
+                handles,
+                ownership,
+                2_000,
+                None,
+            )
+            .await;
+            pods_running.push((dir, monitor, shutdown, instance));
+        }
+
+        for (ordinal, (_, _, _, instance)) in pods_running.iter().enumerate() {
+            let class: Vec<i32> = (0..NUM_PARTITIONS)
+                .filter(|partition| partition % 2 == ordinal as i32)
+                .collect();
+            assert_eq!(
+                instance.assignments,
+                [(); 5].map(|()| class.clone()),
+                "pod {ordinal}"
+            );
+            let mut owned: Vec<i32> = instance.owned().into_iter().collect();
+            owned.sort_unstable();
+            assert_eq!(owned, class, "pod {ordinal}'s dispatcher");
+        }
+
+        for (_, _, shutdown, instance) in pods_running {
+            shutdown.request_shutdown();
+            instance.join().await;
+        }
+    })
+    .await;
+}
+
+/// A tile lands on its owning worker via the 5-topic co-assignment, applies behind an open
+/// fence, emits a tagged change, and the seed group's commits reach the produced high-water mark.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker (KAFKA_HOSTS); run with --ignored against a local stack"]
+async fn seed_tile_applies_on_the_owning_worker_and_commits_to_the_hwm() {
+    let suffix = Uuid::new_v4();
+    let topics = Topics::unique(&suffix);
+    let groups = Groups::unique(&suffix);
+    with_topics_cleanup(&topics.names(), async {
+        topics.create().await;
+
+        let mut manager = Manager::builder("seed-e2e-itest")
+            .with_trap_signals(false)
+            .build();
+        let handles = register_instance(&mut manager);
+        let shutdown = handles[0].clone();
+        let _monitor = manager.monitor_background();
+
+        let dir = TempDir::new().unwrap();
+        let instance = spawn_instance(
+            &topics,
+            &groups,
+            open_store(&dir),
+            seed_catalog(),
+            handles,
+            PartitionOwnership::single(NUM_PARTITIONS as u16),
+            2_000,
+            None,
+        )
+        .await;
+        wait_for(
+            "the consumer to own every partition",
+            Duration::from_secs(30),
+            || instance.owned().len() == NUM_PARTITIONS as usize,
+        )
+        .await;
+
+        let alice = Uuid::from_u128(0xA11CE);
+        // One folded live event opens the fence for the hour-old scan point.
+        let producer = murmur2_producer();
+        produce_warm_event(
+            &producer,
+            &topics.events,
+            alice,
+            0,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+
+        let seed_sink = KafkaSeedTileSink::new(&producer_kafka_config(), topics.seeds.clone())
+            .await
+            .expect("create test seed sink");
+        let s_chunk = chrono::Utc::now().timestamp_millis() - 3_600_000;
+        produce_tile(&seed_sink, tile(alice, s_chunk)).await;
+
+        wait_for(
+            "the seeded flip on the shadow topic",
+            Duration::from_secs(60),
+            || topic_message_count(&topics.shadow) == 1,
+        )
+        .await;
+        let (partition, payload) = consume_all(&topics.shadow, 1, Duration::from_secs(30))
+            .await
+            .into_iter()
+            .next()
+            .expect("one membership change");
+        let change: CohortMembershipChange = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(change.person_id, alice.to_string());
+        assert_eq!(change.cohort_id, 1);
+        assert_eq!(change.status, MembershipStatus::Entered);
+        assert_eq!(change.origin, Some(ChangeOrigin::Seed));
+        assert_eq!(change.run_id, Some(RunId(Uuid::from_u128(0xBF))));
+        // The shadow topic is person-id keyed, so it does not co-partition with the owning
+        // worker; only the keying is assertable.
+        assert_eq!(
+            partition as u32,
+            partition_for(&alice.to_string(), COHORT_PARTITION_COUNT),
+            "the change is person-id keyed on the shadow topic",
+        );
+
+        // Run-completion precondition: committed ⇒ durably applied, reaching the produced HWM.
+        let seed_partition = part(alice) as i32;
+        wait_for(
+            "the seed group's committed offset to reach the produced HWM",
+            Duration::from_secs(30),
+            || seed_group_committed(&groups.seeds, &topics.seeds, seed_partition) == Some(1),
+        )
+        .await;
+
+        shutdown.request_shutdown();
+        instance.join().await;
+    })
+    .await;
+}
+
+/// Wraps the real sink and fails its first produce, so the seed offset holds with nothing on the
+/// topic, which is the crash point the redelivery has to repair.
+struct FailFirstMembershipSink {
+    inner: Arc<dyn MembershipSink>,
+    fail_next: AtomicBool,
+    failed: AtomicBool,
+}
+
+#[async_trait]
+impl MembershipSink for FailFirstMembershipSink {
+    async fn produce(
+        &self,
+        changes: Vec<CohortMembershipChange>,
+    ) -> Vec<Result<(), common_kafka::kafka_producer::KafkaProduceError>> {
+        if self.fail_next.swap(false, Ordering::SeqCst) {
+            self.failed.store(true, Ordering::SeqCst);
+            return changes
+                .iter()
+                .map(|_| Err(common_kafka::kafka_producer::KafkaProduceError::KafkaProduceCanceled))
+                .collect();
+        }
+        self.inner.produce(changes).await
+    }
+}
+
+/// Block until the apply has committed its stage-1 batch, which is what places the register row.
+async fn await_register(instance: &Instance, key: &Stage2Key) -> Stage2State {
+    let start = Instant::now();
+    loop {
+        if let Some(bytes) = instance
+            .store
+            .get_stage2(key, ReadLane::Maintenance)
+            .await
+            .expect("read register")
+        {
+            return Stage2State::decode(&bytes).expect("decode register");
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the held tile never committed its placeholder register",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Reopen the same on-disk store once the previous instance has released its RocksDB lock.
+async fn reopen_store_live(dir: &TempDir) -> CohortStore {
+    let config = StoreConfig {
+        path: dir.path().join("db"),
+        wipe_on_start: false,
+        ..StoreConfig::default()
+    };
+    let start = Instant::now();
+    loop {
+        match CohortStore::open(&config) {
+            Ok(store) => return store,
+            Err(_) if start.elapsed() < Duration::from_secs(10) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("failed to reopen store live: {error}"),
+        }
+    }
+}
+
+/// End to end through a real broker: the first instance commits stage 1 and then fails its
+/// membership produce, so nothing reaches the topic and the seed offset holds. A second instance
+/// over the same store re-derives the change from the register the first one never advanced.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker (KAFKA_HOSTS); run with --ignored against a local stack"]
+async fn a_failed_seed_produce_is_re_emitted_after_a_restart() {
+    let suffix = Uuid::new_v4();
+    let topics = Topics::unique(&suffix);
+    let groups = Groups::unique(&suffix);
+    with_topics_cleanup(&topics.names(), async {
+        topics.create().await;
+        let alice = Uuid::from_u128(0xA11CE);
+        let register = Stage2Key {
+            partition_id: part(alice),
+            team_id: TEAM as u64,
+            cohort_id: 1,
+            person_id: alice,
+        };
+        let dir = TempDir::new().unwrap();
+        let producer = murmur2_producer();
+        let seed_sink = KafkaSeedTileSink::new(&producer_kafka_config(), topics.seeds.clone())
+            .await
+            .expect("create test seed sink");
+
+        // First tenure: stage 1 commits, the membership produce fails.
+        let mut manager = Manager::builder("seed-e2e-itest")
+            .with_trap_signals(false)
+            .build();
+        let handles = register_instance(&mut manager);
+        let shutdown = handles[0].clone();
+        let monitor = manager.monitor_background();
+        let failing = Arc::new(FailFirstMembershipSink {
+            inner: Arc::new(
+                KafkaMembershipSink::new(&producer_kafka_config(), topics.shadow.clone())
+                    .await
+                    .expect("create membership sink"),
+            ),
+            fail_next: AtomicBool::new(true),
+            failed: AtomicBool::new(false),
+        });
+        let instance = spawn_instance(
+            &topics,
+            &groups,
+            open_store(&dir),
+            seed_catalog(),
+            handles,
+            PartitionOwnership::single(NUM_PARTITIONS as u16),
+            2_000,
+            Some(failing.clone()),
+        )
+        .await;
+        wait_for(
+            "the consumer to own every partition",
+            Duration::from_secs(30),
+            || instance.owned().len() == NUM_PARTITIONS as usize,
+        )
+        .await;
+
+        produce_warm_event(
+            &producer,
+            &topics.events,
+            alice,
+            0,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+        produce_tile(
+            &seed_sink,
+            tile(alice, chrono::Utc::now().timestamp_millis() - 3_600_000),
+        )
+        .await;
+
+        let seed_partition = part(alice);
+        wait_for(
+            "the first membership produce to fail",
+            Duration::from_secs(60),
+            || failing.failed.load(Ordering::SeqCst),
+        )
+        .await;
+        assert!(
+            !await_register(&instance, &register).await.in_cohort,
+            "the bit must not advance past a failed produce",
+        );
+        assert_eq!(
+            topic_message_count(&topics.shadow),
+            0,
+            "nothing was emitted"
+        );
+        assert_eq!(
+            instance.seed_committable(seed_partition),
+            None,
+            "the failed produce holds the seed offset",
+        );
+
+        shutdown.request_shutdown();
+        instance.join().await;
+        drop(monitor);
+
+        // Second tenure over the same store: the redelivered tile merges to `Unchanged`, so only
+        // the lagging register can say downstream was never told.
+        let mut manager = Manager::builder("seed-e2e-itest")
+            .with_trap_signals(false)
+            .build();
+        let handles = register_instance(&mut manager);
+        let shutdown = handles[0].clone();
+        let _monitor = manager.monitor_background();
+        let instance = spawn_instance(
+            &topics,
+            &groups,
+            reopen_store_live(&dir).await,
+            seed_catalog(),
+            handles,
+            PartitionOwnership::single(NUM_PARTITIONS as u16),
+            2_000,
+            None,
+        )
+        .await;
+        wait_for(
+            "the consumer to own every partition",
+            Duration::from_secs(30),
+            || instance.owned().len() == NUM_PARTITIONS as usize,
+        )
+        .await;
+        // The new tenure resumes live consumption at its committed offset, so the apply fence
+        // needs a fresh live event before it will re-admit the redelivered tile.
+        produce_warm_event(
+            &producer,
+            &topics.events,
+            alice,
+            1,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+
+        wait_for(
+            "the re-derived flip on the shadow topic",
+            Duration::from_secs(60),
+            || topic_message_count(&topics.shadow) == 1,
+        )
+        .await;
+        let changes = drain_membership_only(&topics.shadow, 1).await;
+        assert_eq!(changes.len(), 1, "exactly one change, not a duplicate");
+        assert_eq!(changes[0].person_id, alice.to_string());
+        assert_eq!(changes[0].cohort_id, 1);
+        assert_eq!(changes[0].status, MembershipStatus::Entered);
+        assert_eq!(changes[0].origin, Some(ChangeOrigin::Seed));
+        assert!(
+            instance.stage2(&register).await.in_cohort,
+            "the bit advances once the re-emission acks",
+        );
+        wait_for(
+            "the seed group's committed offset to reach the produced HWM",
+            Duration::from_secs(30),
+            || seed_group_committed(&groups.seeds, &topics.seeds, seed_partition as i32) == Some(1),
+        )
+        .await;
+
+        shutdown.request_shutdown();
+        instance.join().await;
+    })
+    .await;
+}
+
+/// Partition-targeted controls drain a full 64-partition snapshot, repair a stale membership bit,
+/// and release each seed offset only after that partition's completion marker is acknowledged.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker (KAFKA_HOSTS); run with --ignored against a local stack"]
+async fn reconcile_snapshot_repairs_stale_state_and_commits_after_markers() {
+    let suffix = Uuid::new_v4();
+    let topics = Topics::unique(&suffix);
+    let groups = Groups::unique(&suffix);
+    with_topics_cleanup(&topics.names(), async {
+        topics.create().await;
+
+        let mut manager = Manager::builder("reconcile-e2e-itest")
+            .with_trap_signals(false)
+            .build();
+        let handles = register_instance(&mut manager);
+        let shutdown = handles[0].clone();
+        let _monitor = manager.monitor_background();
+
+        let dir = TempDir::new().unwrap();
+        let before_store = chrono::Utc::now().timestamp_millis();
+        let instance = spawn_instance(
+            &topics,
+            &groups,
+            open_store(&dir),
+            seed_catalog(),
+            handles,
+            PartitionOwnership::single(NUM_PARTITIONS as u16),
+            2_000,
+            None,
+        )
+        .await;
+        wait_for(
+            "the consumer to own every partition",
+            Duration::from_secs(30),
+            || instance.owned().len() == NUM_PARTITIONS as usize,
+        )
+        .await;
+
+        // This person has no leaf state, so current membership is false. The injected true
+        // register bit models an at-most-once output loss or an edit-path stale row.
+        let person = Uuid::from_u128(0xDEC0DE);
+        let person_partition = part(person);
+        let stage2_key = Stage2Key {
+            partition_id: person_partition,
+            team_id: TEAM as u64,
+            cohort_id: COHORT as u64,
+            person_id: person,
+        };
+        instance
+            .put_stage2(
+                &stage2_key,
+                &Stage2State {
+                    in_cohort: true,
+                    last_evaluated_at_ms: 1,
+                },
+            )
+            .await;
+        assert!(instance.stage2(&stage2_key).await.in_cohort);
+
+        let run_id = RunId(Uuid::from_u128(0xB4));
+        let reconcile = ReconcileTile::new(
+            TeamId(TEAM),
+            CohortId(COHORT),
+            ReconcileScope::Behavioral(BehavioralShapeHash::parse(FILTERS_HASH).unwrap()),
+            run_id,
+            boundary_after_slices_began(),
+        );
+        let producer = murmur2_producer();
+
+        for partition in 0..NUM_PARTITIONS {
+            assert_eq!(
+                produce_reconcile(&producer, &topics.seeds, partition, &reconcile).await,
+                0,
+                "a unique topic starts every partition at offset zero",
+            );
+        }
+        wait_for(
+            "all partition-targeted reconcile controls to be admitted",
+            Duration::from_secs(30),
+            || instance.reconcile_backlog.len() == i64::from(NUM_PARTITIONS),
+        )
+        .await;
+        // The claim committed every partition at its start, offset zero.
+        let before_first_tick = seed_group_committed_offsets(&groups.seeds, &topics.seeds);
+        assert!(
+            (0..NUM_PARTITIONS).all(|partition| before_first_tick.get(&partition) == Some(&0)),
+            "no reconcile control commits before draining starts: {before_first_tick:?}",
+        );
+        assert!((0..NUM_PARTITIONS)
+            .all(|partition| { instance.seed_committable(partition as u16).is_none() }));
+
+        // scan_page=1 makes the stale row consume a whole first page. Every empty partition can
+        // emit its marker immediately, while this partition remains pinned after emitting `left`.
+        instance.dispatcher.route_reconcile_drain().await;
+        wait_for(
+            "63 empty-partition markers and one stale-row repair",
+            Duration::from_secs(60),
+            || {
+                topic_message_count(&topics.markers) == i64::from(NUM_PARTITIONS) - 1
+                    && topic_message_count(&topics.shadow) == 1
+            },
+        )
+        .await;
+        wait_for(
+            "only the stale-row partition to remain queued",
+            Duration::from_secs(30),
+            || instance.reconcile_backlog.len() == 1,
+        )
+        .await;
+        assert_ne!(
+            seed_group_committed(&groups.seeds, &topics.seeds, person_partition as i32),
+            Some(1),
+            "the reconcile seed offset stays pinned before its marker",
+        );
+        assert_eq!(
+            instance.seed_committable(person_partition),
+            None,
+            "the production tracker stays pinned immediately after the row and before its marker",
+        );
+        assert!(!instance.stage2(&stage2_key).await.in_cohort);
+
+        let first_changes = drain_membership_only(&topics.shadow, 1).await;
+        assert_eq!(first_changes.len(), 1);
+        assert_eq!(first_changes[0].person_id, person.to_string());
+        assert_eq!(first_changes[0].status, MembershipStatus::Left);
+        assert_eq!(first_changes[0].origin, Some(ChangeOrigin::Reconcile));
+        assert_eq!(first_changes[0].run_id, Some(run_id));
+
+        let first_markers = drain_markers(&topics.markers, NUM_PARTITIONS as usize - 1).await;
+        assert_eq!(first_markers.len(), NUM_PARTITIONS as usize - 1);
+        assert!(!first_markers
+            .iter()
+            .any(|marker| marker.partition() == person_partition));
+
+        instance.dispatcher.route_reconcile_drain().await;
+        wait_for(
+            "the final partition marker",
+            Duration::from_secs(30),
+            || topic_message_count(&topics.markers) == i64::from(NUM_PARTITIONS),
+        )
+        .await;
+        wait_for(
+            "all reconcile jobs to complete",
+            Duration::from_secs(30),
+            || instance.reconcile_backlog.is_empty(),
+        )
+        .await;
+        wait_for(
+            "every seed partition commit to advance past its marker",
+            Duration::from_secs(30),
+            || {
+                let offsets = seed_group_committed_offsets(&groups.seeds, &topics.seeds);
+                (0..NUM_PARTITIONS).all(|partition| offsets.get(&partition) == Some(&1))
+            },
+        )
+        .await;
+        assert!((0..NUM_PARTITIONS)
+            .all(|partition| { instance.seed_committable(partition as u16) == Some(1) }));
+
+        let snapshot_changes = drain_membership_only(&topics.shadow, 1).await;
+        assert_eq!(snapshot_changes.len(), 1);
+        assert_eq!(snapshot_changes[0].status, MembershipStatus::Left);
+
+        let snapshot_markers = drain_markers(&topics.markers, NUM_PARTITIONS as usize).await;
+        let marker_partitions: HashSet<u16> = snapshot_markers
+            .iter()
+            .map(|marker| {
+                assert!(matches!(marker, ReconcileMarker::Complete(_)), "{marker:?}");
+                assert_eq!(marker.team_id(), TeamId(TEAM));
+                assert_eq!(marker.cohort_id(), CohortId(COHORT));
+                assert_eq!(marker.run_id(), run_id);
+                marker.partition()
+            })
+            .collect();
+        let expected_marker_partitions: HashSet<u16> = (0..COHORT_PARTITION_COUNT)
+            .map(|partition| partition as u16)
+            .collect();
+        assert_eq!(marker_partitions, expected_marker_partitions);
+
+        // A duplicate manual dispatch emits the same full snapshot and certificate set, leaves the
+        // repaired bit unchanged, and advances every partition by exactly one more seed offset.
+        for partition in 0..NUM_PARTITIONS {
+            assert_eq!(
+                produce_reconcile(&producer, &topics.seeds, partition, &reconcile).await,
+                1,
+            );
+        }
+        wait_for(
+            "the duplicate reconcile controls to be admitted",
+            Duration::from_secs(30),
+            || instance.reconcile_backlog.len() == i64::from(NUM_PARTITIONS),
+        )
+        .await;
+        instance.dispatcher.route_reconcile_drain().await;
+        wait_for(
+            "the duplicate snapshot first page",
+            Duration::from_secs(60),
+            || {
+                topic_message_count(&topics.markers) == i64::from(NUM_PARTITIONS) * 2 - 1
+                    && topic_message_count(&topics.shadow) == 2
+            },
+        )
+        .await;
+        assert_eq!(
+            seed_group_committed(&groups.seeds, &topics.seeds, person_partition as i32),
+            Some(1),
+            "redispatch stays pinned at the prior next-offset until its new marker",
+        );
+        assert_eq!(
+            instance.seed_committable(person_partition),
+            Some(1),
+            "the production tracker stays at the prior next-offset before the new marker",
+        );
+        instance.dispatcher.route_reconcile_drain().await;
+        wait_for(
+            "the duplicate snapshot marker set",
+            Duration::from_secs(30),
+            || topic_message_count(&topics.markers) == i64::from(NUM_PARTITIONS) * 2,
+        )
+        .await;
+        wait_for(
+            "every redispatched seed partition commit to advance",
+            Duration::from_secs(30),
+            || {
+                let offsets = seed_group_committed_offsets(&groups.seeds, &topics.seeds);
+                (0..NUM_PARTITIONS).all(|partition| offsets.get(&partition) == Some(&2))
+            },
+        )
+        .await;
+        assert!((0..NUM_PARTITIONS)
+            .all(|partition| { instance.seed_committable(partition as u16) == Some(2) }));
+        assert!(!instance.stage2(&stage2_key).await.in_cohort);
+
+        let reconcile_changes = drain_membership_only(&topics.shadow, 2).await;
+        let converged_markers = drain_markers(&topics.markers, NUM_PARTITIONS as usize * 2).await;
+        let mut marker_counts = HashMap::<u16, usize>::new();
+        for marker in &converged_markers {
+            assert!(matches!(marker, ReconcileMarker::Complete(_)), "{marker:?}");
+            assert_eq!(marker.team_id(), TeamId(TEAM));
+            assert_eq!(marker.cohort_id(), CohortId(COHORT));
+            assert_eq!(marker.run_id(), run_id);
+            *marker_counts.entry(marker.partition()).or_default() += 1;
+        }
+        assert_eq!(
+            marker_counts.keys().copied().collect::<HashSet<_>>(),
+            expected_marker_partitions,
+        );
+        assert!(marker_counts.values().all(|count| *count == 2));
+        assert_eq!(reconcile_changes.len(), 2);
+        assert!(reconcile_changes.iter().all(|change| {
+            change.person_id == person.to_string()
+                && change.status == MembershipStatus::Left
+                && change.origin == Some(ChangeOrigin::Reconcile)
+                && change.run_id == Some(run_id)
+        }));
+
+        // A boundary before the store withholds every partition.
+        let early_run = RunId(Uuid::from_u128(0xB5));
+        let early = ReconcileTile::new(
+            TeamId(TEAM),
+            CohortId(COHORT),
+            ReconcileScope::Behavioral(BehavioralShapeHash::parse(FILTERS_HASH).unwrap()),
+            early_run,
+            RunBoundaryMs(before_store - 1),
+        );
+        for partition in 0..NUM_PARTITIONS {
+            assert_eq!(
+                produce_reconcile(&producer, &topics.seeds, partition, &early).await,
+                2,
+            );
+        }
+        wait_for(
+            "the early run's controls to be admitted",
+            Duration::from_secs(30),
+            || instance.reconcile_backlog.len() == i64::from(NUM_PARTITIONS),
+        )
+        .await;
+        instance.dispatcher.route_reconcile_drain().await;
+        wait_for(
+            "one withheld marker per partition",
+            Duration::from_secs(60),
+            || topic_message_count(&topics.markers) == i64::from(NUM_PARTITIONS) * 3,
+        )
+        .await;
+        wait_for(
+            "every seed partition commit to advance past its withheld marker",
+            Duration::from_secs(30),
+            || {
+                let offsets = seed_group_committed_offsets(&groups.seeds, &topics.seeds);
+                (0..NUM_PARTITIONS).all(|partition| offsets.get(&partition) == Some(&3))
+            },
+        )
+        .await;
+        assert_eq!(
+            topic_message_count(&topics.shadow),
+            2,
+            "a slice missing the run's history emits no rows for it",
+        );
+        let withheld_partitions: HashSet<u16> =
+            drain_markers(&topics.markers, NUM_PARTITIONS as usize * 3)
+                .await
+                .iter()
+                .filter(|marker| marker.run_id() == early_run)
+                .map(|marker| {
+                    assert!(
+                        matches!(
+                            marker,
+                            ReconcileMarker::Withheld(withheld)
+                                if matches!(
+                                    withheld.reason(),
+                                    WithheldReason::PartialCoverage { covered_since }
+                                        if covered_since >= CoverageStartMs(before_store)
+                                )
+                        ),
+                        "{marker:?}",
+                    );
+                    marker.partition()
+                })
+                .collect();
+        assert_eq!(withheld_partitions, expected_marker_partitions);
+
+        shutdown.request_shutdown();
+        instance.join().await;
+    })
+    .await;
+}
+
+/// A tile scanned "now" stays fenced until live consumption flows past `s_chunk + margin`.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker (KAFKA_HOSTS); run with --ignored against a local stack"]
+async fn fence_holds_a_fresh_tile_until_live_consumption_passes_its_scan_point() {
+    let suffix = Uuid::new_v4();
+    let topics = Topics::unique(&suffix);
+    let groups = Groups::unique(&suffix);
+    with_topics_cleanup(&topics.names(), async {
+        topics.create().await;
+
+        // Put both same-partition records on the broker before the follower starts so its first
+        // receive batch can observe the closed tile and the FIFO suffix together.
+        let alice = Uuid::from_u128(0xA11CE);
+        let fence_margin_ms = 5_000;
+        let producer = murmur2_producer();
+        let seed_sink = KafkaSeedTileSink::new(&producer_kafka_config(), topics.seeds.clone())
+            .await
+            .expect("create test seed sink");
+        let s_chunk = chrono::Utc::now().timestamp_millis();
+        produce_tile(&seed_sink, tile(alice, s_chunk)).await;
+        let run_id = RunId(Uuid::from_u128(0x0F3E_CEC0));
+        let reconcile = ReconcileTile::new(
+            TeamId(TEAM),
+            CohortId(COHORT),
+            ReconcileScope::Behavioral(BehavioralShapeHash::parse(FILTERS_HASH).unwrap()),
+            run_id,
+            boundary_after_slices_began(),
+        );
+        assert_eq!(
+            produce_reconcile(&producer, &topics.seeds, part(alice) as i32, &reconcile,).await,
+            1,
+            "the reconcile control follows the closed data tile in the same partition",
+        );
+
+        let mut manager = Manager::builder("seed-fence-itest")
+            .with_trap_signals(false)
+            .build();
+        let handles = register_instance(&mut manager);
+        let shutdown = handles[0].clone();
+        let _monitor = manager.monitor_background();
+
+        let dir = TempDir::new().unwrap();
+        let instance = spawn_instance(
+            &topics,
+            &groups,
+            open_store(&dir),
+            seed_catalog(),
+            handles,
+            PartitionOwnership::single(NUM_PARTITIONS as u16),
+            fence_margin_ms,
+            None,
+        )
+        .await;
+        wait_for(
+            "the consumer to own every partition",
+            Duration::from_secs(30),
+            || instance.owned().len() == NUM_PARTITIONS as usize,
+        )
+        .await;
+
+        // No watermark at all: wait until Kafka has delivered both records, then give the follower
+        // a full receive/commit cycle to expose any accidental reconcile admission.
+        wait_for(
+            "the seed consumer to fetch the closed tile and its FIFO suffix",
+            Duration::from_secs(30),
+            || instance.seed_position(&topics.seeds, part(alice)) == Some(2),
+        )
+        .await;
+        tokio::time::sleep(COMMIT_INTERVAL + RECV_TIMEOUT + Duration::from_millis(250)).await;
+        assert_eq!(
+            topic_message_count(&topics.shadow),
+            0,
+            "the fenced tile must not apply",
+        );
+        assert_eq!(
+            seed_group_committed(&groups.seeds, &topics.seeds, part(alice) as i32),
+            Some(0),
+            "a held tile's offset must never commit: the commit stays where the claim put it",
+        );
+        assert!(
+            instance.reconcile_backlog.is_empty(),
+            "reconcile must not leapfrog a closed data tile",
+        );
+        assert_eq!(instance.seed_committable(part(alice)), None);
+
+        // A live event at the exact bound still leaves the fence closed. Its explicit broker
+        // timestamp makes the assertion independent of manager startup and machine speed.
+        let closed_watermark = s_chunk + fence_margin_ms;
+        produce_warm_event(&producer, &topics.events, alice, 0, closed_watermark).await;
+        wait_for(
+            "the below-threshold live watermark to fold",
+            Duration::from_secs(30),
+            || instance.live_watermark(part(alice)) == Some(closed_watermark),
+        )
+        .await;
+        assert_eq!(
+            topic_message_count(&topics.shadow),
+            0,
+            "a watermark below s_chunk + margin keeps the fence closed",
+        );
+        assert!(instance.reconcile_backlog.is_empty());
+
+        // One millisecond past the bound, a newer live fold opens the fence for the tile and then
+        // admits the reconcile control behind it. The tile materializes the scan register first.
+        produce_warm_event(&producer, &topics.events, alice, 1, closed_watermark + 1).await;
+        wait_for(
+            "the fence to open and the held tile to apply",
+            Duration::from_secs(60),
+            || topic_message_count(&topics.shadow) == 1,
+        )
+        .await;
+        wait_for(
+            "the reconcile control behind the opened tile to be admitted",
+            Duration::from_secs(30),
+            || instance.reconcile_backlog.len() == 1,
+        )
+        .await;
+        assert_eq!(
+            instance.seed_committable(part(alice)),
+            Some(1),
+            "the applied data tile advances to the following deferred control",
+        );
+
+        instance.dispatcher.route_reconcile_drain().await;
+        wait_for(
+            "the reconcile membership row",
+            Duration::from_secs(30),
+            || topic_message_count(&topics.shadow) == 2,
+        )
+        .await;
+        assert_eq!(instance.reconcile_backlog.len(), 1);
+        assert_eq!(
+            instance.seed_committable(part(alice)),
+            Some(1),
+            "the control remains deferred after its row and before its marker",
+        );
+
+        instance.dispatcher.route_reconcile_drain().await;
+        wait_for(
+            "the reconcile completion marker",
+            Duration::from_secs(30),
+            || topic_message_count(&topics.markers) == 1,
+        )
+        .await;
+        assert!(instance.reconcile_backlog.is_empty());
+        assert_eq!(instance.seed_committable(part(alice)), Some(2));
+        wait_for(
+            "the seed group to commit both FIFO messages",
+            Duration::from_secs(30),
+            || seed_group_committed(&groups.seeds, &topics.seeds, part(alice) as i32) == Some(2),
+        )
+        .await;
+
+        let changes = drain_membership_only(&topics.shadow, 2).await;
+        let markers = drain_markers(&topics.markers, 1).await;
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().any(|change| {
+            change.person_id == alice.to_string() && change.origin == Some(ChangeOrigin::Seed)
+        }));
+        assert!(changes.iter().any(|change| {
+            change.person_id == alice.to_string()
+                && change.status == MembershipStatus::Entered
+                && change.origin == Some(ChangeOrigin::Reconcile)
+                && change.run_id == Some(run_id)
+        }));
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].partition(), part(alice));
+        assert_eq!(markers[0].run_id(), run_id);
+
+        shutdown.request_shutdown();
+        instance.join().await;
+    })
+    .await;
+}

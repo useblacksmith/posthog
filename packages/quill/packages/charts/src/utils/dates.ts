@@ -1,0 +1,287 @@
+import { type Dayjs, parseDateInTimezone } from './dayjs'
+
+/** Bucket size for a date-based X axis. Mirrors `IntervalType` from product code without
+ * coupling hog-charts to it. */
+export type TimeInterval = 'second' | 'minute' | 'hour' | 'day' | 'week' | 'month' | 'quarter' | 'year'
+
+interface CreateXAxisTickCallbackArgs {
+    interval?: TimeInterval
+    allDays: (string | number)[]
+    timezone: string
+}
+
+type TickMode =
+    | { type: 'month' }
+    | { type: 'quarter' }
+    | { type: 'year' }
+    | { type: 'day' }
+    | { type: 'monthly'; visibleBoundaries: Set<number> }
+    | { type: 'hourly' }
+    | { type: 'hourly-multi-day'; step: number; dayStartIndices: Set<number> }
+
+export function createXAxisTickCallback({
+    interval,
+    allDays,
+    timezone,
+}: CreateXAxisTickCallbackArgs): ((value: string | number, index: number) => string | null) | undefined {
+    if (allDays.length === 0 || typeof allDays[0] !== 'string') {
+        return
+    }
+
+    const parsedDates = allDays.map((d) => parseDateForAxis(String(d), timezone))
+    const first = parsedDates[0]
+    const last = parsedDates[parsedDates.length - 1]
+
+    if (!first?.isValid() || !last?.isValid()) {
+        return
+    }
+
+    const resolvedInterval = interval ?? inferInterval(parsedDates, isDateOnlyLabel(allDays[0]))
+    const mode = pickMode(resolvedInterval, parsedDates, first, last)
+
+    return (_value: string | number, index: number): string | null => {
+        const date = parsedDates[index]
+        if (!date?.isValid()) {
+            return String(_value)
+        }
+
+        if (!isTickVisible(mode, date, index)) {
+            return null
+        }
+
+        return formatTick(mode, date, index)
+    }
+}
+
+export const parseDateForAxis = parseDateInTimezone
+
+/** Full date label for a tooltip header. Unlike the sparse, abbreviated axis ticks, every point
+ *  gets a complete label. Single-day buckets include the weekday, while longer buckets do not.
+ *  Repeated local times include their UTC offsets when `allDays` identifies a DST fallback.
+ *  Non-date labels pass through unchanged. */
+export function createTooltipDateFormatter({
+    interval,
+    timezone,
+    allDays,
+}: {
+    interval: TimeInterval
+    timezone: string
+    allDays?: string[]
+}): (label: string) => string {
+    const formattedOffsets = new Map<string, Set<string>>()
+    if (interval === 'second' || interval === 'minute' || interval === 'hour') {
+        for (const label of allDays ?? []) {
+            const date = parseDateInTimezone(label, timezone)
+            if (date.isValid()) {
+                const formatted = formatTooltipDate(date, interval)
+                const offsets = formattedOffsets.get(formatted) ?? new Set<string>()
+                offsets.add(date.format('Z'))
+                formattedOffsets.set(formatted, offsets)
+            }
+        }
+    }
+
+    return (label: string): string => {
+        const date = parseDateInTimezone(label, timezone)
+        if (!date.isValid()) {
+            return label
+        }
+        const formatted = formatTooltipDate(date, interval)
+        return (formattedOffsets.get(formatted)?.size ?? 0) > 1 ? `${formatted} (${date.format('Z')})` : formatted
+    }
+}
+
+function formatTooltipDate(date: Dayjs, interval: TimeInterval): string {
+    switch (interval) {
+        case 'second':
+            return date.format('ddd, MMM D, HH:mm:ss')
+        case 'minute':
+        case 'hour':
+            return date.format('ddd, MMM D, HH:mm')
+        case 'month':
+            return date.format('MMM YYYY')
+        case 'quarter':
+            return `Q${Math.floor(date.month() / 3) + 1} ${date.year()}`
+        case 'year':
+            return date.format('YYYY')
+        case 'week':
+            return date.format('MMM D, YYYY')
+        case 'day':
+        default:
+            return date.format('ddd, MMM D, YYYY')
+    }
+}
+
+function pickMode(interval: TimeInterval, parsedDates: Dayjs[], first: Dayjs, last: Dayjs): TickMode {
+    const spanMonths = Math.abs((last.year() - first.year()) * 12 + last.month() - first.month())
+    const spanDays = Math.abs(last.diff(first, 'day'))
+
+    if (interval === 'quarter') {
+        return { type: 'quarter' }
+    }
+    if (interval === 'year') {
+        return { type: 'year' }
+    }
+    if (interval === 'month') {
+        return { type: 'month' }
+    }
+    if ((interval === 'day' || interval === 'week') && spanMonths >= 3) {
+        return { type: 'monthly', visibleBoundaries: buildVisibleBoundaries(parsedDates) }
+    }
+    if (interval === 'day' || interval === 'week') {
+        return { type: 'day' }
+    }
+    if (spanDays >= 2) {
+        const step = spanDays <= 3 ? 6 : spanDays <= 7 ? 12 : 24
+        const dayStartIndices = buildDayStartIndices(parsedDates)
+        return { type: 'hourly-multi-day', step, dayStartIndices }
+    }
+    return { type: 'hourly' }
+}
+
+function isTickVisible(mode: TickMode, date: Dayjs, index: number): boolean {
+    switch (mode.type) {
+        case 'monthly':
+            return mode.visibleBoundaries.has(index)
+        case 'hourly-multi-day':
+            if (mode.dayStartIndices.has(index)) {
+                return true
+            }
+            // Only show intermediate time ticks (e.g. 06:00, 12:00) when there are few days
+            return mode.dayStartIndices.size <= 3 && date.hour() % mode.step === 0
+        default:
+            return true
+    }
+}
+
+function formatTick(mode: TickMode, date: Dayjs, index: number): string {
+    switch (mode.type) {
+        case 'month':
+        case 'monthly':
+            return formatMonthLabel(date)
+        case 'quarter':
+            return formatQuarterLabel(date)
+        case 'year':
+            return String(date.year())
+        case 'day':
+            return date.date() === 1 ? formatMonthLabel(date) : date.format('MMM D')
+        case 'hourly-multi-day':
+            return mode.dayStartIndices.has(index) ? date.format('MMM D') : date.format('HH:mm')
+        case 'hourly':
+            return date.format('HH:mm')
+    }
+}
+
+function formatMonthLabel(date: Dayjs): string {
+    if (date.month() === 0) {
+        return String(date.year())
+    }
+    return date.format('MMMM')
+}
+
+// Mirrors formatMonthLabel's convention: the year marks the year boundary, "Q2".."Q4" otherwise.
+function formatQuarterLabel(date: Dayjs): string {
+    if (date.month() === 0) {
+        return String(date.year())
+    }
+    return `Q${Math.floor(date.month() / 3) + 1}`
+}
+
+export function inferTimeInterval(allDays: string[], timezone: string): TimeInterval | undefined {
+    if (allDays.length === 0) {
+        return undefined
+    }
+    const parsedDates = allDays.map((day) => parseDateForAxis(day, timezone))
+    const first = parsedDates[0]
+    const last = parsedDates[parsedDates.length - 1]
+    return first?.isValid() && last?.isValid() ? inferInterval(parsedDates, isDateOnlyLabel(allDays[0])) : undefined
+}
+
+function isDateOnlyLabel(label: string | number): boolean {
+    return typeof label === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(label)
+}
+
+const HOUR_MS = 60 * 60 * 1000
+const DAY_MS = 24 * HOUR_MS
+
+function inferInterval(parsedDates: Dayjs[], dateOnlyLabels: boolean): TimeInterval {
+    // Use the smallest gap, not the first one, so one early outlier in a sparse daily series
+    // does not make the whole axis look monthly.
+    const gapMs = smallestWallClockGapMs(parsedDates)
+    if (gapMs === null) {
+        return 'day'
+    }
+    const diffHours = gapMs / HOUR_MS
+    if (diffHours < 1) {
+        return 'minute'
+    }
+    if (!dateOnlyLabels && diffHours < 24) {
+        return 'hour'
+    }
+    const diffDays = Math.floor(gapMs / DAY_MS)
+    if (diffDays >= 300) {
+        return 'year'
+    }
+    if (diffDays >= 80) {
+        return 'quarter'
+    }
+    if (diffDays >= 25) {
+        return 'month'
+    }
+    if (diffDays >= 5) {
+        return 'week'
+    }
+    return 'day'
+}
+
+// Wall-clock gaps ignore UTC offset changes, so a daily gap across a DST switch stays 24 hours.
+function smallestWallClockGapMs(parsedDates: Dayjs[]): number | null {
+    let smallest: number | null = null
+    for (let i = 1; i < parsedDates.length; i++) {
+        const prev = parsedDates[i - 1]
+        const curr = parsedDates[i]
+        if (!prev.isValid() || !curr.isValid()) {
+            continue
+        }
+        const gap = Math.abs(curr.valueOf() - prev.valueOf() + (curr.utcOffset() - prev.utcOffset()) * 60 * 1000)
+        if (gap > 0 && (smallest === null || gap < smallest)) {
+            smallest = gap
+        }
+    }
+    return smallest
+}
+
+function buildDayStartIndices(parsedDates: Dayjs[]): Set<number> {
+    const indices = new Set<number>()
+    let prevDateStr = ''
+    for (let i = 0; i < parsedDates.length; i++) {
+        const dateStr = parsedDates[i].format('YYYY-MM-DD')
+        if (dateStr !== prevDateStr) {
+            indices.add(i)
+            prevDateStr = dateStr
+        }
+    }
+    return indices
+}
+
+function buildVisibleBoundaries(parsedDates: Dayjs[]): Set<number> {
+    const boundaries: number[] = []
+    for (let i = 0; i < parsedDates.length; i++) {
+        const prev = i > 0 ? parsedDates[i - 1] : null
+        if (!prev || prev.month() !== parsedDates[i].month()) {
+            boundaries.push(i)
+        }
+    }
+
+    const visible = new Set(boundaries)
+    const minGap = Math.max(3, Math.floor(parsedDates.length / 10))
+
+    if (boundaries.length >= 2 && boundaries[1] - boundaries[0] < minGap) {
+        visible.delete(boundaries[0])
+    }
+    if (boundaries.length >= 2 && boundaries[boundaries.length - 1] - boundaries[boundaries.length - 2] < minGap) {
+        visible.delete(boundaries[boundaries.length - 1])
+    }
+
+    return visible
+}

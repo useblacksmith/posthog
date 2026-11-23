@@ -1,0 +1,214 @@
+import struct
+
+import psycopg.errors
+from parameterized import parameterized
+from sshtunnel import BaseSSHTunnelForwarderError
+
+from products.warehouse_sources.backend.temporal.data_imports.cdc.errors import CDCErrorCategory
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.mixins import HostNotAllowedError
+from products.warehouse_sources.backend.temporal.data_imports.sources.postgres.cdc.errors import (
+    classify_postgres_cdc_error,
+)
+
+
+class TestClassifyPostgresCDCError:
+    @parameterized.expand(
+        [
+            (
+                "invalid_password_class",
+                psycopg.errors.InvalidPassword('password authentication failed for user "posthog"'),
+                CDCErrorCategory.AUTH_FAILED,
+            ),
+            (
+                "invalid_authorization_class",
+                psycopg.errors.InvalidAuthorizationSpecification("no pg_hba.conf entry for host"),
+                CDCErrorCategory.AUTH_FAILED,
+            ),
+            (
+                "auth_message_on_operational_error",
+                psycopg.OperationalError('connection failed: password authentication failed for user "x"'),
+                CDCErrorCategory.AUTH_FAILED,
+            ),
+            (
+                "ssl_required",
+                psycopg.OperationalError("server does not support SSL, but SSL was required"),
+                CDCErrorCategory.SSL_REQUIRED,
+            ),
+            (
+                "server_certificate_failed_verification",
+                psycopg.OperationalError("connection failed: SSL error: certificate verify failed"),
+                CDCErrorCategory.CERTIFICATE_REJECTED,
+            ),
+            (
+                "client_certificate_rejected_by_pg_hba",
+                psycopg.OperationalError('connection failed: FATAL:  certificate authentication failed for user "u"'),
+                CDCErrorCategory.CERTIFICATE_REJECTED,
+            ),
+            (
+                "client_certificate_rejected",
+                psycopg.OperationalError("connection failed: SSL error: tlsv13 alert certificate required"),
+                CDCErrorCategory.CERTIFICATE_REJECTED,
+            ),
+            (
+                "ssl_close_is_connection_not_ssl_required",
+                psycopg.OperationalError("SSL connection has been closed unexpectedly"),
+                CDCErrorCategory.CONNECTION_FAILED,
+            ),
+            (
+                "connection_refused",
+                psycopg.OperationalError("connection to server at localhost, port 5432 failed: Connection refused"),
+                CDCErrorCategory.CONNECTION_FAILED,
+            ),
+            (
+                # Observed on a managed provider (Neon-style): the account or project exceeded a
+                # usage quota, so the connection is blocked until the customer upgrades or the
+                # quota resets. Must classify as QUOTA_EXCEEDED, not the generic CONNECTION_FAILED,
+                # so it stops retrying instead of looping into the same wall.
+                "account_quota_exceeded_is_non_retryable",
+                psycopg.OperationalError(
+                    'connection failed: connection to server at "203.0.113.1", port 5432 failed: '
+                    "ERROR:  Your account or project has exceeded the quota. Upgrade your plan to "
+                    "increase limits."
+                ),
+                CDCErrorCategory.QUOTA_EXCEEDED,
+            ),
+            (
+                "pooler_enotfound_tenant_is_non_retryable",
+                psycopg.OperationalError(
+                    'connection to server at "203.0.113.1", port 5432 failed: '
+                    "FATAL:  (ENOTFOUND) tenant/user postgres.exampleref not found"
+                ),
+                CDCErrorCategory.POOLER_TENANT_NOT_FOUND,
+            ),
+            (
+                "pooler_legacy_tenant_wording_is_non_retryable",
+                psycopg.OperationalError("FATAL:  Tenant or user not found"),
+                CDCErrorCategory.POOLER_TENANT_NOT_FOUND,
+            ),
+            (
+                "pooler_nxdomain_is_non_retryable",
+                psycopg.OperationalError("FATAL:  Failed to connect to database: {:error, :nxdomain}"),
+                CDCErrorCategory.POOLER_TENANT_NOT_FOUND,
+            ),
+            (
+                "network_unreachable_is_non_retryable_host",
+                psycopg.OperationalError(
+                    'connection to server at "2001:db8::1", port 5432 failed: Network is unreachable'
+                ),
+                CDCErrorCategory.HOST_UNREACHABLE,
+            ),
+            (
+                "no_route_to_host_is_non_retryable_host",
+                psycopg.OperationalError("connection to server at example.invalid, port 5432 failed: No route to host"),
+                CDCErrorCategory.HOST_UNREACHABLE,
+            ),
+            (
+                # Supavisor reports the same routing failure with its erlang-tuple wording, which
+                # never contains the libpq phrases above.
+                "supavisor_enetunreach_is_non_retryable_host",
+                psycopg.OperationalError(
+                    "connection to server at example.invalid, port 5432 failed: FATAL:  "
+                    "Failed to connect to database: {:error, :enetunreach}"
+                ),
+                CDCErrorCategory.HOST_UNREACHABLE,
+            ),
+            (
+                "provider_ip_allow_list_rejection_is_non_retryable_host",
+                psycopg.OperationalError(
+                    "connection to server at example.invalid, port 5432 failed: ERROR:  This IP address "
+                    "198.51.100.7 is not allowed to connect to this endpoint."
+                ),
+                CDCErrorCategory.HOST_UNREACHABLE,
+            ),
+            (
+                "provider_blocked_network_rejection_is_non_retryable_host",
+                psycopg.OperationalError(
+                    "connection to server at example.invalid, port 5432 failed: ERROR:  This connection is "
+                    "trying to access this endpoint from a blocked network."
+                ),
+                CDCErrorCategory.HOST_UNREACHABLE,
+            ),
+            (
+                "database_host_not_allowed_is_non_retryable_host",
+                HostNotAllowedError("Database host not allowed: resolves to a private address"),
+                CDCErrorCategory.HOST_UNREACHABLE,
+            ),
+            (
+                # ConnectionTimeout only ever reaches here after _connect_with_dropped_retry has
+                # already exhausted its in-process reconnect attempts, so it means the host is
+                # persistently unreachable, not a transient blip. Must not fall through to the
+                # retryable CONNECTION_FAILED bucket, or the workflow retries into the same wall
+                # forever instead of surfacing an actionable message.
+                "connect_timeout_exhausted_is_non_retryable_host",
+                psycopg.errors.ConnectionTimeout("connection timeout expired"),
+                CDCErrorCategory.HOST_UNREACHABLE,
+            ),
+            (
+                "ssh_tunnel_host_not_allowed_is_a_tunnel_failure",
+                HostNotAllowedError("SSH tunnel host not allowed: resolves to a private address"),
+                CDCErrorCategory.SSH_TUNNEL_FAILED,
+            ),
+            (
+                "slot_missing",
+                psycopg.errors.UndefinedObject('replication slot "posthog_slot" does not exist'),
+                CDCErrorCategory.SLOT_MISSING,
+            ),
+            (
+                "publication_missing",
+                psycopg.errors.UndefinedObject('publication "posthog_pub" does not exist'),
+                CDCErrorCategory.PUBLICATION_MISSING,
+            ),
+            (
+                "slot_in_use",
+                psycopg.errors.ObjectInUse('replication slot "posthog_slot" is active for PID 123'),
+                CDCErrorCategory.SLOT_IN_USE,
+            ),
+            (
+                # Recreating a customer-owned publication (e.g. after slot invalidation recovery)
+                # requires owning every table added to it, not just SELECT. This must not fall
+                # through to the retryable UNKNOWN bucket, or recovery retries forever against the
+                # same permission wall.
+                "must_be_owner_is_non_retryable_permission_denied",
+                psycopg.errors.InsufficientPrivilege("must be owner of table orders"),
+                CDCErrorCategory.PERMISSION_DENIED,
+            ),
+            (
+                "permission_denied_for_table_is_non_retryable_permission_denied",
+                psycopg.errors.InsufficientPrivilege("permission denied for table orders"),
+                CDCErrorCategory.PERMISSION_DENIED,
+            ),
+            (
+                "wal_decode_struct_error",
+                struct.error("unpack requires a buffer of 4 bytes"),
+                CDCErrorCategory.WAL_DECODE_ERROR,
+            ),
+            (
+                "ssh_gateway_session_failure_is_non_retryable",
+                BaseSSHTunnelForwarderError("Could not establish session to SSH gateway"),
+                CDCErrorCategory.SSH_TUNNEL_FAILED,
+            ),
+            (
+                "unrecognized_ssh_tunnel_error_falls_back_to_unknown",
+                BaseSSHTunnelForwarderError("Some other sshtunnel failure"),
+                None,
+            ),
+            (
+                "unrelated_runtime_error",
+                RuntimeError("S3 write failed"),
+                None,
+            ),
+            (
+                "undefined_table_is_not_slot_or_publication",
+                psycopg.errors.UndefinedTable('relation "public.orders" does not exist'),
+                None,
+            ),
+        ]
+    )
+    def test_classification(self, _name, exc, expected):
+        assert classify_postgres_cdc_error(exc) is expected
+
+    def test_slot_in_use_takes_precedence_over_does_not_exist_wording(self):
+        # An "is active for PID" message must classify as retryable slot_in_use even if it
+        # mentions the slot — never as the non-retryable slot_missing.
+        exc = psycopg.errors.ObjectInUse('replication slot "posthog_slot" is active for PID 99')
+        assert classify_postgres_cdc_error(exc) is CDCErrorCategory.SLOT_IN_USE

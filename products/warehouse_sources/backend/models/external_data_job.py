@@ -1,0 +1,200 @@
+from collections.abc import Collection
+from uuid import UUID
+
+from django.conf import settings
+from django.db import models
+from django.db.models import F, Func, IntegerField, OuterRef, Prefetch, Q, Subquery, Value
+from django.db.models.functions import Greatest
+
+from posthog.models.utils import CreatedMetaFields, UpdatedMetaFields, UUIDTModel, sane_repr
+from posthog.sync import database_sync_to_async
+
+from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+from products.warehouse_sources.backend.types import ExternalDataJobPipelineVersion, ExternalDataJobStatus
+
+
+class ExternalDataJob(CreatedMetaFields, UpdatedMetaFields, UUIDTModel):
+    # Kept on the model so the nested names stay unchanged.
+    Status = ExternalDataJobStatus
+    PipelineVersion = ExternalDataJobPipelineVersion
+
+    # Overridden from CreatedMetaFields. Import workflows create every job row, so the column is
+    # always NULL, and its index only cost a write per insert. With no index, a user delete would
+    # seq-scan this table twice (Django's SET_NULL update, then the Postgres FK check), so the
+    # constraint goes too and Django's cascade skips it.
+    created_by = models.ForeignKey(
+        "posthog.User",
+        on_delete=models.DO_NOTHING,
+        null=True,
+        blank=True,
+        db_index=False,
+        db_constraint=False,
+    )
+
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, related_name="+")
+    pipeline = models.ForeignKey("warehouse_sources.ExternalDataSource", related_name="jobs", on_delete=models.CASCADE)
+    schema = models.ForeignKey("warehouse_sources.ExternalDataSchema", on_delete=models.CASCADE, null=True, blank=True)
+    status = models.CharField(max_length=400)
+    rows_synced = models.BigIntegerField(null=True, blank=True)
+    latest_error = models.TextField(null=True, help_text="The latest error that occurred during this run.")
+
+    workflow_id = models.CharField(max_length=400, null=True, blank=True)
+    workflow_run_id = models.CharField(max_length=400, null=True, blank=True)
+
+    pipeline_version = models.CharField(max_length=400, choices=PipelineVersion.choices, null=True, blank=True)
+    billable = models.BooleanField(default=True, null=True, blank=True)
+    # The destinations this run delivers to, snapshotted when the run started so a config
+    # change mid-run cannot alter where an in-flight run lands or what it bills. Empty means
+    # the PostHog warehouse alone, which is every run that predates destinations.
+    destination_ids = models.JSONField(default=list, blank=True, db_default=[])
+    finished_at = models.DateTimeField(null=True, blank=True)
+    storage_delta_mib = models.FloatField(null=True, blank=True, default=0)
+    # Also stores `cdc_write_mode` (`incremental_merge` | `scd2_append`) so the Syncs UI can
+    # distinguish the two ExternalDataJob rows produced when `cdc_table_mode='both'`.
+    schema_snapshot = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Snapshot of the ExternalDataSchema at the time this job was created.",
+    )
+
+    __repr__ = sane_repr("id")
+
+    class Meta:
+        db_table = "posthog_externaldatajob"
+        indexes = [
+            # Serves the hot "latest run for a pipeline" lookup (get_latest_run_if_exists):
+            # equality on team/pipeline/status, ordered by created_at DESC with LIMIT.
+            models.Index(
+                fields=["team", "pipeline", "status", "-created_at"],
+                name="idx_extdatajob_latest_run",
+            ),
+            # Serves the incremental-sync watermark scan when the warehouse imports this
+            # table (WHERE updated_at > <cursor> ORDER BY updated_at): without it the read
+            # is a full seq scan + sort of the whole table on every run.
+            models.Index(
+                fields=["updated_at"],
+                name="idx_extdatajob_updated_at",
+            ),
+            # Serves the rows-synced aggregates (usage report, source health): equality on
+            # pipeline/status with a finished_at range. Without it the FK index walks every
+            # job for the pipeline and filters most of them out.
+            models.Index(
+                fields=["pipeline", "status", "finished_at"],
+                name="idx_extdatajob_pipe_stat_fin",
+            ),
+            # Serves the sweeps that look for live runs (sweep_stopped_schema_syncs, the CDC
+            # orphan sweep, teardown, repair): status equality with a created_at range and no
+            # team or pipeline to narrow on first. Running is a fraction of a percent of the
+            # table, so the partial index holds only live rows instead of the whole history.
+            models.Index(
+                fields=["created_at"],
+                condition=Q(status=ExternalDataJobStatus.RUNNING),
+                name="idx_extdatajob_running",
+            ),
+            # Serves the source sync-history list (the `jobs` action): equality on pipeline
+            # ordered by created_at DESC with LIMIT. The polling settings tab reads it every
+            # few seconds. Without it the FK index walks every job of the source and sorts.
+            models.Index(
+                fields=["pipeline", "-created_at"],
+                name="idx_extdatajob_pipe_created",
+            ),
+            # Serves the "newest jobs of a schema" reads: equality on schema and team, ordered by
+            # created_at DESC with LIMIT. Without it Postgres reads every job the schema has run
+            # and sorts them. Team is in the key because the planner treats the schema filter and
+            # the team filter as independent. With team outside the key it expects almost no
+            # matching rows, and it keeps the bitmap scan of the full job history of the schema.
+            models.Index(
+                fields=["schema", "team", "-created_at"],
+                name="idx_extdatajob_schema_team",
+            ),
+        ]
+
+    @classmethod
+    def latest_completed_job_subquery(cls, team_id: int, field: str) -> Subquery:
+        return Subquery(
+            cls.objects.filter(pipeline=OuterRef("pk"), team_id=team_id, status=ExternalDataJobStatus.COMPLETED)
+            .order_by("-created_at")
+            .values(field)[:1]
+        )
+
+    def folder_path(self) -> str:
+        if self.schema:
+            return self.schema.folder_path()
+        else:
+            raise ValueError("Job does not have a schema")
+
+    def url_pattern_by_schema(self, schema: str) -> str:
+        if settings.USE_LOCAL_SETUP:
+            return f"http://{settings.DATAWAREHOUSE_BUCKET_DOMAIN}/{settings.BUCKET_PATH}/{self.folder_path()}/{schema.lower()}/"
+
+        return f"https://{settings.DATAWAREHOUSE_BUCKET_DOMAIN}/{settings.BUCKET_PATH}/{self.folder_path()}/{schema.lower()}/"
+
+
+@database_sync_to_async
+def get_external_data_job(job_id: UUID) -> ExternalDataJob:
+    from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
+
+    return ExternalDataJob.objects.prefetch_related(
+        "pipeline", Prefetch("schema", queryset=ExternalDataSchema.objects.prefetch_related("source"))
+    ).get(pk=job_id)
+
+
+def latest_completed_job_subquery(team_id: int, field: str) -> Subquery:
+    """One field of each source's newest completed job, correlated on the source row.
+
+    Annotate this on a queryset of `ExternalDataSource`. It costs one probe of
+    `idx_extdatajob_latest_run` per source, because the filter matches that index's leading
+    columns and the ordering matches its trailing one.
+
+    Do not replace it with `Max("jobs__created_at", filter=...)`. Django compiles that aggregate
+    to a LEFT OUTER JOIN onto the job table plus a GROUP BY, so Postgres reads and sorts every
+    completed job the team has ever run to produce one timestamp per source.
+    """
+    return ExternalDataJob.latest_completed_job_subquery(team_id, field)
+
+
+def latest_completed_job_prefetch(
+    team_id: int, lookup: str, to_attr: str, source_ids: Collection[UUID | str] | None = None
+) -> Prefetch:
+    """Prefetch each source's newest completed job as a one-element list on `to_attr`.
+
+    Do not replace this with a sliced prefetch queryset (`order_by("-created_at")[:1]`). Django
+    compiles that to a ROW_NUMBER window over every completed job of every listed source, so
+    Postgres reads and sorts the team's whole job history to keep one row per source. Selecting
+    each source's newest job id in a correlated subquery costs one index probe per source.
+
+    The probes run for every live source of the team unless `source_ids` narrows them, because a
+    prefetch queryset cannot see which parent rows it is loaded for.
+    """
+    sources = ExternalDataSource.objects.filter(team_id=team_id).exclude(deleted=True)
+    if source_ids is not None:
+        sources = sources.filter(id__in=source_ids)
+    latest_job_ids = sources.values(latest_job_id=latest_completed_job_subquery(team_id, "id"))
+    return Prefetch(lookup, queryset=ExternalDataJob.objects.filter(id__in=latest_job_ids), to_attr=to_attr)
+
+
+@database_sync_to_async
+def get_latest_run_if_exists(team_id: int, pipeline_id: UUID) -> ExternalDataJob | None:
+    job = (
+        ExternalDataJob.objects.filter(
+            team_id=team_id, pipeline_id=pipeline_id, status=ExternalDataJob.Status.COMPLETED
+        )
+        .prefetch_related("pipeline")
+        .order_by("-created_at")
+        .first()
+    )
+
+    return job
+
+
+def billable_destination_multiplier() -> Greatest:
+    """How many destinations a run billed for, derived from the ids it snapshotted.
+
+    An empty list means the PostHog warehouse alone, so the floor is one. Derived rather than
+    stored beside the ids: the count is exactly `len(destination_ids)`, and a second column
+    holding the same fact can drift from it without anything noticing.
+    """
+    return Greatest(
+        Func(F("destination_ids"), function="jsonb_array_length", output_field=IntegerField()),
+        Value(1),
+    )

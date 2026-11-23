@@ -1,0 +1,130 @@
+import type { InactivityPeriod as BaseInactivityPeriod, NavigationSample } from '@posthog/replay-headless/protocol'
+
+export interface RasterizeRecordingInput {
+    session_id: string
+    team_id: number
+    // Team-scoped read token minted by the Python build_rasterization_input activity and relayed to
+    // recording-api (the rasterizer cannot mint its own). Optional only during migration, before the
+    // minting side has shipped.
+    recording_api_token?: string
+    // Renders this `[windowId, event]` JSONL object instead of fetching blocks from recording-api.
+    source_s3_uri?: string
+    max_virtual_time?: number // max virtual-time seconds before stopping capture (default: unlimited)
+    playback_speed?: number // 1-360, defaults to 4
+    start_offset_s?: number // seconds from session start to begin playback
+    end_offset_s?: number // seconds from session start to stop playback
+    recording_fps?: number // target FPS for final video
+    skip_inactivity?: boolean // skip inactive sections during playback (default: true)
+    mouse_tail?: boolean // show mouse trail (default: true)
+    viewport_events?: Array<{ timestamp: number; width: number; height: number }> // viewport resize events
+    show_metadata_footer?: boolean // render URL + timestamp bar at bottom (for AI pipeline)
+    trim?: number // optional max output duration in seconds (only trims if video is longer)
+    viewport_width?: number // override capture width (default: 1280)
+    viewport_height?: number // override capture height (default: 720)
+    output_format?: 'mp4' | 'webm' | 'gif' // output video format (default: mp4)
+    screenshot_format?: 'jpeg' | 'png' // capture format for each frame (default: jpeg)
+    screenshot_quality?: number // JPEG quality 0-100 (default: 80, ignored for png)
+    s3_bucket: string
+    s3_key_prefix: string // e.g. "exports/mp4/team-123/task-456"
+}
+
+export interface ExtractThumbnailsInput {
+    /** The rendered analysis MP4 to cut the frames from. */
+    source_s3_uri: string
+    /** Each frame's seconds into the analysis video, and the object name it uploads under. A frame that is not
+     * `required` is left out of the output when it cannot be cut, instead of failing the batch. */
+    frames: { video_time_s: number; id: string; required?: boolean }[]
+    /** Pixels of burned-in metadata footer to crop off the bottom before scaling. */
+    footer_crop_px?: number
+    /** Output width; height follows the source aspect ratio. Defaults to 1280. */
+    width?: number
+    /** Width of a second, smaller copy of each frame, cut from the same decode. No copy is made when unset. */
+    small_width?: number
+    /** Image format of every output. Defaults to `png`, which is what a caller that predates the field expects. */
+    image_format?: 'png' | 'webp'
+    s3_bucket: string
+    s3_key_prefix: string
+}
+
+export interface ExtractThumbnailsOutput {
+    /** One entry per frame the video has, in input order. */
+    frames: { id: string; s3_uri: string; file_size_bytes: number; small_s3_uri?: string }[]
+}
+
+/**
+ * Extends the base InactivityPeriod from the shared protocol with
+ * recording_ts fields that map segment boundaries to post-processed video
+ * positions.
+ */
+export interface InactivityPeriod extends BaseInactivityPeriod {
+    recording_ts_from_s?: number
+    recording_ts_to_s?: number
+}
+
+export interface NavigationChange {
+    video_s: number // position in the rendered file where the change first shows
+    session_s: number // recording time of that frame
+    window_id: string // the recording's own window id, as its analytics events carry it
+    window_number: number // the number the footer shows for the window
+    url: string // without query string, as the footer draws it
+}
+
+/**
+ * Structured heartbeat payload sent from the rasterizer activity to Temporal.
+ * The parent workflow reads this via `describe().pending_activities[].heartbeat_details`
+ * to surface fine-grained progress to the frontend during video rendering.
+ */
+export interface RasterizationProgress {
+    phase: 'setup' | 'capture' | 'upload'
+    frame: number
+    estimatedTotalFrames: number
+}
+
+export interface ActivityTimings {
+    total_s: number
+    setup_s: number // browser setup + player load + data fetch
+    capture_s: number // screen recording of playback
+    upload_s: number
+}
+
+export interface RasterizeRecordingOutput {
+    s3_uri: string
+    video_duration_s: number // actual playback duration of the output video
+    playback_speed: number
+    show_metadata_footer: boolean
+    // Pixels at the bottom of each frame the footer takes, which a consumer crops to get the page alone.
+    footer_height_px: number
+    truncated: boolean // true when max_virtual_time stopped the recording early
+    inactivity_periods: InactivityPeriod[]
+    navigation: NavigationChange[]
+    file_size_bytes: number
+    timings: ActivityTimings
+}
+
+export interface CaptureConfig {
+    captureFps: number // recordingFps * playbackSpeed — internal capture rate
+    outputFps: number // recordingFps — what the viewer sees after setpts
+    playbackSpeed: number
+    trim?: number // max output seconds
+    trimFrameLimit: number // trim * outputFps — for early loop stop
+    maxVirtualTimeMs: number // max virtual time before stopping capture (default: unlimited)
+    outputFormat: 'mp4' | 'webm' | 'gif'
+    ffmpegOutputOpts: string[]
+    ffmpegVideoFilters: string[]
+    screenshotFormat: 'jpeg' | 'png'
+    screenshotQuality?: number
+}
+
+/** Internal result from the recorder before S3 upload */
+export interface RecordingResult {
+    playback_speed: number
+    capture_duration_s: number // wall-clock seconds of useful capture (up to RECORDING_ENDED)
+    frame_count: number // total frames captured
+    truncated: boolean // true when max_virtual_time stopped the recording early
+    inactivity_periods: InactivityPeriod[]
+    frame_session_ms: number[] // session time at each captured frame, measured during capture
+    navigation_samples: NavigationSample[] // window or URL changes, each keyed to its frame_session_ms index
+    pre_roll_frames: number // frames captured before playback started, which carry no sample
+    output_fps: number // frames per second of the rendered file, so a frame index is a video position
+    timings: Pick<ActivityTimings, 'setup_s' | 'capture_s'>
+}

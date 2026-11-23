@@ -1,0 +1,597 @@
+import { MOCK_DEFAULT_TEAM } from 'lib/api.mock'
+
+import '@testing-library/jest-dom'
+
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { Provider } from 'kea'
+
+import { OrganizationMembershipLevel } from 'lib/constants'
+import { teamLogic } from 'scenes/teamLogic'
+
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+import { IntegrationType } from '~/types'
+
+import { SlackChannelPicker } from './SlackIntegrationHelpers'
+
+const INTEGRATION: IntegrationType = {
+    id: 1,
+    kind: 'slack',
+    display_name: 'Fake Workspace',
+    icon_url: '',
+    config: {},
+    created_by: null,
+    created_at: '2026-01-01T00:00:00Z',
+}
+
+const CHANNELS = [
+    {
+        id: 'C0B6HUH9FUH',
+        name: 'test-slack-notifications',
+        is_private: false,
+        is_member: true,
+        is_ext_shared: false,
+        is_private_without_access: false,
+    },
+    {
+        id: 'C111111111',
+        name: 'general',
+        is_private: false,
+        is_member: true,
+        is_ext_shared: false,
+        is_private_without_access: false,
+    },
+]
+
+// A channel whose ID is not returned by the bulk /channels endpoint — simulating a workspace
+// where the saved channel falls beyond the first page that the backend returns.
+const OFF_PAGE_CHANNELS = [
+    {
+        id: 'COFFPAGE9XX',
+        name: 'off-page-channel',
+        is_private: false,
+        is_member: true,
+        is_ext_shared: false,
+        is_private_without_access: false,
+    },
+    {
+        id: 'COFFPAGE8XX',
+        name: 'another-off-page-channel',
+        is_private: false,
+        is_member: true,
+        is_ext_shared: false,
+        is_private_without_access: false,
+    },
+]
+const OFF_PAGE_CHANNEL = OFF_PAGE_CHANNELS[0]
+
+// The channel someone picks before inviting the PostHog app to it.
+const NOT_JOINED_CHANNEL = {
+    id: 'CNOTJOINED1',
+    name: 'not-joined',
+    is_private: false,
+    is_member: false,
+    is_ext_shared: false,
+    is_private_without_access: false,
+}
+const MISSING_APP_WARNING = /The PostHog Slack app is not in this channel/
+
+// Typing a channel name and then clicking away is the interaction that drops a search. Two cases
+// below start from it and differ only in what they assert next.
+async function dropASearch(container: HTMLElement): Promise<void> {
+    const input = container.querySelector<HTMLInputElement>('input[data-attr="select-slack-channel"]')!
+    await userEvent.click(input)
+    await userEvent.type(input, 'general')
+    await userEvent.click(document.body)
+}
+
+describe('SlackChannelPicker', () => {
+    let channelsRequestSearchQueries: (string | null)[] = []
+    let channelIdLookups: string[] = []
+    let forcedChannelIdLookups: string[] = []
+    // A test that must observe the by-id lookup mid-flight sets this so the mock waits to respond.
+    let holdChannelIdLookup: Promise<void> | null = null
+    // Channels the bulk list returns on top of CHANNELS, for a test that needs its own fixture.
+    let extraListedChannels: (typeof NOT_JOINED_CHANNEL)[] = []
+    // Whether Slack now reports the app as a member of NOT_JOINED_CHANNEL.
+    let appJoinedTheChannel = false
+
+    beforeEach(() => {
+        channelsRequestSearchQueries = []
+        channelIdLookups = []
+        forcedChannelIdLookups = []
+        holdChannelIdLookup = null
+        extraListedChannels = []
+        appJoinedTheChannel = false
+        useMocks({
+            get: {
+                '/api/environments/:team_id/integrations/:id/channels': async ({ request }) => {
+                    const url = new URL(request.url)
+                    const search = url.searchParams.get('search')
+                    const channelId = url.searchParams.get('channel_id')
+                    if (channelId) {
+                        channelIdLookups.push(channelId)
+                        if (url.searchParams.get('force_refresh') === 'true') {
+                            forcedChannelIdLookups.push(channelId)
+                        }
+                        if (holdChannelIdLookup) {
+                            await holdChannelIdLookup
+                        }
+                        const match =
+                            CHANNELS.find((c) => c.id === channelId) ??
+                            OFF_PAGE_CHANNELS.find((c) => c.id === channelId) ??
+                            (channelId === NOT_JOINED_CHANNEL.id
+                                ? { ...NOT_JOINED_CHANNEL, is_member: appJoinedTheChannel }
+                                : undefined)
+                        return [200, { channels: match ? [match] : [] }]
+                    }
+                    channelsRequestSearchQueries.push(search)
+                    // Server-side search: substring match in name or id (mirrors the backend).
+                    // The bulk endpoint deliberately never returns OFF_PAGE_CHANNEL so we can
+                    // verify name resolution falls back to the direct-by-id lookup.
+                    const listed = [...CHANNELS, ...extraListedChannels]
+                    const filtered = search
+                        ? listed.filter(
+                              (c) =>
+                                  c.name.toLowerCase().includes(search.toLowerCase()) ||
+                                  c.id.toLowerCase().includes(search.toLowerCase())
+                          )
+                        : listed
+                    return [
+                        200,
+                        {
+                            channels: filtered,
+                            lastRefreshedAt: '2026-01-01T00:00:00Z',
+                            has_more: false,
+                        },
+                    ]
+                },
+            },
+        })
+        initKeaTests()
+    })
+
+    afterEach(() => {
+        cleanup()
+    })
+
+    it('does not search for the composite key when the input is focused with an existing value', async () => {
+        // The saved value is the composite "id|#name" — what the picker stores after a user selection.
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker
+                    integration={INTEGRATION}
+                    value="C0B6HUH9FUH|#test-slack-notifications"
+                    onChange={jest.fn()}
+                />
+            </Provider>
+        )
+
+        // Initial useEffect-driven load — single GET /channels with empty search.
+        await waitFor(() => {
+            expect(channelsRequestSearchQueries).toEqual([''])
+        })
+
+        // Focus the picker. LemonInputSelect._onFocus auto-fills the input with the selected
+        // option's composite key, which lands in onInputChange. Before the fix this would have
+        // triggered a second GET /channels?search=C0B6HUH9FUH|#test-slack-notifications, returning
+        // zero matches and wiping the cached channel list. After the fix, no extra request fires
+        // because the val equals the currently displayed key.
+        const input = container.querySelector<HTMLInputElement>('input[data-attr="select-slack-channel"]')!
+        await userEvent.click(input)
+
+        // Give kea-loaders' debounce (300ms breakpoint on non-empty search) plus the fetch round-trip
+        // a generous buffer to fire if the guard were missing. We deliberately wait well past the
+        // breakpoint window so a slow CI runner can't produce a false negative by observing
+        // `['']` before the unwanted request lands.
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+        expect(channelsRequestSearchQueries).toEqual([''])
+    })
+
+    // The saved channel needs to be in slackChannels for LemonInputSelect's options to contain a
+    // matching key — otherwise the picker falls back to displaying the raw value text instead of
+    // "#name (id)". The by-id fetch is what feeds the channel into slackChannels regardless of
+    // bulk-list position, so it has to fire for both shapes the value can take. The lookup must
+    // also use just the id portion: sending the composite would 404 against Slack's
+    // conversations.info.
+    it.each<[string, string]>([
+        ['bare ID', 'COFFPAGE9XX'],
+        ['composite "id|#name"', 'COFFPAGE9XX|#off-page-channel'],
+    ])('directly fetches the saved channel by id on mount when value is a %s', async (_label, savedValue) => {
+        render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} value={savedValue} onChange={jest.fn()} />
+            </Provider>
+        )
+
+        await waitFor(
+            () => {
+                expect(channelIdLookups).toContain('COFFPAGE9XX')
+            },
+            { timeout: 2000 }
+        )
+        // Never forward the composite to /channels?channel_id=… — that would 404 against Slack.
+        expect(channelIdLookups).not.toContain('COFFPAGE9XX|#off-page-channel')
+    })
+
+    // The dead end this replaces: the warning was answered from a copy of the channel that no
+    // button could refresh, so inviting the app changed nothing on screen.
+    it('clears the missing-app warning when a re-check finds the app in the channel', async () => {
+        extraListedChannels = [NOT_JOINED_CHANNEL]
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker
+                    integration={INTEGRATION}
+                    value={`${NOT_JOINED_CHANNEL.id}|#${NOT_JOINED_CHANNEL.name}`}
+                    onChange={jest.fn()}
+                />
+            </Provider>
+        )
+        expect(await screen.findByText(MISSING_APP_WARNING)).toBeInTheDocument()
+
+        appJoinedTheChannel = true
+        await userEvent.click(screen.getByText('Check again'))
+
+        await waitFor(() => {
+            expect(container).not.toHaveTextContent('The PostHog Slack app is not in this channel')
+        })
+        // One live lookup of the picked channel, not a full re-enumeration of the workspace.
+        expect(forcedChannelIdLookups).toEqual([NOT_JOINED_CHANNEL.id])
+        expect(channelsRequestSearchQueries).toEqual([''])
+    })
+
+    it('resolves a saved channel name when the picker is disabled without displaying its ID', async () => {
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker
+                    integration={INTEGRATION}
+                    value={OFF_PAGE_CHANNEL.id}
+                    onChange={jest.fn()}
+                    disabled
+                />
+            </Provider>
+        )
+
+        expect(container).not.toHaveTextContent(OFF_PAGE_CHANNEL.id)
+
+        await waitFor(
+            () => {
+                expect(channelIdLookups).toContain(OFF_PAGE_CHANNEL.id)
+                expect(container).toHaveTextContent(`#${OFF_PAGE_CHANNEL.name}`)
+                expect(container).not.toHaveTextContent(OFF_PAGE_CHANNEL.id)
+            },
+            { timeout: 2000 }
+        )
+    })
+
+    it('resolves every saved channel outside the loaded page in multiple mode', async () => {
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker
+                    integration={INTEGRATION}
+                    mode="multiple"
+                    value={OFF_PAGE_CHANNELS.map((channel) => channel.id)}
+                    onChange={jest.fn()}
+                    disabled
+                />
+            </Provider>
+        )
+
+        await waitFor(() => {
+            expect(channelIdLookups).toEqual(expect.arrayContaining(OFF_PAGE_CHANNELS.map((channel) => channel.id)))
+            for (const channel of OFF_PAGE_CHANNELS) {
+                expect(container).toHaveTextContent(`#${channel.name}`)
+            }
+        })
+    })
+
+    it('does not fire a direct lookup when there is no saved value', async () => {
+        render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} onChange={jest.fn()} />
+            </Provider>
+        )
+
+        // Wait for the bulk load to finish so the test isn't racing the mount effects.
+        await waitFor(() => {
+            expect(channelsRequestSearchQueries).toEqual([''])
+        })
+        expect(channelIdLookups).toEqual([])
+    })
+
+    it('does not reload the bulk list on blur when no search has clobbered the cache', async () => {
+        // LemonInputSelect calls setInputValue('') on blur (LemonInputSelect.tsx:_onBlur), which
+        // lands in onInputChange(''). Without the hasActiveSearchRef guard the empty-val branch
+        // would unconditionally fire loadAllSlackChannels() and briefly toggle
+        // allSlackChannelsLoading true → false, flickering the "Only the first page" hint off and
+        // back on for every focus → blur cycle.
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker
+                    integration={INTEGRATION}
+                    value="C0B6HUH9FUH|#test-slack-notifications"
+                    onChange={jest.fn()}
+                />
+            </Provider>
+        )
+
+        // Wait for the initial useEffect-driven bulk load.
+        await waitFor(() => {
+            expect(channelsRequestSearchQueries).toEqual([''])
+        })
+
+        // Focus and blur the picker without typing — the user clicks into the input and then
+        // clicks somewhere else. Clicking outside triggers LemonDropdown's onClickOutside, which
+        // clears popoverFocusRef and blurs the input, so _onBlur reaches setInputValue('').
+        const input = container.querySelector<HTMLInputElement>('input[data-attr="select-slack-channel"]')!
+        await userEvent.click(input)
+        await userEvent.click(document.body)
+
+        // The empty-search load has no breakpoint, so a missed guard fires its request during the
+        // awaited click above — verified by reverting the guard. 100ms is margin for CI scheduling.
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        expect(channelsRequestSearchQueries).toEqual([''])
+    })
+
+    it('does reload the bulk list on blur after a search clobbered it', async () => {
+        // Sanity check that the guard still allows the original "user typed a search, cleared
+        // it, wants the full list back" recovery — otherwise the dropdown would stay stuck on
+        // search results after the user gave up.
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} onChange={jest.fn()} />
+            </Provider>
+        )
+        await waitFor(() => {
+            expect(channelsRequestSearchQueries).toEqual([''])
+        })
+
+        const input = container.querySelector<HTMLInputElement>('input[data-attr="select-slack-channel"]')!
+        await userEvent.click(input)
+        await userEvent.type(input, 'general')
+        await waitFor(() => expect(channelsRequestSearchQueries).toContain('general'), { timeout: 5000 })
+
+        // Now clear the input — should trigger the recovery reload (empty search) to refresh the
+        // bulk list back to the full first page.
+        await userEvent.clear(input)
+        await waitFor(
+            () => {
+                // The recovery is observable as a second empty-search request beyond the initial one.
+                expect(channelsRequestSearchQueries.filter((q) => q === '').length).toBeGreaterThanOrEqual(2)
+            },
+            { timeout: 2000 }
+        )
+    })
+
+    it('reports a dropped search when the user types a channel name and clicks away', async () => {
+        // LemonInputSelect discards typed text on blur, so without this the input silently empties
+        // itself and the user is left thinking the picker reset for no reason.
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} onChange={jest.fn()} />
+            </Provider>
+        )
+        await waitFor(() => {
+            expect(channelsRequestSearchQueries).toEqual([''])
+        })
+
+        await dropASearch(container)
+
+        expect(await screen.findByText('No channel selected. Pick one from the list.')).toBeInTheDocument()
+    })
+
+    it('selects the channel when someone pastes its id', async () => {
+        // Pasting an id is already an unambiguous choice, and the option it matches is labelled by
+        // name, so leaving it unselected asks the user to recognize a channel they only have an id for.
+        const onChange = jest.fn()
+        const { container, rerender } = render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} onChange={onChange} />
+            </Provider>
+        )
+
+        const input = container.querySelector<HTMLInputElement>('input[data-attr="select-slack-channel"]')!
+        await userEvent.click(input)
+        // Only reachable through the by-id lookup: the bulk endpoint never returns this channel.
+        await userEvent.paste(OFF_PAGE_CHANNEL.id)
+
+        await waitFor(() => expect(onChange).toHaveBeenCalledWith(`${OFF_PAGE_CHANNEL.id}|#off-page-channel`), {
+            timeout: 3000,
+        })
+        rerender(
+            <Provider>
+                <SlackChannelPicker
+                    integration={INTEGRATION}
+                    value={`${OFF_PAGE_CHANNEL.id}|#off-page-channel`}
+                    onChange={onChange}
+                />
+            </Provider>
+        )
+        expect(input).toHaveFocus()
+        expect(screen.getByText('#off-page-channel')).toBeVisible()
+        expect(screen.queryByText(/No channels found/)).not.toBeInTheDocument()
+        await userEvent.click(screen.getByText('#off-page-channel'))
+        expect(input).toHaveValue('')
+        expect(within(container).getByText('#off-page-channel')).toBeVisible()
+        expect(screen.queryByText('No channel selected. Pick one from the list.')).toBeNull()
+    })
+
+    // The by-id lookup is not instant. Clicking away while it runs must not read as a dropped
+    // search, and a paste that resolves to nothing must still say so.
+    it.each([
+        { settles: 'a channel', pastedId: OFF_PAGE_CHANNEL.id, reportsDroppedSearch: false },
+        { settles: 'nothing', pastedId: 'CNOSUCHCHAN', reportsDroppedSearch: true },
+    ])('pasting an id that settles on $settles, then clicking away', async ({ pastedId, reportsDroppedSearch }) => {
+        let releaseChannelIdLookup: () => void = () => {}
+        holdChannelIdLookup = new Promise<void>((resolve) => {
+            releaseChannelIdLookup = resolve
+        })
+        const onChange = jest.fn()
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} onChange={onChange} />
+            </Provider>
+        )
+
+        const input = container.querySelector<HTMLInputElement>('input[data-attr="select-slack-channel"]')!
+        await userEvent.click(input)
+        await userEvent.paste(pastedId)
+        await userEvent.click(document.body)
+
+        // The lookup is held in flight here, so neither outcome may show the message yet.
+        expect(screen.queryByText('No channel selected. Pick one from the list.')).toBeNull()
+        releaseChannelIdLookup()
+
+        if (reportsDroppedSearch) {
+            expect(
+                await screen.findByText('No channel selected. Pick one from the list.', undefined, { timeout: 3000 })
+            ).toBeInTheDocument()
+            expect(onChange).not.toHaveBeenCalled()
+        } else {
+            await waitFor(() => expect(onChange).toHaveBeenCalledWith(`${OFF_PAGE_CHANNEL.id}|#off-page-channel`), {
+                timeout: 3000,
+            })
+            expect(screen.queryByText('No channel selected. Pick one from the list.')).toBeNull()
+        }
+    })
+
+    it('drops the reported search when the caller swaps the workspace', async () => {
+        // Some callers swap the integration without unmounting, so an error raised against the old
+        // workspace would otherwise sit over a picker now listing a different workspace's channels.
+        const { container, rerender } = render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} onChange={jest.fn()} />
+            </Provider>
+        )
+        await dropASearch(container)
+        expect(await screen.findByText('No channel selected. Pick one from the list.')).toBeInTheDocument()
+
+        rerender(
+            <Provider>
+                <SlackChannelPicker integration={{ ...INTEGRATION, id: 2 }} onChange={jest.fn()} />
+            </Provider>
+        )
+
+        await waitFor(() => {
+            expect(screen.queryByText('No channel selected. Pick one from the list.')).toBeNull()
+        })
+    })
+
+    it('reports no dropped search when the user picks a channel from the list', async () => {
+        // Selecting an option blurs the input before it reports the new value, so the picker sees
+        // the same "blurred with typed text" signal it does for a genuine click-away.
+        const onChange = jest.fn()
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} onChange={onChange} />
+            </Provider>
+        )
+        await waitFor(() => {
+            expect(channelsRequestSearchQueries).toEqual([''])
+        })
+
+        const input = container.querySelector<HTMLInputElement>('input[data-attr="select-slack-channel"]')!
+        await userEvent.click(input)
+        await userEvent.type(input, 'general')
+        await userEvent.click(await screen.findByText('#general'))
+
+        expect(onChange).toHaveBeenCalledWith('C111111111|#general')
+        expect(screen.queryByText('No channel selected. Pick one from the list.')).toBeNull()
+    })
+
+    it('keeps selected channels when another channel is added in multiple mode', async () => {
+        const onChange = jest.fn()
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker
+                    integration={INTEGRATION}
+                    mode="multiple"
+                    value={['C0B6HUH9FUH|#test-slack-notifications']}
+                    onChange={onChange}
+                />
+            </Provider>
+        )
+        await waitFor(() => {
+            expect(channelsRequestSearchQueries).toEqual([''])
+        })
+
+        const input = container.querySelector<HTMLInputElement>('input[data-attr="select-slack-channel"]')!
+        await userEvent.click(input)
+        await userEvent.type(input, 'general')
+        await userEvent.click(await screen.findByText('#general'))
+
+        expect(onChange).toHaveBeenCalledWith(['C0B6HUH9FUH|#test-slack-notifications', 'C111111111|#general'])
+    })
+
+    it('still searches when the user actually types a different value', async () => {
+        // Render without an initial value so the input starts empty and typing isn't appended
+        // to LemonInputSelect's auto-fill of an existing selection.
+        const { container } = render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} onChange={jest.fn()} />
+            </Provider>
+        )
+        await waitFor(() => {
+            expect(channelsRequestSearchQueries).toEqual([''])
+        })
+
+        const input = container.querySelector<HTMLInputElement>('input[data-attr="select-slack-channel"]')!
+        await userEvent.click(input)
+        await userEvent.type(input, 'general')
+
+        // The typed text differs from any currently displayed key, so the server-side search fires.
+        // Timeout is generous: userEvent.type sims each keystroke, intermediate calls are cancelled
+        // by the breakpoint, and the final search waits 300ms before fetching — well within 5s.
+        await waitFor(
+            () => {
+                expect(channelsRequestSearchQueries).toContain('general')
+            },
+            { timeout: 5000 }
+        )
+    })
+})
+
+describe('SlackChannelPicker — inactive integration banner', () => {
+    // Reconnecting is an overwrite, which the API reserves for project admins. Offering the OAuth
+    // link to a member sends them through the whole flow only to be rejected on the final write.
+    beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/environments/:team_id/integrations/:id/channels': () => [
+                    400,
+                    {
+                        type: 'validation_error',
+                        code: 'slack_integration_inactive',
+                        detail: 'Your Slack connection is no longer active.',
+                    },
+                ],
+            },
+        })
+        initKeaTests()
+        teamLogic.mount()
+    })
+
+    afterEach(() => {
+        cleanup()
+    })
+
+    it.each([
+        [OrganizationMembershipLevel.Admin, true],
+        [OrganizationMembershipLevel.Member, false],
+    ])('membership level %s renders the reconnect link: %s', async (level, expectsLink) => {
+        teamLogic.actions.loadCurrentTeamSuccess({ ...MOCK_DEFAULT_TEAM, effective_membership_level: level })
+
+        render(
+            <Provider>
+                <SlackChannelPicker integration={INTEGRATION} onChange={jest.fn()} />
+            </Provider>
+        )
+
+        await waitFor(() => {
+            expect(screen.getByText(/Slack connection is no longer active/)).toBeInTheDocument()
+        })
+        expect(screen.queryByText('Reconnect Slack')).toEqual(expectsLink ? expect.anything() : null)
+        expect(screen.queryByText(/Ask a project admin/)).toEqual(expectsLink ? null : expect.anything())
+    })
+})
