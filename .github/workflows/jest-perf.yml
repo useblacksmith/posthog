@@ -13,13 +13,13 @@ jobs:
     run:
         name: paired jest (${{ matrix.chunk }}) ${{ matrix.order }} rep ${{ matrix.rep }}
         runs-on: blacksmith-4vcpu-ubuntu-2404
-        timeout-minutes: 45
+        timeout-minutes: 60
         strategy:
             fail-fast: false
             matrix:
-                order: [ab, ba]
+                order: [abc, bca, cab]
                 chunk: [1, 2, 3, 4]
-                rep: [1, 2]
+                rep: [1]
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
               with:
@@ -39,11 +39,13 @@ jobs:
                   set +e
                   cache=$(cd frontend && BLACKSMITH_JEST=0 pnpm exec jest --showConfig 2>/dev/null | grep -m1 '"cacheDirectory"' | cut -d'"' -f4)
                   echo "jest cache: $cache"
-                  for round in 1 2; do
+                  dist=$(readlink -f frontend/node_modules/@useblacksmith/jest)/dist
+                  for round in 1; do
                     for arm in $(echo "$ORDER" | grep -o .); do
                       [ -n "$cache" ] && rm -rf "$cache"
                       rm -rf frontend/node_modules/.cache/blacksmith-jest
-                      export BLACKSMITH_JEST=$([ "$arm" = b ] && echo 1 || echo 0)
+                      export BLACKSMITH_JEST=$([ "$arm" = a ] && echo 0 || echo 1)
+                      if [ "$arm" != a ]; then rm -rf "$dist"; tar xzf .bench/dist-$([ "$arm" = b ] && echo 010 || echo fix).tgz -C "$(dirname "$dist")"; fi
                       export BS_KEY="perf-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ORDER-$REP-$round"
                       t0=$(head -1 /proc/stat)
                       start=$(date +%s.%N)
