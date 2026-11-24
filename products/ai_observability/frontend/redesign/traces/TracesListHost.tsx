@@ -20,7 +20,8 @@ import { TraceDrawerHost } from '../trace/TraceDrawerHost'
 import { TraceDrawerListId } from '../trace/traceDrawerLists'
 import { TraceDrawerRowsSync, useTraceDrawerTable, useTraceFullPageHref } from '../trace/TraceDrawerRowsHost'
 import { TraceListRow } from '../trace/traceListRows'
-import { tracesTableColumns } from './components/TracesTableColumns'
+import { TracesTableCells, tracesTableColumns } from './components/TracesTableColumns'
+import { traceCellsLogic } from './traceCellsLogic'
 import { TRACES_LIST_FILTERS, tracesListLogic } from './tracesListLogic'
 
 // pinned: autocapture dashboards and tests select the list and its controls by this value and the suffixes built on it
@@ -28,8 +29,16 @@ const DATA_ATTR = 'ai-observability-traces-list'
 const LIST_ID: TraceDrawerListId = 'traces'
 const TRACE_LINK = '[data-attr="trace-name-link"]'
 
-function toRow(item: TraceListItemApi): TraceListRow {
-    return { traceId: item.id, timestamp: item.createdAt, stepId: null }
+function toRow(item: TraceListItemApi, people: TracesTableCells['people']): TraceListRow {
+    const person = people.get(item.id)
+    return {
+        traceId: item.id,
+        timestamp: item.createdAt,
+        stepId: null,
+        overview: item,
+        defaultStepId: item.defaultNodeId ?? undefined,
+        ...(person?.status === 'ready' && person.value && { person: person.value }),
+    }
 }
 
 export function TracesListHost(): JSX.Element {
@@ -40,15 +49,20 @@ export function TracesListHost(): JSX.Element {
     const { setPropertyFilters, setFilterTestAccounts, setSearchDraft, toggleQuickFilter, resetFilters } = useActions(
         listFiltersLogic(TRACES_LIST_FILTERS)
     )
+    const { previews, people, sentiments } = useValues(traceCellsLogic)
     const { dateFrom, dateTo } = useValues(shellScopeLogic)
     const { setDateRange } = useActions(shellScopeLogic)
     const { groupsTaxonomicTypes } = useValues(groupsModel)
 
     const fullPageHref = useTraceFullPageHref(LIST_ID)
-    const linkTo = useCallback((item: TraceListItemApi): string => fullPageHref(toRow(item)), [fullPageHref])
-    const columns = useMemo(() => tracesTableColumns({ linkTo }), [linkTo])
-    const drawerRows = useMemo(() => items.map(toRow), [items])
-    const { onRow } = useTraceDrawerTable(LIST_ID, TRACE_LINK, toRow)
+    const rowOf = useCallback((item: TraceListItemApi): TraceListRow => toRow(item, people), [people])
+    const linkTo = useCallback((item: TraceListItemApi): string => fullPageHref(rowOf(item)), [fullPageHref, rowOf])
+    const columns = useMemo(
+        () => tracesTableColumns({ linkTo, cells: { previews, people, sentiments } }),
+        [linkTo, previews, people, sentiments]
+    )
+    const drawerRows = useMemo(() => items.map(rowOf), [items, rowOf])
+    const { onRow } = useTraceDrawerTable(LIST_ID, TRACE_LINK, rowOf)
 
     return (
         <div className="flex flex-col gap-3">
