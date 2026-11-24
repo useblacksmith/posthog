@@ -1,0 +1,148 @@
+import pytest
+from unittest import mock
+
+from django.test.client import Client as HttpClient
+
+from rest_framework import status
+
+from posthog.api.test.test_team import create_team
+from posthog.api.test.test_user import create_user
+
+from products.batch_exports.backend.tests.api.fixtures import create_organization
+from products.batch_exports.backend.tests.api.operations import (
+    create_batch_export_ok,
+    delete_batch_export_ok,
+    list_batch_exports_ok,
+)
+
+pytestmark = [
+    pytest.mark.django_db,
+    pytest.mark.usefixtures("temporal_worker", "cleanup"),
+]
+
+
+def test_list_batch_exports(client: HttpClient, organization, team, user, s3_batch_export_data):
+    """
+    Should be able to list batch exports.
+    """
+    client.force_login(user)
+
+    first_export = create_batch_export_ok(client, team.pk, s3_batch_export_data)
+    second_export = create_batch_export_ok(client, team.pk, s3_batch_export_data)
+
+    response = list_batch_exports_ok(client, team.pk)
+    assert len(response["results"]) == 2
+
+    pages: list[str] = []
+    for offset in range(2):
+        response = client.get(f"/api/projects/{team.pk}/batch_exports?limit=1&offset={offset}")
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        page = response.json()
+        assert page["count"] == 2
+        pages.extend(result["id"] for result in page["results"])
+
+    assert page["next"] is None
+    assert page["previous"] is not None
+    assert pages == [second_export["id"], first_export["id"]]
+
+    # Deleted batch exports should not be returned.
+    delete_batch_export_ok(client, team.pk, first_export["id"])
+    response = list_batch_exports_ok(client, team.pk)
+    assert len(response["results"]) == 1
+
+    delete_batch_export_ok(client, team.pk, second_export["id"])
+    response = list_batch_exports_ok(client, team.pk)
+    assert len(response["results"]) == 0
+
+
+def test_cannot_list_batch_exports_for_other_organizations(
+    client: HttpClient, organization, team, user, s3_batch_export_data
+):
+    """
+    Should not be able to list batch exports for other teams.
+    """
+    other_organization = create_organization("Other Test Org")
+    other_team = create_team(other_organization)
+    other_user = create_user("another-test@user.com", "Another Test User", other_organization)
+
+    client.force_login(user)
+    create_batch_export_ok(client, team.pk, s3_batch_export_data)
+    create_batch_export_ok(client, team.pk, s3_batch_export_data)
+
+    # Make sure we can list batch exports for our own team.
+    response = list_batch_exports_ok(client, team.pk)
+    assert len(response["results"]) == 2
+
+    client.force_login(other_user)
+    response = list_batch_exports_ok(client, other_team.pk)
+    assert len(response["results"]) == 0
+
+
+def test_list_is_partitioned_by_team(client: HttpClient, organization, team, user, s3_batch_export_data):
+    """
+    Should be able to list batch exports for a specific team.
+    """
+    another_team = create_team(organization)
+
+    client.force_login(user)
+    create_batch_export_ok(client, team.pk, s3_batch_export_data)
+    create_batch_export_ok(client, team.pk, s3_batch_export_data)
+
+    # Make sure we can list batch exports for that team.
+    response = list_batch_exports_ok(client, team.pk)
+    assert len(response["results"]) == 2
+
+    # Make sure we can't see these batch exports for the other team.
+    response = list_batch_exports_ok(client, another_team.pk)
+    assert len(response["results"]) == 0
+
+
+@pytest.fixture
+def enable_backfilling_workflows(team):
+    with mock.patch(
+        "products.batch_exports.backend.presentation.views.batch_export.exports.posthoganalytics.feature_enabled",
+        return_value=True,
+    ) as feature_enabled:
+        yield
+
+        feature_enabled.assert_any_call(
+            "backfill-workflows-destination",
+            str(team.uuid),
+            groups={"organization": str(team.organization.id)},
+            group_properties={
+                "organization": {
+                    "id": str(team.organization.id),
+                    "created_at": team.organization.created_at,
+                }
+            },
+            send_feature_flag_events=False,
+        )
+
+
+def test_list_filters_workflows_destination(
+    client: HttpClient, organization, team, user, s3_batch_export_data, enable_backfilling_workflows
+):
+    """
+    Workflows should be filtered out from the list.
+    """
+    client.force_login(user)
+
+    realtime_destination_data = {
+        "type": "Workflows",
+        "config": {
+            "hog_function_id": "aaaa-bbbb-cccc",
+        },
+    }
+
+    realtime_batch_export_data = {
+        "name": "my-realtime-destination",
+        "destination": realtime_destination_data,
+        "interval": "hour",
+    }
+
+    create_batch_export_ok(client, team.pk, s3_batch_export_data)
+    create_batch_export_ok(client, team.pk, realtime_batch_export_data)
+
+    response = list_batch_exports_ok(client, team.pk)
+    assert len(response["results"]) == 1
+    assert response["results"][0]["destination"]["type"] == "AwsS3"

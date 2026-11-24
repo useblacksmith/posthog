@@ -1,0 +1,1318 @@
+import pytest
+from unittest.mock import MagicMock, patch
+
+from django.core.cache import cache
+
+from temporalio.exceptions import ApplicationError
+from temporalio.testing import ActivityEnvironment
+
+from posthog.models.user_integration import ReauthorizationRequired
+
+from products.tasks.backend.logic.services.agent_command import CommandResult
+from products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox import (
+    DENIED_PERMISSION_STOP_MESSAGE,
+    REFRESH_RETRY_DELAY_SECONDS,
+    RUN_STOPPING_MESSAGE,
+    SANDBOX_STOPPED_MESSAGE,
+    SEND_FOLLOWUP_MAX_ATTEMPTS,
+    STEER_DECLINED_OUTCOME,
+    TURN_IN_FLIGHT_OUTCOME,
+    LiveSandboxLookup,
+    SandboxRebindFailure,
+    SendFollowupToSandboxInput,
+    _refresh_sandbox_github,
+    _refresh_sandbox_mcp,
+    send_followup_to_sandbox,
+)
+from products.tasks.backend.temporal.process_task.utils import (
+    McpServerConfig,
+    PrAuthorshipMode,
+    UserMcpServerConfigs,
+    _sandbox_identity_cache_key,
+    get_sandbox_github_identity_user,
+    get_sandbox_mcp_session_user,
+    mark_sandbox_github_identity,
+    mark_sandbox_mcp_session,
+)
+
+pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(autouse=True)
+def _clear_session_cache():
+    """Ensure each test starts with no recorded session bindings so the
+    refresh gate doesn't carry state between tests."""
+    cache.clear()
+    yield
+    cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_sandbox_session_bookkeeping():
+    """The mocked runs here have no sandbox session rows, so the claim and activity stamps are stubbed."""
+    with (
+        patch("products.tasks.backend.logic.services.sandbox_usage.claim_task_run_sandbox_sessions"),
+        patch("products.tasks.backend.logic.services.sandbox_usage.record_task_run_user_activity"),
+    ):
+        yield
+
+
+def _run_activity(activity_input: SendFollowupToSandboxInput) -> str | None:
+    """The activity opens `HeartbeaterSync`, which needs a Temporal activity context."""
+    return ActivityEnvironment().run(send_followup_to_sandbox, activity_input)
+
+
+def _make_mcp_config(name: str = "posthog", token: str = "tok") -> McpServerConfig:
+    return McpServerConfig(
+        type="http",
+        name=name,
+        url="https://mcp.posthog.com/mcp",
+        headers=[{"name": "Authorization", "value": f"Bearer {token}"}],
+    )
+
+
+def _make_task_run_mock(team_id: int = 7, created_by_id: int | None = 42, state: dict | None = None) -> MagicMock:
+    task = MagicMock()
+    task.created_by_id = created_by_id
+    task.team_id = team_id
+    task.internal = False
+    task.stored_profile = None
+    task.origin_product = "user_created"
+    task.mcp_builtin_agent_key = None
+    task.mcp_credential_owner_id = None
+    task.mcp_gateway_server_allowlist = None
+    task.repository_integration_id = None
+    if created_by_id is not None:
+        task.created_by = MagicMock(id=created_by_id, distinct_id=f"user-{created_by_id}")
+    else:
+        task.created_by = None
+    task_run = MagicMock()
+    task_run.id = "run-1"
+    task_run.team_id = team_id
+    task_run.task = task
+    task_run.task_id = "task-1"
+    # Default to None so `(task_run.state or {}).get(...)` returns None cleanly.
+    # MagicMock auto-attributes would otherwise return further MagicMock objects
+    # and leak into kwargs passed to `get_sandbox_ph_mcp_configs`.
+    task_run.state = state
+    task_run.imported_mcp_servers = None
+    return task_run
+
+
+def _refresh(task_run, actor_id: int | None = 42, scopes="read_only", auth_token=None) -> None:
+    actor = MagicMock(id=actor_id) if actor_id is not None else None
+    _refresh_sandbox_mcp(task_run, scopes, auth_token, actor_user=actor, state=task_run.state)
+
+
+def _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh):
+    mock_oauth.return_value = "fresh-token"
+    mock_ph_configs.return_value = [_make_mcp_config(token="fresh-token")]
+    mock_user_configs.return_value = UserMcpServerConfigs(configs=[])
+    mock_send_refresh.return_value = CommandResult(success=True, status_code=200)
+
+
+@patch("products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.time.sleep")
+@patch("products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.send_refresh_session")
+@patch("products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.get_user_mcp_server_configs")
+@patch("products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.get_sandbox_ph_mcp_configs")
+@patch(
+    "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.create_oauth_access_token_for_run"
+)
+class TestRefreshSandboxMcp:
+    def test_success_path_uses_persisted_task_agent_marker(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, _sleep
+    ):
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+
+        task_run = _make_task_run_mock(state={"mcp_builtin_agent_key": "scout", "mcp_exclude_tools": ["docs-search"]})
+        task_run.task.internal = True
+        task_run.task.origin_product = "support_reply"
+        task_run.task.mcp_builtin_agent_key = "support"
+        task_run.task.mcp_credential_owner_id = 99
+        task_run.task.mcp_gateway_server_allowlist = ["srv-9"]
+        _refresh(task_run, auth_token="jwt")
+
+        mock_oauth.assert_called_once_with(task_run.task, task_run.state, scopes="read_only", run_id="run-1")
+        mock_ph_configs.assert_called_once_with(
+            token="fresh-token",
+            project_id=7,
+            scopes="read_only",
+            interaction_origin=None,
+            slack_reply_context=False,
+            task_id="task-1",
+            origin_product="support_reply",
+            exclude_tools=["docs-search"],
+        )
+        mock_user_configs.assert_called_once_with(
+            token="fresh-token",
+            team_id=7,
+            user_id=42,
+            include_personal=False,
+            interaction_origin=None,
+            slack_reply_context=False,
+            allowed_installation_ids=None,
+            origin_product="support_reply",
+            task_agent_key="support",
+            credential_owner_id=99,
+            allowed_gateway_server_ids=["srv-9"],
+            profile=None,
+        )
+        mock_send_refresh.assert_called_once()
+        _, kwargs = mock_send_refresh.call_args
+        assert kwargs["auth_token"] == "jwt"
+        assert mock_send_refresh.call_args.args[0] is task_run
+        # mcpServers payload is serialized McpServerConfig shape
+        mcp_servers = mock_send_refresh.call_args.args[1]
+        assert mcp_servers == [_make_mcp_config(token="fresh-token").to_dict()]
+
+    def test_refresh_keeps_imported_mcp_servers(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, _sleep
+    ):
+        """refresh_session replaces the session's server list wholesale; without
+        this, the run's client-imported servers vanish at the first token refresh."""
+        mock_oauth.return_value = "fresh-token"
+        mock_ph_configs.return_value = [_make_mcp_config(token="fresh-token")]
+        mock_user_configs.return_value = UserMcpServerConfigs(configs=[])
+        mock_send_refresh.return_value = CommandResult(success=True, status_code=200)
+
+        task_run = _make_task_run_mock()
+        task_run.imported_mcp_servers = [
+            {
+                "type": "http",
+                "name": "grafana",
+                "url": "https://mcp.grafana.example.com/mcp",
+                "headers": [{"name": "Authorization", "value": "Bearer x"}],
+            },
+            # collides with the PostHog MCP config: existing servers win
+            {"type": "http", "name": "posthog", "url": "https://shadow.example.com/mcp", "headers": []},
+        ]
+
+        _refresh(task_run, auth_token="jwt")
+
+        mcp_servers = mock_send_refresh.call_args.args[1]
+        assert [server["name"] for server in mcp_servers] == ["posthog", "grafana"]
+        assert mcp_servers[1] == {
+            "type": "http",
+            "name": "grafana",
+            "url": "https://mcp.grafana.example.com/mcp",
+            "headers": [{"name": "Authorization", "value": "Bearer x"}],
+        }
+
+    def test_retries_once_on_first_failure(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, mock_sleep
+    ):
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+        mock_send_refresh.side_effect = [
+            CommandResult(success=False, status_code=502, error="transient", retryable=True),
+            CommandResult(success=True, status_code=200),
+        ]
+
+        _refresh(_make_task_run_mock())
+
+        assert mock_send_refresh.call_count == 2
+        mock_sleep.assert_called_once_with(REFRESH_RETRY_DELAY_SECONDS)
+        # Marked on the successful retry → next same-actor refresh is gated.
+        assert get_sandbox_mcp_session_user("run-1") == 42
+
+    def test_two_failures_are_non_fatal_and_unmarked(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, _sleep
+    ):
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+        mock_send_refresh.return_value = CommandResult(success=False, status_code=502, error="down")
+
+        # Must not raise.
+        _refresh(_make_task_run_mock())
+
+        assert mock_send_refresh.call_count == 2
+        # Cache stays empty so the next follow-up retries the dispatch.
+        assert get_sandbox_mcp_session_user("run-1") is None
+
+    def test_token_mint_failure_is_non_fatal_and_skips_send(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, _sleep
+    ):
+        mock_oauth.side_effect = RuntimeError("oauth service down")
+
+        _refresh(_make_task_run_mock())
+
+        mock_ph_configs.assert_not_called()
+        mock_user_configs.assert_not_called()
+        mock_send_refresh.assert_not_called()
+
+    def test_skips_send_when_no_mcp_configs_resolved(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, _sleep
+    ):
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+        mock_ph_configs.return_value = []
+
+        _refresh(_make_task_run_mock())
+
+        mock_send_refresh.assert_not_called()
+        # Marked anyway: with no session to rebind, don't re-mint per message.
+        assert get_sandbox_mcp_session_user("run-1") == 42
+
+    def test_no_actor_skips_entirely(self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, _sleep):
+        # Creator-less non-Slack run: the mint is guaranteed to fail, so the
+        # refresh must not attempt (and warn) on every message.
+        _refresh(_make_task_run_mock(created_by_id=None), actor_id=None)
+
+        mock_oauth.assert_not_called()
+        mock_send_refresh.assert_not_called()
+
+    def test_scopes_propagate_to_oauth_and_configs(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, _sleep
+    ):
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+
+        _refresh(_make_task_run_mock(), scopes="full")
+
+        mock_oauth.assert_called_once_with(mock_oauth.call_args.args[0], None, scopes="full", run_id="run-1")
+        mock_ph_configs.assert_called_once_with(
+            token="fresh-token",
+            project_id=7,
+            scopes="full",
+            interaction_origin=None,
+            slack_reply_context=False,
+            task_id="task-1",
+            origin_product="user_created",
+            exclude_tools=[],
+        )
+
+    def test_transition_refresh_failure_reports_unsafe(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, _sleep
+    ):
+        # A prior actor holds the session and the new actor's refresh fails both
+        # attempts: the rebind never happened, so the gate reports unsafe (the
+        # caller fails the follow-up closed) and the previous binding is left as is.
+        mock_oauth.return_value = "fresh-token"
+        mock_ph_configs.return_value = [_make_mcp_config()]
+        mock_user_configs.return_value = UserMcpServerConfigs(configs=[])
+        mock_send_refresh.return_value = CommandResult(success=False, status_code=502, error="down")
+        mark_sandbox_mcp_session("run-1", 99)
+
+        actor = MagicMock(id=42)
+        failure = _refresh_sandbox_mcp(_make_task_run_mock(), "read_only", None, actor_user=actor, state=None)
+
+        assert failure == SandboxRebindFailure.REFRESH_SESSION_FAILED
+        assert get_sandbox_mcp_session_user("run-1") == 99
+
+    def test_unknown_binding_refresh_failure_fails_closed(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh, _sleep
+    ):
+        # No marker for this scope: the marker self-expires before the OAuth
+        # session does, so an absent one may hide the previous actor's still-live
+        # session rather than a fresh sandbox. When the refresh can't confirm the
+        # rebind, the gate reports unsafe so the caller fails closed.
+        mock_oauth.return_value = "fresh-token"
+        mock_ph_configs.return_value = [_make_mcp_config()]
+        mock_user_configs.return_value = UserMcpServerConfigs(configs=[])
+        mock_send_refresh.return_value = CommandResult(success=False, status_code=502, error="down")
+
+        actor = MagicMock(id=42)
+        failure = _refresh_sandbox_mcp(_make_task_run_mock(), "read_only", None, actor_user=actor, state=None)
+
+        assert failure == SandboxRebindFailure.REFRESH_SESSION_FAILED
+
+
+@patch("products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.send_refresh_session")
+@patch("products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.get_user_mcp_server_configs")
+@patch("products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.get_sandbox_ph_mcp_configs")
+@patch(
+    "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.create_oauth_access_token_for_run"
+)
+class TestSessionIdentityGate:
+    """One cache entry per sandbox records who the live session was last bound
+    to and expires with the freshness window — so a same-actor repeat skips,
+    while a transition, an expired entry, or a replacement sandbox refreshes."""
+
+    def test_same_actor_within_window_is_skipped(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh
+    ):
+        mark_sandbox_mcp_session("run-1", 42)
+
+        _refresh(_make_task_run_mock(), actor_id=42)
+
+        mock_oauth.assert_not_called()
+        mock_send_refresh.assert_not_called()
+
+    def test_built_in_agent_same_actor_refreshes_to_pick_up_new_grants(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh
+    ):
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+        task_run = _make_task_run_mock()
+        task_run.task.internal = True
+        task_run.task.origin_product = "support_reply"
+        task_run.task.mcp_builtin_agent_key = "support"
+        mark_sandbox_mcp_session("run-1", 42)
+
+        _refresh(task_run, actor_id=42)
+
+        mock_oauth.assert_called_once()
+        mock_user_configs.assert_called_once()
+        mock_send_refresh.assert_called_once()
+
+    def test_actor_change_bypasses_freshness_window(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh
+    ):
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+        # The session is freshly bound to the creator…
+        mark_sandbox_mcp_session("run-1", 42)
+
+        # …but the next message comes from a different actor.
+        _refresh(_make_task_run_mock(), actor_id=99)
+
+        mock_send_refresh.assert_called_once()
+        assert get_sandbox_mcp_session_user("run-1") == 99
+
+    def test_switch_back_refreshes(self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh):
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+        # The session was last bound to another user — the creator speaking
+        # again is a transition even though they spoke recently.
+        mark_sandbox_mcp_session("run-1", 99)
+
+        _refresh(_make_task_run_mock(), actor_id=42)
+
+        mock_send_refresh.assert_called_once()
+        assert get_sandbox_mcp_session_user("run-1") == 42
+
+    def test_unknown_binding_refreshes(self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh):
+        # No entry (expired window, cache eviction, pre-rollout sandbox):
+        # fail safe by refreshing rather than guessing who the session holds.
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+
+        _refresh(_make_task_run_mock(), actor_id=42)
+
+        mock_send_refresh.assert_called_once()
+        assert get_sandbox_mcp_session_user("run-1") == 42
+
+    def test_replacement_sandbox_starts_unmarked(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh
+    ):
+        _arm_success(mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh)
+        # A binding recorded against the run id (legacy scope) must not gate a
+        # run whose state now points at a concrete sandbox.
+        mark_sandbox_mcp_session("run-1", 42)
+
+        _refresh(_make_task_run_mock(state={"sandbox_id": "sb-2"}), actor_id=42)
+
+        mock_send_refresh.assert_called_once()
+        assert get_sandbox_mcp_session_user("sb-2") == 42
+        assert cache.get(_sandbox_identity_cache_key("mcp-session", "run-1")) == 42  # untouched
+
+    def test_transition_with_no_configs_fails_closed(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh
+    ):
+        # The prior actor holds the live session and the new actor resolves no MCP
+        # configs, so an empty-list refresh can neither rebind nor tear it down.
+        # Reject the turn rather than run it against the prior actor's session.
+        mock_oauth.return_value = "fresh-token"
+        mock_ph_configs.return_value = []
+        mock_user_configs.return_value = UserMcpServerConfigs(configs=[])
+        mark_sandbox_mcp_session("run-1", 99)
+
+        actor = MagicMock(id=42)
+        failure = _refresh_sandbox_mcp(_make_task_run_mock(), "read_only", None, actor_user=actor, state=None)
+
+        assert failure == SandboxRebindFailure.NO_CONFIGS_ON_TRANSITION  # fail closed: prior session may still be live
+        mock_send_refresh.assert_not_called()
+        assert get_sandbox_mcp_session_user("run-1") == 99  # binding unchanged
+
+    def test_unknown_binding_with_no_configs_runs(
+        self, mock_oauth, mock_ph_configs, mock_user_configs, mock_send_refresh
+    ):
+        # No recorded prior actor and no MCP configs to establish a session: there
+        # is nothing to leak, so the turn runs rather than being blocked just
+        # because MCP is unavailable. The binding is recorded for later transitions.
+        mock_oauth.return_value = "fresh-token"
+        mock_ph_configs.return_value = []
+        mock_user_configs.return_value = UserMcpServerConfigs(configs=[])
+
+        actor = MagicMock(id=42)
+        failure = _refresh_sandbox_mcp(_make_task_run_mock(), "read_only", None, actor_user=actor, state=None)
+
+        assert failure is None
+        mock_send_refresh.assert_not_called()
+        assert get_sandbox_mcp_session_user("run-1") == 42  # binding recorded
+
+
+_GH_MODULE = "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox"
+
+# The GitHub identity marker is keyed on the sandbox, so the write and the read below must
+# agree on one id.
+_GATE_SANDBOX_ID = "sb-gate"
+
+
+def _gate_lookup() -> LiveSandboxLookup:
+    return LiveSandboxLookup(sandbox=MagicMock(id=_GATE_SANDBOX_ID))
+
+
+@patch(f"{_GH_MODULE}.upgrade_run_to_user_authorship", return_value=None)
+@patch(f"{_GH_MODULE}.clear_github_credentials_from_sandbox")
+@patch(f"{_GH_MODULE}.apply_github_credentials_to_sandbox")
+@patch(f"{_GH_MODULE}.get_sandbox_github_token")
+@patch(f"{_GH_MODULE}._resolve_live_sandbox")
+@patch(f"{_GH_MODULE}.get_pr_authorship_mode")
+class TestSandboxGithubIdentityGate:
+    """Every turn re-establishes the sandbox's GitHub credentials for the acting user:
+    their token when they have access, otherwise a logout so no previous actor's
+    identity survives."""
+
+    def test_same_actor_is_re_established_not_skipped(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        # The actor can connect or disconnect between messages, and a resume or snapshot restore
+        # can drop the token, so an unchanged actor is not evidence the sandbox still holds it.
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.return_value = "ghu_token"
+        mock_apply.return_value = True
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 42)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) is None
+        mock_apply.assert_called_once()
+        assert mock_apply.call_args.args[2] == "ghu_token"
+        mock_clear.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "cleared, expected",
+        [(True, None), (False, SandboxRebindFailure.LOGOUT_UNCONFIRMED)],
+        ids=["cleared", "clear_unconfirmed"],
+    )
+    @pytest.mark.parametrize("state", [None, {"github_read_access": True}, {"github_token_scope": "push"}])
+    def test_gitlab_task_clears_github_credentials_left_from_github(
+        self,
+        mock_authorship,
+        mock_resolve,
+        mock_get_token,
+        mock_apply,
+        mock_clear,
+        mock_upgrade,
+        cleared,
+        expected,
+        state,
+    ):
+        # A task that moved from GitHub to GitLab while its sandbox ran can still hold the previous
+        # actor's GitHub token, so the GitLab turn clears it and fails closed when it can't.
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.return_value = "ghu_token"
+        task_run = _make_task_run_mock()
+        task_run.task.repository_integration_id = 5
+
+        with patch(f"{_GH_MODULE}.clear_github_env_from_gitlab_sandbox", return_value=cleared) as clear_env:
+            assert _refresh_sandbox_github(task_run, MagicMock(id=42), state) == expected
+
+        clear_env.assert_called_once()
+        mock_upgrade.assert_not_called()
+        mock_get_token.assert_not_called()
+        mock_apply.assert_not_called()
+        mock_clear.assert_not_called()
+
+    def test_revoked_connection_logs_the_sandbox_out_on_the_same_actor(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        # Same actor as last turn, but their install no longer mints: the cheap skip must not
+        # leave their token live in the sandbox until the refresh loop next runs.
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.return_value = None
+        mock_clear.return_value = True
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 42)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) is None
+        mock_clear.assert_called_once()
+        mock_apply.assert_not_called()
+
+    def test_a_self_revoked_connection_that_cannot_clear_fails_closed(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        # Same actor, their own connection revoked, and the clear cannot be confirmed. Deleting the
+        # integration does not revoke the token GitHub already issued, so proceeding could leave it
+        # usable in the sandbox after the user disconnected.
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.return_value = None
+        mock_clear.return_value = False
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 42)
+
+        assert (
+            _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None)
+            == SandboxRebindFailure.LOGOUT_UNCONFIRMED
+        )
+
+    def test_a_transition_that_cannot_clear_still_fails_closed(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        # A different actor inheriting the previous one's live token is the case the gate exists for.
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.return_value = None
+        mock_clear.return_value = False
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert (
+            _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None)
+            == SandboxRebindFailure.LOGOUT_UNCONFIRMED
+        )
+
+    def test_reconnecting_after_a_logout_rebinds_the_actor(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        # Revoke, then reconnect. The logout leaves the sandbox marked against this actor, and the
+        # reconnect must still be picked up — no marker check may short-circuit the rebind.
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_clear.return_value = True
+        mock_get_token.return_value = None
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 42)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) is None
+        assert get_sandbox_github_identity_user(_GATE_SANDBOX_ID) == 42
+
+        mock_get_token.return_value = "ghu_reconnected"
+        mock_apply.return_value = True
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) is None
+        mock_apply.assert_called_once()
+        assert mock_apply.call_args.args[2] == "ghu_reconnected"
+
+    @pytest.mark.parametrize(
+        "authorship,state",
+        [
+            (PrAuthorshipMode.BOT, None),
+            (PrAuthorshipMode.USER, {"github_read_access": True}),
+            (PrAuthorshipMode.BOT, {"github_read_access": True}),
+            (PrAuthorshipMode.USER, {"github_token_scope": "push"}),
+        ],
+    )
+    def test_shared_installation_credentials_skip_actor_rebinding(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade, authorship, state
+    ):
+        mock_authorship.return_value = authorship
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), state) is None
+        mock_get_token.assert_not_called()
+        mock_apply.assert_not_called()
+        mock_clear.assert_not_called()
+        if state:
+            mock_upgrade.assert_not_called()
+
+    def test_transition_with_access_rebinds(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.return_value = "ghu_newtoken"
+        mock_apply.return_value = True
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) is None
+        mock_apply.assert_called_once()
+        assert mock_apply.call_args.args[2] == "ghu_newtoken"
+        mock_clear.assert_not_called()
+        assert get_sandbox_github_identity_user(_GATE_SANDBOX_ID) == 42
+
+    def test_transition_without_access_logs_out(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.side_effect = ReauthorizationRequired("no repo access")
+        mock_clear.return_value = True
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) is None
+        mock_apply.assert_not_called()
+        mock_clear.assert_called_once()
+        # Still marked: owner-scoped refreshes read this to know the sandbox is bound away from the
+        # run owner, and must not inject the owner's token into this actor's session.
+        assert get_sandbox_github_identity_user(_GATE_SANDBOX_ID) == 42
+
+    def test_apply_failure_falls_back_to_logout(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.return_value = "ghu_newtoken"
+        mock_apply.side_effect = RuntimeError("write failed")
+        mock_clear.return_value = True
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) is None
+        mock_apply.assert_called_once()
+        mock_clear.assert_called_once()  # fell through to logout so no stale creds remain
+
+    def test_apply_incomplete_falls_back_to_logout(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        # A partial credential write (one location refused, no exception) is not a confirmed
+        # rebind: the prior actor's token may still be live in the other location, so log out
+        # rather than record the new actor.
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.return_value = "ghu_newtoken"
+        mock_apply.return_value = False
+        mock_clear.return_value = True
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) is None
+        mock_apply.assert_called_once()
+        mock_clear.assert_called_once()
+        # Still marked: owner-scoped refreshes read this to know the sandbox is bound away from the
+        # run owner, and must not inject the owner's token into this actor's session.
+        assert get_sandbox_github_identity_user(_GATE_SANDBOX_ID) == 42  # logout confirmed, bound to new actor
+
+    @pytest.mark.parametrize(
+        "lookup,expected_reason",
+        [
+            (LiveSandboxLookup(), SandboxRebindFailure.NO_SANDBOX_HANDLE),
+            (LiveSandboxLookup(stopped=True), SandboxRebindFailure.SANDBOX_NOT_RUNNING),
+        ],
+    )
+    def test_no_sandbox_handle_fails_closed(
+        self,
+        mock_authorship,
+        mock_resolve,
+        mock_get_token,
+        mock_apply,
+        mock_clear,
+        mock_upgrade,
+        lookup,
+        expected_reason,
+    ):
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = lookup
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) == expected_reason
+        mock_get_token.assert_not_called()
+        mock_apply.assert_not_called()
+        mock_clear.assert_not_called()
+        assert get_sandbox_github_identity_user(_GATE_SANDBOX_ID) == 99  # binding unchanged
+
+    def test_logout_failure_fails_closed(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        # New actor has no access and the sandbox can't even be cleared — the
+        # previous actor's creds may still be live, so fail closed.
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.side_effect = ReauthorizationRequired("no repo access")
+        mock_clear.return_value = False
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert (
+            _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None)
+            == SandboxRebindFailure.LOGOUT_UNCONFIRMED
+        )
+        assert get_sandbox_github_identity_user(_GATE_SANDBOX_ID) == 99  # binding unchanged
+
+    def test_logout_exception_fails_closed(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        # The clear itself raising (sandbox stopped/timed out between is_running and here) must
+        # fail closed, not escape uncontrolled.
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.side_effect = ReauthorizationRequired("no repo access")
+        mock_clear.side_effect = RuntimeError("sandbox stopped")
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert (
+            _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None)
+            == SandboxRebindFailure.LOGOUT_ERRORED
+        )
+        assert get_sandbox_github_identity_user(_GATE_SANDBOX_ID) == 99  # binding unchanged
+
+    def test_credential_unavailable_logs_out(
+        self, mock_authorship, mock_resolve, mock_get_token, mock_apply, mock_clear, mock_upgrade
+    ):
+        # A disconnected/deleted integration mid-run yields no usable credential (not just
+        # ReauthorizationRequired): log out rather than let the exception escape.
+        from products.tasks.backend.exceptions import CredentialUnavailableError
+
+        mock_authorship.return_value = PrAuthorshipMode.USER
+        mock_resolve.return_value = _gate_lookup()
+        mock_get_token.side_effect = CredentialUnavailableError("integration disconnected", {})
+        mock_clear.return_value = True
+        mark_sandbox_github_identity(_GATE_SANDBOX_ID, 99)
+
+        assert _refresh_sandbox_github(_make_task_run_mock(), MagicMock(id=42), None) is None
+        mock_apply.assert_not_called()
+        mock_clear.assert_called_once()
+        # Still marked: owner-scoped refreshes read this to know the sandbox is bound away from the
+        # run owner, and must not inject the owner's token into this actor's session.
+        assert get_sandbox_github_identity_user(_GATE_SANDBOX_ID) == 42
+
+
+class TestSendFollowupActivityRefreshOrdering:
+    """Refresh call must precede user_message, and the activity must succeed
+    when refresh fails (non-fatal) as long as user_message succeeds."""
+
+    @pytest.fixture
+    def _patches(self):
+        """Patch everything the activity touches at module boundary."""
+        with (
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.TaskRun"
+            ) as mock_task_run_cls,
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.create_sandbox_connection_token"
+            ) as mock_conn_token,
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._refresh_sandbox_mcp",
+                return_value=None,
+            ) as mock_refresh,
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._refresh_sandbox_github",
+                return_value=None,
+            ) as mock_refresh_github,
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.send_user_message"
+            ) as mock_user_msg,
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._write_turn_complete"
+            ),
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._write_error_and_complete"
+            ),
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.refresh_store_skills_state"
+            ) as mock_refresh_store_skills,
+        ):
+            task_run = _make_task_run_mock()
+            task_run.task.created_by = MagicMock(id=42, distinct_id="u42")
+            mock_task_run_cls.objects.select_related.return_value.get.return_value = task_run
+            mock_conn_token.return_value = "jwt"
+
+            yield {
+                "task_run": task_run,
+                "task_run_cls": mock_task_run_cls,
+                "refresh": mock_refresh,
+                "refresh_github": mock_refresh_github,
+                "user_msg": mock_user_msg,
+                "conn_token": mock_conn_token,
+                "refresh_store_skills": mock_refresh_store_skills,
+            }
+
+    def test_refresh_called_before_user_message(self, _patches):
+        call_order: list[str] = []
+
+        def _record_refresh(*a, **kw):
+            call_order.append("refresh")
+            return None  # refresh confirmed the session is safe; gate lets the turn proceed
+
+        def _record_user_msg(*a, **kw):
+            call_order.append("user_message")
+            return CommandResult(success=True, status_code=200, data={"result": {"stopReason": "end_turn"}})
+
+        _patches["refresh"].side_effect = _record_refresh
+        _patches["user_msg"].side_effect = _record_user_msg
+
+        _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", posthog_mcp_scopes="full"))
+
+        assert call_order == ["refresh", "user_message"]
+
+    @pytest.mark.parametrize(
+        "gate,reason",
+        [("refresh", "refresh_session_failed"), ("refresh_github", "logout_unconfirmed")],
+    )
+    def test_gate_rejection_names_its_reason_in_the_failure(self, _patches, gate, reason):
+        # A fail-closed follow-up raises without delivering, so the reason the gate
+        # gave is the only account of why the run stopped.
+        _patches[gate].return_value = reason
+
+        with pytest.raises(RuntimeError, match=reason):
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi"))
+
+        _patches["user_msg"].assert_not_called()
+
+    def test_a_stopped_sandbox_is_named_before_either_credential_gate_runs(self, _patches):
+        _patches["task_run"].state = {"sandbox_id": "sb-1"}
+        _patches["refresh"].return_value = SandboxRebindFailure.REFRESH_SESSION_FAILED
+
+        with (
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._resolve_live_sandbox",
+                return_value=LiveSandboxLookup(stopped=True),
+            ),
+            pytest.raises(ApplicationError) as excinfo,
+        ):
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi"))
+
+        assert str(excinfo.value) == SANDBOX_STOPPED_MESSAGE
+        assert excinfo.value.non_retryable
+        _patches["refresh"].assert_not_called()
+        _patches["user_msg"].assert_not_called()
+
+    def test_a_stopping_run_rejects_before_rebinding_credentials(self, _patches):
+        _patches["task_run"].state = {"cancel_requested_at": "2026-01-01T00:00:00+00:00"}
+
+        with pytest.raises(ApplicationError) as excinfo:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi"))
+
+        assert str(excinfo.value) == RUN_STOPPING_MESSAGE
+        assert excinfo.value.non_retryable
+        _patches["conn_token"].assert_not_called()
+        _patches["refresh"].assert_not_called()
+        _patches["refresh_github"].assert_not_called()
+        _patches["user_msg"].assert_not_called()
+
+    def test_a_cancelled_status_run_rejects_before_rebinding_credentials(self, _patches):
+        # Out-of-band cancellation sets CANCELLED without the cancel marker,
+        # so the status alone must reject the follow-up.
+        _patches["task_run"].state = {}
+        _patches["task_run"].status = _patches["task_run_cls"].Status.CANCELLED
+
+        with pytest.raises(ApplicationError) as excinfo:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi"))
+
+        assert str(excinfo.value) == RUN_STOPPING_MESSAGE
+        assert excinfo.value.non_retryable
+        _patches["conn_token"].assert_not_called()
+        _patches["refresh"].assert_not_called()
+        _patches["refresh_github"].assert_not_called()
+        _patches["user_msg"].assert_not_called()
+
+    def test_stopped_sandbox_says_so_once_instead_of_retrying(self, _patches):
+        _patches["refresh_github"].return_value = SandboxRebindFailure.SANDBOX_NOT_RUNNING
+
+        with pytest.raises(ApplicationError) as excinfo:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi"))
+
+        assert str(excinfo.value) == SANDBOX_STOPPED_MESSAGE
+        assert excinfo.value.non_retryable
+        _patches["user_msg"].assert_not_called()
+
+    def test_scopes_flow_from_input_to_refresh(self, _patches):
+        _patches["user_msg"].return_value = CommandResult(success=True, status_code=200)
+
+        _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", posthog_mcp_scopes="full"))
+
+        _patches["refresh"].assert_called_once()
+        args, _kwargs = _patches["refresh"].call_args
+        assert args[0] is _patches["task_run"]
+        assert args[1] == "full"
+        assert args[2] == "jwt"
+
+    def test_payload_actor_pins_resolution_over_run_state(self, _patches):
+        # A concurrent follow-up (or permission response) may overwrite the
+        # run-state actor between queueing and delivery; the message's own
+        # sender must win.
+        _patches["user_msg"].return_value = CommandResult(success=True, status_code=200)
+        _patches["task_run"].state = {"interaction_origin": "slack", "slack_actor_user_id": 42}
+
+        with patch(
+            "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.get_task_run_credential_user"
+        ) as mock_resolve:
+            mock_resolve.return_value = MagicMock(id=99)
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", actor_user_id=99))
+
+        resolved_state = mock_resolve.call_args.args[1]
+        assert resolved_state["slack_actor_user_id"] == 99
+
+    def test_slack_delivery_stamps_turn_actor(self, _patches):
+        # The durable run-state actor must move at turn boundaries: delivery
+        # persists this message's sender so between-turn consumers (reply
+        # tagging, credential refresh) follow the executing turn.
+        _patches["user_msg"].return_value = CommandResult(success=True, status_code=200)
+        _patches["task_run"].state = {"interaction_origin": "slack", "slack_actor_user_id": 42}
+
+        order: list[str] = []
+        _patches["refresh_store_skills"].side_effect = lambda *args, **kwargs: order.append("store_skills")
+        _patches["refresh"].side_effect = lambda *args, **kwargs: order.append("mcp")
+
+        with patch(
+            "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.get_task_run_credential_user"
+        ) as mock_resolve:
+            new_actor = MagicMock(id=99)
+            mock_resolve.return_value = new_actor
+            _run_activity(
+                SendFollowupToSandboxInput(
+                    run_id="run-1", message="hi", actor_user_id=99, context={"actor_slack_user_id": "U_BOB"}
+                )
+            )
+
+        _patches["task_run_cls"].update_state_atomic.assert_any_call(
+            _patches["task_run"].id,
+            updates={"slack_actor_user_id": 99, "slack_actor_slack_user_id": "U_BOB"},
+        )
+        # The MCP refresh makes the sandbox re-read the run, so the new actor's skills go in first.
+        _patches["refresh_store_skills"].assert_called_once_with(
+            _patches["task_run"], new_actor, reason="slack_actor_change"
+        )
+        assert order == ["store_skills", "mcp"]
+
+    @pytest.mark.parametrize("actor_user_id, locks", [(99, True), (42, False)])
+    def test_non_slack_delivery_stamps_only_the_memory_lock(self, _patches, actor_user_id, locks):
+        _patches["user_msg"].return_value = CommandResult(success=True, status_code=200)
+
+        _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", actor_user_id=actor_user_id))
+
+        if locks:
+            _patches["task_run_cls"].update_state_atomic.assert_called_once_with(
+                "run-1", updates={"agent_memory_locked": True}
+            )
+        else:
+            _patches["task_run_cls"].update_state_atomic.assert_not_called()
+        _patches["refresh_store_skills"].assert_not_called()
+
+    def test_a_failed_lock_write_fails_the_delivery_before_the_message_is_sent(self, _patches):
+        _patches["task_run_cls"].update_state_atomic.side_effect = RuntimeError("database unavailable")
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", actor_user_id=99))
+
+        _patches["user_msg"].assert_not_called()
+
+    def test_default_scope_is_read_only(self, _patches):
+        _patches["user_msg"].return_value = CommandResult(success=True, status_code=200)
+
+        _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi"))
+
+        args, _kwargs = _patches["refresh"].call_args
+        assert args[1] == "read_only"
+
+    def test_steer_from_different_actor_declines_before_using_credentials(self, _patches):
+        _patches["task_run"].state = {"sandbox_id": "sandbox-1"}
+        _patches["task_run"].task.created_by_id = 42
+
+        outcome = _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", actor_user_id=99, steer=True))
+
+        assert outcome == STEER_DECLINED_OUTCOME
+        _patches["conn_token"].assert_not_called()
+        _patches["refresh"].assert_not_called()
+        _patches["user_msg"].assert_not_called()
+
+
+class TestSendFollowupTurnTimeout:
+    """A read timeout (turn_in_flight) means the message was delivered and the
+    turn is still running — the activity must not fail the run or write stream
+    markers. A 504 *response* leaves delivery unknown and must retry; any other
+    delivery failure stays fatal."""
+
+    @pytest.fixture
+    def _patches(self):
+        with (
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.TaskRun"
+            ) as mock_task_run_cls,
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.create_sandbox_connection_token"
+            ) as mock_conn_token,
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._refresh_sandbox_mcp",
+                return_value=None,
+            ),
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._refresh_sandbox_github",
+                return_value=None,
+            ),
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.send_user_message"
+            ) as mock_user_msg,
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._write_turn_complete"
+            ) as mock_turn_complete,
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._write_error_and_complete"
+            ) as mock_error,
+        ):
+            task_run = _make_task_run_mock()
+            task_run.task.created_by = MagicMock(id=42, distinct_id="u42")
+            mock_task_run_cls.objects.select_related.return_value.get.return_value = task_run
+            denial_state: dict[str, object] = {}
+
+            def mutate_state(_run_id, mutator):
+                mutator(denial_state)
+                return denial_state
+
+            mock_task_run_cls.mutate_state_atomic.side_effect = mutate_state
+            mock_conn_token.return_value = "jwt"
+
+            yield {
+                "task_run": task_run,
+                "task_run_cls": mock_task_run_cls,
+                "denial_state": denial_state,
+                "user_msg": mock_user_msg,
+                "turn_complete": mock_turn_complete,
+                "error": mock_error,
+            }
+
+    def test_read_timeout_is_non_fatal_and_writes_no_markers(self, _patches):
+        # Regression: a turn longer than FOLLOWUP_TIMEOUT_SECONDS used to fail
+        # the run and destroy a healthy sandbox mid-work.
+        _patches["user_msg"].return_value = CommandResult(
+            success=False, status_code=504, error="Sandbox request timed out", retryable=True, turn_in_flight=True
+        )
+
+        outcome = _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi"))
+
+        assert outcome == TURN_IN_FLIGHT_OUTCOME
+        _patches["error"].assert_not_called()
+        _patches["turn_complete"].assert_not_called()
+
+    def test_retryable_failure_retries_without_sentinel(self, _patches):
+        _patches["user_msg"].return_value = CommandResult(
+            success=False, status_code=502, error="Connection to sandbox failed", retryable=True
+        )
+
+        with pytest.raises(ApplicationError, match="retryable failure") as exc_info:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        assert exc_info.value.non_retryable is False
+        _patches["error"].assert_not_called()
+        _patches["turn_complete"].assert_not_called()
+
+    def test_pi_retryable_failure_writes_sentinel_on_its_only_attempt(self, _patches):
+        _patches["user_msg"].return_value = CommandResult(
+            success=False, status_code=502, error="Connection to sandbox failed", retryable=True
+        )
+
+        with pytest.raises(ApplicationError, match="send_followup failed") as exc_info:
+            _run_activity(
+                SendFollowupToSandboxInput(
+                    run_id="run-1",
+                    message="hi",
+                    message_id="m-1",
+                    max_attempts=1,
+                )
+            )
+
+        assert exc_info.value.non_retryable is True
+        _patches["error"].assert_called_once()
+        _patches["turn_complete"].assert_not_called()
+
+    def test_retryable_stream_error_final_attempt_writes_actionable_sentinel(self, _patches):
+        _patches["user_msg"].return_value = CommandResult(
+            success=False,
+            status_code=200,
+            error="Internal error: API Error: Content block not found",
+            retryable=True,
+        )
+
+        with (
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._current_attempt",
+                return_value=SEND_FOLLOWUP_MAX_ATTEMPTS,
+            ),
+            pytest.raises(ApplicationError, match="The model response could not be completed") as exc_info,
+        ):
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        assert exc_info.value.non_retryable is True
+        _patches["error"].assert_called_once_with(
+            "run-1",
+            "The model response could not be completed. Please retry the task.",
+            False,
+            False,
+            "user_created",
+        )
+        _patches["turn_complete"].assert_not_called()
+
+    def test_turn_that_ended_without_a_response_is_redelivered(self, _patches):
+        _patches["user_msg"].return_value = CommandResult(
+            success=False,
+            status_code=200,
+            error="Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+            retryable=True,
+        )
+
+        with pytest.raises(ApplicationError, match="retryable failure") as exc_info:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        assert exc_info.value.non_retryable is False
+        _patches["error"].assert_not_called()
+
+    def test_a_later_steer_race_is_still_redelivered_after_an_earlier_denial(self, _patches):
+        _patches["task_run"].state = {}
+        _patches["user_msg"].return_value = CommandResult(
+            success=False,
+            status_code=200,
+            error="Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+            retryable=True,
+        )
+        _patches["denial_state"].update(
+            {
+                "slack_permission_rejected": True,
+                "slack_permission_rejected_request_id": "req-1",
+                "followup_denial_brake_request_id": "req-1",
+            }
+        )
+
+        with pytest.raises(ApplicationError, match="retryable failure") as exc_info:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        assert exc_info.value.non_retryable is False
+        _patches["error"].assert_not_called()
+
+    def test_a_denial_recorded_during_the_turn_is_not_redelivered(self, _patches):
+        _patches["task_run"].state = {}
+        _patches["user_msg"].return_value = CommandResult(
+            success=False,
+            status_code=200,
+            error="Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+            retryable=True,
+        )
+        _patches["denial_state"].update(
+            {"slack_permission_rejected": True, "slack_permission_rejected_request_id": "req-1"}
+        )
+
+        with pytest.raises(ApplicationError) as exc_info:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        assert exc_info.value.non_retryable is True
+        _patches["error"].assert_called_once()
+        assert _patches["denial_state"]["followup_denial_brake_request_id"] == "req-1"
+
+    def test_a_denied_turn_tells_the_user_why_it_stopped(self, _patches):
+        _patches["task_run"].state = {}
+        _patches["user_msg"].return_value = CommandResult(
+            success=False,
+            status_code=200,
+            error="Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+            retryable=True,
+        )
+        _patches["denial_state"].update(
+            {"slack_permission_rejected": True, "slack_permission_rejected_request_id": "req-1"}
+        )
+
+        with pytest.raises(ApplicationError, match="ede_diagnostic") as exc_info:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        assert exc_info.value.non_retryable is True
+        _patches["error"].assert_called_once_with("run-1", DENIED_PERMISSION_STOP_MESSAGE, False, False, "user_created")
+
+    def test_a_steer_never_claims_the_denial_that_ended_its_turn(self, _patches):
+        _patches["denial_state"].update(
+            {"slack_permission_rejected": True, "slack_permission_rejected_request_id": "req-1"}
+        )
+        _patches["user_msg"].return_value = CommandResult(
+            success=False,
+            status_code=200,
+            error="Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+            retryable=True,
+        )
+
+        with (
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.get_sandbox_mcp_session_user",
+                return_value=42,
+            ),
+            pytest.raises(ApplicationError, match="retryable failure") as steer_failure,
+        ):
+            _run_activity(
+                SendFollowupToSandboxInput(
+                    run_id="run-1", message="wait", message_id="m-steer", actor_user_id=42, steer=True
+                )
+            )
+        with pytest.raises(ApplicationError) as base_failure:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-base"))
+
+        assert steer_failure.value.non_retryable is False
+        assert base_failure.value.non_retryable is True
+        assert _patches["denial_state"]["followup_denial_brake_request_id"] == "req-1"
+
+    def test_two_deliveries_failing_on_one_denial_only_brake_once(self, _patches):
+        # A steer joins the turn the denial ends, so the base delivery and the steer come back
+        # on the same diagnostic. Only the racer that claims the denial may brake; the other
+        # has to stay retryable or its message is the one that disappears.
+        _patches["denial_state"].update(
+            {"slack_permission_rejected": True, "slack_permission_rejected_request_id": "req-1"}
+        )
+        _patches["user_msg"].return_value = CommandResult(
+            success=False,
+            status_code=200,
+            error="Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+            retryable=True,
+        )
+
+        verdicts = []
+        for message_id in ("m-1", "m-2"):
+            with pytest.raises(ApplicationError) as exc_info:
+                _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id=message_id))
+            verdicts.append(exc_info.value.non_retryable)
+
+        assert verdicts == [True, False]
+
+    def test_response_504_retries_without_sentinel(self, _patches):
+        # Regression: a genuine 504 *response* (tunnel gateway timeout,
+        # delivery unknown) used to be conflated with the read-timeout case
+        # and silently treated as delivered — losing the user's message.
+        _patches["user_msg"].return_value = CommandResult(
+            success=False, status_code=504, error="Sandbox returned 504", retryable=True
+        )
+
+        with pytest.raises(ApplicationError, match="delivery unknown") as exc_info:
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        assert exc_info.value.non_retryable is False
+        _patches["error"].assert_not_called()
+        _patches["turn_complete"].assert_not_called()
+
+    def test_response_504_final_attempt_writes_sentinel_and_fails(self, _patches):
+        _patches["user_msg"].return_value = CommandResult(
+            success=False, status_code=504, error="Sandbox returned 504", retryable=True
+        )
+
+        with (
+            patch(
+                "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox._current_attempt",
+                return_value=SEND_FOLLOWUP_MAX_ATTEMPTS,
+            ),
+            pytest.raises(ApplicationError, match="send_followup failed") as exc_info,
+        ):
+            _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        assert exc_info.value.non_retryable is True
+        _patches["error"].assert_called_once()
+        _patches["turn_complete"].assert_not_called()
+
+    def test_duplicate_delivery_skips_markers(self, _patches):
+        # A retried attempt whose message the agent-server already accepted
+        # must not write a synthetic turn_complete — the turn is still running
+        # and the event stream owns its completion.
+        _patches["user_msg"].return_value = CommandResult(
+            success=True,
+            status_code=200,
+            data={"result": {"duplicate": True, "stopReason": "duplicate_delivery"}},
+        )
+
+        _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        _patches["error"].assert_not_called()
+        _patches["turn_complete"].assert_not_called()
+
+    def test_declined_steer_returns_for_normal_requeue_without_markers(self, _patches):
+        _patches["task_run"].state = {"sandbox_id": "sandbox-1"}
+        _patches["user_msg"].return_value = CommandResult(
+            success=True,
+            status_code=200,
+            data={"result": {"steered": False, "stopReason": STEER_DECLINED_OUTCOME}},
+        )
+
+        with patch(
+            "products.tasks.backend.temporal.process_task.activities.send_followup_to_sandbox.get_sandbox_mcp_session_user",
+            return_value=42,
+        ):
+            outcome = _run_activity(
+                SendFollowupToSandboxInput(
+                    run_id="run-1",
+                    message="hi",
+                    message_id="m-1",
+                    actor_user_id=42,
+                    steer=True,
+                )
+            )
+
+        assert outcome == STEER_DECLINED_OUTCOME
+        _patches["user_msg"].assert_called_once()
+        _patches["error"].assert_not_called()
+        _patches["turn_complete"].assert_not_called()
+
+    def test_message_id_forwarded_to_sandbox(self, _patches):
+        _patches["user_msg"].return_value = CommandResult(success=True, status_code=200)
+
+        _run_activity(SendFollowupToSandboxInput(run_id="run-1", message="hi", message_id="m-1"))
+
+        _, kwargs = _patches["user_msg"].call_args
+        assert kwargs["message_id"] == "m-1"

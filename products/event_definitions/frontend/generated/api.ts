@@ -1,0 +1,403 @@
+import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * To modify these types, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+import type {
+    BulkUpdateTagsUUIDRequestApi,
+    BulkUpdateTagsUUIDResponseApi,
+    EnterpriseEventDefinitionApi,
+    EnterpriseEventDefinitionRequestApi,
+    EventDefinitionBulkUpdateVerifiedRequestApi,
+    EventDefinitionBulkUpdateVerifiedResponseApi,
+    EventDefinitionRecordApi,
+    EventDefinitionsByNameRetrieveParams,
+    EventDefinitionsGolangRetrieveParams,
+    EventDefinitionsListParams,
+    EventDefinitionsPrimaryPropertiesRetrieveParams,
+    EventDefinitionsTypescriptRetrieveParams,
+    GeneratedDefinitionsApi,
+    GeneratedGolangDefinitionsApi,
+    PaginatedEnterpriseEventDefinitionListApi,
+    PatchedEnterpriseEventDefinitionApi,
+    PrimaryPropertiesResponseApi,
+} from './api.schemas'
+
+// https://stackoverflow.com/questions/49579094/typescript-conditional-types-filter-out-readonly-properties-pick-only-requir/49579497#49579497
+type IfEquals<X, Y, A = X, B = never> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2 ? A : B
+
+type WritableKeys<T> = {
+    [P in keyof T]-?: IfEquals<{ [Q in P]: T[P] }, { -readonly [Q in P]: T[P] }, P>
+}[keyof T]
+
+type UnionToIntersection<U> = (U extends any ? (k: U) => void : never) extends (k: infer I) => void ? I : never
+type DistributeReadOnlyOverUnions<T> = T extends any ? NonReadonly<T> : never
+
+type Writable<T> = Pick<T, WritableKeys<T>>
+type NonReadonly<T> = [T] extends [UnionToIntersection<T>]
+    ? {
+          [P in keyof Writable<T>]: T[P] extends object ? NonReadonly<NonNullable<T[P]>> : T[P]
+      }
+    : DistributeReadOnlyOverUnions<T>
+
+export const getEventDefinitionsListUrl = (projectId: string, params?: EventDefinitionsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/event_definitions/?${stringifiedParams}`
+        : `/api/projects/${projectId}/event_definitions/`
+}
+
+/**
+ * List the event definitions of a project. On projects with more than 50000 event definitions, `count` stops at 10000 and `count_is_capped` is true, unless the request sets `search`, `exclude_stale`, `verified`, `names`, `tags` or `event_type=event_posthog`. Projects with more than 100000 event definitions also default to ordering by name under the same condition.
+ */
+export const eventDefinitionsList = async (
+    projectId: string,
+    params?: EventDefinitionsListParams,
+    options?: RequestInit
+): Promise<PaginatedEnterpriseEventDefinitionListApi> => {
+    return apiMutator<PaginatedEnterpriseEventDefinitionListApi>(getEventDefinitionsListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getEventDefinitionsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/event_definitions/`
+}
+
+export const eventDefinitionsCreate = async (
+    projectId: string,
+    enterpriseEventDefinitionRequestApi: NonReadonly<EnterpriseEventDefinitionRequestApi>,
+    options?: RequestInit
+): Promise<EnterpriseEventDefinitionApi> => {
+    return apiMutator<EnterpriseEventDefinitionApi>(getEventDefinitionsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(enterpriseEventDefinitionRequestApi),
+    })
+}
+
+export const getEventDefinitionsRetrieveUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/event_definitions/${id}/`
+}
+
+export const eventDefinitionsRetrieve = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<EnterpriseEventDefinitionApi> => {
+    return apiMutator<EnterpriseEventDefinitionApi>(getEventDefinitionsRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getEventDefinitionsUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/event_definitions/${id}/`
+}
+
+export const eventDefinitionsUpdate = async (
+    projectId: string,
+    id: string,
+    enterpriseEventDefinitionRequestApi: NonReadonly<EnterpriseEventDefinitionRequestApi>,
+    options?: RequestInit
+): Promise<EnterpriseEventDefinitionApi> => {
+    return apiMutator<EnterpriseEventDefinitionApi>(getEventDefinitionsUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(enterpriseEventDefinitionRequestApi),
+    })
+}
+
+export const getEventDefinitionsPartialUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/event_definitions/${id}/`
+}
+
+export const eventDefinitionsPartialUpdate = async (
+    projectId: string,
+    id: string,
+    patchedEnterpriseEventDefinitionApi?: NonReadonly<PatchedEnterpriseEventDefinitionApi>,
+    options?: RequestInit
+): Promise<EnterpriseEventDefinitionApi> => {
+    return apiMutator<EnterpriseEventDefinitionApi>(getEventDefinitionsPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedEnterpriseEventDefinitionApi),
+    })
+}
+
+export const getEventDefinitionsDestroyUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/event_definitions/${id}/`
+}
+
+export const eventDefinitionsDestroy = async (projectId: string, id: string, options?: RequestInit): Promise<void> => {
+    return apiMutator<void>(getEventDefinitionsDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getEventDefinitionsMetricsRetrieveUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/event_definitions/${id}/metrics/`
+}
+
+export const eventDefinitionsMetricsRetrieve = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getEventDefinitionsMetricsRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getEventDefinitionsStopIngestingCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/event_definitions/${id}/stop_ingesting/`
+}
+
+/**
+ * Drop new events with this name at ingestion, then hide the definition and schedule its delete.
+ *
+ * Adds an exact event name condition to the live event filter of each environment in the
+ * project, because the definition is shared by all of them. This never makes a team's own
+ * filter conditions live: if a filter is in dry run or turned off, or can't take one more
+ * condition, the request fails and nothing changes. Dropped events can't be recovered.
+ */
+export const eventDefinitionsStopIngestingCreate = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<EventDefinitionRecordApi> => {
+    return apiMutator<EventDefinitionRecordApi>(getEventDefinitionsStopIngestingCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getEventDefinitionsBulkUpdateTagsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/event_definitions/bulk_update_tags/`
+}
+
+/**
+ * Add, remove, or replace tags across multiple event definitions in one request.
+ *
+ * Overrides ``TaggedItemViewSetMixin.bulk_update_tags``, which assumes integer PKs and runs
+ * object-level access-control filtering. Event definitions use UUID PKs and are not an
+ * object-level access-controlled resource — project membership (enforced by the viewset) is
+ * the only boundary, matching the single-object update path — so this scopes by project and
+ * skips the per-object editor check. Tags live on the base ``EventDefinition`` row, so it
+ * operates there regardless of the enterprise extension.
+ */
+export const eventDefinitionsBulkUpdateTagsCreate = async (
+    projectId: string,
+    bulkUpdateTagsUUIDRequestApi: BulkUpdateTagsUUIDRequestApi,
+    options?: RequestInit
+): Promise<BulkUpdateTagsUUIDResponseApi> => {
+    return apiMutator<BulkUpdateTagsUUIDResponseApi>(getEventDefinitionsBulkUpdateTagsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(bulkUpdateTagsUUIDRequestApi),
+    })
+}
+
+export const getEventDefinitionsBulkUpdateVerifiedCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/event_definitions/bulk_update_verified/`
+}
+
+/**
+ * Mark multiple event definitions as verified or unverified in one request.
+ *
+ * In the same vein as ``bulk_update_tags``, but ``verified`` lives on the enterprise
+ * ``EnterpriseEventDefinition`` extension rather than the base row, so this action:
+ * - requires an enterprise license;
+ * - scopes by project (``team__project_id``) and relies on project membership — the same
+ *   boundary the single-object update path uses — rather than object-level RBAC;
+ * - lazily promotes ingestion-created base rows to ``EnterpriseEventDefinition`` (mirroring
+ *   ``_get_event_definition``) before setting ``verified``;
+ * - mirrors the single-object semantics: verifying stamps ``verified_by``/``verified_at`` and
+ *   unhides the event (an event cannot be both hidden and verified); unverifying clears them;
+ * - logs a "changed" activity per event so the History tab matches the single-object path.
+ *
+ * Events already in the target state are skipped (not re-written, not logged).
+ */
+export const eventDefinitionsBulkUpdateVerifiedCreate = async (
+    projectId: string,
+    eventDefinitionBulkUpdateVerifiedRequestApi: EventDefinitionBulkUpdateVerifiedRequestApi,
+    options?: RequestInit
+): Promise<EventDefinitionBulkUpdateVerifiedResponseApi> => {
+    return apiMutator<EventDefinitionBulkUpdateVerifiedResponseApi>(
+        getEventDefinitionsBulkUpdateVerifiedCreateUrl(projectId),
+        {
+            ...options,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(eventDefinitionBulkUpdateVerifiedRequestApi),
+        }
+    )
+}
+
+export const getEventDefinitionsByNameRetrieveUrl = (
+    projectId: string,
+    params: EventDefinitionsByNameRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/event_definitions/by_name/?${stringifiedParams}`
+        : `/api/projects/${projectId}/event_definitions/by_name/`
+}
+
+/**
+ * Get event definition by exact name
+ */
+export const eventDefinitionsByNameRetrieve = async (
+    projectId: string,
+    params: EventDefinitionsByNameRetrieveParams,
+    options?: RequestInit
+): Promise<EventDefinitionRecordApi> => {
+    return apiMutator<EventDefinitionRecordApi>(getEventDefinitionsByNameRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getEventDefinitionsGolangRetrieveUrl = (
+    projectId: string,
+    params?: EventDefinitionsGolangRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/event_definitions/golang/?${stringifiedParams}`
+        : `/api/projects/${projectId}/event_definitions/golang/`
+}
+
+export const eventDefinitionsGolangRetrieve = async (
+    projectId: string,
+    params?: EventDefinitionsGolangRetrieveParams,
+    options?: RequestInit
+): Promise<GeneratedGolangDefinitionsApi> => {
+    return apiMutator<GeneratedGolangDefinitionsApi>(getEventDefinitionsGolangRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getEventDefinitionsPrimaryPropertiesRetrieveUrl = (
+    projectId: string,
+    params?: EventDefinitionsPrimaryPropertiesRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/event_definitions/primary_properties/?${stringifiedParams}`
+        : `/api/projects/${projectId}/event_definitions/primary_properties/`
+}
+
+/**
+ * Resolve team-configured primary properties for event definitions.
+ *
+ * The response only contains entries where a non-null primary_property is set on the
+ * EventDefinition. Callers should fall back to the core taxonomy defaults client-side
+ * for names not present in the response.
+ */
+export const eventDefinitionsPrimaryPropertiesRetrieve = async (
+    projectId: string,
+    params?: EventDefinitionsPrimaryPropertiesRetrieveParams,
+    options?: RequestInit
+): Promise<PrimaryPropertiesResponseApi> => {
+    return apiMutator<PrimaryPropertiesResponseApi>(
+        getEventDefinitionsPrimaryPropertiesRetrieveUrl(projectId, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getEventDefinitionsPythonRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/event_definitions/python/`
+}
+
+export const eventDefinitionsPythonRetrieve = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<GeneratedDefinitionsApi> => {
+    return apiMutator<GeneratedDefinitionsApi>(getEventDefinitionsPythonRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getEventDefinitionsTypescriptRetrieveUrl = (
+    projectId: string,
+    params?: EventDefinitionsTypescriptRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/event_definitions/typescript/?${stringifiedParams}`
+        : `/api/projects/${projectId}/event_definitions/typescript/`
+}
+
+export const eventDefinitionsTypescriptRetrieve = async (
+    projectId: string,
+    params?: EventDefinitionsTypescriptRetrieveParams,
+    options?: RequestInit
+): Promise<GeneratedDefinitionsApi> => {
+    return apiMutator<GeneratedDefinitionsApi>(getEventDefinitionsTypescriptRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}

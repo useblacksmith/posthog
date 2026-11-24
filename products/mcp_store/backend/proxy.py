@@ -1,0 +1,790 @@
+import json
+from collections.abc import Iterator
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+from django.http import HttpResponse, StreamingHttpResponse
+from django.http.response import HttpResponseBase
+from django.utils import timezone
+
+import httpx
+import structlog
+
+from posthog.api.streaming import sse_streaming_response
+from posthog.security.pinned_httpx import pinned_client
+from posthog.security.pinned_requests import SSRFBlockedError
+from posthog.security.url_validation import is_url_allowed
+from posthog.settings import SERVER_GATEWAY_INTERFACE
+
+from ee.hogai.utils.asgi import SyncIterableToAsync
+
+from .borrowed_credential import BORROWED_POSTHOG_CREDENTIAL_DETAIL, BorrowedCredentialRefused, is_posthog_connection
+from .models import MCPAuditEvent, MCPGatewayServer, MCPServerInstallation, MCPServerInstallationTool
+from .oauth import TokenRefreshError, TokenRefreshRejectedError, is_token_expiring, refresh_installation_token
+from .policy import GatewayCaller, PolicyContext, legacy_state_for_caller
+from .url_policy import resolve_mcp_url_policy, trust_environment_proxy
+
+logger = structlog.get_logger(__name__)
+
+UPSTREAM_TIMEOUT = 180
+MAX_PROXY_BODY_SIZE = 1_048_576  # 1 MB
+MAX_UPSTREAM_RESPONSE_SIZE = 8 * 1024 * 1024
+MAX_LOGGED_MISSING_TOOLS = 20
+REDIRECT_STATUS_CODES = {301, 302, 307, 308}
+
+# JSON-RPC error codes used by per-tool approval enforcement. -32000..-32099 is
+# the implementation-defined server-error range; we deliberately use distinct
+# codes so clients can tell "needs approval" apart from "disabled" apart from
+# the batch-level rejection, which is not tied to any individual item.
+TOOL_NEEDS_APPROVAL_CODE = -32001
+TOOL_DISABLED_CODE = -32002
+BATCH_REJECTED_CODE = -32000
+METHOD_NOT_FOUND_CODE = -32601
+
+
+def _normalized_origin(url: str) -> tuple[str, str, int | None] | None:
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        if parsed.scheme == "https":
+            port = 443
+        elif parsed.scheme == "http":
+            port = 80
+    return parsed.scheme, (parsed.hostname or "").lower(), port
+
+
+def validated_same_origin_redirect_url(original_url: str, response: httpx.Response) -> str | None:
+    """Return a safe redirect target for MCP URL canonicalization, or None.
+
+    MCP servers commonly redirect `/mcp` to `/mcp/`. Retrying with credentials is
+    only safe when the redirect stays on exactly the same origin; SSRF-safe is
+    not the same as credential-safe.
+    """
+    if response.status_code not in REDIRECT_STATUS_CODES:
+        return None
+
+    location = response.headers.get("location")
+    if not location:
+        return None
+
+    redirect_url = urljoin(original_url, location)
+    original_origin = _normalized_origin(original_url)
+    redirect_origin = _normalized_origin(redirect_url)
+    if not original_origin or not redirect_origin or original_origin != redirect_origin:
+        logger.warning(
+            "Upstream MCP redirect rejected: target is cross-origin",
+            original_url=original_url,
+            redirect_url=redirect_url,
+        )
+        return None
+
+    allowed, reason = is_url_allowed(redirect_url)
+    if not allowed:
+        logger.warning(
+            "Upstream MCP redirect rejected by SSRF protection",
+            original_url=original_url,
+            redirect_url=redirect_url,
+            reason=reason,
+        )
+        return None
+
+    return redirect_url
+
+
+def send_mcp_request_with_same_origin_redirect(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    content: bytes | None = None,
+    stream: bool = False,
+) -> tuple[httpx.Response, str]:
+    request_kwargs: dict[str, Any] = {"headers": headers}
+    if content is not None:
+        request_kwargs["content"] = content
+
+    upstream_request = client.build_request(method, url, **request_kwargs)
+    upstream_response = client.send(upstream_request, stream=stream)
+
+    redirect_url = validated_same_origin_redirect_url(url, upstream_response)
+    if not redirect_url:
+        return upstream_response, url
+
+    upstream_response.close()
+    redirected_request = client.build_request(method, redirect_url, **request_kwargs)
+    return client.send(redirected_request, stream=stream), redirect_url
+
+
+def build_upstream_auth_headers(installation: MCPServerInstallation, *, borrowed: bool = False) -> dict[str, str]:
+    """`borrowed` marks a caller other than the credential's owner. BorrowedCredentialRefused is raised when that
+    caller would act with a PostHog credential."""
+    headers = _owner_auth_headers(installation)
+    if borrowed and _is_posthog_connection(installation, headers):
+        raise BorrowedCredentialRefused(BORROWED_POSTHOG_CREDENTIAL_DETAIL)
+    return headers
+
+
+def is_posthog_installation(installation: MCPServerInstallation) -> bool:
+    return _is_posthog_connection(installation, _owner_auth_headers(installation))
+
+
+def borrowed_refusal_detail(installation: MCPServerInstallation, *, borrowed: bool) -> str | None:
+    """The message for a caller who may not use this connection, or None when the call may go ahead."""
+    return BORROWED_POSTHOG_CREDENTIAL_DETAIL if borrowed and is_posthog_installation(installation) else None
+
+
+def _is_posthog_connection(installation: MCPServerInstallation, auth_headers: dict[str, str]) -> bool:
+    return is_posthog_connection(
+        installation.url, auth_headers.get("Authorization", "").removeprefix("Bearer ") or None
+    )
+
+
+def is_borrowed_by(installation: MCPServerInstallation, caller: GatewayCaller | None) -> bool:
+    return caller is None or caller.kind != "member" or caller.user_id != installation.user_id
+
+
+def _owner_auth_headers(installation: MCPServerInstallation) -> dict[str, str]:
+    sensitive = installation.sensitive_configuration or {}
+
+    if installation.auth_type == "api_key":
+        api_key = sensitive.get("api_key")
+        if not api_key:
+            return {}
+        return {"Authorization": f"Bearer {api_key}"}
+
+    if installation.auth_type == "oauth":
+        access_token = installation.upstream_access_token()
+        if not access_token:
+            return {}
+        return {"Authorization": f"Bearer {access_token}"}
+
+    return {}
+
+
+def ensure_valid_token(installation: MCPServerInstallation) -> None:
+    if not is_token_expiring(installation.sensitive_configuration or {}):
+        return
+    refresh_installation_token(installation)
+
+
+def validate_installation_auth(
+    installation: MCPServerInstallation,
+) -> tuple[bool, HttpResponse | None]:
+    """Validate that the installation has valid auth credentials.
+
+    Returns (True, None) if auth is valid, or (False, error_response) if not.
+    """
+    if not installation.is_enabled:
+        logger.warning(
+            "Proxy auth failed: server is disabled",
+            installation_id=str(installation.id),
+            url=installation.url,
+        )
+        return False, HttpResponse(
+            '{"error": "Server is disabled"}',
+            content_type="application/json",
+            status=403,
+        )
+
+    sensitive = installation.sensitive_configuration or {}
+
+    if sensitive.get("needs_reauth"):
+        logger.warning(
+            "Proxy auth failed: needs re-authentication", installation_id=str(installation.id), url=installation.url
+        )
+        return False, HttpResponse(
+            '{"error": "Installation needs re-authentication"}',
+            content_type="application/json",
+            status=401,
+        )
+
+    if installation.auth_type == "oauth":
+        if not installation.upstream_access_token():
+            logger.warning(
+                "Proxy auth failed: no OAuth credentials", installation_id=str(installation.id), url=installation.url
+            )
+            return False, HttpResponse(
+                '{"error": "No credentials configured"}',
+                content_type="application/json",
+                status=401,
+            )
+        try:
+            ensure_valid_token(installation)
+        except TokenRefreshRejectedError:
+            # refresh_installation_token has flagged the installation, unless a concurrent
+            # request had already replaced the credential the provider turned down. Say the
+            # refresh was rejected either way rather than leaving the caller to read a
+            # permanent failure as a retryable one.
+            logger.warning("OAuth token refresh rejected", installation_id=str(installation.id))
+            return False, HttpResponse(
+                '{"error": "Installation needs re-authentication"}',
+                content_type="application/json",
+                status=401,
+            )
+        except TokenRefreshError:
+            logger.warning("OAuth token refresh failed", installation_id=str(installation.id))
+            return False, HttpResponse(
+                '{"error": "Authentication failed"}',
+                content_type="application/json",
+                status=401,
+            )
+
+    if installation.auth_type == "api_key" and not sensitive.get("api_key"):
+        logger.warning(
+            "Proxy auth failed: no API key configured", installation_id=str(installation.id), url=installation.url
+        )
+        return False, HttpResponse(
+            '{"error": "No credentials configured"}',
+            content_type="application/json",
+            status=401,
+        )
+
+    return True, None
+
+
+def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def _is_tools_call(item: Any) -> bool:
+    return isinstance(item, dict) and item.get("method") == "tools/call"
+
+
+def _gateway_decision(policy_context: PolicyContext, tool: MCPServerInstallationTool) -> tuple[str, bool]:
+    """Map a resolved policy onto an audit decision and whether to block.
+
+    approved via the caller's own scope (or a legacy per-installation approval)
+    reads as a human having approved it; approved via team baseline/rule is
+    auto. needs_approval blocks at the proxy — approval happens in PostHog, not
+    inline — and is recorded as pending."""
+    resolved = policy_context.resolve(tool.tool_name, tool.annotations)
+    if resolved.state == "do_not_use":
+        return "blocked", True
+    if resolved.state == "needs_approval":
+        return "pending", True
+    if resolved.decided_by in ("scope", "legacy"):
+        return "approved", False
+    return "auto", False
+
+
+def resolve_call_decision(
+    tool: MCPServerInstallationTool,
+    policy_context: PolicyContext | None,
+    *,
+    caller_owns_installation: bool,
+) -> tuple[str, str | None]:
+    """Decide one tool call outside the JSON-RPC proxy path.
+
+    Returns ``(audit_decision, block_reason)`` where ``block_reason`` is None when
+    the call may proceed, else one of ``"removed"``, ``"needs_approval"`` or
+    ``"disabled"``. Shares :func:`_gateway_decision` with the proxy so policy
+    resolution cannot diverge between the two entry points; the proxy keeps its own
+    JSON-RPC error mapping because its wire format is fixed by the MCP spec.
+    """
+    if tool.removed_at is not None:
+        return "blocked", "removed"
+
+    if policy_context is not None:
+        decision, blocked = _gateway_decision(policy_context, tool)
+        if not blocked:
+            return decision, None
+        return decision, "needs_approval" if decision == "pending" else "disabled"
+
+    # Pre-gateway installations fall back to the cached per-tool approval flag.
+    state = legacy_state_for_caller(tool.approval_state, caller_owns_installation=caller_owns_installation)
+    if state == "approved":
+        return "approved", None
+    if state == "needs_approval":
+        return "pending", "needs_approval"
+    return "blocked", "disabled"
+
+
+def record_tool_call_audit(
+    installation: MCPServerInstallation,
+    gateway_server: MCPGatewayServer,
+    caller: GatewayCaller,
+    actor_label: str,
+    tool_name: str,
+    decision: str,
+) -> None:
+    """Audit a single tool call. Same writer the proxy uses, one entry at a time."""
+    _write_audit_events(installation, gateway_server, caller, actor_label, [(tool_name, decision)])
+
+
+def _evaluate_tool_call(
+    tools_by_name: dict[str, MCPServerInstallationTool],
+    item: dict[str, Any],
+    policy_context: PolicyContext | None,
+    audit_entries: list[tuple[str, str]] | None,
+    *,
+    caller_owns_installation: bool,
+) -> dict[str, Any] | None:
+    """Check a single JSON-RPC item against the installation's tool approval state.
+
+    Returns a JSON-RPC error object to send back (short-circuiting the upstream
+    call), or ``None`` to let the call pass through. With a ``policy_context``,
+    the effective state comes from the gateway policy engine instead of the raw
+    per-installation approval flag, and each decision is appended to
+    ``audit_entries`` as ``(tool_name, decision)``.
+    """
+    if not _is_tools_call(item):
+        return None
+
+    params = item.get("params") or {}
+    tool_name = params.get("name") if isinstance(params, dict) else None
+    request_id = item.get("id")
+
+    if not tool_name or not isinstance(tool_name, str):
+        return _jsonrpc_error(request_id, METHOD_NOT_FOUND_CODE, "tools/call missing 'name' parameter")
+
+    tool = tools_by_name.get(tool_name)
+    if tool is None:
+        return _jsonrpc_error(
+            request_id,
+            METHOD_NOT_FOUND_CODE,
+            f"Tool '{tool_name}' is not registered for this installation",
+        )
+
+    if tool.removed_at is not None:
+        return _jsonrpc_error(
+            request_id,
+            METHOD_NOT_FOUND_CODE,
+            f"Tool '{tool_name}' is no longer available on the upstream server",
+        )
+
+    if policy_context is not None:
+        decision, blocked = _gateway_decision(policy_context, tool)
+        if audit_entries is not None:
+            audit_entries.append((tool_name, decision))
+        if not blocked:
+            return None
+        if decision == "pending":
+            return _jsonrpc_error(
+                request_id,
+                TOOL_NEEDS_APPROVAL_CODE,
+                f"Tool '{tool_name}' requires approval before it can be called",
+            )
+        return _jsonrpc_error(
+            request_id,
+            TOOL_DISABLED_CODE,
+            f"Tool '{tool_name}' is blocked by team policy",
+        )
+
+    state = legacy_state_for_caller(tool.approval_state, caller_owns_installation=caller_owns_installation)
+    if state == "approved":
+        return None
+    if state == "needs_approval":
+        return _jsonrpc_error(
+            request_id,
+            TOOL_NEEDS_APPROVAL_CODE,
+            f"Tool '{tool_name}' requires approval before it can be called",
+        )
+    if state == "do_not_use":
+        return _jsonrpc_error(
+            request_id,
+            TOOL_DISABLED_CODE,
+            f"Tool '{tool_name}' has been disabled by the user",
+        )
+    return None
+
+
+def _requested_tool_names(data: dict[str, Any] | list[Any]) -> set[str]:
+    names: set[str] = set()
+    for item in data if isinstance(data, list) else [data]:
+        if not _is_tools_call(item):
+            continue
+        params = item.get("params") or {}
+        name = params.get("name") if isinstance(params, dict) else None
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _unresolvable_tool_names(tools: dict[str, MCPServerInstallationTool], requested: set[str]) -> set[str]:
+    """The requested names no live row answers. A row marked removed counts as a
+    miss, so a tool the upstream server brings back is picked up by a re-listing."""
+    return {name for name in requested if tools.get(name) is None or tools[name].removed_at is not None}
+
+
+def _tools_by_name(installation: MCPServerInstallation, requested: set[str]) -> dict[str, MCPServerInstallationTool]:
+    """The installation's tool rows, re-listed from upstream on a miss.
+
+    These rows are the policy registry rather than a performance cache: a call
+    whose tool has no row cannot be resolved against policy, so it is refused.
+    An installation whose connect-time listing never landed therefore refuses
+    every call until a person presses "Refresh tools". Re-listing once on a miss
+    repairs that without waiting for them, and covers a tool the upstream server
+    renamed after the last listing.
+    """
+    tools = {t.tool_name: t for t in installation.tools.all()}
+    if not _unresolvable_tool_names(tools, requested):
+        return tools
+
+    from .tools import resync_installation_tools  # noqa: PLC0415 — tools.py imports this module
+
+    if resync_installation_tools(installation):
+        tools = {t.tool_name: t for t in installation.tools.all()}
+    missing = _unresolvable_tool_names(tools, requested)
+    if missing:
+        logger.warning(
+            "MCP tool call refers to an unregistered tool",
+            installation_id=str(installation.id),
+            url=installation.url,
+            # A batch carries as many names as the body allows, and the size limit
+            # is checked further down, so log a sample rather than all of them.
+            missing_tools=sorted(missing)[:MAX_LOGGED_MISSING_TOOLS],
+            missing_tool_count=len(missing),
+            registered_tool_count=len(tools),
+        )
+    return tools
+
+
+def enforce_tool_approval(
+    installation: MCPServerInstallation,
+    data: dict[str, Any] | list[Any],
+    policy_context: PolicyContext | None = None,
+    audit_entries: list[tuple[str, str]] | None = None,
+    *,
+    caller_user_id: int | None,
+) -> HttpResponse | None:
+    """Inspect a JSON-RPC body and short-circuit tools/call that isn't approved.
+
+    Returns an HttpResponse when at least one tool call is blocked, or None to
+    pass the request through unchanged. Non-tools/call methods are always
+    passed through; unknown tool names return a JSON-RPC method-not-found error
+    without hitting the upstream server.
+    """
+    caller_owns_installation = caller_user_id is not None and caller_user_id == installation.user_id
+    if isinstance(data, list):
+        if not any(_is_tools_call(item) for item in data):
+            return None
+        # Pre-fetch the installation's tools once to avoid N queries on batched tools/call.
+        tools_by_name = _tools_by_name(installation, _requested_tool_names(data))
+        responses: list[dict[str, Any]] = []
+        any_blocked = False
+        any_passthrough = False
+        for item in data:
+            blocked = _evaluate_tool_call(
+                tools_by_name, item, policy_context, audit_entries, caller_owns_installation=caller_owns_installation
+            )
+            if blocked is not None:
+                responses.append(blocked)
+                any_blocked = True
+            else:
+                any_passthrough = True
+        # Mixed batches (some blocked, some passthrough) can't be safely split
+        # without reshuffling responses. Reject the whole batch so clients retry
+        # individual calls — this matches the spec's guidance to keep batches atomic.
+        # Use a batch-level code rather than TOOL_NEEDS_APPROVAL_CODE: passthrough
+        # items like tools/list have no per-item approval concept, so signaling
+        # "approval needed" on them would mislead client retry logic.
+        if any_blocked and any_passthrough:
+            if audit_entries is not None:
+                audit_entries[:] = [entry for entry in audit_entries if entry[1] in ("blocked", "pending")]
+            return HttpResponse(
+                json.dumps(
+                    [
+                        _jsonrpc_error(
+                            (item.get("id") if isinstance(item, dict) else None),
+                            BATCH_REJECTED_CODE,
+                            "Batch rejected: it contains a tool call that requires approval or is disabled; "
+                            "send items individually",
+                        )
+                        for item in data
+                    ]
+                ),
+                content_type="application/json",
+                status=200,
+            )
+        if any_blocked:
+            return HttpResponse(json.dumps(responses), content_type="application/json", status=200)
+        return None
+
+    if not _is_tools_call(data):
+        return None
+    tools_by_name = _tools_by_name(installation, _requested_tool_names(data))
+    blocked = _evaluate_tool_call(
+        tools_by_name, data, policy_context, audit_entries, caller_owns_installation=caller_owns_installation
+    )
+    if blocked is None:
+        return None
+    return HttpResponse(json.dumps(blocked), content_type="application/json", status=200)
+
+
+def _write_audit_events(
+    installation: MCPServerInstallation,
+    gateway_server: MCPGatewayServer,
+    caller: GatewayCaller,
+    actor_label: str,
+    entries: list[tuple[str, str]],
+    credential_owner_id: int | None = None,
+    grant_scope: str = "",
+) -> None:
+    """Best-effort audit trail — a failed insert must never break the proxy."""
+    try:
+        MCPAuditEvent.objects.for_team(gateway_server.team_id, canonical=True).bulk_create(
+            [
+                MCPAuditEvent(
+                    team_id=gateway_server.team_id,
+                    gateway_server=gateway_server,
+                    installation=installation,
+                    actor_user_id=caller.user_id,
+                    actor_service_account_id=caller.service_account_id,
+                    actor_label=actor_label,
+                    credential_owner_id=credential_owner_id,
+                    grant_scope=grant_scope,
+                    server_name=gateway_server.name,
+                    tool_name=tool_name,
+                    decision=decision,
+                )
+                for tool_name, decision in entries
+            ]
+        )
+        if any(decision in ("auto", "approved") for _, decision in entries):
+            MCPServerInstallation.objects.filter(pk=installation.pk).update(last_used_at=timezone.now())
+    except Exception:
+        logger.exception("Failed to write MCP gateway audit events", installation_id=str(installation.id))
+
+
+_PROXY_OWNED_HEADERS = frozenset({"x-posthog-mcp-mode", "x-posthog-mcp-store"})
+_BORROWED_PROXY_OWNED_HEADERS = _PROXY_OWNED_HEADERS | {"x-posthog-project-id", "x-posthog-organization-id"}
+
+
+def proxy_mcp_request(
+    request: Any,
+    installation: MCPServerInstallation,
+    *,
+    caller: GatewayCaller | None = None,
+    gateway_server: MCPGatewayServer | None = None,
+    actor_label: str = "",
+    credential_owner_id: int | None = None,
+    grant_scope: str = "",
+) -> HttpResponseBase:
+    """Forward one MCP request upstream, enforcing tool policy and auditing it.
+
+    `credential_owner_id` and `grant_scope` describe the agent grant the call
+    rides, so the audit trail answers whose connection an agent used. Both are
+    empty for member calls, where the actor already is the credential owner.
+    """
+    verdict = resolve_mcp_url_policy(installation.url, installation.team_id)
+    if not verdict.allowed:
+        logger.warning("SSRF: blocked proxy request", url=installation.url, reason=verdict.reason)
+        return HttpResponse(
+            json.dumps({"error": f"URL not allowed: {verdict.reason}"}),
+            content_type="application/json",
+            status=400,
+        )
+
+    data = request.data
+    if not data or not isinstance(data, (dict, list)):
+        logger.warning("Proxy request rejected: invalid request body", url=installation.url)
+        return HttpResponse(
+            '{"error": "Request body must be valid JSON"}',
+            content_type="application/json",
+            status=400,
+        )
+
+    borrowed = is_borrowed_by(installation, caller)
+    refusal_detail = borrowed_refusal_detail(installation, borrowed=borrowed)
+
+    policy_context: PolicyContext | None = None
+    audit_entries: list[tuple[str, str]] = []
+    if gateway_server is not None and caller is not None:
+        policy_context = PolicyContext(
+            team_id=installation.team_id,
+            caller=caller,
+            gateway_server=gateway_server,
+            installation=installation,
+        )
+
+    enforcement_response: HttpResponse | None = None
+    if refusal_detail is not None:
+        # The tool policy is skipped because resolving an unregistered tool lists tools upstream with the
+        # owner's credential. The audit trail still keeps each attempted call, as blocked.
+        audit_entries = [(tool_name, "blocked") for tool_name in sorted(_requested_tool_names(data))]
+    else:
+        enforcement_response = enforce_tool_approval(
+            installation,
+            data,
+            policy_context,
+            audit_entries,
+            caller_user_id=caller.user_id if caller is not None and caller.kind == "member" else None,
+        )
+    if gateway_server is not None and caller is not None and audit_entries:
+        _write_audit_events(
+            installation,
+            gateway_server,
+            caller,
+            actor_label,
+            audit_entries,
+            credential_owner_id=credential_owner_id,
+            grant_scope=grant_scope,
+        )
+    if refusal_detail is not None:
+        return HttpResponse(json.dumps({"error": refusal_detail}), content_type="application/json", status=403)
+    if enforcement_response:
+        return enforcement_response
+
+    body = json.dumps(data).encode()
+
+    if len(body) > MAX_PROXY_BODY_SIZE:
+        logger.warning("Proxy request rejected: body too large", url=installation.url, body_size=len(body))
+        return HttpResponse(
+            '{"error": "Request body too large"}',
+            content_type="application/json",
+            status=413,
+        )
+
+    try:
+        auth_headers = build_upstream_auth_headers(installation, borrowed=borrowed)
+    except BorrowedCredentialRefused as exc:
+        return HttpResponse(json.dumps({"error": str(exc)}), content_type="application/json", status=403)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        **auth_headers,
+    }
+
+    owned_headers = _BORROWED_PROXY_OWNED_HEADERS if borrowed else _PROXY_OWNED_HEADERS
+    for header_name in request.headers:
+        if header_name.lower().startswith("x-posthog-") and header_name.lower() not in owned_headers:
+            headers[header_name] = request.headers[header_name]
+
+    # Store policy must see leaf tools, and shared credentials must not expand nested connectors.
+    headers["x-posthog-mcp-mode"] = "tools"
+    headers["x-posthog-mcp-store"] = "true"
+
+    mcp_session_id = request.headers.get("mcp-session-id")
+    if mcp_session_id:
+        headers["Mcp-Session-Id"] = mcp_session_id
+
+    client = pinned_client(
+        installation.url,
+        verdict.pinned_ips,
+        timeout=UPSTREAM_TIMEOUT,
+        total_timeout=UPSTREAM_TIMEOUT,
+        max_response_bytes=MAX_UPSTREAM_RESPONSE_SIZE,
+        trust_env=trust_environment_proxy(installation.url, installation.team_id),
+    )
+    try:
+        upstream_response, upstream_url = send_mcp_request_with_same_origin_redirect(
+            client,
+            "POST",
+            installation.url,
+            content=body,
+            headers=headers,
+            stream=True,
+        )
+    except (SSRFBlockedError, httpx.ProxyError):
+        client.close()
+        logger.warning("Upstream MCP connection blocked by URL or proxy policy")
+        return HttpResponse(
+            '{"error": "Upstream MCP connection blocked. Ask an administrator to check the outbound proxy configuration."}',
+            content_type="application/json",
+            status=502,
+        )
+    except httpx.ConnectError:
+        client.close()
+        logger.warning("Upstream MCP server unreachable", url=installation.url)
+        return HttpResponse(
+            '{"error": "Upstream MCP server unreachable"}',
+            content_type="application/json",
+            status=502,
+        )
+    except httpx.TimeoutException:
+        client.close()
+        logger.warning("Upstream MCP server timed out", url=installation.url)
+        return HttpResponse(
+            '{"error": "Upstream MCP server timed out"}',
+            content_type="application/json",
+            status=502,
+        )
+    except httpx.DecodingError:
+        client.close()
+        return _rejected_upstream_response(installation.url)
+    except Exception:
+        client.close()
+        raise
+
+    content_type = upstream_response.headers.get("content-type", "")
+
+    if "text/event-stream" in content_type:
+        return _build_sse_response(upstream_response, client)
+
+    try:
+        upstream_response.read()
+    except httpx.TimeoutException:
+        logger.warning("Upstream MCP server timed out", url=upstream_url)
+        return HttpResponse(
+            '{"error": "Upstream MCP server timed out"}',
+            content_type="application/json",
+            status=502,
+        )
+    except httpx.DecodingError:
+        return _rejected_upstream_response(upstream_url)
+    finally:
+        client.close()
+
+    if upstream_response.status_code >= 400:
+        logger.warning(
+            "Upstream MCP server returned error",
+            url=upstream_url,
+            status_code=upstream_response.status_code,
+            response_body=upstream_response.text[:500] if upstream_response.text else "",
+        )
+
+    response = HttpResponse(
+        upstream_response.content,
+        content_type=upstream_response.headers.get("content-type", "application/json"),
+        status=upstream_response.status_code,
+    )
+
+    upstream_session_id = upstream_response.headers.get("mcp-session-id")
+    if upstream_session_id:
+        response["Mcp-Session-Id"] = upstream_session_id
+
+    return response
+
+
+def _rejected_upstream_response(url: str) -> HttpResponse:
+    # The bounded transport raises DecodingError for bodies over the size limit and for compressed bodies.
+    logger.warning("Upstream MCP response rejected", url=url)
+    return HttpResponse(
+        '{"error": "Upstream MCP response rejected"}',
+        content_type="application/json",
+        status=502,
+    )
+
+
+def _stream_upstream(upstream_response: httpx.Response, client: httpx.Client) -> Iterator[bytes]:
+    try:
+        yield from upstream_response.iter_bytes(4096)
+    except (httpx.TimeoutException, httpx.DecodingError):
+        logger.warning("Upstream MCP stream ended at the response limit", url=str(upstream_response.url))
+    finally:
+        upstream_response.close()
+        client.close()
+
+
+def _build_sse_response(upstream_response: httpx.Response, client: httpx.Client) -> HttpResponseBase:
+    stream = _stream_upstream(upstream_response, client)
+    astream = SyncIterableToAsync(stream) if SERVER_GATEWAY_INTERFACE == "ASGI" else stream
+    response = sse_streaming_response(astream, endpoint="mcp_store_proxy")
+
+    if not isinstance(response, StreamingHttpResponse):
+        # Over-cap rejection: the generator that owns these resources never
+        # starts, so its finally never runs. Close them here (both closes are
+        # idempotent) instead of leaking them until the upstream timeout.
+        upstream_response.close()
+        client.close()
+        return response
+
+    upstream_session_id = upstream_response.headers.get("mcp-session-id")
+    if upstream_session_id:
+        response["Mcp-Session-Id"] = upstream_session_id
+
+    return response

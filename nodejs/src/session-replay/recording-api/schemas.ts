@@ -1,0 +1,76 @@
+import { z } from 'zod'
+
+import { RetentionPeriodToDaysMap } from '~/ingestion/pipelines/sessionreplay/shared/constants'
+
+// Schema for positive integer string (e.g., "123" -> 123)
+const positiveIntString = (fieldName: string) =>
+    z
+        .string({ error: `Missing ${fieldName} parameter` })
+        .regex(/^\d+$/, `Invalid ${fieldName} parameter`)
+        .transform(Number)
+        .pipe(z.number().positive(`Invalid ${fieldName} parameter`))
+
+// Schema for non-negative integer string (e.g., "0" -> 0, "123" -> 123)
+const nonNegativeIntString = (fieldName: string) =>
+    z
+        .string({ error: `Missing ${fieldName} query parameter` })
+        .regex(/^\d+$/, `Invalid ${fieldName} query parameter`)
+        .transform(Number)
+        .pipe(z.number().nonnegative())
+
+// Shared schema for recording path params
+export const RecordingParamsSchema = z.object({
+    team_id: positiveIntString('team_id'),
+    session_id: z.string({ error: 'Missing session_id parameter' }).min(1, 'Invalid session_id parameter'),
+})
+
+// Path params for the browser block route. A ref is short, so the length cap only rejects junk early.
+export const ReplayBlockParamsSchema = RecordingParamsSchema.extend({
+    viewer: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/, 'Invalid viewer'),
+    ref: z.string().regex(/^v1\.[A-Za-z0-9_-]{1,1024}$/, 'Invalid block ref'),
+})
+
+// Path params with team_id only (no session_id)
+export const TeamParamsSchema = z.object({
+    team_id: positiveIntString('team_id'),
+})
+
+// Mirrored by MAX_RECORDINGS_PER_BULK_DELETE in posthog/session_recordings/session_recording_api.py — keep in sync.
+const MAX_DELETE_SESSION_IDS = 100
+
+// Body schema for delete requests
+export const DeleteRecordingsBodySchema = z.object({
+    session_ids: z
+        .array(z.string().min(1, 'Invalid session_id'))
+        .min(1, 'session_ids must not be empty')
+        .max(MAX_DELETE_SESSION_IDS, `Too many session_ids (max ${MAX_DELETE_SESSION_IDS})`),
+    deleted_by: z.string().min(1, 'Missing deleted_by').max(254),
+})
+
+const MAX_ENCRYPT_BLOCKS = 100
+const VALID_RETENTION_DAYS = new Set(Object.values(RetentionPeriodToDaysMap))
+
+export const EncryptBlocksBodySchema = z.object({
+    // Base64 of each compressed plaintext block, encrypted in order.
+    blocks: z
+        .array(z.base64('Invalid block encoding'))
+        .min(1, 'blocks must not be empty')
+        .max(MAX_ENCRYPT_BLOCKS, `Too many blocks (max ${MAX_ENCRYPT_BLOCKS})`),
+    retention_days: z.number().refine((d) => VALID_RETENTION_DAYS.has(d), 'Invalid retention_days'),
+})
+
+// Static schema for getBlock query params (validates structure only)
+export const GetBlockQuerySchema = z
+    .object({
+        key: z.string({ error: 'Missing key query parameter' }).min(1, 'Invalid key query parameter'),
+        start_byte: nonNegativeIntString('start_byte'),
+        end_byte: nonNegativeIntString('end_byte'),
+        decompress: z
+            .enum(['true', 'false', '1', '0'])
+            .optional()
+            .transform((v) => v === 'true' || v === '1'),
+    })
+    .refine((data) => data.start_byte <= data.end_byte, {
+        message: 'start_byte must be less than or equal to end_byte',
+        path: ['start_byte'],
+    })

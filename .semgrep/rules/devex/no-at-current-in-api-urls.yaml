@@ -1,0 +1,56 @@
+rules:
+    - id: no-at-current-in-api-urls
+      message: |
+          `@current` in an API path resolves to the project or organization the
+          user last opened, in any tab or device. A call that sends it can act on
+          a different project than the one on screen, and the API is retiring it.
+
+          Pass the explicit ID instead: `currentProjectId` from `projectLogic`,
+          `currentTeamId` from `teamLogic`, or `currentOrganization?.id` from
+          `organizationLogic`. Each is null until loaded, so skip the call until
+          then rather than falling back to `'@current'`. Avoid
+          `teamLogic.currentProjectId`, `teamLogic.currentTeamIdStrict` and
+          `organizationLogic.currentOrganizationId`: they return `'@current'`
+          before the data loads.
+
+          This covers URLs and IDs passed to generated API clients, such as
+          `fooRetrieve('@current')`. `personal_api_keys/@current` names the key
+          itself and is allowed. A few bootstrap files and the toolbar are
+          exempted in paths.exclude below.
+      languages: [typescript, javascript]
+      severity: ERROR
+      paths:
+          include:
+              - 'frontend/'
+              - 'products/*/frontend/'
+          exclude:
+              # tests and fixtures legitimately exercise the `@current` route
+              - '**/*.test.ts'
+              - '**/*.test.tsx'
+              - '**/*.spec.ts'
+              - '**/e2e/**'
+              - '**/test/**'
+              - '**/__tests__/**'
+              - '**/*.stories.tsx'
+              - '**/*.stories.ts'
+              - '**/__mocks__/**'
+              - '**/mocks/**'
+              # toolbar runs in third-party page context — separate concern
+              - '/frontend/src/toolbar/'
+              # documented bootstrap exceptions: explicit ID isn't loaded yet
+              - '/frontend/src/scenes/teamLogic.tsx'
+              - '/frontend/src/scenes/organizationLogic.tsx'
+              - '/frontend/src/scenes/projectLogic.ts'
+      patterns:
+          # Any string or template literal with an `@current` path segment: URLs
+          # handed to api/fetch/combineUrl, `<img src>` URLs, and IDs passed to
+          # generated clients or used as a fallback (`org?.id ?? '@current'`).
+          - pattern: '"$S"'
+          - metavariable-regex:
+                metavariable: $S
+                regex: '^(.*/)?@current([/?#].*)?$'
+          - pattern-not-regex: 'personal_api_keys/@current'
+      metadata:
+          category: best-practice
+          subcategory:
+              - audit

@@ -1,0 +1,459 @@
+import {
+  ArrowsSplit,
+  CaretDown,
+  Check,
+  Cloud,
+  Cube,
+  Laptop,
+  Plus,
+  Star,
+} from "@phosphor-icons/react";
+import {
+  Button,
+  cn,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemMedia,
+  ItemMenuItem,
+  ItemTitle,
+  MenuLabel,
+} from "@posthog/quill";
+import type { Adapter, WorkspaceMode } from "@posthog/shared";
+import { useAdapterSubscription } from "@posthog/ui/features/settings/adapterSubscription";
+import { openSettings } from "@posthog/ui/features/settings/hooks/useOpenSettings";
+import { useHostCapabilities } from "@posthog/ui/shell/useHostCapabilities";
+import { useCallback, useMemo, useRef, useState } from "react";
+import {
+  type CloudTarget,
+  type CloudTargetOption,
+  cloudTargetKey,
+  DEFAULT_CLOUD_TARGET,
+} from "../cloudTargets";
+import { useCloudModeEnabled } from "../hooks/useCloudModeEnabled";
+import { useCloudTargetOptions } from "../hooks/useCloudTarget";
+import { CloudGithubSetupDialog } from "./CloudGithubSetupDialog";
+
+export type { WorkspaceMode };
+
+const SUBSCRIPTION_IN_USE_LABEL: Record<Adapter, string> = {
+  codex: "Using Codex subscription",
+  claude: "Using Claude subscription",
+};
+
+interface WorkspaceModeSelectProps {
+  value: WorkspaceMode;
+  onChange: (mode: WorkspaceMode) => void;
+  size?: "1" | "2";
+  disabled?: boolean;
+  overrideModes?: WorkspaceMode[];
+  adapter?: Adapter;
+  cloudTarget?: CloudTarget;
+  onCloudTargetChange?: (target: CloudTarget) => void;
+  hasGithubIntegration?: boolean;
+  isLoadingGithubIntegration?: boolean;
+}
+
+const LOCAL_MODES: {
+  mode: WorkspaceMode;
+  label: string;
+  description: string;
+  icon: React.ReactNode;
+}[] = [
+  {
+    mode: "local",
+    label: "Local",
+    description: "Edits your current checkout on the selected branch",
+    icon: <Laptop size={14} weight="regular" />,
+  },
+  {
+    mode: "worktree",
+    label: "Worktree",
+    description: "Uses an isolated copy so you can run tasks in parallel",
+    icon: <ArrowsSplit size={14} weight="regular" className="rotate-270" />,
+  },
+];
+
+const CLOUD_ICON = <Cloud size={14} weight="regular" />;
+
+const IMAGE_ICON = <Cube size={14} weight="regular" />;
+
+/**
+ * Rendered on every row so the trailing column keeps its width as the selection
+ * moves. Hidden from assistive tech, which reads the selection off the row's
+ * aria-current.
+ */
+function SelectedCheck({
+  selected,
+}: {
+  selected: boolean;
+}): React.ReactElement {
+  return (
+    <Check
+      aria-hidden="true"
+      size={12}
+      weight="bold"
+      className={cn("shrink-0", !selected && "opacity-0")}
+    />
+  );
+}
+
+export function WorkspaceModeSelect({
+  value,
+  onChange,
+  disabled,
+  overrideModes,
+  adapter,
+  cloudTarget = DEFAULT_CLOUD_TARGET,
+  onCloudTargetChange,
+  hasGithubIntegration,
+  isLoadingGithubIntegration = false,
+}: WorkspaceModeSelectProps) {
+  const { localWorkspaces } = useHostCapabilities();
+  const cloudModeEnabled = useCloudModeEnabled();
+  const codexSubscription = useAdapterSubscription("codex");
+  const claudeSubscription = useAdapterSubscription("claude");
+  const adapterSubscription = adapter
+    ? { codex: codexSubscription, claude: claudeSubscription }[adapter]
+    : undefined;
+  const subscriptionInUseLabel =
+    adapter &&
+    adapterSubscription?.flagEnabled &&
+    adapterSubscription.subscriptionOn &&
+    adapterSubscription.loggedIn
+      ? SUBSCRIPTION_IN_USE_LABEL[adapter]
+      : null;
+
+  const { options, favoriteKey, toggleFavorite } = useCloudTargetOptions();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const pendingCloudTargetRef = useRef<CloudTarget | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [setupDialogOpen, setSetupDialogOpen] = useState(false);
+  const githubSetupRequired =
+    hasGithubIntegration === false && !isLoadingGithubIntegration;
+
+  const environmentOptions = options.filter(
+    (option) => option.target.kind !== "image",
+  );
+  const imageOptions = options.filter(
+    (option) => option.target.kind === "image",
+  );
+
+  const handleAddEnvironment = useCallback(() => {
+    setMenuOpen(false);
+    openSettings("cloud-environments", "create");
+  }, []);
+
+  const commitCloudTarget = useCallback(
+    (target: CloudTarget) => {
+      onChange("cloud");
+      onCloudTargetChange?.(target);
+    },
+    [onChange, onCloudTargetChange],
+  );
+
+  const selectTarget = useCallback(
+    (target: CloudTarget) => {
+      setMenuOpen(false);
+      if (githubSetupRequired) {
+        pendingCloudTargetRef.current = target;
+        setSetupDialogOpen(true);
+        return;
+      }
+      commitCloudTarget(target);
+    },
+    [commitCloudTarget, githubSetupRequired],
+  );
+
+  const closeGithubSetupDialog = useCallback(() => {
+    pendingCloudTargetRef.current = null;
+    setSetupDialogOpen(false);
+    window.requestAnimationFrame(() => triggerRef.current?.focus());
+  }, []);
+
+  const handleGithubConnected = useCallback(() => {
+    if (!pendingCloudTargetRef.current) return;
+    commitCloudTarget(pendingCloudTargetRef.current);
+    pendingCloudTargetRef.current = null;
+  }, [commitCloudTarget]);
+
+  const showCloud = overrideModes
+    ? overrideModes.includes("cloud")
+    : cloudModeEnabled;
+
+  const localModes = useMemo(
+    () =>
+      // Hide worktree/local modes on cloud-only hosts.
+      localWorkspaces
+        ? LOCAL_MODES.filter(
+            (m) => !overrideModes || overrideModes.includes(m.mode),
+          )
+        : [],
+    [overrideModes, localWorkspaces],
+  );
+
+  const selectedTargetKey =
+    value === "cloud" ? cloudTargetKey(cloudTarget) : null;
+
+  const selectedTargetName = useMemo(() => {
+    if (value !== "cloud" || cloudTarget.kind === "default") return null;
+    const key = cloudTargetKey(cloudTarget);
+    return options.find((option) => option.key === key)?.name ?? null;
+  }, [value, cloudTarget, options]);
+
+  const triggerLabel = useMemo(() => {
+    if (value === "cloud") {
+      return ["Cloud", selectedTargetName].filter(Boolean).join(" · ");
+    }
+    return LOCAL_MODES.find((m) => m.mode === value)?.label ?? "Local";
+  }, [value, selectedTargetName]);
+
+  const triggerIcon = useMemo(() => {
+    if (value === "cloud") return CLOUD_ICON;
+    return (
+      LOCAL_MODES.find((m) => m.mode === value)?.icon ?? LOCAL_MODES[0].icon
+    );
+  }, [value]);
+
+  return (
+    <>
+      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              type="button"
+              ref={triggerRef}
+              variant="outline"
+              size="sm"
+              disabled={disabled}
+              aria-label="Workspace mode"
+            >
+              <span className="text-muted-foreground">{triggerIcon}</span>
+              {triggerLabel}
+              <CaretDown
+                size={10}
+                weight="bold"
+                className="text-muted-foreground"
+              />
+            </Button>
+          }
+        />
+        <DropdownMenuContent
+          align="start"
+          side="bottom"
+          sideOffset={6}
+          className="w-auto min-w-[280px]"
+        >
+          {localModes.length > 0 && (
+            <div className="flex items-center justify-between px-2 py-1">
+              <MenuLabel className="p-0">
+                {showCloud && options.length === 1 ? "Run location" : "Local"}
+              </MenuLabel>
+              {subscriptionInUseLabel && (
+                <span className="text-[11px] text-muted-foreground">
+                  {subscriptionInUseLabel}
+                </span>
+              )}
+            </div>
+          )}
+
+          <DropdownMenuGroup>
+            {localModes.map((item) => (
+              <DropdownMenuItem
+                key={item.mode}
+                aria-current={value === item.mode ? "true" : undefined}
+                onClick={() => onChange(item.mode)}
+                render={
+                  <ItemMenuItem size="xs" className="w-full" render={<div />}>
+                    <ItemMedia variant="icon" className="mt-2 ml-2">
+                      <span>{item.icon}</span>
+                    </ItemMedia>
+                    <ItemContent variant="menuItem">
+                      <ItemTitle>{item.label}</ItemTitle>
+                      <ItemDescription className="leading-none">
+                        {item.description}
+                      </ItemDescription>
+                    </ItemContent>
+                    <ItemActions className="mr-1.5 ml-auto self-center">
+                      <SelectedCheck selected={value === item.mode} />
+                    </ItemActions>
+                  </ItemMenuItem>
+                }
+              />
+            ))}
+          </DropdownMenuGroup>
+
+          {showCloud && options.length === 1 && (
+            <DropdownMenuItem
+              aria-current={value === "cloud" ? "true" : undefined}
+              onClick={() => selectTarget(DEFAULT_CLOUD_TARGET)}
+              render={
+                <ItemMenuItem size="xs" className="w-full" render={<div />}>
+                  <ItemMedia variant="icon" className="mt-2 ml-2">
+                    <span>{CLOUD_ICON}</span>
+                  </ItemMedia>
+                  <ItemContent variant="menuItem">
+                    <ItemTitle>Cloud</ItemTitle>
+                    <ItemDescription className="whitespace-nowrap leading-none">
+                      Runs on PostHog servers. Your local files do not change.
+                    </ItemDescription>
+                  </ItemContent>
+                  <ItemActions className="mr-1.5 ml-auto self-center">
+                    {githubSetupRequired && (
+                      <span className="whitespace-nowrap text-[11px] text-warning-foreground">
+                        Requires GitHub
+                      </span>
+                    )}
+                    <SelectedCheck selected={value === "cloud"} />
+                  </ItemActions>
+                </ItemMenuItem>
+              }
+            />
+          )}
+
+          {showCloud && options.length > 1 && (
+            <>
+              <DropdownMenuSeparator />
+              <div className="flex items-center justify-between px-2 py-1">
+                <MenuLabel className="p-0">Cloud environments</MenuLabel>
+                <div className="flex items-center gap-1.5">
+                  <Button
+                    type="button"
+                    size="icon-xs"
+                    variant="default"
+                    onClick={handleAddEnvironment}
+                    aria-label="Add cloud environment"
+                  >
+                    <Plus size={12} />
+                  </Button>
+                </div>
+              </div>
+
+              <DropdownMenuGroup>
+                {environmentOptions.map((option) => (
+                  <CloudTargetItem
+                    key={option.key}
+                    option={option}
+                    isFavorite={favoriteKey === option.key}
+                    isSelected={selectedTargetKey === option.key}
+                    githubSetupRequired={githubSetupRequired}
+                    onSelect={selectTarget}
+                    onToggleFavorite={toggleFavorite}
+                  />
+                ))}
+              </DropdownMenuGroup>
+
+              {imageOptions.length > 0 && (
+                <>
+                  <div className="px-2 py-1">
+                    <MenuLabel className="p-0">Images</MenuLabel>
+                  </div>
+                  <DropdownMenuGroup>
+                    {imageOptions.map((option) => (
+                      <CloudTargetItem
+                        key={option.key}
+                        option={option}
+                        isFavorite={favoriteKey === option.key}
+                        isSelected={selectedTargetKey === option.key}
+                        githubSetupRequired={githubSetupRequired}
+                        onSelect={selectTarget}
+                        onToggleFavorite={toggleFavorite}
+                      />
+                    ))}
+                  </DropdownMenuGroup>
+                </>
+              )}
+            </>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      {setupDialogOpen ? (
+        <CloudGithubSetupDialog
+          hasGithubIntegration={hasGithubIntegration}
+          onConnected={handleGithubConnected}
+          onClose={closeGithubSetupDialog}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function CloudTargetItem({
+  option,
+  isFavorite,
+  isSelected,
+  githubSetupRequired,
+  onSelect,
+  onToggleFavorite,
+}: {
+  option: CloudTargetOption;
+  isFavorite: boolean;
+  isSelected: boolean;
+  githubSetupRequired: boolean;
+  onSelect: (target: CloudTarget) => void;
+  onToggleFavorite: (target: CloudTarget) => void;
+}) {
+  const icon = option.target.kind === "image" ? IMAGE_ICON : CLOUD_ICON;
+  return (
+    <DropdownMenuItem
+      aria-current={isSelected ? "true" : undefined}
+      onClick={() => onSelect(option.target)}
+      render={
+        <ItemMenuItem size="xs" className="w-full" render={<div />}>
+          <ItemMedia variant="icon" className="mt-2 ml-2">
+            <span>{icon}</span>
+          </ItemMedia>
+          <ItemContent variant="menuItem">
+            <ItemTitle>{option.name}</ItemTitle>
+            <ItemDescription className="leading-none">
+              {option.description}
+            </ItemDescription>
+          </ItemContent>
+          <ItemActions className="mr-1.5 ml-auto self-center">
+            {githubSetupRequired && (
+              <span className="whitespace-nowrap text-[11px] text-warning-foreground">
+                Requires GitHub
+              </span>
+            )}
+            <Button
+              type="button"
+              size="icon-xs"
+              variant="default"
+              tabIndex={-1}
+              aria-label={
+                isFavorite
+                  ? `Stop using ${option.name} by default`
+                  : `Use ${option.name} by default`
+              }
+              aria-pressed={isFavorite}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onToggleFavorite(option.target);
+              }}
+              className={cn(
+                isFavorite
+                  ? "text-foreground"
+                  : "text-muted-foreground opacity-0 group-hover/dropdown-menu-item:opacity-100",
+              )}
+            >
+              <Star size={12} weight={isFavorite ? "fill" : "regular"} />
+            </Button>
+            <SelectedCheck selected={isSelected} />
+          </ItemActions>
+        </ItemMenuItem>
+      }
+    />
+  );
+}

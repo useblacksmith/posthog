@@ -1,0 +1,2002 @@
+import json
+import dataclasses
+from collections.abc import Callable, Iterable, Mapping
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Literal, Optional, Required, TypedDict, Union, cast
+from uuid import UUID
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import AnonymousUser
+from django.contrib.contenttypes.fields import GenericRelation
+from django.contrib.postgres.indexes import GinIndex
+from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
+from django.core.paginator import EmptyPage, Paginator
+from django.db import models, router, transaction
+from django.db.models import QuerySet
+from django.db.models.signals import post_save
+from django.dispatch.dispatcher import receiver
+from django.utils import timezone
+
+import structlog
+from prometheus_client import Counter
+
+from posthog.dataclasses import frozen
+from posthog.exceptions_capture import capture_exception
+from posthog.models.activity_logging import activity_log_config_registry
+from posthog.models.activity_logging.utils import (
+    ACTIVITY_LOG_CLIENT_MAX_LENGTH,
+    ACTIVITY_LOG_CREDENTIAL_ID_MAX_LENGTH,
+    CUSTOMER_VISIBLE_CREDENTIAL_ID_TYPES,
+    ActivityCredential,
+    activity_storage,
+    is_uncached_reverse_one_to_one,
+)
+from posthog.models.utils import ActivityDetailEncoder, UUIDTModel
+
+if TYPE_CHECKING:
+    from posthog.models.user import User
+
+logger = structlog.get_logger(__name__)
+
+# Kafka rejects messages above `message.max.bytes` (1 MB by default), so leave room for the event envelope.
+MAX_INTERNAL_EVENT_DETAIL_BYTES = 512 * 1024
+_SUMMARY_DETAIL_KEYS = ("id", "short_id", "type", "name")
+_MAX_SUMMARY_NAME_LENGTH = 1000
+
+ACTIVITY_LOG_WRITE_FAILURES = Counter(
+    "activity_log_write_failures_total",
+    "Activity log rows that failed to write",
+    labelnames=["deferred"],
+)
+
+ActivityScope = Literal[
+    "Cohort",
+    "CrossProjectDashboard",
+    "DevGatewayToken",
+    "FeatureFlag",
+    "Person",
+    "Group",
+    "Insight",
+    "Plugin",
+    "PluginConfig",
+    "HogFunction",
+    "HogFlow",
+    "DataManagement",
+    "EventDefinition",
+    "PropertyDefinition",
+    "Notebook",
+    "GeneratedWidget",
+    "Canvas",
+    "Endpoint",
+    "EndpointVersion",
+    "Dashboard",
+    "Replay",
+    "Experiment",
+    "ExperimentHoldout",
+    "ExperimentSavedMetric",
+    "Survey",
+    "EarlyAccessFeature",
+    "SessionRecordingPlaylist",
+    "ReplayScanner",
+    "ReplayObservation",
+    "VisionAlertConfiguration",
+    "Comment",
+    "Team",
+    "Project",
+    "ErrorTrackingIssue",
+    "DataWarehouseExpression",
+    "DataWarehouseSavedQuery",
+    "LegalDocument",
+    "Organization",
+    "OrganizationDomain",
+    "OrganizationIPRestrictions",
+    "IdentityProviderConfig",
+    "OrganizationMembership",
+    "Role",
+    "UserGroup",
+    "BatchExport",
+    "BatchImport",
+    "ExportedAsset",
+    "Integration",
+    "Annotation",
+    "Tag",
+    "TaggedItem",
+    "Subscription",
+    "PersonalAPIKey",
+    "ProjectSecretAPIKey",
+    "OAuthApplication",
+    "WorkloadTrustPolicy",
+    "WorkloadTrustPolicyRequest",
+    "User",
+    "Action",
+    "AccountView",
+    "AlertConfiguration",
+    "Threshold",
+    "AlertSubscription",
+    "ExternalDataSource",
+    "ExternalDataSchema",
+    "Evaluation",
+    "EvaluationDirectory",
+    "LLMPrompt",
+    "LLMPromptLabel",
+    "LLMSkill",
+    "LLMTrace",
+    "AIGatewayCredit",
+    "WebAnalyticsFilterPreset",
+    "CustomerProfileConfig",
+    "Log",
+    "LogsAlertConfiguration",
+    "PlatformAlertConfiguration",
+    "LogsExclusionRule",
+    "LogsRetentionRule",
+    "TracesRetentionRule",
+    "DashboardWidget",
+    "ProductTour",
+    "Ticket",
+    "TicketMacro",
+    "KnowledgeSource",
+    "KnowledgeLibrary",
+    "InstanceSetting",
+    "SignalReport",
+    "SignalScoutConfig",
+    "SignalSourceConfig",
+    "SignalTeamConfig",
+    "StreamlitApp",
+    "Metric",
+    "TableCertification",
+    "DataQualityCheck",
+    "DataQualityCheckSchedule",
+    "WarehouseSuggestion",
+    "AccessControl",
+    "DataWarehouseTable",
+    "DataWarehouseJoin",
+    "Billing",
+    "Loop",
+    "SandboxEnvironment",
+    "SandboxCustomImage",
+    "StamphogRepoConfig",
+    "ReviewRepository",
+    "ReviewProjectSettings",
+    "ReviewInstallationClaim",
+    "RecommendationResolution",
+]
+ChangeAction = Literal[
+    "changed", "created", "deleted", "merged", "split", "exported", "revoked", "logged_in", "logged_out", "copied"
+]
+
+# Internal-only scope key. Used by `field_exclusions` and `changes_between` to address
+# through-tables and other internal models that are never exposed as a top-level
+# `scope` in stored activity logs. Keeping these out of `ActivityScope` prevents them
+# from leaking into the generated `ActivityLogListScope` API enum, where filtering by
+# them would always return zero results.
+InternalActivityScope = Literal["ExperimentToSavedMetric",]
+AuditableScope = Union[ActivityScope, InternalActivityScope]
+
+
+@dataclasses.dataclass(frozen=True)
+class Change:
+    type: ActivityScope | str
+    action: ChangeAction
+    field: Optional[str] = None
+    before: Optional[Any] = None
+    after: Optional[Any] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Trigger:
+    job_type: str
+    job_id: str
+    payload: dict
+
+
+@dataclasses.dataclass(frozen=True)
+class ActivityContextBase:
+    """
+    Extend this class in specific implementations to add context-specific fields.
+    """
+
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class Detail:
+    # The display name of the item in question
+    name: Optional[str] = None
+    # The short_id if it has one
+    short_id: Optional[str] = None
+    type: Optional[str] = None
+    changes: Optional[list[Change]] = None
+    trigger: Optional[Trigger] = None
+    context: Optional[ActivityContextBase] = None
+
+
+class ActivityLog(UUIDTModel):
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                name="must_have_team_or_organization_id",
+                condition=models.Q(team_id__isnull=False) | models.Q(organization_id__isnull=False),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["team_id", "scope", "item_id"]),
+            # Serves whole-column containment (`detail @> ...`), the only detail lookup an index
+            # can answer. Key-path lookups and the `detail::text` search are not GIN-servable
+            # under any opclass. `jsonb_path_ops` stores one hash per root-to-leaf path, so it is
+            # smaller and cheaper to maintain than `jsonb_ops`, whose only extra operators are the
+            # key-existence family (`?`, `?|`, `?&`) that no query path uses. It also stores no
+            # entry for a JSON structure that holds no scalar, so containment against an empty
+            # object or array (`detail @> '{"changes": []}'`) falls back to a full index scan.
+            GinIndex(
+                name="idx_alog_detail_gin_path_ops",
+                fields=["detail"],
+                opclasses=["jsonb_path_ops"],
+            ),
+            # User-specific filtered queries
+            models.Index(
+                fields=["team_id", "activity", "scope", "user"],
+                name="idx_alog_team_act_scope_usr",
+                condition=models.Q(was_impersonated=False) & models.Q(is_system=False),
+            ),
+            # Advanced activity logs: team-scoped queries with ordering
+            models.Index(
+                fields=["team_id", "scope", "-created_at"],
+                name="idx_alog_team_scope_created",
+                condition=models.Q(was_impersonated=False) & models.Q(is_system=False),
+            ),
+            # Advanced activity logs: team queries with activity filter
+            models.Index(
+                fields=["team_id", "scope", "activity", "-created_at"],
+                name="idx_alog_team_scp_act_crtd",
+                condition=models.Q(was_impersonated=False) & models.Q(is_system=False),
+            ),
+            # Advanced activity logs default list ordering. The org- and team-scoped list
+            # endpoints order by -created_at with no scope filter, so the scope-led indexes
+            # above can't serve the sort. These full indexes let the LIMITed ordered scan walk
+            # created_at directly instead of sorting the whole partition. No index is partial on
+            # a `detail` predicate: no reader filters on `jsonb_typeof(detail)`, so the planner
+            # could never pick one, and each would only add write cost to every insert.
+            models.Index(
+                fields=["organization_id", "-created_at"],
+                name="idx_alog_org_created_at",
+            ),
+            models.Index(
+                fields=["team_id", "-created_at"],
+                name="idx_alog_team_created_at",
+            ),
+            # One user's rows in a time window, for the activity summary. Not partial, because the
+            # query keeps rows where `is_system` and `was_impersonated` are NULL.
+            models.Index(
+                fields=["team_id", "user", "-created_at"],
+                name="idx_alog_team_user_created_at",
+            ),
+        ]
+
+    team_id = models.PositiveIntegerField(null=True)
+    organization_id = models.UUIDField(null=True)
+    user = models.ForeignKey("posthog.User", null=True, on_delete=models.SET_NULL)
+    was_impersonated = models.BooleanField(null=True)
+    # If truthy, user can be unset and this indicates a 'system' user made activity asynchronously
+    is_system = models.BooleanField(null=True)
+    # Which API client the activity arrived through. Usually the self-reported x-posthog-client
+    # request header, which is capped shorter than this column. A sandbox OAuth token bound to a
+    # scout run overrides it with the scout's own `scout:<skill_name>` tag, which the caller
+    # cannot set and which needs the full width.
+    client = models.CharField(max_length=ACTIVITY_LOG_CLIENT_MAX_LENGTH, null=True, blank=True)
+    # Client IP captured at request time. Null for non-HTTP activity (system, Celery).
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    # The credential that authenticated the request, from `ActivityCredential`. Unlike `client`,
+    # the caller cannot set these, so they answer which key, OAuth application or session made a
+    # change. Null outside a request. A project secret key row has no user but keeps its credential.
+    credential_type = models.CharField(max_length=32, null=True, blank=True)
+    credential_id = models.CharField(max_length=ACTIVITY_LOG_CREDENTIAL_ID_MAX_LENGTH, null=True, blank=True)
+    # The staff user behind an impersonated change. A plain integer rather than a foreign key:
+    # `SET_NULL` would make every user deletion update this table through a full scan, because
+    # nothing indexes the column.
+    impersonated_by_id = models.BigIntegerField(null=True, blank=True)
+
+    activity = models.fields.CharField(max_length=79, null=False)
+    # if scoped to a model this activity log holds the id of the model being logged
+    # if not scoped to a model this log might not hold an item_id
+    # this might be a numerical id, short id, or UUID, so each will be converted to string
+    # it will be used to lookup rows with exactly matching item_ids
+    # it probably only needs to be 36 characters in order to hold a GUID
+    # but 72 may be useful to avoid a migration in future
+    item_id = models.fields.CharField(max_length=72, null=True)
+    # e.g. FeatureFlags - this will often be the name of a model class
+    scope = models.fields.CharField(max_length=79, null=False)
+    detail = models.JSONField(encoder=ActivityDetailEncoder, null=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    @property
+    def safe_detail(self) -> Optional[dict[str, Any]]:
+        """The detail with the values of masked fields hidden, including rows written before the mask."""
+        masked_fields = {
+            *field_with_masked_contents.get(cast(AuditableScope, self.scope), []),
+            *read_masked_fields.get(self.scope, []),
+        }
+        if not masked_fields or not isinstance(self.detail, dict) or not isinstance(self.detail.get("changes"), list):
+            return self.detail
+        changes = []
+        for change in self.detail["changes"]:
+            if isinstance(change, dict) and change.get("field") in masked_fields:
+                masked = mask_change_values(self.scope, change["field"], change.get("before"), change.get("after"))
+                change = {**change, "before": masked.before, "after": masked.after}
+            changes.append(change)
+        return {**self.detail, "changes": changes}
+
+    @property
+    def customer_visible_credential_id(self) -> Optional[str]:
+        """The `credential_id` that customer-facing surfaces may show, or None when it stays internal."""
+        if self.credential_type not in CUSTOMER_VISIBLE_CREDENTIAL_ID_TYPES:
+            return None
+        # An impersonated change used the staff member's login session. That session is in no list
+        # the customer can read, so its id would point nowhere.
+        if self.was_impersonated or self.impersonated_by_id is not None:
+            return None
+        return self.credential_id
+
+
+# Fields older rows still hold in plaintext although new rows no longer record them.
+read_masked_fields: dict[str, list[str]] = {
+    # Site functions inline their input values into the compiled JavaScript.
+    "HogFunction": ["transpiled"],
+}
+
+# Fields whose keys stay readable, so a reader still sees which entry changed.
+key_masked_fields: dict[str, list[str]] = {
+    "HogFunction": ["inputs"],
+}
+
+
+@frozen
+class MaskedChange:
+    before: Any
+    after: Any
+
+
+def mask_change_values(scope: str, field: str, before: Any, after: Any) -> MaskedChange:
+    """Hide a masked field's values. A key-masked field keeps its keys and marks the changed ones."""
+    if field in key_masked_fields.get(scope, []) and isinstance(before or {}, dict) and isinstance(after or {}, dict):
+        before_values = before or {}
+        after_values = after or {}
+        masked_before = dict.fromkeys(before_values, "masked") if before is not None else None
+        masked_after = (
+            {
+                key: "masked"
+                if key in before_values
+                and json.dumps(before_values[key], sort_keys=True, default=str)
+                == json.dumps(value, sort_keys=True, default=str)
+                else "changed"
+                for key, value in after_values.items()
+            }
+            if after is not None
+            else None
+        )
+        return MaskedChange(before=masked_before, after=masked_after)
+    return MaskedChange(before="masked" if before is not None else None, after="masked" if after is not None else None)
+
+
+common_field_exclusions = [
+    "id",
+    "uuid",
+    "short_id",
+    "created_at",
+    "created_by",
+    "last_modified_at",
+    "last_modified_by",
+    "updated_at",
+    "updated_by",
+    "team",
+    "team_id",
+]
+
+
+field_with_masked_contents: dict[AuditableScope, list[str]] = {
+    # Any activity-log reader sees these rows, including readers denied the tables they name.
+    "DataWarehouseJoin": [
+        "source_table_name",
+        "source_table_key",
+        "joining_table_name",
+        "joining_table_key",
+        "field_name",
+        "configuration",
+    ],
+    "SignalTeamConfig": ["onboarding"],
+    "AccountView": ["name", "content", "text_content"],
+    "WarehouseSuggestion": ["dismissal_note"],
+    # Macro replies are support content; activity-log readers may lack ticket access.
+    "TicketMacro": ["body"],
+    "HogFunction": [
+        "inputs",
+        "mappings",
+        # Encrypted secret inputs (Fernet ciphertext) — a diff would be noise at best and
+        # leak-adjacent at worst; record that they changed, never the values.
+        "encrypted_inputs",
+        "draft_encrypted_inputs",
+        # Full config snapshot including input values (auth headers, API keys on rows written before
+        # secret inputs were encrypted) — record that a draft was staged/published/discarded, never
+        # its contents. The per-version config audit lives in the revisions endpoints instead.
+        "draft",
+    ],
+    "Integration": [
+        "config",
+        "sensitive_config",
+    ],
+    "BatchImport": [
+        "import_config",
+    ],
+    "Subscription": [
+        "target_value",
+    ],
+    "ExternalDataSource": [
+        "job_inputs",
+    ],
+    "HogFlow": [
+        # Full content snapshot including action inputs (auth headers, API keys) — record that a
+        # draft was staged/published/discarded, never its contents.
+        "draft",
+        # Encrypted secret function inputs (Fernet ciphertext) — a diff would be noise at best and
+        # leak-adjacent at worst; record that they changed, never the values.
+        "encrypted_inputs",
+        "draft_encrypted_inputs",
+        # The action graph can carry secret function inputs (auth headers, API keys). New writes strip
+        # them into encrypted_inputs, but a legacy row's first write would diff its still-plaintext
+        # `before` against the stripped `after`, leaking the secret. Record that actions changed, never
+        # the contents — the per-version content audit lives in the revisions feature instead.
+        "actions",
+        # Reverse FK into WorkflowProposal's fail-closed manager, and a suggestion filed or resolved
+        # is not a workflow edit.
+        "proposals",
+    ],
+    "OrganizationDomain": [
+        "_scim_bearer_token",
+        "verification_challenge",
+        "_saml_x509_cert",
+    ],
+    "IdentityProviderConfig": [
+        "scim_bearer_token",
+        "scim_token_digest",
+        "oidc_credentials",
+        "saml_x509_cert",
+    ],
+    "User": [
+        "email",
+        "password",
+        # No longer used but kept for backwards-compatibility with existing activity log entries
+        "temporary_token",
+        "pending_email",
+    ],
+    # Support-ticket comment bodies are gated on ticket access and must not be readable via
+    # activity_log:read. Both ticket comment scopes mask `content`: internal ticket discussions
+    # ("Ticket") and customer-facing ticket messages ("conversations_ticket" — the literal scope
+    # the conversations product writes, not an ActivityScope member, hence the cast). Comment rows
+    # never go through changes_between; the Comment post_save signal consults these entries
+    # directly, keyed by the comment's own scope.
+    "Ticket": ["content"],
+    cast(AuditableScope, "conversations_ticket"): ["content"],
+    # Observation notes are gated on observation access, which activity_log:read does not imply.
+    "ReplayObservation": ["content"],
+    # The rubric API is limited to staff, so saved criteria and generated suggestions must not be
+    # readable through activity_log:read. Record that the rubrics changed, never their contents.
+    "SignalScoutConfig": ["rubrics"],
+    "SandboxEnvironment": ["environment_variables"],
+    "SandboxCustomImage": ["spec"],
+}
+
+field_name_overrides: dict[AuditableScope, dict[str, str]] = {
+    "AlertConfiguration": {
+        "schedule_start_time": "schedule start time",
+    },
+    "HogFunction": {
+        "execution_order": "priority",
+    },
+    "Organization": {
+        "name": "organization name",
+        "enforce_2fa": "two-factor authentication requirement",
+        "members_can_invite": "member invitation permissions",
+        "members_can_create_projects": "member project creation permissions",
+        "members_can_use_personal_api_keys": "personal API key permissions",
+        "allow_publicly_shared_resources": "public sharing permissions",
+        "is_member_join_email_enabled": "member join email notifications",
+        "session_cookie_age": "session cookie age",
+        "is_ai_data_processing_approved": "third-party AI services",
+        "uses_most_specific_access_resolution": "most-specific access resolution",
+    },
+    "BatchExport": {
+        "paused": "enabled",
+    },
+    "ExternalDataSource": {
+        "job_inputs": "configuration",
+    },
+    "ExternalDataSchema": {
+        "should_sync": "enabled",
+        "live_query_enabled": "live queries",
+        "masked_columns": "masked columns",
+        "full_refresh_interval_days": "full refresh interval (days)",
+        "full_refresh_time_of_day": "full refresh time (UTC)",
+    },
+    "SignalScoutConfig": {
+        "run_interval_minutes": "run interval (minutes)",
+        "emit": "emit findings",
+        "pause_reason": "pause reason",
+        "managed_by": "managed by",
+        "auto_pause_exempt": "never pause for inactivity",
+        "write_scopes": "write access",
+        "report_actions": "report actions",
+        "max_report_actions_per_day": "report actions per day",
+        "lifecycle_locked": "owner-only pause, resume, and delete",
+        "allowed_mcp_tools": "allowed MCP tools",
+        "tool_preset": "tool preset",
+    },
+    # Match the labels the inbox settings show, so an entry reads the way the setting was flipped.
+    "SignalTeamConfig": {
+        "autostart_enabled": "PR generation",
+        "default_autostart_priority": "project PR threshold",
+        "default_slack_notification_channel": "team Slack channel",
+        "default_slack_notification_min_priority": "team Slack minimum priority",
+        "autostart_base_branches": "base branch overrides",
+        "issue_tracking_integration": "issue tracker",
+        "issue_tracking_config": "issue tracker target",
+        "default_open_pull_request_ready": "PRs open as",
+        "github_issue_writeback_enabled": "comment back on GitHub issues",
+        "pull_request_label_enabled": "label self-driving PRs",
+        "pull_request_label": "self-driving PR label",
+        "anomaly_scoring_enabled": "anomaly scoring",
+        "scout_instructions": "scout instructions",
+        "research_instructions": "research instructions",
+        "implementation_instructions": "implementation instructions",
+    },
+    "OrganizationIPRestrictions": {
+        "ip_restrictions": "IP allowlist",
+        "enabled": "IP restrictions enabled",
+    },
+    "OrganizationDomain": {
+        "jit_provisioning_enabled": "just-in-time provisioning",
+        "sso_enforcement": "SSO enforcement",
+        "_saml_entity_id": "SAML entity ID",
+        "_saml_acs_url": "SAML ACS URL",
+        "_saml_x509_cert": "SAML X.509 certificate",
+        "_scim_enabled": "SCIM provisioning",
+        "verified_at": "domain verification",
+    },
+    "IdentityProviderConfig": {
+        "saml_entity_id": "SAML entity ID",
+        "saml_acs_url": "SAML ACS URL",
+        "saml_x509_cert": "SAML X.509 certificate",
+    },
+}
+
+# Machine-written. A test asserts this covers `ReplayScanner._MACHINE_OWNED_FIELDS`, a narrower set.
+replay_scanner_machine_fields = [
+    "scanner_version",
+    "origin",
+    "inline_key",
+    "primed_at",
+    "last_swept_at",
+    "last_seen_session_id",
+    "deep_swept_through",
+    "deep_seen_session_id",
+    "deep_attempted_at",
+    "sweep_read_bytes_by_hour",
+    "fast_read_bytes_by_hour",
+    "deep_read_bytes_by_hour",
+    "sweep_throttle_factor",
+    "last_found_candidates_at",
+    "sweep_paused_until",
+    "sweep_pause_reason",
+    "estimated_monthly_observations",
+    "estimated_at",
+    "estimate_attempted_at",
+    "filter_error",
+    "filter_error_at",
+    "prompt_question",
+    "prompt_question_source",
+    "prompt_valence",
+    "limit_notified_period_start",
+    "admission_budget_used",
+    "admission_budget_refreshed_at",
+    "admission_budget_period_start",
+    "admission_credits_since_refresh",
+    "updated_at",
+]
+
+# Rewritten on every check; an alert's firing history is read from its own event log instead.
+vision_alert_machine_fields = [
+    "state",
+    "consecutive_failures",
+    "last_checked_at",
+    "last_notified_at",
+    "next_check_at",
+    "first_enabled_at",
+    # The engine passes this alongside next_check_at on every suppressed check.
+    "updated_at",
+]
+
+# Written by checks, ownership handovers and the logs route's snooze, never by a settings edit.
+platform_alert_runtime_fields = [
+    "next_check_at",
+    "snooze_until",
+    "consecutive_failures",
+    "check_status",
+    "owner",
+    "owner_changed_at",
+    "switched_off_at",
+    "updated_at",
+]
+
+sandbox_custom_image_machine_fields = [
+    "status",
+    "version",
+    "modal_image_name",
+    "base_image_reference",
+    "base_image_refresh_reference",
+    "scan_result",
+    "error",
+    "build_log",
+    "builder_task",
+]
+
+# Fields that prevent activity signal triggering entirely when only these fields change
+signal_exclusions: dict[ActivityScope, list[str]] = {
+    "DataQualityCheckSchedule": ["next_run_at", "last_run_at", "last_suite_run", "updated_at"],
+    # Written by the runner on every run, not by a person editing the check.
+    "DataQualityCheck": [
+        "last_run_at",
+        "last_status",
+        "subject_name",
+        "subject_status",
+        "failing_since",
+        "last_succeeded_at",
+        "updated_at",
+    ],
+    "AlertConfiguration": [
+        "last_checked_at",
+        "next_check_at",
+        "is_calculating",
+        "last_notified_at",
+        "last_error_at",
+    ],
+    "Dashboard": ["last_accessed_at"],
+    "ReplayScanner": replay_scanner_machine_fields,
+    "VisionAlertConfiguration": vision_alert_machine_fields,
+    "LogsAlertConfiguration": [
+        "next_check_at",
+        "last_notified_at",
+        "last_checked_at",
+        "consecutive_failures",
+        "state",
+    ],
+    "PlatformAlertConfiguration": platform_alert_runtime_fields,
+    "PersonalAPIKey": [
+        "last_used_at",
+    ],
+    "User": [
+        "last_login",
+        "date_joined",
+        "current_organization",
+        "current_team",
+        "current_organization_id",
+        "current_team_id",
+    ],
+    "OrganizationDomain": [
+        "last_verification_retry",
+    ],
+    "Subscription": [
+        "next_delivery_date",
+    ],
+    # The facade logs a version change as `uploaded_version` or `activated_version` at the write
+    # site, so the save that only moves the active version must not add an `updated` row.
+    "StreamlitApp": ["active_version", "updated_at"],
+    # `last_run_at` is written by the scout coordinator on every tick (~every 15 min per scout),
+    # the pre-check fields on every scheduled pre-check, and the failure streak by the runner on
+    # every run outcome. When those are the only
+    # change, suppress the activity signal entirely so run bookkeeping never spams the audit
+    # log. A breaker trip is NOT suppressed: it moves `status`, which logs like any pause.
+    "SignalScoutConfig": [
+        "last_run_at",
+        "consecutive_failure_count",
+        "last_precheck_at",
+        "last_precheck_outcome",
+        "last_precheck_row_count",
+    ],
+    # Inserts bump these on every use. They are not a settings edit.
+    "TicketMacro": ["usage_count", "last_used_at"],
+    "SandboxCustomImage": [*sandbox_custom_image_machine_fields, "updated_at"],
+}
+
+# Activity visibility restrictions - controls which users can see certain activity logs
+# Used to hide sensitive activities (e.g., impersonated logins, user account changes) from non-staff users
+activity_visibility_restrictions: list[dict[str, Any]] = [
+    {
+        # Account views are private to their creator, so even their IDs and timestamps stay out of
+        # the team and org feeds.
+        "scope": "AccountView",
+        "activities": ["created", "updated", "deleted"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    {"scope": "Integration", "activities": ["github_diagnostic"], "allow_staff": True},
+    {
+        "scope": "User",
+        "activities": ["logged_in", "logged_out"],
+        "exclude_when": {"was_impersonated": True},
+        "allow_staff": True,
+    },
+    {
+        "scope": "User",
+        "activities": ["created", "updated", "deleted"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    {
+        "scope": "User",
+        "activities": ["scim_provisioned", "scim_replaced", "scim_updated", "scim_deprovisioned"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    {
+        # Staff-only email sending controls: the acting staff user must not leak into the org
+        # activity log. Suspensions and automatic tier moves reach the customer through email and
+        # in-app notification, and the Reputation tab shows the current tier.
+        "scope": "Team",
+        "activities": ["email_sending_suspended", "email_sending_unsuspended", "email_sending_tier_changed"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    {
+        "scope": "Role",
+        "activities": ["scim_provisioned", "scim_replaced", "scim_updated", "scim_deprovisioned"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    {
+        # Instance-setting changes are staff-only operations and must not leak into the
+        # org-scoped activity log endpoints, which are visible to organization admins.
+        "scope": "InstanceSetting",
+        "activities": ["updated"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    {
+        # Redis TTL edits from PostHog Admin carry the staff reason, and the row lands on the acting
+        # staff user's current organization, which has no relation to the edited key.
+        "scope": "Admin",
+        "activities": ["ttl_updated", "ttl_removed"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    {
+        # Admin AI-gateway top-ups are staff-only; keep the staff email, credit reason,
+        # and wallet balance out of the org-scoped activity log endpoints.
+        "scope": "AIGatewayCredit",
+        "activities": ["credit_added"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    {
+        # Support-ticket comment rows: bodies are gated on ticket access, and rows written before
+        # write-time masking (see field_with_masked_contents) still hold plaintext content readable
+        # with only activity_log:read. People with ticket access read the discussion on the ticket
+        # itself, so nothing needs these rows in the feeds. Ticket lifecycle activities
+        # (created/updated) stay visible — only comment rows are hidden.
+        "scope": "Ticket",
+        "activities": ["commented", "created task"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    {
+        # As above, for customer-facing ticket messages (the literal scope the conversations
+        # product writes).
+        "scope": "conversations_ticket",
+        "activities": ["commented", "created task"],
+        "exclude_when": {},
+        "allow_staff": True,
+    },
+    *(
+        {
+            "scope": scope,
+            "activities": ["commented", "created task", "completed task", "reopened task"],
+            "exclude_when": {},
+            "allow_staff": True,
+        }
+        for scope in ("desktop_canvas", "canvas")
+    ),
+]
+
+field_exclusions: dict[AuditableScope, list[str]] = {
+    "AccountView": ["version"],
+    # These fields copy warehouse data, and the activity log does not check warehouse access.
+    "RecommendationResolution": ["subject", "subject_hash", "customer_id", "campaign_id", "resolved_at"],
+    "TicketMacro": ["usage_count", "last_used_at"],
+    # Tiles are edited through their own endpoint, so diffing the reverse relation only reads every tile row.
+    "CrossProjectDashboard": ["tiles", "organization"],
+    # The reverse relations are listed because the diff reads each one in full; a scanner's
+    # observations run to millions of rows, and its alerts carry their own audit trail.
+    "ReplayScanner": [
+        *replay_scanner_machine_fields,
+        "observations",
+        "backfills",
+        "learned_rulesets",
+        "alerts",
+    ],
+    "VisionAlertConfiguration": [*vision_alert_machine_fields, "events", "matches"],
+    # The reverse relations read through team-scoped managers, which fail a save outside a request.
+    "PlatformAlertConfiguration": [
+        *platform_alert_runtime_fields,
+        "alerts",
+        "threads",
+        "delivery_paths",
+        "delivery_holds",
+        "destinations",
+    ],
+    "DataQualityCheckSchedule": ["subject_type", "subject_uuid", "next_run_at", "last_run_at", "last_suite_run"],
+    # The pointer names the tagged object, which a row never changes, and content_type and team
+    # are model objects the diff cannot serialize.
+    "TaggedItem": ["content_type", "object_id", "object_uuid", "team"],
+    "StamphogRepoConfig": [
+        # Reverse relation to the repo's review history. The diff would read every pull request row
+        # on each settings toggle, and none of it is configuration.
+        "pull_requests",
+    ],
+    "StreamlitApp": [
+        # Reverse relations. Version uploads and activations log their own rows, and a version's
+        # str() includes the app name, so a rename would show a false versions change.
+        "versions",
+        "sandbox",
+    ],
+    "HogFlow": [
+        # System-maintained skip-forward map for deleted steps, refreshed as a side effect of graph
+        # writes — bookkeeping, not a user edit, so keep it out of change diffs.
+        "action_redirects",
+    ],
+    "Metric": [
+        # Derived/throttled fields, not user-meaningful change diffs.
+        "last_run_at",
+        "source_insight_query_hash",
+        "referenced_table_names",
+        "embedding",
+        "embedding_model",
+        "embedding_text_hash",
+    ],
+    "DataQualityCheck": [
+        # Written by the runner, not by a person editing the check.
+        "last_run_at",
+        "last_status",
+        "subject_name",
+        "subject_status",
+        "failing_since",
+        "last_succeeded_at",
+        # Subject FKs are immutable after create and not JSON-serializable for the change detail.
+        "metric",
+        "saved_query",
+        "table",
+    ],
+    "WarehouseSuggestion": [
+        "evidence",
+        "score_inputs",
+        "payload",
+    ],
+    "OrganizationIPRestrictions": ["organization"],
+    "OrganizationDomain": [
+        "organization",
+        "scim_provisioned_users",
+        "scim_request_logs",
+        # Internal link to the IdP config mirror; the mirrored fields themselves are already logged
+        "_identity_provider_config",
+    ],
+    "IdentityProviderConfig": [
+        "organization",
+        # Reverse relations, not plain field diffs — and diffing them reads every related row, which
+        # for SCIM request logs is the tenant's whole request history.
+        "linked_identity_provider_configs",
+        "scim_provisioned_users",
+        "scim_request_logs",
+    ],
+    "Subscription": [
+        # Scheduler-derived field; keep it out of user-facing change diffs even when another
+        # field changes in the same save (signal_exclusions only governs whether the signal fires).
+        "next_delivery_date",
+        # Context rows use a fail-closed team manager that has no scope during signal handling.
+        "contexts",
+        # FK to a connected Slack integration. The generic field-diff captures the related object,
+        # which isn't JSON-serializable for the change detail (same reason FeatureFlag/Experiment
+        # exclude their FK relations) — without this, editing a subscription's integration 500s the save.
+        "integration",
+    ],
+    "Cohort": [
+        "version",
+        "pending_version",
+        "count",
+        "is_calculating",
+        "last_calculation",
+        "last_error_at",
+        "errors_calculating",
+    ],
+    "HogFunction": [
+        # Compiled output of `hog`, which the diff records on its own. For site functions the
+        # transpiled JavaScript also inlines the input values that `field_with_masked_contents`
+        # hides, so a diff of it would put those values back into the log.
+        "bytecode",
+        "transpiled",
+        "icon_url",
+        # Bookkeeping for the draft/revision cycle: `draft` already records that config was staged,
+        # and the per-version audit lives in the revisions endpoints.
+        "version",
+        "draft_updated_at",
+        "revisions",
+    ],
+    "Notebook": [
+        "text_content",
+        "widget_instances",
+        "widget_snapshots",
+    ],
+    "Experiment": [
+        "feature_flag",
+        "feature_flag_auto_archived",
+        "exposure_cohort",
+        "holdout",
+        "saved_metrics",
+        "experimenttosavedmetric_set",
+        # Optimistic-concurrency counter, not a user-meaningful change.
+        "version",
+        # Internal pointer to the flag-cleanup task, not a user-meaningful change.
+        "flag_cleanup_task_id",
+        # The copy of the rule that a launch stores for the analysis. It holds the rule's seed.
+        "feature_flag_rule_snapshot",
+    ],
+    "ExperimentSavedMetric": [
+        "experiments",
+        "experimenttosavedmetric_set",
+    ],
+    "ExperimentToSavedMetric": [
+        "experiment",
+        "saved_metric",
+    ],
+    "ProjectSecretAPIKey": [
+        "secure_value",
+        # Gateway is team-scoped; resolving it for a diff would hit the fail-closed
+        # manager. Binding changes are audited by the gateway management API instead.
+        "gateway",
+    ],
+    "Person": [
+        "distinct_ids",
+        "name",
+        "is_identified",
+        "persondistinctid",
+        "cohort",
+        "cohortpeople",
+        "version",
+        "is_user",
+    ],
+    "Insight": [
+        "filters_hash",
+        "refreshing",
+        "dive_dashboard",
+        "type",
+        "funnel",
+        "layouts",
+        "color",
+        "order",
+        "result",
+        "dashboard",
+        "last_refresh",
+        "saved",
+        "is_sample",
+        "refresh_attempt",
+        "short_id",
+        "insightviewed",
+        "dashboardtile",
+        "explanations",
+    ],
+    "EventDefinition": [
+        "eventdefinition_ptr_id",
+        "_state",
+        "deprecated_tags",
+        "owner_id",
+        "query_usage_30_day",
+        "verified_at",
+        "verified_by",
+        "post_to_slack",
+    ],
+    "PropertyDefinition": [
+        "propertydefinition_ptr_id",
+        "_state",
+        "deprecated_tags",
+        "owner_id",
+        "query_usage_30_day",
+        "volume_30_day",
+        "verified_at",
+        "verified_by",
+        "post_to_slack",
+        "property_type_format",
+    ],
+    "Team": [
+        "uuid",
+        "updated_at",
+        "created_at",
+        "id",
+        "secret_api_token",
+        "secret_api_token_backup",
+    ],
+    "Project": ["id", "created_at"],
+    "DataWarehouseExpression": ["deleted_at"],
+    "DataWarehouseJoin": ["deleted_at"],
+    # The subject is the identity of a rule and never changes. The receiver names it in the
+    # context, so the diff does not load the role and the membership for both sides.
+    "AccessControl": ["organization_member", "role"],
+    "DataWarehouseSavedQuery": [
+        "name",
+        "columns",
+        "query_revision",
+        "status",
+        "external_tables",
+        "last_run_at",
+        "latest_error",
+        "deleted_name",
+        "table",
+        "managed_viewset",
+        "origin",
+        "expires_at",
+        "incremental_state",
+        "semantic_enrichment_hash",
+    ],
+    "Endpoint": [
+        "saved_query",
+        "current_version",
+    ],
+    "EndpointVersion": [
+        "saved_query",
+    ],
+    "Organization": [
+        "teams",
+        "billing",
+        "organization_billing",
+        "_billing_plan_details",
+        "usage",
+        "customer_id",
+        "customer_trust_scores",
+        "personalization",
+        "members",
+        "memberships",
+        "available_product_features",
+        "domain_whitelist",
+        "setup_section_2_completed",
+        "plugins_access_level",
+        "never_drop_data",
+    ],
+    "BatchExport": [
+        "latest_runs",
+        "last_updated_at",
+        "last_paused_at",
+        "batchexportrun_set",
+        "batchexportbackfill_set",
+    ],
+    "BatchImport": [
+        "lease_id",
+        "leased_until",
+        "status_message",
+        "state",
+        "secrets",
+        "lease_id",
+        "backoff_attempt",
+        "backoff_until",
+        "pending_commit",
+    ],
+    "Integration": [
+        "sensitive_config",
+        "errors",
+    ],
+    "PersonalAPIKey": [
+        "value",
+        "secure_value",
+        "last_used_at",
+        "last_rolled_at",
+    ],
+    "User": [
+        # ForeignKey fields
+        "current_organization",
+        "current_team",
+        # The onboarding delegation FK is excluded here because the generic field-diffing
+        # path tries to serialize the related invite during the signal, which races the
+        # same transaction that created the invite. Forensic visibility for delegation
+        # state transitions is handled via explicit structlog entries from
+        # `set_delegated_state` / `clear_delegation_state` / the pre_delete receiver.
+        "onboarding_delegated_to_invite",
+        # With _id suffix for direct attribute access
+        "current_organization_id",
+        "current_team_id",
+        "onboarding_delegated_to_invite_id",
+        # System/internal fields
+        "distinct_id",
+        "partial_notification_settings",
+        "_billing_plan_details",
+        "strapi_id",
+        # Reverse relations and many-to-many fields
+        "organization",
+        "logentry_set",
+        "groups",
+        "user_permissions",
+        "social_auth",
+        "organization_memberships",
+        "totp_device_set",
+        "staticdevice_set",
+        "activitylog_set",
+        "personal_api_keys",
+        "organizations",
+        "plugin_set",
+        "insightviewed_set",
+        "text_set",
+        "insight_set",
+        "sharingconfiguration_set",
+        "exportedasset_set",
+        "uploaded_media",
+        "accesscontrol_set",
+        "rolemembership_set",
+        "totp_devices",
+        "static_devices",
+        "recovery_devices",
+        # Reads through UserFacetSettings' own fail-closed TeamScopedManager, which has no
+        # ambient team scope at signal-handling time.
+        "facet_settings",
+    ],
+    "AlertConfiguration": [
+        "last_checked_at",
+        "next_check_at",
+        "is_calculating",
+        "last_notified_at",
+        "last_error_at",
+    ],
+    "Action": [
+        "bytecode",
+        "bytecode_error",
+        "is_calculating",
+        "last_calculated_at",
+        "embedding_last_synced_at",
+        "embedding_version",
+        "last_summarized_at",
+        "action_steps",
+        "events",
+        "plugin_configs",
+        "tagged_items",
+        "survey",
+    ],
+    "ExternalDataSource": [
+        "connection_id",
+        "destination_id",
+        "are_tables_created",
+        # Reverse relation to a fail-closed model: reading through it in `changes_between` raises
+        # TeamScopeError when a source is saved outside request scope, and it isn't source-config intent.
+        "custom_oauth2_integrations",
+        # Same hazard: the destination set is edited through its own endpoint, not by saving a source.
+        "destination_links",
+        # The diff reads each reverse relation in full on both sides, after the save, so it never
+        # sees a real before-state. The view prefetches `schemas` without the deleted ones, so the
+        # two lists differ on every save and the entry stores every job and schema twice, which
+        # goes past the Kafka message limit for a source with a long sync history. Schemas log
+        # their own changes under the ExternalDataSchema scope, and jobs are sync runs, not user changes.
+        "jobs",
+        "schemas",
+    ],
+    "ExternalDataSchema": [
+        "status",
+        "sync_type_config",
+        "latest_error",
+        "last_synced_at",
+        # Reverse relation to a fail-closed model — same hazard as the source's `destination_links`.
+        # Every sync saves the schema from a Temporal activity, where diffing it would raise.
+        "destination_links",
+        # Pipeline-assigned, not user intent. Diffing it resolves the FK through
+        # DataWarehouseTable.objects, whose manager adds two joins and a prefetch on every
+        # schema save (even ones that don't touch this field) — the extra queries have
+        # deadlocked with concurrent DDL in production.
+        "table",
+        # Written by the model on the stop-syncing transition to record whether PostHog halted
+        # the schema itself, so it is derived state and not user intent. Diffing it also puts a
+        # second change on the entry that turns syncing on or off, which makes the schema
+        # activity feed read "updated schema" in place of "enabled schema".
+        "auto_disabled_at",
+        # Derived from full_refresh_interval_days and moved by every full resync, so it is not user intent.
+        "next_full_refresh_at",
+    ],
+    "Evaluation": [
+        # The fail-closed relation cannot be resolved outside a team scope; the handler diffs IDs instead.
+        "directory",
+        # Reverse relations — auto-managed by FK creates, not user intent.
+        "reports",
+        "backfills",
+    ],
+    "SignalScoutConfig": [
+        # Run bookkeeping, not user intent — keep it out of change detection even when it
+        # rides along with a real change (belt-and-suspenders with signal_exclusions above).
+        "last_run_at",
+        "consecutive_failure_count",
+        # Companion bookkeeping that rides along with every logged `status` change; the
+        # activity log entry itself already carries who and when.
+        "status_changed_at",
+        "status_changed_by",
+        # Reverse relations auto-managed by FK creates, not user-initiated config changes.
+        "runs",
+    ],
+    "SandboxCustomImage": sandbox_custom_image_machine_fields,
+}
+
+
+# A scope's tuning lives next to the model it configures, in a data-only module, so the team that
+# owns the model owns its tuning. The registry lists those modules; the registries above keep the
+# scopes whose model has no product owner. Merging here rather than in the registry keeps the
+# duplicate check in this reviewed file.
+_SCOPE_CONFIG_REGISTRIES: dict[str, dict[Any, Any]] = {
+    "FIELD_EXCLUSIONS": field_exclusions,
+    "FIELD_NAME_OVERRIDES": field_name_overrides,
+    "FIELD_WITH_MASKED_CONTENTS": field_with_masked_contents,
+    "SIGNAL_EXCLUSIONS": signal_exclusions,
+}
+
+
+def _merge_scope_configs(registries: Mapping[str, dict[Any, Any]], modules: Iterable[ModuleType]) -> None:
+    for module in modules:
+        for attribute, registry in registries.items():
+            for scope, value in getattr(module, attribute, {}).items():
+                if scope in registry:
+                    raise RuntimeError(
+                        f"{attribute}: {scope} is tuned twice, so {module.__name__} cannot tune it again"
+                    )
+                registry[scope] = value
+
+
+_merge_scope_configs(_SCOPE_CONFIG_REGISTRIES, activity_log_config_registry.MODULES)
+
+
+def describe_change(m: Any) -> Union[str, dict]:
+    # Use lazy imports to avoid circular dependencies
+    from products.dashboards.backend.models.dashboard import Dashboard
+    from products.dashboards.backend.models.dashboard_tile import DashboardTile
+
+    if isinstance(m, Dashboard):
+        return {"id": m.id, "name": m.name}
+    if isinstance(m, DashboardTile):
+        description: dict[str, Any] = {"dashboard": {"id": m.dashboard.id, "name": m.dashboard.name}}
+        description["insight"] = {"id": m.insight_id} if m.insight_id else None
+        description["text"] = {"id": m.text_id} if m.text_id else None
+        description["button_tile"] = {"id": m.button_tile_id} if m.button_tile_id else None
+        description["widget"] = {"id": str(m.widget_id)} if m.widget_id else None
+        return description
+    else:
+        return str(m)
+
+
+def _read_through_relation(relation: models.Manager) -> list[Union[dict, str]]:
+    described_models = [describe_change(r) for r in relation.all()]
+
+    if all(isinstance(elem, str) for elem in described_models):
+        # definitely a list of strings now but mypy doesn't know that
+        described_models = sorted(described_models)  # type: ignore
+
+    return described_models
+
+
+def safely_get_field_value(instance: models.Model | None, field: str):
+    """Helper function to get the value of a field, handling related objects and exceptions."""
+    if instance is None:
+        return None
+
+    try:
+        field_obj = instance._meta.get_field(field)
+
+        # For ForeignKey/OneToOneField, always access the ID first to avoid lazy loading
+        # throwing malformed UUID validation errors
+        if isinstance(field_obj, models.ForeignKey | models.OneToOneField):
+            field_id = getattr(instance, f"{field}_id", None)
+            if field_id is None:
+                return None
+            # Ensure field_id is actually an ID, not the object itself
+            if hasattr(field_id, "pk"):
+                field_id = field_id.pk
+            # Only fetch the actual object if we have a valid ID
+            # Widen the stub type to keep the guard against an unresolved lazy "app.Model" reference.
+            related_model: type[models.Model] | str = field_obj.related_model
+            if isinstance(related_model, type) and issubclass(related_model, models.Model):
+                return related_model.objects.get(pk=field_id)  # type: ignore[attr-defined]
+            else:
+                return field_id
+
+        # For other fields, use normal access
+        value = getattr(instance, field, None)
+        if isinstance(value, models.Manager):
+            value = _read_through_relation(value)
+        return value
+
+    # If the field is a related field and the related object has been deleted, this will raise an ObjectDoesNotExist
+    # exception. We catch this exception and return None, since the related object has been deleted, and we
+    # don't need any additional information about it other than the fact that it was deleted.
+    except (ObjectDoesNotExist, FieldDoesNotExist):
+        return None
+
+
+def _is_unchanged_without_a_query(
+    field: Any, previous: models.Model, current: models.Model, current_deferred: set[str]
+) -> bool:
+    """Decide from loaded values alone whether a field can differ, so the diff skips its read."""
+    if is_uncached_reverse_one_to_one(field, previous, current):
+        return True
+    if not field.concrete:
+        return False
+    if field.attname in current_deferred:
+        # A save writes only the loaded fields of a deferred instance, so the row keeps the value `previous` holds.
+        return True
+    if isinstance(field, models.ForeignKey | models.OneToOneField):
+        # Both sides fetch the related row by this id, so the same id gives the same value.
+        return getattr(previous, field.attname) == getattr(current, field.attname)
+    return False
+
+
+def changes_between(
+    model_type: AuditableScope,
+    previous: Optional[models.Model],
+    current: Optional[models.Model],
+) -> list[Change]:
+    """
+    Identifies changes between two models by comparing fields.
+    Note that this method only really works for models that have a single instance
+    and not for models that have a many-to-many relationship with another model.
+    """
+    changes: list[Change] = []
+
+    if previous is None and current is None:
+        # There are no changes between two things that don't exist.
+        return changes
+
+    if previous is not None:
+        fields = current._meta.get_fields() if current is not None else []
+        # get_fields() lists a GenericRelation last, as a private field, but lists the reverse
+        # foreign key it replaced first. Keep the old position so the diff order does not change.
+        fields = sorted(fields, key=lambda f: not isinstance(f, GenericRelation))
+        excluded_fields = field_exclusions.get(model_type, []) + common_field_exclusions
+        masked_fields = field_with_masked_contents.get(model_type, [])
+        filtered_fields = [f for f in fields if f.name not in excluded_fields]
+        filtered_field_names = [f.name for f in filtered_fields]
+        current_deferred = current.get_deferred_fields() if current is not None else set()
+
+        for field in filtered_fields:
+            if current is not None and _is_unchanged_without_a_query(field, previous, current, current_deferred):
+                continue
+
+            field_name = field.name
+            left = safely_get_field_value(previous, field_name)
+            right = safely_get_field_value(current, field_name)
+
+            if field_name == "tagged_items":
+                field_name = "tags"  # Or the UI needs to be coupled to this internal backend naming.
+
+            if field_name == "dashboards" and "dashboard_tiles" in filtered_field_names:
+                # Only process dashboard_tiles when it is present. It supersedes dashboards.
+                continue
+
+            if model_type == "Insight" and field_name == "dashboard_tiles":
+                # The API exposes this as dashboards and that's what the activity describers expect.
+                field_name = "dashboards"
+
+            # if is a django model field, check the empty_values list
+            # A reverse foreign key has no empty_values, so an empty list counts as a value. A
+            # GenericRelation inherits them from Field, and keeps the reverse foreign key behavior.
+            empty_values = None if isinstance(field, GenericRelation) else getattr(field, "empty_values", None)
+            left_is_none = left is None or (empty_values is not None and left in empty_values)
+            right_is_none = right is None or (empty_values is not None and right in empty_values)
+
+            change_values = (
+                mask_change_values(model_type, field_name, left, right)
+                if field_name in masked_fields
+                else MaskedChange(before=left, after=right)
+            )
+            left_value = change_values.before
+            right_value = change_values.after
+
+            # Use the override name if it exists
+            display_name = field_name_overrides.get(model_type, {}).get(field_name, field_name)
+            if left_is_none and right_is_none:
+                pass  # could be {} vs None
+            elif left_is_none and not right_is_none:
+                changes.append(Change(type=model_type, field=display_name, action="created", after=right_value))
+            elif right_is_none and not left_is_none:
+                changes.append(Change(type=model_type, field=display_name, action="deleted", before=left_value))
+            elif left != right:
+                changes.append(
+                    Change(
+                        type=model_type,
+                        field=display_name,
+                        action="changed",
+                        before=left_value,
+                        after=right_value,
+                    )
+                )
+
+    return changes
+
+
+def dict_changes_between(
+    model_type: AuditableScope,
+    previous: dict[Any, Any],
+    new: dict[Any, Any],
+    use_field_exclusions: bool = False,
+) -> list[Change]:
+    """
+    Identifies changes between two dictionaries by comparing fields
+    """
+    changes: list[Change] = []
+
+    if previous == new:
+        return changes
+
+    previous = previous or {}
+    new = new or {}
+
+    # Callers pass a model's `__dict__`, which also holds private attributes set by signal
+    # handlers (for example a snapshot of the old API token). They are not fields, and can be secrets.
+    fields = {field for field in [*previous.keys(), *new.keys()] if not str(field).startswith("_")}
+    if use_field_exclusions:
+        fields = fields - set(field_exclusions.get(model_type, [])) - set(common_field_exclusions)
+
+    for field in fields:
+        previous_value = previous.get(field, None)
+        new_value = new.get(field, None)
+
+        if previous_value is None and new_value is not None:
+            changes.append(Change(type=model_type, field=field, action="created", after=new_value))
+        elif new_value is None and previous_value is not None:
+            changes.append(
+                Change(
+                    type=model_type,
+                    field=field,
+                    action="deleted",
+                    before=previous_value,
+                )
+            )
+        elif previous_value != new_value:
+            changes.append(
+                Change(
+                    type=model_type,
+                    field=field,
+                    action="changed",
+                    before=previous_value,
+                    after=new_value,
+                )
+            )
+
+    return changes
+
+
+def _report_activity_log_write_failure(e: Exception, error_context: dict, deferred: bool) -> None:
+    logger.warn(
+        "activity_log.failed_to_write_to_activity_log",
+        **error_context,
+        exception=e,
+    )
+    capture_exception(e)
+    ACTIVITY_LOG_WRITE_FAILURES.labels(deferred=str(deferred).lower()).inc()
+
+
+def _deleted_user_ids(user_ids: set[int]) -> set[int]:
+    if not user_ids:
+        return set()
+    user_model = get_user_model()
+    # The insert checks the foreign key on the writer. A lagging replica can miss a user that the
+    # committed transaction created, or still hold one that it deleted.
+    existing = user_model.objects.using(router.db_for_write(user_model)).filter(pk__in=user_ids)
+    return user_ids - set(existing.values_list("pk", flat=True))
+
+
+def _handle_activity_log_transaction(
+    create_fn: Callable[[bool], Any], error_context: dict, *, using: str | None = None, strict: bool = False
+):
+    """Call `create_fn(deferred)`.
+
+    A deferred write runs after the commit, so the transaction can delete the acting user first.
+    A user who deletes their own account is the actor of the rows that the cascade logs.
+    `on_delete=SET_NULL` covers only rows that exist. When `deferred` is true, `create_fn` must
+    unset a deleted user, or the insert breaks the foreign key.
+    """
+    try:
+        # Check if we're in a transaction, if yes, defer the activity log creation to the commit signal
+        if (
+            not strict
+            and not transaction.get_autocommit(using=using)
+            and getattr(settings, "ACTIVITY_LOG_TRANSACTION_MANAGEMENT", True)
+        ):
+            # The transaction already committed by the time this callback runs, so its own guard
+            # keeps a slow audit write from failing a request whose data is already durable.
+            def _deferred_create():
+                try:
+                    create_fn(True)
+                except Exception as e:
+                    _report_activity_log_write_failure(e, error_context, deferred=True)
+                    if settings.TEST:
+                        raise
+
+            transaction.on_commit(_deferred_create, using=using)
+            return None
+        else:
+            return create_fn(False)
+
+    except Exception as e:
+        if strict:
+            raise
+        _report_activity_log_write_failure(e, error_context, deferred=False)
+        if settings.TEST:
+            raise
+        return None
+
+
+# The frontend matches on this job type to render the job id as a link to a sandbox task.
+# Product triggers (`hog_flow`, `canvas_action`) carry job ids that point elsewhere.
+AGENT_TRIGGER_JOB_TYPE = "agent"
+# A row written with a workload access token. The frontend shows the workload as the actor instead of the
+# organization owner the token acts as. `job_id` is the trust policy id, because a run id, when the provider
+# has one, is one of the recorded claims in the payload.
+WORKLOAD_TRIGGER_JOB_TYPE = "workload"
+
+
+def agent_trigger() -> Optional[Trigger]:
+    """The agent attribution for this request, or None when neither field reached it.
+
+    The task id is the only server-set part. The intent is the agent's claim.
+    """
+    task_id = activity_storage.get_agent_task_id()
+    intent = activity_storage.get_agent_intent()
+    if not task_id and not intent:
+        return None
+    return Trigger(
+        job_type=AGENT_TRIGGER_JOB_TYPE,
+        job_id=task_id or "",
+        payload={"intent": intent} if intent else {},
+    )
+
+
+def _with_request_trigger(detail: Detail) -> Detail:
+    """The row is written inside the user's save, so an error here must not fail that save.
+
+    A verified trigger, such as a CI job, comes before agent intent, which is the agent's own claim."""
+    try:
+        trigger = activity_storage.get_verified_trigger() or agent_trigger()
+        return dataclasses.replace(detail, trigger=trigger) if trigger is not None else detail
+    except Exception as e:
+        capture_exception(e)
+        return detail
+
+
+def log_activity(
+    *,
+    organization_id: Optional[UUID],
+    team_id: Optional[int],
+    user: Optional["User"],
+    item_id: Optional[Union[int, str, UUID]],
+    scope: str,
+    activity: str,
+    detail: Detail,
+    was_impersonated: bool,
+    client: Optional[str] = None,
+    ip_address: Optional[str] = None,
+    force_save: bool = False,
+    instance_only: bool = False,
+    # A product on its own database passes `router.db_for_write(Model)`, so the audit write waits
+    # for that connection's commit and is dropped when it rolls back. `None` uses the default one.
+    using: str | None = None,
+    strict: bool = False,
+    # The actor belongs to an organization other than the row's, and the row's organization must
+    # not learn who acted. The row stores no user, no impersonation flag and nothing the request
+    # recorded. `is_system=False` keeps it from reading as a change that PostHog made.
+    external_actor: bool = False,
+) -> ActivityLog | None:
+    credential: ActivityCredential | None
+    if external_actor:
+        user = None
+        was_impersonated = False
+        client = None
+        ip_address = None
+        credential = None
+    else:
+        if client is None:
+            client = activity_storage.get_client()
+        if ip_address is None:
+            ip_address = activity_storage.get_ip_address()
+        credential = activity_storage.get_credential()
+        if credential is None and activity_storage.is_request_scoped():
+            # The request was anonymous, or an authentication class that records no credential verified
+            # it. Say so, so that the row does not read like one written outside a request.
+            credential = ActivityCredential(type="unattributed")
+        if detail.trigger is None:
+            # A product that sets its own trigger already says what drove the write.
+            detail = _with_request_trigger(detail)
+    if was_impersonated and user is None:
+        logger.warn(
+            "activity_log.failed_to_write_to_activity_log",
+            team=team_id,
+            organization_id=organization_id,
+            scope=scope,
+            activity=activity,
+            exception=ValueError("Cannot log impersonated activity without a user"),
+        )
+        return None
+    try:
+        if activity == "updated" and (detail.changes is None or len(detail.changes) == 0) and not force_save:
+            logger.warn(
+                "activity_log.ignore_update_activity_no_changes",
+                team_id=team_id,
+                organization_id=organization_id,
+                user_id=user.id if user else None,
+                scope=scope,
+            )
+            return None
+
+        fields: dict[str, Any] = {
+            "organization_id": organization_id,
+            "team_id": team_id,
+            "user": user,
+            "was_impersonated": was_impersonated,
+            "is_system": user is None and not external_actor,
+            "item_id": str(item_id) if item_id is not None else None,
+            "scope": scope,
+            "activity": activity,
+            "detail": detail,
+            "client": client,
+            "ip_address": ip_address,
+            "credential_type": credential.type if credential else None,
+            # Postgres rejects a NUL in text, and a failed insert drops the whole audit row. An ID-JAG
+            # client id is a claim from the organization's identity provider, so it can carry one.
+            "credential_id": credential.id.replace("\x00", "") if credential and credential.id else None,
+            "impersonated_by_id": credential.impersonated_by_id if credential else None,
+        }
+
+        # Read the id now. When the transaction deletes this same instance, `delete()` sets its pk to None.
+        user_id = user.pk if user is not None else None
+
+        def _do_log_activity(deferred: bool) -> ActivityLog:
+            if deferred and user_id is not None and _deleted_user_ids({user_id}):
+                return ActivityLog.objects.create(**{**fields, "user": None})
+            return ActivityLog.objects.create(**fields)
+
+        if instance_only:
+            return ActivityLog(**fields)
+
+        return _handle_activity_log_transaction(
+            _do_log_activity,
+            {
+                "team": team_id,
+                "organization_id": organization_id,
+                "scope": scope,
+                "activity": activity,
+            },
+            using=using,
+            strict=strict,
+        )
+
+    except Exception as e:
+        logger.warn(
+            "activity_log.failed_to_write_to_activity_log",
+            team=team_id,
+            organization_id=organization_id,
+            scope=scope,
+            activity=activity,
+            exception=e,
+        )
+        capture_exception(e)
+        if settings.TEST or strict:
+            raise
+        return None
+
+
+class LogActivityEntry(TypedDict, total=False):
+    organization_id: Optional[UUID]
+    team_id: Optional[int]
+    user: Optional["User"]
+    item_id: Optional[Union[int, str, UUID]]
+    scope: Required[str]
+    activity: Required[str]
+    detail: Required[Detail]
+    was_impersonated: Required[bool]
+    client: Optional[str]
+    ip_address: Optional[str]
+    force_save: bool
+    external_actor: bool
+
+
+def update_activity_context(row: ActivityLog, **fields: Any) -> None:
+    """Add fields that are known only after the logged action ran to the row's context.
+
+    `$activity_log_entry_created` went out when the row was created, so a destination that streams the
+    activity log does not receive these fields.
+    """
+    try:
+        detail = cast(Detail, row.detail)
+        if detail.context is None:
+            raise ValueError(f"{row.scope} activity row has no context to update")
+        row.detail = dataclasses.replace(detail, context=dataclasses.replace(detail.context, **fields))
+        row.save(update_fields=["detail"])
+    except Exception as e:
+        logger.warn("activity_log.failed_to_update_activity_context", scope=row.scope, exception=e)
+        capture_exception(e)
+        if settings.TEST:
+            raise
+
+
+def log_activity_with_soft_delete(
+    *,
+    scope: str,
+    previous: models.Model | None,
+    current: models.Model | None,
+    activity: str,
+    user: "User | None",
+    was_impersonated: bool,
+    name: str | None = None,
+    organization_id: UUID | None = None,
+) -> None:
+    instance = current or previous
+    if instance is None:
+        return
+
+    changes = changes_between(cast(AuditableScope, scope), previous=previous, current=current)
+    # Soft delete and restore go through save(), so the mixin reports them as "updated".
+    deleted_change = next((change for change in changes if change.field == "deleted"), None)
+    if deleted_change:
+        activity = "deleted" if deleted_change.after else "restored"
+    log_activity(
+        organization_id=organization_id,
+        team_id=instance.serializable_value("team"),
+        user=user,
+        was_impersonated=was_impersonated,
+        item_id=str(instance.pk),
+        scope=scope,
+        activity=activity,
+        detail=Detail(name=name if name is not None else str(instance), changes=changes),
+    )
+
+
+def bulk_log_activity(
+    log_entries: list[LogActivityEntry], batch_size: int = 500, *, notify: bool = True, using: str | None = None
+) -> list[ActivityLog]:
+    """Write activity log rows in bulk.
+
+    Each row created also fires `post_save`, which produces a CDP internal event so customer
+    destinations and workflows can react. Pass `notify=False` for a maintenance sweep, where that
+    fan-out would put one event per affected row onto the internal-events topic.
+
+    A product on its own database passes `using=router.db_for_write(Model)`, so the audit write
+    waits for that connection's commit and is dropped when it rolls back.
+    """
+    if not log_entries:
+        return []
+
+    activity_logs = []
+    dropped_count = 0
+    for entry in log_entries:
+        log = log_activity(**entry, instance_only=True)
+
+        if log:
+            activity_logs.append(log)
+        else:
+            dropped_count += 1
+            logger.info(
+                "bulk_log_activity.entry_dropped",
+                scope=entry.get("scope"),
+                activity=entry.get("activity"),
+                team_id=entry.get("team_id"),
+                organization_id=entry.get("organization_id"),
+            )
+
+    if dropped_count > 0:
+        logger.info(
+            "bulk_log_activity.entries_dropped",
+            total_entries=len(log_entries),
+            dropped_count=dropped_count,
+            created_count=len(activity_logs),
+        )
+
+    if not activity_logs:
+        return []
+
+    def _do_bulk_create(deferred: bool) -> list[ActivityLog]:
+        if deferred:
+            deleted_user_ids = _deleted_user_ids({log.user_id for log in activity_logs if log.user_id is not None})
+            for log in activity_logs:
+                if log.user_id in deleted_user_ids:
+                    log.user = None
+
+        created_logs = ActivityLog.objects.bulk_create(activity_logs, batch_size=batch_size)
+
+        if notify:
+            for log in created_logs:
+                post_save.send(sender=ActivityLog, instance=log, created=True)
+
+        return created_logs
+
+    return (
+        _handle_activity_log_transaction(
+            _do_bulk_create,
+            {
+                "count": len(activity_logs),
+                "scope": "bulk_log_activity",
+                "activity": "bulk_create",
+                "log_entries": log_entries,
+            },
+            using=using,
+        )
+        or []
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class ActivityPage:
+    total_count: int
+    limit: int
+    has_next: bool
+    has_previous: bool
+    results: list[ActivityLog]
+
+
+def get_activity_page(activity_query: models.QuerySet, limit: int = 10, page: int = 1) -> ActivityPage:
+    paginator = Paginator(activity_query, limit)
+    try:
+        activity_page = paginator.page(page)
+    except EmptyPage:
+        # A page after the last one holds no records. It is not an error.
+        return ActivityPage(
+            results=[],
+            total_count=paginator.count,
+            limit=limit,
+            has_next=False,
+            has_previous=page > 1,
+        )
+
+    return ActivityPage(
+        results=list(activity_page.object_list),
+        total_count=paginator.count,
+        limit=limit,
+        has_next=activity_page.has_next(),
+        has_previous=activity_page.has_previous(),
+    )
+
+
+def apply_activity_visibility_restrictions(queryset: QuerySet, user: Union["User", AnonymousUser, None]) -> QuerySet:
+    """
+    Apply visibility restrictions to activity log queryset based on user permissions.
+    """
+    from posthog.models.activity_logging.utils import activity_visibility_manager
+
+    is_staff = bool(user and not isinstance(user, AnonymousUser) and hasattr(user, "is_staff") and user.is_staff)
+    return activity_visibility_manager.apply_to_queryset(queryset, is_staff)
+
+
+def load_activity(
+    scope: ActivityScope,
+    team_id: int,
+    item_ids: Optional[list[str]] = None,
+    limit: int = 10,
+    page: int = 1,
+    user: Union["User", AnonymousUser, None] = None,
+) -> ActivityPage:
+    # TODO in follow-up to posthog #8931 selecting specific fields into a return type from this query
+
+    activity_query = (
+        ActivityLog.objects.select_related("user").filter(team_id=team_id, scope=scope).order_by("-created_at")
+    )
+
+    if item_ids is not None:
+        activity_query = activity_query.filter(item_id__in=item_ids)
+
+    if user is not None:
+        activity_query = apply_activity_visibility_restrictions(activity_query, user)
+
+    return get_activity_page(activity_query, limit, page)
+
+
+def load_all_activity(scope_list: list[ActivityScope], team_id: int, limit: int = 10, page: int = 1):
+    activity_query = (
+        ActivityLog.objects.select_related("user").filter(team_id=team_id, scope__in=scope_list).order_by("-created_at")
+    )
+
+    return get_activity_page(activity_query, limit, page)
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value).encode("utf-8"))
+
+
+def bound_detail_for_internal_event(detail: Any) -> tuple[Any, bool]:
+    """Shrink an activity detail so the internal event stays under the Kafka message limit.
+
+    Returns the detail to send and a flag that tells if it was truncated.
+    """
+    if _json_size(detail) <= MAX_INTERNAL_EVENT_DETAIL_BYTES:
+        return detail, False
+    if not isinstance(detail, dict):
+        return None, True
+
+    # First drop the change values and the free-form fields, but keep which fields changed.
+    bounded: dict[str, Any] = {key: detail.get(key) for key in _SUMMARY_DETAIL_KEYS if key in detail}
+    bounded["changes"] = [
+        {key: change.get(key) for key in ("type", "action", "field")}
+        for change in detail.get("changes") or []
+        if isinstance(change, dict)
+    ]
+    if _json_size(bounded) <= MAX_INTERNAL_EVENT_DETAIL_BYTES:
+        return bounded, True
+
+    summary: dict[str, Any] = {key: detail.get(key) for key in _SUMMARY_DETAIL_KEYS if key in detail}
+    if isinstance(summary.get("name"), str):
+        summary["name"] = summary["name"][:_MAX_SUMMARY_NAME_LENGTH]
+    if _json_size(summary) <= MAX_INTERNAL_EVENT_DETAIL_BYTES:
+        return summary, True
+    return None, True
+
+
+@receiver(post_save, sender=ActivityLog)
+def activity_log_created(sender, instance: "ActivityLog", created, **kwargs):
+    from posthog.api.advanced_activity_logs import ActivityLogSerializer
+    from posthog.api.shared import UserBasicSerializer
+    from posthog.models.activity_logging.utils import activity_visibility_manager
+
+    from products.cdp.backend.internal_events import InternalEventEvent, InternalEventPerson, produce_internal_event
+
+    if not created:
+        return
+
+    try:
+        if activity_visibility_manager.is_restricted(instance, restrict_for_staff=True):
+            logger.info(
+                "Skipping restricted activity log event",
+                scope=instance.scope,
+                activity=instance.activity,
+                team_id=instance.team_id,
+                organization_id=instance.organization_id,
+            )
+            return
+
+        serialized_data = ActivityLogSerializer(instance).data
+        # We need to serialize the detail object using the encoder to avoid unsupported types like timedelta
+        serialized_data["detail"] = json.loads(json.dumps(serialized_data["detail"], cls=ActivityDetailEncoder))
+        serialized_data["detail"], detail_truncated = bound_detail_for_internal_event(serialized_data["detail"])
+        if detail_truncated:
+            serialized_data["detail_truncated"] = True
+        # TODO: Move this into the producer to support dataclasses
+        user_data = UserBasicSerializer(instance.user).data if instance.user else None
+
+        if instance.team_id is not None:
+            produce_internal_event(
+                team_id=instance.team_id,
+                event=InternalEventEvent(
+                    event="$activity_log_entry_created",
+                    distinct_id=user_data["distinct_id"] if user_data else f"team_{instance.team_id}",
+                    properties=serialized_data,
+                ),
+                person=(
+                    InternalEventPerson(
+                        id=user_data["id"],
+                        properties=user_data,
+                    )
+                    if user_data
+                    else None
+                ),
+            )
+        elif instance.organization_id is not None:
+            from posthog.tasks.activity_log import broadcast_activity_log_to_organization
+
+            broadcast_activity_log_to_organization.delay(
+                organization_id=instance.organization_id,
+                serialized_data=serialized_data,
+                user_data=user_data,
+            )
+    except Exception as e:
+        # We don't want to hard fail here.
+        # Identify the entry by ids only: the detail can carry person data and runs to megabytes.
+        logger.exception(
+            "Failed to produce internal event",
+            activity_log_id=str(instance.id),
+            scope=instance.scope,
+            activity=instance.activity,
+            team_id=instance.team_id,
+            organization_id=instance.organization_id,
+            error=e,
+        )
+        capture_exception(e)
+        return

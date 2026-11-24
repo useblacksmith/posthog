@@ -1,0 +1,611 @@
+import { Client, Connection, WorkflowExecutionAlreadyStartedError } from '@temporalio/client'
+
+import { getDefaultAIObservabilityConfig } from '~/ai-observability/config'
+import { EncryptionCodec } from '~/common/temporal/codec'
+import { RawKafkaEvent } from '~/types'
+
+import { EVENT_REFERENCE_START_DELAY, TemporalService, resolveSettleConfig, workflowSafeId } from './temporal.service'
+import type { EvaluationWorkflowRuntime, TemporalServiceConfig } from './temporal.service'
+
+jest.mock('@temporalio/client')
+
+const createMockEvent = (overrides: Partial<RawKafkaEvent> = {}): RawKafkaEvent => {
+    return {
+        uuid: 'event-456',
+        event: '$ai_generation',
+        properties: '{}',
+        timestamp: '2024-01-01T00:00:00Z',
+        team_id: 1,
+        distinct_id: 'test-user',
+        elements_chain: '',
+        created_at: '2024-01-01T00:00:00Z',
+        project_id: 1,
+        ...overrides,
+    } as RawKafkaEvent
+}
+
+describe('TemporalService', () => {
+    let config: TemporalServiceConfig
+    let service: TemporalService
+    let mockClient: jest.Mocked<Client>
+    let mockConnection: jest.Mocked<Connection>
+    let mockWorkflowHandle: any
+
+    beforeEach(() => {
+        config = {
+            TEMPORAL_CLIENT_ROOT_CA: undefined,
+            TEMPORAL_CLIENT_CERT: undefined,
+            TEMPORAL_CLIENT_KEY: undefined,
+            TEMPORAL_PORT: '7233',
+            TEMPORAL_HOST: 'localhost',
+            TEMPORAL_NAMESPACE: 'test-namespace',
+            TEMPORAL_SECRET_KEY: undefined,
+            TEMPORAL_FALLBACK_SECRET_KEYS: '',
+        }
+
+        mockWorkflowHandle = {
+            workflowId: 'test-workflow-id',
+        }
+
+        mockConnection = {
+            close: jest.fn().mockResolvedValue(undefined),
+        } as any
+
+        mockClient = {
+            workflow: {
+                start: jest.fn().mockResolvedValue(mockWorkflowHandle),
+            },
+            connection: mockConnection,
+        } as any
+        ;(Connection.connect as jest.Mock) = jest.fn().mockResolvedValue(mockConnection)
+        ;(Client as unknown as jest.Mock) = jest.fn().mockReturnValue(mockClient)
+
+        service = new TemporalService(config)
+    })
+
+    afterEach(() => {
+        jest.useRealTimers()
+        jest.restoreAllMocks()
+        jest.clearAllMocks()
+    })
+
+    describe('connection management', () => {
+        it('creates client with correct config', async () => {
+            await service.startEvaluationRunWorkflow('test', createMockEvent({ uuid: 'test-uuid' }), 'llm_judge')
+
+            expect(Connection.connect).toHaveBeenCalledWith({
+                address: 'localhost:7233',
+                tls: false,
+            })
+        })
+
+        it('handles TLS config when certificates provided', async () => {
+            config.TEMPORAL_CLIENT_ROOT_CA = 'root-ca-cert'
+            config.TEMPORAL_CLIENT_CERT = 'client-cert'
+            config.TEMPORAL_CLIENT_KEY = 'client-key'
+
+            const newService = new TemporalService(config)
+            await newService.startEvaluationRunWorkflow('test', createMockEvent({ uuid: 'test-uuid' }), 'llm_judge')
+
+            expect(Connection.connect).toHaveBeenCalledWith({
+                address: 'localhost:7233',
+                tls: {
+                    serverRootCACertificate: expect.any(Buffer),
+                    clientCertPair: {
+                        crt: expect.any(Buffer),
+                        key: expect.any(Buffer),
+                    },
+                },
+            })
+        })
+
+        it.each([
+            {
+                name: 'configures an encryption codec when a temporal secret key is set',
+                env: {
+                    CLOUD_DEPLOYMENT: 'US',
+                    TEMPORAL_SECRET_KEY: 'test-secret-key-for-codec-000000',
+                    TEMPORAL_FALLBACK_SECRET_KEYS: 'fallback-key-one-000000000000000,fallback-key-two-000000000000000',
+                },
+                expected: { encryptionCodecs: [true] },
+            },
+            {
+                name: 'sends payloads unencrypted when no secret key is set',
+                env: {},
+                expected: { encryptionCodecs: undefined },
+            },
+            {
+                name: 'does not use SECRET_KEY as the codec key on self-hosted',
+                env: { NODE_ENV: 'production', SECRET_KEY: 'app-secret-key-not-for-temporal-00' },
+                expected: { encryptionCodecs: undefined },
+            },
+            {
+                name: 'refuses to start on cloud without a temporal secret key',
+                env: { CLOUD_DEPLOYMENT: 'US', SECRET_KEY: 'app-secret-key-not-for-temporal-00' },
+                expected: { error: expect.stringContaining('TEMPORAL_SECRET_KEY is required') },
+            },
+        ])('$name', async ({ env, expected }) => {
+            const names = [
+                'CLOUD_DEPLOYMENT',
+                'SECRET_KEY',
+                'TEMPORAL_SECRET_KEY',
+                'TEMPORAL_FALLBACK_SECRET_KEYS',
+                ...Object.keys(env),
+            ]
+            const original = Object.fromEntries(names.map((name) => [name, process.env[name]]))
+            for (const name of names) {
+                delete process.env[name]
+            }
+            Object.assign(process.env, env)
+
+            try {
+                const startWorkflow = async (): Promise<boolean[] | undefined> => {
+                    const { TEMPORAL_SECRET_KEY, TEMPORAL_FALLBACK_SECRET_KEYS } = getDefaultAIObservabilityConfig()
+                    const newService = new TemporalService({
+                        ...config,
+                        TEMPORAL_SECRET_KEY,
+                        TEMPORAL_FALLBACK_SECRET_KEYS,
+                    })
+                    await newService.startEvaluationRunWorkflow(
+                        'test',
+                        createMockEvent({ uuid: 'test-uuid' }),
+                        'llm_judge'
+                    )
+                    const clientOptions = (Client as unknown as jest.Mock).mock.calls[0][0]
+                    return clientOptions.dataConverter?.payloadCodecs.map(
+                        (codec: unknown) => codec instanceof EncryptionCodec
+                    )
+                }
+                const outcome = await startWorkflow().then(
+                    (encryptionCodecs) => ({ encryptionCodecs }),
+                    (error: Error) => ({ error: error.message })
+                )
+
+                expect(outcome).toEqual(expected)
+            } finally {
+                for (const name of names) {
+                    if (original[name] === undefined) {
+                        delete process.env[name]
+                    } else {
+                        process.env[name] = original[name]
+                    }
+                }
+            }
+        })
+
+        it('disconnects client properly', async () => {
+            await service.startEvaluationRunWorkflow('test', createMockEvent({ uuid: 'test-uuid' }), 'llm_judge')
+            await service.disconnect()
+
+            expect(mockConnection.close).toHaveBeenCalled()
+        })
+    })
+
+    describe('workflow triggering', () => {
+        it('starts evaluation run workflow with correct parameters', async () => {
+            const mockEvent = createMockEvent({ properties: { $ai_input: 'test', $ai_output: 'response' } as any })
+
+            await service.startEvaluationRunWorkflow('eval-123', mockEvent, 'llm_judge')
+
+            expect(mockClient.workflow.start).toHaveBeenCalledWith('run-evaluation', {
+                taskQueue: 'llm-analytics-evals-task-queue',
+                workflowId: 'llma-llm-eval-eval-123-event-456-ingestion',
+                workflowIdConflictPolicy: 'USE_EXISTING',
+                workflowIdReusePolicy: 'ALLOW_DUPLICATE_FAILED_ONLY',
+                workflowTaskTimeout: '2 minutes',
+                args: [
+                    {
+                        evaluation_id: 'eval-123',
+                        event_data: mockEvent,
+                    },
+                ],
+            })
+        })
+
+        it('uses sentiment workflow prefix for sentiment evaluations', async () => {
+            const mockEvent = createMockEvent()
+
+            await service.startEvaluationRunWorkflow('eval-123', mockEvent, 'sentiment')
+
+            expect(mockClient.workflow.start).toHaveBeenCalledWith(
+                'run-evaluation',
+                expect.objectContaining({
+                    workflowId: 'llma-sentiment-eval-eval-123-event-456-ingestion',
+                })
+            )
+        })
+
+        it('throws when evaluation runtime has no workflow prefix', async () => {
+            await expect(
+                service.startEvaluationRunWorkflow(
+                    'eval-123',
+                    createMockEvent(),
+                    'unknown' as EvaluationWorkflowRuntime
+                )
+            ).rejects.toThrow('Unsupported evaluation runtime: unknown')
+
+            expect(mockClient.workflow.start).not.toHaveBeenCalled()
+        })
+
+        it('generates deterministic workflow IDs', async () => {
+            const mockEvent = createMockEvent()
+
+            await service.startEvaluationRunWorkflow('eval-123', mockEvent, 'llm_judge')
+            await service.startEvaluationRunWorkflow('eval-123', mockEvent, 'llm_judge')
+
+            const calls = (mockClient.workflow.start as jest.Mock).mock.calls
+            const workflowId1 = calls[0][1].workflowId
+            const workflowId2 = calls[1][1].workflowId
+
+            expect(workflowId1).toEqual(workflowId2)
+            expect(workflowId1).toBe('llma-llm-eval-eval-123-event-456-ingestion')
+        })
+
+        it('generates different workflow IDs for different events', async () => {
+            const mockEvent1 = createMockEvent({ uuid: 'event-1' })
+            const mockEvent2 = createMockEvent({ uuid: 'event-2' })
+
+            await service.startEvaluationRunWorkflow('eval-123', mockEvent1, 'llm_judge')
+            await service.startEvaluationRunWorkflow('eval-123', mockEvent2, 'llm_judge')
+
+            const calls = (mockClient.workflow.start as jest.Mock).mock.calls
+            const workflowId1 = calls[0][1].workflowId
+            const workflowId2 = calls[1][1].workflowId
+
+            expect(workflowId1).not.toEqual(workflowId2)
+            expect(workflowId1).toBe('llma-llm-eval-eval-123-event-1-ingestion')
+            expect(workflowId2).toBe('llma-llm-eval-eval-123-event-2-ingestion')
+        })
+
+        it('returns workflow handle on success', async () => {
+            const handle = await service.startEvaluationRunWorkflow('eval-123', createMockEvent(), 'llm_judge')
+
+            expect(handle).toBe(mockWorkflowHandle)
+        })
+
+        it('throws on workflow start failure', async () => {
+            ;(mockClient.workflow.start as jest.Mock).mockRejectedValue(new Error('Temporal unavailable'))
+
+            await expect(
+                service.startEvaluationRunWorkflow('eval-123', createMockEvent(), 'llm_judge')
+            ).rejects.toThrow('Temporal unavailable')
+        })
+
+        it('starts tagger run workflow with correct parameters', async () => {
+            const mockEvent = createMockEvent({ properties: { $ai_input: 'test', $ai_output: 'response' } as any })
+
+            await service.startTaggerRunWorkflow('tagger-123', mockEvent)
+
+            expect(mockClient.workflow.start).toHaveBeenCalledWith('run-tagger', {
+                taskQueue: 'llm-analytics-evals-task-queue',
+                workflowId: 'llma-tagger-tagger-123-event-456-ingestion',
+                workflowIdConflictPolicy: 'USE_EXISTING',
+                workflowIdReusePolicy: 'ALLOW_DUPLICATE_FAILED_ONLY',
+                workflowTaskTimeout: '2 minutes',
+                args: [
+                    {
+                        tagger_id: 'tagger-123',
+                        event_data: mockEvent,
+                    },
+                ],
+            })
+        })
+
+        it.each([
+            [
+                'run-evaluation',
+                (event: RawKafkaEvent) => service.startEvaluationRunWorkflow('eval-123', event, 'llm_judge'),
+            ],
+            ['run-tagger', (event: RawKafkaEvent) => service.startTaggerRunWorkflow('tagger-123', event)],
+        ])(
+            'starts %s with a delayed reference when the worker would encode the event over the payload limit',
+            async (workflow, start) => {
+                const oversizedOutput = 'é'.repeat(300_000)
+                const events = [
+                    createMockEvent({
+                        properties: JSON.stringify({ $ai_trace_id: 'trace-1', $ai_output: oversizedOutput }),
+                    }),
+                    createMockEvent({
+                        properties: JSON.stringify({ $ai_trace_id: 12345, $ai_output: oversizedOutput }),
+                    }),
+                    createMockEvent({ properties: JSON.stringify({ $ai_trace_id: 'é'.repeat(300_000) }) }),
+                ]
+                const sameLengthAscii = createMockEvent({
+                    properties: JSON.stringify({ $ai_trace_id: 'trace-1', $ai_output: 'e'.repeat(300_000) }),
+                })
+
+                for (const event of [...events, sameLengthAscii]) {
+                    await start(event)
+                }
+
+                const calls = (mockClient.workflow.start as jest.Mock).mock.calls
+                const reference = {
+                    uuid: 'event-456',
+                    team_id: 1,
+                    timestamp: '2024-01-01T00:00:00Z',
+                    awaiting_ingestion: true,
+                }
+                ;['trace-1', '12345', null].forEach((traceId, i) => {
+                    expect(calls[i][0]).toBe(workflow)
+                    expect(calls[i][1]).toEqual(expect.objectContaining({ startDelay: EVENT_REFERENCE_START_DELAY }))
+                    expect(calls[i][1].args[0].event_data).toEqual({ ...reference, trace_id: traceId })
+                })
+                expect(calls[3][1].args[0].event_data).toBe(sameLengthAscii)
+                expect(calls[3][1]).not.toHaveProperty('startDelay')
+            }
+        )
+
+        it('generates deterministic tagger workflow IDs', async () => {
+            const mockEvent = createMockEvent()
+
+            await service.startTaggerRunWorkflow('tagger-123', mockEvent)
+            await service.startTaggerRunWorkflow('tagger-123', mockEvent)
+
+            const calls = (mockClient.workflow.start as jest.Mock).mock.calls
+            expect(calls[0][1].workflowId).toEqual(calls[1][1].workflowId)
+            expect(calls[0][1].workflowId).toBe('llma-tagger-tagger-123-event-456-ingestion')
+        })
+
+        it('generates different tagger workflow IDs for different events', async () => {
+            const mockEvent1 = createMockEvent({ uuid: 'event-1' })
+            const mockEvent2 = createMockEvent({ uuid: 'event-2' })
+
+            await service.startTaggerRunWorkflow('tagger-123', mockEvent1)
+            await service.startTaggerRunWorkflow('tagger-123', mockEvent2)
+
+            const calls = (mockClient.workflow.start as jest.Mock).mock.calls
+            expect(calls[0][1].workflowId).toBe('llma-tagger-tagger-123-event-1-ingestion')
+            expect(calls[1][1].workflowId).toBe('llma-tagger-tagger-123-event-2-ingestion')
+        })
+
+        it('tagger and evaluation share the same task queue', async () => {
+            await service.startEvaluationRunWorkflow('eval-1', createMockEvent({ uuid: 'e1' }), 'llm_judge')
+            await service.startTaggerRunWorkflow('tagger-1', createMockEvent({ uuid: 'e2' }))
+
+            const calls = (mockClient.workflow.start as jest.Mock).mock.calls
+            expect(calls[0][1].taskQueue).toEqual(calls[1][1].taskQueue)
+        })
+
+        it('throws on tagger workflow start failure', async () => {
+            ;(mockClient.workflow.start as jest.Mock).mockRejectedValue(new Error('Temporal unavailable'))
+
+            await expect(service.startTaggerRunWorkflow('tagger-123', createMockEvent())).rejects.toThrow(
+                'Temporal unavailable'
+            )
+        })
+    })
+
+    describe('aggregate evaluation workflows', () => {
+        it('starts the aggregate workflow with the resolved settle config', async () => {
+            const mockEvent = createMockEvent()
+
+            await service.startAggregateEvaluationWorkflow({
+                evaluationId: 'eval-123',
+                event: mockEvent,
+                target: 'trace',
+                traceId: 'trace-abc',
+                sessionId: 'session-1',
+                aiSessionId: null,
+                settle: { strategy: 'inactivity', quiet_period_seconds: 120, max_age_seconds: 600 },
+            })
+
+            expect(mockClient.workflow.start).toHaveBeenCalledWith('run-aggregate-evaluation', {
+                args: [
+                    {
+                        evaluation_id: 'eval-123',
+                        team_id: mockEvent.team_id,
+                        trace_id: 'trace-abc',
+                        distinct_id: mockEvent.distinct_id,
+                        session_id: 'session-1',
+                        ai_session_id: null,
+                        target: 'trace',
+                        settle: { strategy: 'inactivity', quiet_period_seconds: 120, max_age_seconds: 600 },
+                    },
+                ],
+                taskQueue: 'llm-analytics-evals-task-queue',
+                workflowId: 'llma-trace-eval-eval-123-trace-abc',
+                workflowIdConflictPolicy: 'USE_EXISTING',
+                workflowIdReusePolicy: 'ALLOW_DUPLICATE_FAILED_ONLY',
+                workflowTaskTimeout: '2 minutes',
+            })
+        })
+
+        it('keys the session workflow on the ai session id, not the product-analytics session id', async () => {
+            const mockEvent = createMockEvent()
+
+            await service.startAggregateEvaluationWorkflow({
+                evaluationId: 'eval-123',
+                event: mockEvent,
+                target: 'session',
+                traceId: 'trace-abc',
+                sessionId: 'ph-session-1',
+                aiSessionId: 'ai-session-9',
+                settle: { strategy: 'inactivity', quiet_period_seconds: 3600, max_age_seconds: 86400 },
+            })
+
+            expect(mockClient.workflow.start).toHaveBeenCalledWith('run-aggregate-evaluation', {
+                args: [
+                    {
+                        evaluation_id: 'eval-123',
+                        team_id: mockEvent.team_id,
+                        trace_id: 'trace-abc',
+                        distinct_id: mockEvent.distinct_id,
+                        session_id: 'ph-session-1',
+                        ai_session_id: 'ai-session-9',
+                        target: 'session',
+                        settle: { strategy: 'inactivity', quiet_period_seconds: 3600, max_age_seconds: 86400 },
+                    },
+                ],
+                taskQueue: 'llm-analytics-evals-task-queue',
+                workflowId: 'llma-session-eval-eval-123-ai-session-9',
+                workflowIdConflictPolicy: 'USE_EXISTING',
+                workflowIdReusePolicy: 'ALLOW_DUPLICATE_FAILED_ONLY',
+                workflowTaskTimeout: '2 minutes',
+            })
+        })
+
+        it('returns null when the trace was already evaluated', async () => {
+            ;(mockClient.workflow.start as jest.Mock).mockRejectedValueOnce(
+                new WorkflowExecutionAlreadyStartedError('done', 'llma-trace-eval-x', 'run-aggregate-evaluation')
+            )
+
+            const result = await service.startAggregateEvaluationWorkflow({
+                evaluationId: 'eval-123',
+                event: createMockEvent(),
+                target: 'trace',
+                traceId: 'trace-abc',
+                sessionId: null,
+                aiSessionId: null,
+                settle: { strategy: 'fixed_window', window_seconds: 1800 },
+            })
+
+            expect(result).toBeNull()
+        })
+
+        it.each([
+            {
+                name: 'every event of one trace',
+                target: 'trace' as const,
+                units: [
+                    { uuid: 'event-1', traceId: 'trace-789', aiSessionId: null },
+                    { uuid: 'event-2', traceId: 'trace-789', aiSessionId: null },
+                ],
+                workflowId: 'llma-trace-eval-eval-123-trace-789',
+            },
+            {
+                name: 'every trace of one session',
+                target: 'session' as const,
+                units: [
+                    { uuid: 'event-1', traceId: 'trace-1', aiSessionId: 'ai-session-9' },
+                    { uuid: 'event-2', traceId: 'trace-2', aiSessionId: 'ai-session-9' },
+                ],
+                workflowId: 'llma-session-eval-eval-123-ai-session-9',
+            },
+        ])('starts one workflow for $name until the dedup window ends', async ({ target, units, workflowId }) => {
+            // lru-cache reads the clock through the performance object it captured at import. Fake
+            // timers replace that global object, so only a spy on the method moves the cache clock.
+            // The fake timers still have to run, because lru-cache holds each clock reading until a
+            // timer clears it.
+            let now = performance.now()
+            jest.spyOn(performance, 'now').mockImplementation(() => now)
+            jest.useFakeTimers({ doNotFake: ['performance'] })
+            const advanceClock = (ms: number): void => {
+                now += ms
+                jest.advanceTimersByTime(ms)
+            }
+            const starts = () =>
+                units.map(
+                    ({ uuid, traceId, aiSessionId }) =>
+                        () =>
+                            service.startAggregateEvaluationWorkflow({
+                                evaluationId: 'eval-123',
+                                event: createMockEvent({ uuid }),
+                                target,
+                                traceId,
+                                sessionId: null,
+                                aiSessionId,
+                                settle: { strategy: 'fixed_window', window_seconds: 1800 },
+                            })
+                )
+
+            await Promise.all(starts().map((start) => start()))
+            for (const start of starts()) {
+                await start()
+            }
+
+            const calls = (mockClient.workflow.start as jest.Mock).mock.calls
+            expect(calls).toHaveLength(1)
+            expect(calls[0][1].workflowId).toEqual(workflowId)
+
+            const [repeatStart] = starts()
+            advanceClock(40_000)
+            await repeatStart()
+            expect(calls).toHaveLength(1)
+
+            advanceClock(40_000)
+            await repeatStart()
+            expect(calls).toHaveLength(2)
+            expect(calls[1][1].workflowId).toEqual(workflowId)
+        })
+
+        it('rethrows non-dedup start failures and lets the next start retry', async () => {
+            ;(mockClient.workflow.start as jest.Mock).mockRejectedValue(new Error('Temporal unavailable'))
+
+            await expect(
+                service.startAggregateEvaluationWorkflow({
+                    evaluationId: 'eval-123',
+                    event: createMockEvent(),
+                    target: 'trace',
+                    traceId: 'trace-789',
+                    sessionId: null,
+                    aiSessionId: null,
+                    settle: { strategy: 'fixed_window', window_seconds: 1800 },
+                })
+            ).rejects.toThrow('Temporal unavailable')
+            ;(mockClient.workflow.start as jest.Mock).mockResolvedValue(mockWorkflowHandle)
+            await expect(
+                service.startAggregateEvaluationWorkflow({
+                    evaluationId: 'eval-123',
+                    event: createMockEvent(),
+                    target: 'trace',
+                    traceId: 'trace-789',
+                    sessionId: null,
+                    aiSessionId: null,
+                    settle: { strategy: 'fixed_window', window_seconds: 1800 },
+                })
+            ).resolves.toBe(mockWorkflowHandle)
+            expect(mockClient.workflow.start).toHaveBeenCalledTimes(2)
+        })
+    })
+
+    describe('resolveSettleConfig', () => {
+        it.each([
+            // Trace keeps its fixed_window fallback: rows saved before strategies existed mean that.
+            ['trace' as const, undefined, { strategy: 'fixed_window', window_seconds: 1800 }],
+            ['trace' as const, {}, { strategy: 'fixed_window', window_seconds: 1800 }],
+            [
+                'trace' as const,
+                { strategy: 'inactivity' as const },
+                { strategy: 'inactivity', quiet_period_seconds: 300, max_age_seconds: 7200 },
+            ],
+            // Sessions have no legacy rows, so a session config is always complete server-side and
+            // must never pick up the trace fallbacks.
+            [
+                'session' as const,
+                { strategy: 'inactivity' as const, quiet_period_seconds: 86400, max_age_seconds: 604800 },
+                { strategy: 'inactivity', quiet_period_seconds: 86400, max_age_seconds: 604800 },
+            ],
+            [
+                'session' as const,
+                { strategy: 'fixed_window' as const, window_seconds: 604800 },
+                { strategy: 'fixed_window', window_seconds: 604800 },
+            ],
+        ])('resolves %s %j', (target, input, expected) => {
+            expect(resolveSettleConfig(input, target)).toEqual(expected)
+        })
+
+        it('does not apply trace fallbacks to an incomplete session config', () => {
+            expect(resolveSettleConfig({ strategy: 'inactivity' }, 'session')).toEqual({
+                strategy: 'inactivity',
+                quiet_period_seconds: 3600,
+                max_age_seconds: 86400,
+            })
+        })
+    })
+
+    describe('workflowSafeId', () => {
+        it('keeps short ids as-is', () => {
+            expect(workflowSafeId('trace-789')).toBe('trace-789')
+        })
+
+        it('hashes oversized ids deterministically', () => {
+            const longId = 'x'.repeat(500)
+
+            const safeId = workflowSafeId(longId)
+
+            expect(safeId).toHaveLength(32)
+            expect(safeId).toBe(workflowSafeId(longId))
+            expect(safeId).not.toBe(workflowSafeId(`${longId}y`))
+        })
+    })
+})

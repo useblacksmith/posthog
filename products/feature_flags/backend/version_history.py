@@ -1,0 +1,374 @@
+from datetime import datetime
+from typing import Any
+
+from django.db.models import Q
+from django.utils import timezone
+
+from rest_framework.exceptions import ValidationError
+
+from posthog.models.activity_logging.activity_log import ActivityLog, common_field_exclusions, field_exclusions
+
+from products.feature_flags.backend.facade.config import detect_config_format, is_v1_config
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+
+
+class VersionNotFound(Exception):
+    pass
+
+
+class VersionHistoryIncomplete(Exception):
+    pass
+
+
+def _validate_aware_timestamp(timestamp: datetime) -> None:
+    """Validate that the timestamp is timezone-aware to avoid comparison errors."""
+    if not timezone.is_aware(timestamp):
+        raise ValueError("timestamp must be timezone-aware")
+
+
+def _get_reconstructable_fields() -> frozenset[str]:
+    """Derive tracked fields dynamically so new FeatureFlag fields are picked up automatically."""
+    excluded = set(common_field_exclusions) | set(field_exclusions.get("FeatureFlag", []))
+    return frozenset(
+        f.name for f in FeatureFlag._meta.get_fields() if f.name not in excluded and getattr(f, "concrete", False)
+    )
+
+
+RECONSTRUCTABLE_FIELDS = _get_reconstructable_fields()
+
+# Fields a restore writes back from a past version. Every other reconstructed field stays as it is now:
+# `active` because turning a flag on or off is its own action, `key` because SDKs and code call the
+# flag by it and the old key may belong to another flag by now, `deleted` and `archived` because they
+# have their own lifecycle actions, `has_encrypted_payloads` because the log holds ciphertext, and
+# `version` and `last_called_at` because they are bookkeeping, not configuration.
+RESTORABLE_FIELDS = frozenset(
+    {
+        "filters",
+        "name",
+        "ensure_experience_continuity",
+        "bucketing_identifier",
+        "evaluation_runtime",
+        "is_remote_configuration",
+        "has_enriched_analytics",
+    }
+)
+
+# Safety cap on the number of activity log entries scanned when walking backwards.
+# In normal use we stop early once we reach the target version; this bound protects
+# against unbounded scans if the activity log is malformed or much larger than expected.
+MAX_HISTORY_ENTRIES = 10_000
+
+# Fields that need special accessor logic instead of plain getattr.
+_FIELD_ACCESSORS: dict[str, Any] = {
+    "filters": lambda flag: flag.get_filters(),
+}
+
+
+def _extract_tracked_fields(flag: FeatureFlag) -> dict[str, Any]:
+    return {
+        field: _FIELD_ACCESSORS[field](flag) if field in _FIELD_ACCESSORS else getattr(flag, field)
+        for field in RECONSTRUCTABLE_FIELDS
+    }
+
+
+def _build_response(
+    flag: FeatureFlag,
+    fields: dict[str, Any],
+    *,
+    is_historical: bool,
+    version_timestamp: datetime | None,
+    modified_by: int | None,
+) -> dict[str, Any]:
+    return {
+        **fields,
+        "id": flag.id,
+        "created_at": flag.created_at,
+        "created_by": flag.created_by_id,
+        "is_historical": is_historical,
+        "version_timestamp": version_timestamp,
+        "modified_by": modified_by,
+    }
+
+
+def _get_version_after(changes: list[dict[str, Any]]) -> int | None:
+    """Extract the 'after' value from the version change in an activity log entry."""
+    for change in changes:
+        if change.get("field") == "version":
+            return change.get("after")
+    return None
+
+
+def reconstruct_flag_at_version(
+    flag: FeatureFlag,
+    target_version: int,
+    team_id: int,
+) -> dict[str, Any]:
+    """
+    Reconstruct a feature flag's state at a given version by working
+    backward from the current state using the activity log.
+
+    Returns a dict of field values representing the flag at that version.
+
+    Raises VersionNotFound if the version is out of range.
+    Raises VersionHistoryIncomplete if activity log entries are missing.
+    """
+    current_version = flag.version
+    if current_version is None:
+        raise VersionHistoryIncomplete("Flag has no version set")
+
+    if target_version < 1 or target_version > current_version:
+        raise VersionNotFound(f"Version {target_version} not found (current version is {current_version})")
+
+    fields = _extract_tracked_fields(flag)
+
+    if target_version == current_version:
+        return _build_response(
+            flag,
+            fields,
+            is_historical=False,
+            version_timestamp=flag.updated_at or flag.created_at,
+            modified_by=flag.last_modified_by_id,
+        )
+
+    # Fetch activity log entries that bump the version, newest first, streaming
+    # with .iterator() so we stop reading from the DB once we reach the target.
+    # Soft-delete and restore also bump the version but are logged as "deleted"
+    # and "restored" rather than "updated".
+    entries = (
+        ActivityLog.objects.filter(
+            team_id=team_id,
+            scope="FeatureFlag",
+            item_id=str(flag.id),
+            activity__in=["updated", "deleted", "restored"],
+        )
+        .order_by("-created_at", "-id")
+        .values_list("detail", "created_at", "user_id")[:MAX_HISTORY_ENTRIES]
+        .iterator()
+    )
+
+    # Walk backwards, undoing changes until we reach the target version.
+    # Each entry with version_after > target_version needs to be undone.
+    # The entry with version_after == target_version created our target — use its metadata.
+    version_timestamp = None
+    modified_by = None
+    reached_target = False
+
+    for detail, created_at, user_id in entries:
+        changes = (detail or {}).get("changes") or []
+        version_after = _get_version_after(changes)
+
+        if version_after is None:
+            continue
+
+        if version_after == target_version:
+            version_timestamp = created_at
+            modified_by = user_id
+            reached_target = True
+            break
+
+        if version_after > target_version:
+            for change in changes:
+                field = change.get("field")
+                if field and field in RECONSTRUCTABLE_FIELDS:
+                    fields[field] = change.get("before")
+        elif version_after < target_version:
+            # Entries are newest-first; falling below the target means its entry is missing.
+            break
+
+    if not reached_target:
+        if target_version == 1:
+            # Version 1 is the creation — no activity log entry transitions "into" it.
+            # We've undone all entries, so fields now represent the creation state.
+            version_timestamp = flag.created_at
+            modified_by = flag.created_by_id
+        else:
+            raise VersionHistoryIncomplete(f"Activity log is incomplete. Cannot reconstruct version {target_version}.")
+
+    # Historical activity log entries may store filters in legacy shapes
+    # (None, {}, or missing "groups"). Normalize so the response shape is
+    # predictable for API consumers. Other config formats stay as stored: the v2 schema allows
+    # no extra keys, so adding "groups" would make the document invalid.
+    raw_filters = fields.get("filters")
+    if not raw_filters:
+        fields["filters"] = {"groups": []}
+    elif is_v1_config(raw_filters) and "groups" not in raw_filters:
+        fields["filters"] = {**raw_filters, "groups": []}
+
+    return _build_response(
+        flag,
+        fields,
+        is_historical=True,
+        version_timestamp=version_timestamp,
+        modified_by=modified_by,
+    )
+
+
+def find_version_at_timestamp(flag: FeatureFlag, timestamp: datetime, team_id: int) -> int | None:
+    """
+    Find the appropriate version number for a feature flag at a given timestamp.
+
+    Returns the version that was active at the specified timestamp, or None if
+    the flag didn't exist at that time.
+
+    A flag is considered non-existent if:
+    - The timestamp is before the flag's creation
+    - The flag was soft-deleted at or before the timestamp (without subsequent restoration)
+
+    This ensures historical evaluation treats soft-deleted flags consistently
+    with flags that never existed at the given time.
+
+    Raises:
+        VersionHistoryIncomplete: If the flag exists but is missing version metadata.
+        ValueError: If the timestamp is not timezone-aware.
+    """
+    _validate_aware_timestamp(timestamp)
+    if flag.version is None:
+        raise VersionHistoryIncomplete(f"Flag {flag.id} is missing version metadata")
+
+    # If timestamp is before flag creation, flag didn't exist
+    if timestamp < flag.created_at:
+        return None
+
+    history = ActivityLog.objects.filter(
+        team_id=team_id,
+        scope="FeatureFlag",
+        item_id=str(flag.id),
+        created_at__lte=timestamp,
+    ).order_by("-created_at", "-id")
+
+    # Deletion state and version are resolved independently. The most recent
+    # entry that changed deletion state at or before the timestamp decides
+    # existence, while a versioned "updated" entry does not, since a deleted
+    # flag's row can still receive versioned writes (and bulk deletes log
+    # "deleted" with empty changes). Deletion state comes from the activity
+    # name AND from a `deleted` field change: before #41043 (2025-11-19), soft
+    # deletes and restores through PATCH were logged as "updated" with a
+    # `deleted` change, and those legacy entries still decide existence.
+    lifecycle_entry = (
+        history.filter(Q(activity__in=["deleted", "restored"]) | Q(detail__changes__contains=[{"field": "deleted"}]))
+        .values_list("activity", "detail")
+        .first()
+    )
+    if lifecycle_entry is not None:
+        activity, detail = lifecycle_entry
+        changes = (detail or {}).get("changes") or []
+        deleted_after = next(
+            (change.get("after") for change in changes if change.get("field") == "deleted"),
+            None,
+        )
+        marks_deleted = activity == "deleted" or bool(deleted_after)
+        if marks_deleted:
+            return None
+
+    # The most recent entry with a version change decides the version.
+    details = (
+        history.filter(activity__in=["updated", "deleted", "restored"])
+        .values_list("detail", flat=True)[:MAX_HISTORY_ENTRIES]
+        .iterator()
+    )
+    for detail in details:
+        version_after = _get_version_after((detail or {}).get("changes") or [])
+        if version_after is not None:
+            return version_after
+
+    # No versioned entries found. If timestamp is after the flag's last update,
+    # return the current version. The lifecycle lookup above has authoritative
+    # deletion state, or we wouldn't reach here.
+    if timestamp >= (flag.updated_at or flag.created_at):
+        return flag.version
+
+    return 1
+
+
+def reconstruct_flag_at_timestamp(
+    flag: FeatureFlag,
+    timestamp: datetime,
+    team_id: int,
+) -> dict[str, Any]:
+    """
+    Resolve the version active at timestamp and return that version's state.
+
+    Raises VersionNotFound if the flag did not exist at the timestamp (before creation,
+    or soft-deleted without a subsequent restore).
+    Raises VersionHistoryIncomplete if the flag is missing version metadata, or if the
+    activity log is missing entries needed for reconstruction.
+    Raises ValueError if timestamp is not timezone-aware.
+    """
+    # Find the version that was active at the timestamp
+    target_version = find_version_at_timestamp(flag, timestamp, team_id)
+
+    if target_version is None:
+        raise VersionNotFound(f"Flag did not exist at {timestamp} (created at {flag.created_at})")
+
+    # Use the existing reconstruction logic
+    return reconstruct_flag_at_version(flag, target_version, team_id)
+
+
+# Filter keys that other features own: early access features set the enrollment, and experiments
+# attach and detach the holdout. A restore keeps their current values, so it never brings back an
+# enrollment or a holdout that the owning feature has removed since.
+_EXTERNALLY_OWNED_FILTER_KEYS = ("feature_enrollment", "super_groups", "holdout", "holdout_groups")
+
+
+def _restored_filters(current: dict[str, Any], past: dict[str, Any]) -> dict[str, Any]:
+    restored = {key: value for key, value in past.items() if key not in _EXTERNALLY_OWNED_FILTER_KEYS}
+    restored.update({key: current[key] for key in _EXTERNALLY_OWNED_FILTER_KEYS if key in current})
+    return restored
+
+
+def _restore_payload(flag: FeatureFlag, reconstructed: dict[str, Any]) -> dict[str, Any]:
+    """The restorable fields of a reconstructed version that differ from the flag as it is now."""
+    current = _extract_tracked_fields(flag)
+    past = {**reconstructed, "filters": _restored_filters(current["filters"] or {}, reconstructed["filters"])}
+    payload = {
+        field: past[field] for field in sorted(RESTORABLE_FIELDS) if field in past and past[field] != current.get(field)
+    }
+    if "filters" in payload:
+        # The serializer merges the filters it receives over the stored ones key by key, so a key
+        # the past version did not have goes out empty. Otherwise its current value survives.
+        cleared: dict[str, Any] = {
+            key: {} if key == "payloads" else None for key in current["filters"] or {} if key not in payload["filters"]
+        }
+        payload["filters"] = {**cleared, **payload["filters"]}
+    return payload
+
+
+def build_restore_write(flag: FeatureFlag, target_version: int) -> dict[str, Any]:
+    """The fields to write to set a flag's configuration back to a past version.
+
+    Only the fields in ``RESTORABLE_FIELDS`` that differ from the flag are returned, so the flag
+    keeps its key, its enabled state and its archived and deleted state. Tags, evaluation contexts
+    and the definitions of the cohorts it targets are not part of a version and stay as they are.
+    An empty result means the past version matches the current configuration.
+
+    Raises ``VersionNotFound`` or ``VersionHistoryIncomplete`` when the version cannot be rebuilt,
+    and ``ValidationError`` for a flag this cannot restore (archived, encrypted payloads, or a
+    config format other than 1).
+
+    This function does not lock the row. Call it with the row locked by ``select_for_update``,
+    after you compare the caller's ``version`` with the flag's. Write the result with a
+    ``FlagVersionCheckedWriteRequest`` that carries that version, so the serializer repeats the
+    comparison while it holds the row lock.
+    """
+    if flag.archived:
+        raise ValidationError("Unarchive this flag before restoring a past version.", code="flag_archived")
+    if flag.has_encrypted_payloads:
+        raise ValidationError(
+            "Past versions of a flag with encrypted payloads cannot be restored.", code="encrypted_payloads"
+        )
+    if detect_config_format(flag.filters).kind != "v1":
+        raise ValidationError(
+            "This flag uses a configuration format that cannot be restored from history yet.",
+            code="unsupported_config_version",
+        )
+
+    # The activity log is written under the flag's own team, which is the project's root team.
+    reconstructed = reconstruct_flag_at_version(flag=flag, target_version=target_version, team_id=flag.team_id)
+    # The live flag can have been downgraded from encrypted payloads, which strips the ciphertext
+    # from the row but not from the activity log the rebuild reads.
+    if reconstructed["has_encrypted_payloads"]:
+        raise ValidationError(
+            "Past versions of a flag with encrypted payloads cannot be restored.", code="encrypted_payloads"
+        )
+
+    return _restore_payload(flag, reconstructed)

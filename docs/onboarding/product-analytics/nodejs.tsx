@@ -1,0 +1,122 @@
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
+
+import { StepDefinition } from '../steps'
+
+export const getNodeJSInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+    const { CodeBlock, Markdown, dedent } = ctx
+
+    return [
+        {
+            title: 'Install the package',
+            badge: 'required',
+            content: (
+                <>
+                    <Markdown>Install the PostHog Node.js library using your package manager:</Markdown>
+                    <CodeBlock
+                        blocks={[
+                            {
+                                language: 'bash',
+                                file: 'npm',
+                                code: dedent`
+                                npm install posthog-node@6
+                            `,
+                            },
+                            {
+                                language: 'bash',
+                                file: 'yarn',
+                                code: dedent`
+                                yarn add posthog-node@6
+                            `,
+                            },
+                            {
+                                language: 'bash',
+                                file: 'pnpm',
+                                code: dedent`
+                                pnpm add posthog-node@6
+                            `,
+                            },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                bun add posthog-node@6
+                            `,
+                            },
+                        ]}
+                    />
+                </>
+            ),
+        },
+        {
+            title: 'Initialize PostHog',
+            badge: 'required',
+            content: (
+                <>
+                    <Markdown>Initialize the PostHog client with your project token:</Markdown>
+                    <CodeBlock
+                        blocks={[
+                            {
+                                language: 'javascript',
+                                file: 'Node.js',
+                                code: dedent`
+                                import { PostHog } from 'posthog-node'
+
+                                const client = new PostHog(
+                                    '<ph_project_token>',
+                                    {
+                                        host: '<ph_client_api_host>'
+                                    }
+                                )
+                            `,
+                            },
+                        ]}
+                    />
+                </>
+            ),
+        },
+    ]
+}
+
+export const getNodeJSEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { CodeBlock, Markdown, dedent } = ctx
+
+    return {
+        title: 'Send an event',
+        badge: 'recommended',
+        content: (
+            <>
+                <Markdown>Once installed, you can manually send events to test your integration:</Markdown>
+                <CodeBlock
+                    blocks={[
+                        {
+                            language: 'javascript',
+                            file: 'Node.js',
+                            code: dedent`
+                                client.capture({
+                                    distinctId: 'distinct_id_of_the_user',
+                                    event: 'event_name',
+                                    properties: {
+                                        property1: 'value',
+                                        property2: 'value',
+                                    },
+                                })
+
+                                // The client sends events in batches. Call shutdown() before the process
+                                // exits so that queued events are sent. In a long-running server, call it
+                                // once when the server stops.
+                                await client.shutdown()
+                            `,
+                        },
+                    ]}
+                />
+            </>
+        ),
+    }
+}
+
+export const getNodeJSSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getNodeJSInstallSteps(ctx),
+    getNodeJSEventStep(ctx),
+]
+
+export const NodeJSInstallation = createInstallation(getNodeJSSteps)

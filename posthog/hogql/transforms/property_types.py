@@ -1,0 +1,968 @@
+import dataclasses
+from datetime import datetime
+from typing import Literal, Optional
+
+from posthog.hogql import ast
+from posthog.hogql.constants import EXCEPTION_STRING_ARRAY_PROPERTIES, is_virtual_feature_flag_key
+from posthog.hogql.context import HogQLContext
+from posthog.hogql.database.models import BooleanDatabaseField, DateTimeDatabaseField, StringJSONDatabaseField
+from posthog.hogql.database.s3_table import S3Table
+from posthog.hogql.database.schema.events import EVENTS_TABLE_TYPES, EventsGroupSubTable, EventsPersonSubTable
+from posthog.hogql.database.schema.events_with_flag_calls import (
+    EVENT_ROW_TABLES,
+    EventsWithFlagCallsTable,
+    union_table_of,
+)
+from posthog.hogql.database.schema.flag_evaluations import FlagEvaluationsPersonSubTable
+from posthog.hogql.database.schema.groups import GroupsTable
+from posthog.hogql.database.schema.persons import PersonsTable, RawPersonsTable
+from posthog.hogql.escape_sql import escape_hogql_identifier
+from posthog.hogql.functions.clickhouse.json import JSON_FUNCTIONS, JSON_KEY_PATH_FUNCTIONS, JSON_TYPED_PATH_FUNCTIONS
+from posthog.hogql.helpers.timestamp_visitor import parse_zoned_datetime_string
+from posthog.hogql.property_metadata import load_property_metadata
+from posthog.hogql.property_planner import PropertySourceKind, plan_property_access
+from posthog.hogql.restricted_properties import restricted_property_keys_for_table_type
+from posthog.hogql.type_system import normalized_runtime_type, parse_sql_runtime_type
+from posthog.hogql.visitor import CloningVisitor, TraversingVisitor
+
+from posthog.clickhouse.materialized_column_types import MATERIALIZATION_VALID_TABLES, MaterializedColumn
+from posthog.dataclasses import frozen
+
+_JSON_EXTRACT_SCALAR_CASTS: dict[str, tuple[str, object]] = {
+    "JSONExtractString": ("String", ""),
+    "JSONExtractInt": ("Int64", 0),
+    "JSONExtractUInt": ("UInt64", 0),
+    "JSONExtractFloat": ("Float64", 0.0),
+    "JSONExtractBool": ("Bool", 0),
+}
+
+
+def build_property_swapper(node: ast.AST, context: HogQLContext) -> None:
+    if not context or not context.team_id:
+        return
+
+    # find all properties
+    property_finder = PropertyFinder(context)
+    property_finder.visit(node)
+
+    metadata = load_property_metadata(
+        context,
+        event_property_names=property_finder.event_properties,
+        person_property_names=property_finder.person_properties,
+        group_property_names=property_finder.group_properties,
+    )
+    context.property_metadata = metadata
+
+    if context.type_observability is not None:
+        context.type_observability.record_property_definition_lookup(
+            property_source="event",
+            known_count=len(metadata.event_properties),
+            total_count=len(property_finder.event_properties),
+        )
+        context.type_observability.record_property_definition_lookup(
+            property_source="person",
+            known_count=len(metadata.person_properties),
+            total_count=len(property_finder.person_properties),
+        )
+        context.type_observability.record_property_definition_lookup(
+            property_source="group",
+            known_count=len(metadata.group_properties),
+            total_count=sum(len(properties) for properties in property_finder.group_properties.values()),
+        )
+
+    timezone = context.database.get_timezone() if context and context.database else "UTC"
+    context.property_swapper = PropertySwapper(
+        timezone=timezone,
+        event_properties=metadata.event_properties,
+        person_properties=metadata.person_properties,
+        group_properties=metadata.group_properties,
+        context=context,
+        setTimeZones=True,
+    )
+
+
+class PropertyFinder(TraversingVisitor):
+    context: HogQLContext
+
+    def __init__(self, context: HogQLContext):
+        super().__init__()
+        self.person_properties: set[str] = set()
+        self.event_properties: set[str] = set()
+        self.group_properties: dict[int, set[str]] = {}
+        self.found_timestamps = False
+        self.context = context
+
+    def visit_property_type(self, node: ast.PropertyType):
+        if node.field_type.name == "properties" and len(node.chain) == 1:
+            if isinstance(node.field_type.table_type, ast.BaseTableType):
+                table_type = node.field_type.table_type
+                resolved_table = table_type.resolve_database_table(self.context)
+                property_name = str(node.chain[0])
+                if isinstance(resolved_table, (PersonsTable, RawPersonsTable)):
+                    self.person_properties.add(property_name)
+                if isinstance(resolved_table, GroupsTable):
+                    if isinstance(table_type, ast.LazyJoinType):
+                        if table_type.field.startswith("group_"):
+                            group_id = int(table_type.field.split("_")[1])
+                            if self.group_properties.get(group_id) is None:
+                                self.group_properties[group_id] = set()
+                            self.group_properties[group_id].add(property_name)
+                    elif isinstance(table_type, ast.LazyTableType):
+                        global_group_id: Optional[int] = (
+                            self.context.globals.get("group_id") if self.context.globals else None
+                        )
+                        if isinstance(global_group_id, int):
+                            if self.group_properties.get(global_group_id) is None:
+                                self.group_properties[global_group_id] = set()
+                            self.group_properties[global_group_id].add(property_name)
+                if isinstance(resolved_table, EventsPersonSubTable | FlagEvaluationsPersonSubTable):
+                    self.person_properties.add(property_name)
+                elif isinstance(resolved_table, EventsGroupSubTable):
+                    pass  # group properties are handled above via GroupsTable
+                elif isinstance(resolved_table, EVENT_ROW_TABLES):
+                    self.event_properties.add(property_name)
+
+    def visit_field(self, node: ast.Field):
+        super().visit_field(node)
+        if isinstance(node.type, ast.FieldType) and isinstance(
+            node.type.resolve_database_field(self.context), DateTimeDatabaseField
+        ):
+            self.found_timestamps = True
+
+
+@frozen
+class ToTimeZoneParts:
+    bare_field: ast.Expr
+    timezone: str
+    other_side: ast.Expr
+    swapped: bool
+
+
+_PERSON_PROPERTIES_TABLES = (*EVENTS_TABLE_TYPES, EventsWithFlagCallsTable)
+
+# ClickHouse string-parsing conversions (toFloat64OrZero, toInt64OrZero,
+# toFloat64OrDefault, toInt64OrDefault) require a String first argument and raise
+# ILLEGAL_TYPE_OF_ARGUMENT on numeric input. When a user explicitly wraps a
+# Numeric-typed property in one of these, we must not auto-convert the property
+# to Float, the raw String value has to flow through for the parser to work.
+STRING_INPUT_CONVERSIONS = frozenset({"toFloatOrZero", "toIntOrZero", "toFloatOrDefault", "toIntOrDefault"})
+
+# These functions return one of their arguments unchanged, so the call around them receives the property itself.
+# A property that the outer call needs as its stored string must stay unconverted through them, as in
+# `JSONExtractArrayRaw(properties.items ?? '[]')`.
+NULL_DEFAULT_FUNCTIONS = frozenset({"ifNull", "coalesce"})
+
+
+class PropertySwapper(CloningVisitor):
+    _RANGE_OPS: set[str] = {
+        ast.CompareOperationOp.Gt,
+        ast.CompareOperationOp.GtEq,
+        ast.CompareOperationOp.Lt,
+        ast.CompareOperationOp.LtEq,
+    }
+    _EQUALITY_OPS: set[str] = {
+        ast.CompareOperationOp.Eq,
+        ast.CompareOperationOp.NotEq,
+    }
+
+    # ClickHouse array-membership functions whose first argument must be an array. Users write these
+    # against exception properties (e.g. hasAny(properties.$exception_values, [...])), but those
+    # properties are stored as a raw JSON String once materialized, so the bare column read raises
+    # ILLEGAL_TYPE_OF_ARGUMENT. We extract the array via JSONExtract(..., 'Array(String)') — the same
+    # wrapping property_to_expr applies to typed exception filters.
+    _ARRAY_MEMBERSHIP_FUNCTIONS: set[str] = {"has", "hasAll", "hasAny", "hasSubstr"}
+
+    def __init__(
+        self,
+        timezone: str,
+        event_properties: dict[str, dict[str, str | None]],
+        person_properties: dict[str, dict[str, str | None]],
+        group_properties: dict[str, dict[str, str | None]],
+        context: HogQLContext,
+        setTimeZones: bool,
+        before_lazy_tables: bool = False,
+    ):
+        """`before_lazy_tables` marks the pass that runs before lazy tables resolve. Of the event and person
+        properties, that pass converts only the reads of a union scan, and the pass after it converts the rest."""
+        super().__init__(clear_types=False)
+        self.timezone = timezone
+        self.event_properties = event_properties
+        self.person_properties = person_properties
+        self.group_properties = group_properties
+        self.context = context
+        self.setTimeZones = setTimeZones
+        self._inside_call_depth = 0
+        self._inside_where_depth = 0
+        self._suppress_numeric_conversion = False
+        self._string_compared_operand_ids: frozenset[int] = frozenset()
+        self.before_lazy_tables = before_lazy_tables
+        self._union_scan_depth = 0
+
+    def visit_join_expr(self, node: ast.JoinExpr) -> ast.JoinExpr:
+        if not (
+            isinstance(node.type, ast.SelectQueryAliasType)
+            and isinstance(node.type.lazy_table, EventsWithFlagCallsTable)
+        ):
+            return super().visit_join_expr(node)
+        # Only the table is the union. The constraint and the joins after it read other tables.
+        self._union_scan_depth += 1
+        try:
+            table = self.visit(node.table)
+        finally:
+            self._union_scan_depth -= 1
+        joined = super().visit_join_expr(dataclasses.replace(node, table=None))
+        joined.table = table
+        return joined
+
+    def visit_select_query(self, node: ast.SelectQuery):
+        # We need to track when we're inside WHERE/PREWHERE so that the
+        # toTimeZone stripping only fires where it helps (partition/PK pruning).
+        # Stripping in JOIN ON, SELECT, HAVING etc. is unnecessary.
+        #
+        # The CloningVisitor.visit_select_query visits fields in a fixed order.
+        # We replicate that here, wrapping only where/prewhere with our flag.
+        saved_where_depth = self._inside_where_depth
+        self._inside_where_depth = 0  # each SelectQuery gets its own scope
+
+        # Visit everything except where/prewhere normally (depth=0, no stripping)
+        ctes = {key: self.visit(expr) for key, expr in node.ctes.items()} if node.ctes else None
+        select_from = self.visit(node.select_from)
+        select = [self.visit(expr) for expr in node.select] if node.select else []
+        array_join_list = [self.visit(expr) for expr in node.array_join_list] if node.array_join_list else None
+
+        # Visit where/prewhere with the flag set (depth=1, stripping enabled)
+        self._inside_where_depth = 1
+        where = self.visit(node.where)
+        prewhere = self.visit(node.prewhere)
+        self._inside_where_depth = 0
+
+        having = self.visit(node.having)
+        qualify = self.visit(node.qualify)
+        group_by = [self.visit(expr) for expr in node.group_by] if node.group_by else None
+        order_by = [self.visit(expr) for expr in node.order_by] if node.order_by else None
+        interpolate = [self.visit(expr) for expr in node.interpolate] if node.interpolate is not None else None
+
+        self._inside_where_depth = saved_where_depth  # restore parent scope
+
+        return ast.SelectQuery(
+            start=None if self.clear_locations else node.start,
+            end=None if self.clear_locations else node.end,
+            type=None if self.clear_types else node.type,
+            ctes=ctes,
+            select_from=select_from,
+            select=select,
+            array_join_op=node.array_join_op,
+            array_join_list=array_join_list,
+            where=where,
+            prewhere=prewhere,
+            having=having,
+            qualify=qualify,
+            group_by=group_by,
+            group_by_mode=node.group_by_mode,
+            order_by=order_by,
+            interpolate=interpolate,
+            limit_by=self.visit(node.limit_by),
+            limit=self.visit(node.limit),
+            limit_with_ties=node.limit_with_ties,
+            limit_percent=node.limit_percent,
+            offset=self.visit(node.offset),
+            distinct=node.distinct,
+            window_exprs=(
+                {name: self.visit(expr) for name, expr in node.window_exprs.items()} if node.window_exprs else None
+            ),
+            settings=node.settings.model_copy() if node.settings is not None else None,
+            view_name=node.view_name,
+        )
+
+    def _visit_json_function_call(self, node: ast.Call) -> ast.Call:
+        # ClickHouse reads the first argument of a JSON function as JSON text and raises ILLEGAL_TYPE_OF_ARGUMENT on
+        # any other type, so a typed property in that position keeps its stored string. The other arguments are keys
+        # and type names, which convert as in any other call.
+        self._suppress_numeric_conversion = True
+        document = self.visit(node.args[0])
+        self._suppress_numeric_conversion = False
+        call = super().visit_call(dataclasses.replace(node, args=node.args[1:]))
+        call.args.insert(0, document)
+        return call
+
+    def visit_call(self, node: ast.Call):
+        rewritten = self._rewrite_json_property_call(node)
+        if rewritten is not None:
+            return rewritten
+
+        # Track whether the immediate enclosing call parses its argument as a
+        # string. Re-evaluated per call, so nested non-parsing calls (e.g.
+        # toFloatOrZero(toString(prop))) correctly reset the flag. A null default
+        # passes the property through, so it keeps the flag of the call around it.
+        saved_suppress = self._suppress_numeric_conversion
+        self._suppress_numeric_conversion = node.name in STRING_INPUT_CONVERSIONS or (
+            saved_suppress and node.name in NULL_DEFAULT_FUNCTIONS
+        )
+
+        self._inside_call_depth += 1
+        try:
+            if node.name in JSON_FUNCTIONS and node.args:
+                result = self._visit_json_function_call(node)
+            else:
+                result = super().visit_call(node)
+        finally:
+            self._inside_call_depth -= 1
+            self._suppress_numeric_conversion = saved_suppress
+
+        return self._maybe_extract_exception_string_array(result)
+
+    def _maybe_extract_exception_string_array(self, node: ast.Expr) -> ast.Expr:
+        """Wrap a bare exception-array property passed to an array-membership function in
+        JSONExtract(..., 'Array(String)'), so it type-checks against its materialized String column.
+
+        Only bare property reads are wrapped: property_to_expr already emits its own JSONExtract for
+        typed filters, and a user who wrote the extract by hand passes a Call here — neither is a bare
+        Field, so neither gets double-wrapped.
+        """
+        if not isinstance(node, ast.Call) or node.name not in self._ARRAY_MEMBERSHIP_FUNCTIONS or not node.args:
+            return node
+        if not self._is_exception_string_array_field(node.args[0]):
+            return node
+        node.args[0] = self._extract_string_array(node.args[0])
+        return node
+
+    def _is_exception_string_array_field(self, expr: ast.Expr) -> bool:
+        if isinstance(expr, ast.Alias):
+            expr = expr.expr
+        if not isinstance(expr, ast.Field):
+            return False
+        type = expr.type
+        if not (isinstance(type, ast.PropertyType) and type.field_type.name == "properties" and len(type.chain) == 1):
+            return False
+        if str(type.chain[0]) not in EXCEPTION_STRING_ARRAY_PROPERTIES:
+            return False
+        table_type = type.field_type.table_type
+        if not isinstance(table_type, ast.BaseTableType):
+            return False
+        return isinstance(table_type.resolve_database_table(self.context), EVENT_ROW_TABLES)
+
+    @staticmethod
+    def _extract_string_array(field: ast.Expr) -> ast.Call:
+        return ast.Call(
+            name="JSONExtract",
+            args=[
+                ast.Call(name="ifNull", args=[field, ast.Constant(value="")]),
+                ast.Constant(value="Array(String)"),
+            ],
+            type=ast.CallType(
+                name="JSONExtract",
+                arg_types=[ast.StringType(nullable=True), ast.StringType()],
+                return_type=ast.ArrayType(item_type=ast.StringType()),
+            ),
+        )
+
+    def _rewrite_json_property_call(self, node: ast.Call) -> ast.Expr | None:
+        """A JSON function on `properties` with a constant first key reads that key instead of the whole document.
+
+        On the native events table `properties` is a JSON column, so a JSON function over it needs the document rebuilt
+        as text from every subcolumn, once per row. With a constant first key, only that key's value is serialized and
+        the function runs on it, for the same answer at a fraction of the cost. The ClickHouse property resolver later
+        removes even that serialization for string, float and Bool extraction (`_rewrite_scalar_json_extract`).
+
+        The read is marked `as_json`, so the metadata pass leaves it unconverted and the JSON function determines
+        conversion and defaults. `JSONHas` keeps the whole document: a key holding JSON null and a missing key read the
+        same from a subcolumn, but `JSONHas` tells them apart. Legacy calls rewrite only when an equivalent materialized
+        column exists.
+        """
+        property_path = self._simple_json_extract_property_path(node)
+        if node.name not in JSON_KEY_PATH_FUNCTIONS or node.name == "JSONHas":
+            return None
+        if not node.args:
+            return None
+
+        # Unwrap Alias if present (resolver wraps fields in Alias nodes)
+        field_arg = node.args[0]
+        if isinstance(field_arg, ast.Alias):
+            field_arg = field_arg.expr
+        if (
+            self.context.uses_new_events_schema()
+            and isinstance(field_arg, ast.Call)
+            and field_arg.name == "toString"
+            and len(field_arg.args) == 1
+        ):
+            field_arg = field_arg.args[0]
+            if isinstance(field_arg, ast.Alias):
+                field_arg = field_arg.expr
+        if not isinstance(field_arg, ast.Field):
+            return None
+
+        # Unwrap FieldAliasType to get the underlying FieldType
+        field_type = field_arg.type
+        if isinstance(field_type, ast.FieldAliasType):
+            field_type = field_type.type
+        if not isinstance(field_type, ast.FieldType):
+            return None
+
+        database_field = field_type.resolve_database_field(self.context)
+        if not isinstance(database_field, StringJSONDatabaseField):
+            return None
+
+        table_type = field_type.table_type
+        while isinstance(table_type, (ast.TableAliasType, ast.ColumnAliasedTableType, ast.VirtualTableType)):
+            table_type = table_type.table_type
+        if not isinstance(table_type, ast.TableType):
+            return None
+
+        table_name = table_type.resolve_database_table(self.context).to_printed_hogql()
+        if table_name not in MATERIALIZATION_VALID_TABLES:
+            return None
+
+        # events_json holds no `$feature/<key>` subcolumns: the rebuilt document, or the resolver's map read, serves
+        # these keys with the boolean or string type the SDK sent.
+        if (
+            self.context.uses_new_events_schema()
+            and table_name == "events"
+            and database_field.name == "properties"
+            and len(node.args) > 1
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+            and is_virtual_feature_flag_key(node.args[1].value)
+        ):
+            return None
+
+        if (
+            self.context.uses_new_events_schema()
+            and table_name == "events"
+            and field_type.name
+            in (
+                "properties",
+                "person_properties",
+            )
+        ):
+            first_key = self._json_extract_first_key(node)
+            if first_key is None:
+                # A key computed per row can name any property, so the call keeps the whole document. The native
+                # document stores `$feature/<key>` in the `$feature_flags` map, so a key naming a flag reads as missing.
+                return None
+            return self._json_extract_subcolumn_expr(node, field_arg, field_type, first_key)
+
+        if property_path is None:
+            return None
+        if len(property_path) != 1:
+            return None
+        property_name = property_path[0]
+        if not isinstance(property_name, str):
+            return None
+
+        mat_col = (
+            self.context.property_metadata.materialized_column(table_name, database_field.name, property_name)
+            if self.context.property_metadata is not None
+            else None
+        )
+        if mat_col is None:
+            return None
+
+        if not self._json_extract_matches_materialized_column_type(node, mat_col):
+            return None
+
+        return ast.Field(
+            start=node.start,
+            end=node.end,
+            chain=[*field_arg.chain, property_name],
+            type=ast.PropertyType(chain=[property_name], field_type=field_type),
+        )
+
+    @staticmethod
+    def _simple_json_extract_property_path(node: ast.Call) -> list[str | int] | None:
+        if node.name in JSON_TYPED_PATH_FUNCTIONS:
+            if len(node.args) < 3:
+                return None
+            type_arg = node.args[-1]
+            if not isinstance(type_arg, ast.Constant) or not isinstance(type_arg.value, str):
+                return None
+            path_args = node.args[1:-1]
+        elif node.name in JSON_KEY_PATH_FUNCTIONS:
+            path_args = node.args[1:]
+        else:
+            return None
+
+        if not path_args:
+            return None
+
+        property_path: list[str | int] = []
+        for path_arg in path_args:
+            if not isinstance(path_arg, ast.Constant) or not isinstance(path_arg.value, str | int):
+                return None
+            property_path.append(path_arg.value)
+        return property_path
+
+    @staticmethod
+    def _json_extract_first_key(node: ast.Call) -> str | int | None:
+        path_args = node.args[1:-1] if node.name in JSON_TYPED_PATH_FUNCTIONS else node.args[1:]
+        if not path_args or not isinstance(path_args[0], ast.Constant):
+            return None
+        first_key = path_args[0].value
+        return first_key if isinstance(first_key, str | int) else None
+
+    def _json_extract_subcolumn_expr(
+        self,
+        node: ast.Call,
+        field_arg: ast.Field,
+        field_type: ast.FieldType,
+        first_key: str | int,
+    ) -> ast.Expr | None:
+        if not isinstance(first_key, str):
+            return ast.Call(
+                start=node.start,
+                end=node.end,
+                type=node.type,
+                name=node.name,
+                args=[ast.Constant(value="{}"), *node.args[1:]],
+                params=node.params,
+                distinct=node.distinct,
+                within_group=node.within_group,
+                order_by=node.order_by,
+                filter_expr=node.filter_expr,
+            )
+        if first_key in restricted_property_keys_for_table_type(field_type.table_type, self.context):
+            return ast.Call(
+                start=node.start,
+                end=node.end,
+                type=node.type,
+                name=node.name,
+                args=[ast.Constant(value="{}"), *node.args[1:]],
+                params=node.params,
+                distinct=node.distinct,
+                within_group=node.within_group,
+                order_by=node.order_by,
+                filter_expr=node.filter_expr,
+            )
+        property_value = ast.Field(
+            start=node.start,
+            end=node.end,
+            chain=[*field_arg.chain, first_key],
+            # The function parses this value as JSON, so the read is marked `as_json` and the metadata pass leaves a
+            # typed key unconverted.
+            type=ast.PropertyType(chain=[first_key], field_type=field_type, as_json=True),
+        )
+        property_document: ast.Expr = ast.Call(
+            name="toJSONString",
+            args=[property_value],
+            type=ast.StringType(nullable=True),
+        )
+        property_document = ast.Call(
+            name="ifNull",
+            args=[
+                property_document,
+                ast.Constant(value="", inline_sentinel=True),
+            ],
+            type=ast.StringType(nullable=False),
+        )
+
+        # Keep remaining indices on the JSON function: integer indices can address both arrays and object members.
+        return ast.Call(
+            start=node.start,
+            end=node.end,
+            type=node.type,
+            name=node.name,
+            args=[property_document, *node.args[2:]],
+            params=node.params,
+            distinct=node.distinct,
+            within_group=node.within_group,
+            order_by=node.order_by,
+            filter_expr=node.filter_expr,
+        )
+
+    @staticmethod
+    def _json_extract_matches_materialized_column_type(node: ast.Call, mat_col: MaterializedColumn) -> bool:
+        if node.name == "JSONExtractString":
+            # JSONExtractString has string semantics, so it only matches a string-backed column.
+            # A non-string materialized column (e.g. Nullable(Float64)) would otherwise be rewritten
+            # to the bare typed column, dropping the string type the surrounding query expects.
+            return parse_sql_runtime_type(mat_col.type).family == "string"
+
+        if node.name != "JSONExtract" or len(node.args) != 3:
+            return False
+
+        type_arg = node.args[2]
+        if not isinstance(type_arg, ast.Constant) or not isinstance(type_arg.value, str):
+            return False
+
+        # Normalize before comparing so formatting differences in the type spelling
+        # (whitespace, quoting) don't block the rewrite; semantic differences
+        # (nullability, width, timezone) still do, because JSON helper semantics for
+        # missing keys and out-of-range values differ from bare column semantics.
+        requested_type = normalized_runtime_type(parse_sql_runtime_type(type_arg.value))
+        materialized_type = normalized_runtime_type(parse_sql_runtime_type(mat_col.type))
+        return requested_type.family != "unknown" and requested_type == materialized_type
+
+    def visit_compare_operation(self, node: ast.CompareOperation):
+        saved_operand_ids = self._string_compared_operand_ids
+        self._string_compared_operand_ids = saved_operand_ids | self._string_compared_operand_ids_for(node)
+        try:
+            result = super().visit_compare_operation(node)
+        finally:
+            self._string_compared_operand_ids = saved_operand_ids
+
+        if (
+            not self.setTimeZones
+            or result.op not in self._RANGE_OPS
+            or self._inside_call_depth > 0
+            or self._inside_where_depth == 0
+        ):
+            return result
+
+        return self._move_timezone_from_field_to_constant(result) or result
+
+    @classmethod
+    def _string_compared_operand_ids_for(cls, node: ast.CompareOperation) -> frozenset[int]:
+        """Find the operand of an equality check against '' that is itself a field.
+
+        ClickHouse cannot parse '' as a DateTime, so the property must stay a string
+        for this comparison. Only the operand itself qualifies, never a field nested in a
+        function call, and other constants keep the DateTime conversion.
+        """
+        if node.op not in cls._EQUALITY_OPS:
+            return frozenset()
+        operand_ids: set[int] = set()
+        for operand, other in ((node.left, node.right), (node.right, node.left)):
+            if isinstance(other, ast.Constant) and other.value == "":
+                while isinstance(operand, ast.Alias):
+                    operand = operand.expr
+                if isinstance(operand, ast.Field):
+                    operand_ids.add(id(operand))
+        return frozenset(operand_ids)
+
+    def _move_timezone_from_field_to_constant(self, node: ast.CompareOperation) -> ast.CompareOperation | None:
+        """Move toTimeZone() from the field side to the constant side of a range comparison.
+
+        ClickHouse DateTime values are epoch seconds internally, and toTimeZone()
+        only changes display metadata — not the underlying value. So for range
+        comparisons, instead of:
+
+            toTimeZone(timestamp, 'US/Pacific') >= '2024-03-01'
+
+        we rewrite to:
+
+            timestamp >= toDateTime64('2024-03-01', 6, 'US/Pacific')
+
+        This lets the query planner use the partition key (toYYYYMM(timestamp))
+        and primary key (toDate(timestamp)) for pruning, which it can't do when
+        the field is wrapped in a function call. The timezone on the constant
+        ensures ClickHouse interprets it in the correct timezone.
+
+        We only do this for top-level range comparisons (not inside function
+        calls like if(), coalesce()) via the _inside_call_depth guard.
+        """
+        parts = self._extract_toTimeZone_parts(node)
+        if parts is None:
+            return None
+
+        tz_constant = self._anchor_to_timezone(parts.other_side, parts.timezone)
+
+        if parts.swapped:
+            return ast.CompareOperation(left=tz_constant, right=parts.bare_field, op=node.op)
+        else:
+            return ast.CompareOperation(left=parts.bare_field, right=tz_constant, op=node.op)
+
+    @staticmethod
+    def _extract_toTimeZone_parts(node: ast.CompareOperation) -> ToTimeZoneParts | None:
+        """Extract the bare field, timezone, other side and side from a comparison
+        where one side is toTimeZone(field, tz).
+
+        Returns None if the pattern doesn't match.
+        swapped=True means the toTimeZone was on the right side.
+        """
+        for left_is_tz in (True, False):
+            tz_side = node.left if left_is_tz else node.right
+            other_side = node.right if left_is_tz else node.left
+
+            inner = tz_side
+            if isinstance(inner, ast.Alias):
+                inner = inner.expr
+            if isinstance(inner, ast.Call) and inner.name == "toTimeZone" and len(inner.args) == 2:
+                tz_arg = inner.args[1]
+                if isinstance(tz_arg, ast.Constant) and isinstance(tz_arg.value, str):
+                    return ToTimeZoneParts(
+                        bare_field=inner.args[0],
+                        timezone=tz_arg.value,
+                        other_side=other_side,
+                        swapped=not left_is_tz,
+                    )
+
+        return None
+
+    @staticmethod
+    def _anchor_to_timezone(expr: ast.Expr, tz: str) -> ast.Expr:
+        inner = expr
+        if isinstance(inner, ast.Alias):
+            inner = inner.expr
+
+        if isinstance(inner, ast.Call):
+            if inner.name in ("toDateTime", "toDateTime64"):
+                return expr
+            # Recurse into wrapper functions like assumeNotNull(toDateTime(...))
+            if inner.name in ("assumeNotNull",) and len(inner.args) == 1:
+                wrapped_arg = PropertySwapper._anchor_to_timezone(inner.args[0], tz)
+                if wrapped_arg is not inner.args[0]:
+                    new_call = ast.Call(
+                        name=inner.name, args=[wrapped_arg], type=PropertySwapper._datetime_call_type(inner.name, False)
+                    )
+                    return PropertySwapper._replace_keeping_alias(expr, new_call)
+                return expr
+
+        # Skip if the value is already a timezone-aware datetime: the printer
+        # converts it to the team timezone and emits toDateTime64('...', 6, tz)
+        # regardless of the constant's original tzinfo (see escape_sql.py:249).
+        if isinstance(inner, ast.Constant):
+            if isinstance(inner.value, datetime) and inner.value.tzinfo is not None:
+                return expr
+            # ClickHouse's toDateTime64 can't parse 'Z'/offset strings, so parse them in Python instead.
+            if (zoned := parse_zoned_datetime_string(inner.value)) is not None:
+                inner.value = zoned
+                return expr
+
+        new_call = ast.Call(
+            name="toDateTime64",
+            args=[inner, ast.Constant(value=6), ast.Constant(value=tz)],
+            type=PropertySwapper._datetime_call_type("toDateTime64", PropertySwapper._is_nullable_bound(inner)),
+        )
+        return PropertySwapper._replace_keeping_alias(expr, new_call)
+
+    @staticmethod
+    def _replace_keeping_alias(expr: ast.Expr, replacement: ast.Expr) -> ast.Expr:
+        if isinstance(expr, ast.Alias):
+            return ast.Alias(alias=expr.alias, expr=replacement, hidden=expr.hidden)
+        return replacement
+
+    @staticmethod
+    def _datetime_call_type(name: str, nullable: bool) -> ast.CallType:
+        return ast.CallType(name=name, arg_types=[], return_type=ast.DateTimeType(nullable=nullable))
+
+    @staticmethod
+    def _is_nullable_bound(expr: ast.Expr) -> bool:
+        if isinstance(expr, ast.Constant):
+            return expr.value is None
+        if isinstance(expr.type, ast.CallType):
+            return expr.type.return_type.nullable
+        if isinstance(expr.type, ast.ConstantType):
+            return expr.type.nullable
+        return True
+
+    def visit_field(self, node: ast.Field):
+        if isinstance(node.type, ast.FieldType):
+            if self.setTimeZones and isinstance(node.type.resolve_database_field(self.context), DateTimeDatabaseField):
+                nullable = node.type.is_nullable(self.context)
+                return ast.Call(
+                    name="toTimeZone",
+                    args=[node, ast.Constant(value=self.timezone)],
+                    type=ast.CallType(
+                        name="toTimeZone",
+                        arg_types=[ast.DateTimeType(nullable=nullable)],
+                        return_type=ast.DateTimeType(nullable=nullable),
+                    ),
+                )
+
+            if isinstance(node.type.table_type, ast.LazyJoinType) and isinstance(
+                node.type.table_type.lazy_join.join_table, S3Table
+            ):
+                field = node.chain[-1]
+                field_type = node.type.table_type.lazy_join.join_table.fields.get(str(field), None)
+                prop_type = "String"
+
+                if isinstance(field_type, DateTimeDatabaseField):
+                    prop_type = "DateTime"
+                if isinstance(field_type, BooleanDatabaseField):
+                    prop_type = "Boolean"
+
+                return self._field_type_to_property_call(node, prop_type)
+
+        type = node.type
+        if isinstance(type, ast.PropertyType) and type.as_json:
+            # The read is consumed as JSON text, so it keeps the stored value whatever the property's type.
+            return node
+        if isinstance(type, ast.PropertyType):
+            definition = self._property_definition(type)
+            if definition is not None:
+                return self._convert_string_property_to_type(node, *definition)
+        return node
+
+    def _property_definition(self, type: ast.PropertyType) -> tuple[Literal["event", "person", "group"], str] | None:
+        """The metadata entry that applies to this property read, as its kind and key, or None when none does."""
+        if type.field_type.name == "properties" and len(type.chain) == 1:
+            property_name = str(type.chain[0])
+            if (
+                isinstance(type.field_type.table_type, ast.VirtualTableType)
+                and type.field_type.table_type.field == "poe"
+            ):
+                if property_name in self.person_properties:
+                    return ("person", property_name)
+            elif isinstance(type.field_type.table_type, ast.BaseTableType):
+                table_type = type.field_type.table_type
+                resolved_table = table_type.resolve_database_table(self.context)
+                if isinstance(resolved_table, (PersonsTable, RawPersonsTable)):
+                    if property_name in self.person_properties:
+                        return ("person", property_name)
+                if isinstance(resolved_table, GroupsTable):
+                    if isinstance(table_type, ast.LazyJoinType):
+                        if table_type.field.startswith("group_"):
+                            group_id = int(table_type.field.split("_")[1])
+                            if f"{group_id}_{property_name}" in self.group_properties:
+                                return ("group", f"{group_id}_{property_name}")
+                    elif isinstance(table_type, ast.LazyTableType):
+                        global_group_id: Optional[int] = (
+                            self.context.globals.get("group_id") if self.context.globals else None
+                        )
+                        if isinstance(global_group_id, int):
+                            if f"{global_group_id}_{property_name}" in self.group_properties:
+                                return ("group", f"{global_group_id}_{property_name}")
+                if isinstance(resolved_table, EventsPersonSubTable | FlagEvaluationsPersonSubTable):
+                    if property_name in self.person_properties:
+                        return ("person", property_name)
+                elif isinstance(resolved_table, EVENT_ROW_TABLES):
+                    if property_name in self.event_properties:
+                        return ("event", property_name)
+        if type.field_type.name == "person_properties" and len(type.chain) == 1:
+            property_name = str(type.chain[0])
+            if isinstance(type.field_type.table_type, ast.BaseTableType):
+                resolved_table = type.field_type.table_type.resolve_database_table(self.context)
+                if isinstance(resolved_table, _PERSON_PROPERTIES_TABLES):
+                    if property_name in self.person_properties:
+                        return ("person", property_name)
+        return None
+
+    def converts(self, type: ast.PropertyType) -> bool:
+        """Whether this pass replaces the property read with a typed conversion, so a caller that serializes the read
+        itself knows whether the stored value or the converted value is what a direct read yields."""
+        definition = self._property_definition(type)
+        if definition is None:
+            return False
+        kind, property_name = definition
+        properties_by_type = {
+            "event": self.event_properties,
+            "person": self.person_properties,
+            "group": self.group_properties,
+        }
+        return properties_by_type[kind].get(property_name, {}).get("type") in ("Numeric", "Boolean", "DateTime")
+
+    def _convert_string_property_to_type(
+        self,
+        node: ast.Field,
+        property_type: Literal["event", "person", "group"],
+        property_name: str,
+    ):
+        properties_by_type = {
+            "event": self.event_properties,
+            "person": self.person_properties,
+            "group": self.group_properties,
+        }
+        if property_type != "group" and not self._converts_event_or_person_property(node):
+            return node
+        prop_info = properties_by_type[property_type].get(property_name, {})
+        field_type = "Float" if prop_info.get("type") == "Numeric" else prop_info.get("type") or "String"
+
+        # Add notice about the property type and materialization status
+        self._add_property_notice(node, property_type, field_type, prop_info.get("dmat"))
+
+        # The user is parsing this property as a string (toFloatOrZero/toIntOrZero/
+        # toFloatOrDefault). Those ClickHouse functions require a String argument, so
+        # leave the raw materialized-column/JSON value in place rather than casting it.
+        if self._suppress_numeric_conversion:
+            return node
+
+        # Both paths fall through to the wrapper: dmat columns are `Nullable(String)` (the
+        # printer swaps the field to `dmat_string_<idx>`), so they need the same cast as
+        # the JSON fallback.
+        return self._field_type_to_property_call(node, field_type)
+
+    def _converts_event_or_person_property(self, node: ast.Field) -> bool:
+        # Lazy tables move a union scan's property reads into branches, away from a call such as toFloatOrZero that
+        # needs the raw value. The pass before lazy tables converts each read at its call, so the branches stay raw.
+        if self._union_scan_depth > 0:
+            return False
+        if not self.before_lazy_tables:
+            return True
+        assert isinstance(node.type, ast.PropertyType)
+        return union_table_of(node.type.field_type.table_type) is not None
+
+    def _field_type_to_property_call(self, node: ast.Field, field_type: str):
+        if field_type == "DateTime":
+            if id(node) in self._string_compared_operand_ids:
+                return ast.Call(name="toString", args=[node])
+            # Carry the return type so an enclosing toDateTime() resolves its
+            # already-a-datetime overload instead of re-parsing this value
+            # (parseDateTime64BestEffortOrNull only accepts strings). Only
+            # return_type drives overload resolution here; arg_types is an
+            # approximation of the signature and is not re-validated.
+            return ast.Call(
+                name="toDateTime",
+                args=[node],
+                type=ast.CallType(
+                    name="toDateTime",
+                    arg_types=[ast.StringType(nullable=True)],
+                    return_type=ast.DateTimeType(nullable=True),
+                ),
+            )
+        if field_type == "Float":
+            return ast.Call(
+                name="toFloat",
+                args=[node],
+                type=ast.CallType(
+                    name="toFloat",
+                    arg_types=[ast.StringType(nullable=True)],
+                    return_type=ast.FloatType(nullable=True),
+                ),
+            )
+        if field_type == "Boolean":
+            return ast.Call(
+                name="toBool",
+                args=[
+                    ast.Call(
+                        name="transform",
+                        args=[
+                            ast.Call(name="toString", args=[node]),
+                            ast.Constant(value=["true", "false"]),
+                            ast.Constant(value=[1, 0]),
+                            ast.Constant(value=None),
+                        ],
+                    )
+                ],
+                type=ast.CallType(
+                    name="toBool",
+                    arg_types=[ast.StringType(nullable=True)],
+                    return_type=ast.BooleanType(nullable=True),
+                ),
+            )
+        return node
+
+    def _add_property_notice(
+        self,
+        node: ast.Field,
+        property_type: Literal["event", "person", "group"],
+        field_type: str,
+        dmat_column: str | None = None,
+    ):
+        property_name = str(node.chain[-1])
+        if property_type == "group" and "_" in property_name:
+            property_name = property_name.split("_", 1)[1]
+
+        message = f"{property_type.capitalize()} property '{property_name}' is of type '{field_type}'."
+        if self.context.debug:
+            access_plan = plan_property_access(node, self.context)
+            if access_plan is not None and access_plan.source.kind == PropertySourceKind.MATERIALIZED_COLUMN:
+                message += " This property is materialized (mat_*) ⚡️."
+            elif access_plan is not None and access_plan.source.kind == PropertySourceKind.DYNAMIC_MATERIALIZED_COLUMN:
+                message += f" This property is materialized ({access_plan.source.column_name}) ⚡️."
+            elif access_plan is not None and access_plan.source.kind == PropertySourceKind.PROPERTY_GROUP:
+                message += f" This property is served from property group column '{access_plan.source.column_name}' ⚡️."
+            elif dmat_column is not None:
+                message += f" This property is materialized ({dmat_column}) ⚡️."
+            else:
+                message += " This property is not materialized 🐢."
+
+        self._add_notice(node=node, message=message)
+
+    def _add_notice(self, node: ast.Field, message: str):
+        if node.start is None or node.end is None:
+            return  # Don't add notices for nodes without location (e.g. from EventsQuery JSON)
+        # Only highlight the last part of the chain
+        self.context.add_notice(
+            start=max(node.start, node.end - len(escape_hogql_identifier(node.chain[-1]))),
+            end=node.end,
+            message=message,
+        )

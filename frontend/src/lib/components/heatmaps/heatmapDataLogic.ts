@@ -1,0 +1,885 @@
+import { MakeLogicType, actions, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import { loaders } from 'kea-loaders'
+import { encodeParams } from 'kea-router'
+import { subscriptions } from 'kea-subscriptions'
+import { windowValues } from 'kea-window-values'
+
+import {
+    CommonFilters,
+    HeatmapArea,
+    HeatmapBoundsFilter,
+    HeatmapEventsResponse,
+    HeatmapFilters,
+    HeatmapFixedPositionMode,
+    HeatmapJsData,
+    HeatmapJsDataPoint,
+    HeatmapKind,
+} from 'lib/components/heatmaps/types'
+import {
+    DEFAULT_HEATMAP_FILTERS,
+    DEFAULT_HEATMAP_HEIGHT,
+    DEFAULT_HEATMAP_WIDTH,
+    calculateViewportRange,
+} from 'lib/components/IframedToolbarBrowser/utils'
+import { LemonSelectOption } from 'lib/lemon-ui/LemonSelect'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { toolbarScopedPath } from 'lib/toolbar/toolbarProject'
+import { getToolbarRuntime } from 'lib/toolbar/toolbarRuntime'
+import { dateFilterToText } from 'lib/utils/dateFilters'
+import { getAppContext } from 'lib/utils/getAppContext'
+
+import { ToolbarRequestError } from '~/toolbar/shared/toolbarRequestError'
+import { HeatmapElement, HeatmapResponseType } from '~/toolbar/shared/types'
+import { FilterType } from '~/types'
+
+export interface HeatmapDateRangeOverride {
+    date_from: string
+    date_to: string
+    timestamp_from: string
+    timestamp_to: string
+}
+
+export interface HeatmapHistoryView {
+    owner: string
+    dateRange: HeatmapDateRangeOverride
+    width: number
+    imageUrl: string
+}
+
+// The endpoint defaults to a bounded page for API callers; the overlay renders every point.
+const UNBOUNDED_HEATMAP_LIMIT = 0
+
+// Limit canvas height to prevent browser freezing with heatmap.js
+// Large canvases (e.g., 24000px) cause heatmap.js to block the main thread
+export const MAX_HEATMAP_HEIGHT = 8000
+
+export const HEATMAP_LOADING_DEBOUNCE_MS = 200
+
+export const HEATMAP_TYPES: Record<HeatmapKind, { label: string; noun: string }> = {
+    click: { label: 'Clicks', noun: 'click' },
+    rageclick: { label: 'Rageclicks', noun: 'rageclick' },
+    deadclick: { label: 'Dead clicks', noun: 'dead click' },
+    mousemove: { label: 'Mouse moves', noun: 'mouse move' },
+    scrolldepth: { label: 'Scroll depth', noun: 'scroll depth' },
+}
+
+export const HEATMAP_TYPE_OPTIONS: LemonSelectOption<HeatmapKind>[] = (Object.keys(HEATMAP_TYPES) as HeatmapKind[]).map(
+    (value) => ({ value, label: HEATMAP_TYPES[value].label })
+)
+
+export const HEATMAP_COLOR_PALETTE_OPTIONS: LemonSelectOption<string>[] = [
+    { value: 'default', label: 'Default (multicolor)' },
+    { value: 'red', label: 'Red (monocolor)' },
+    { value: 'green', label: 'Green (monocolor)' },
+    { value: 'blue', label: 'Blue (monocolor)' },
+]
+
+async function parseHeatmapErrorMessage(response: Response): Promise<string> {
+    try {
+        const body = await response.clone().json()
+        if (typeof body?.detail === 'string' && body.detail.length > 0) {
+            return body.detail
+        }
+        for (const value of Object.values(body ?? {})) {
+            if (Array.isArray(value) && typeof value[0] === 'string') {
+                return value[0]
+            }
+            if (typeof value === 'string' && value.length > 0) {
+                return value
+            }
+        }
+    } catch {
+        /* empty */
+    }
+    return `Heatmap request failed (status ${response.status})`
+}
+
+export interface HeatmapDataLogicProps {
+    context: 'in-app' | 'toolbar'
+    exportToken?: string | null
+}
+
+/**
+ * Fetch a heatmap endpoint and raise request failures the right way for each context:
+ * in the toolbar a failed request is an expected outcome, so it becomes a tagged
+ * `ToolbarRequestError` (drives the loader's *Failure action without being reported to
+ * error tracking); in-app the pre-existing plain-error behavior is preserved.
+ */
+async function fetchHeatmapData(
+    props: HeatmapDataLogicProps,
+    apiURL: string,
+    options: { authenticateOn403?: boolean } = {}
+): Promise<Response> {
+    let response: Response
+    try {
+        response = await (props.context === 'toolbar'
+            ? // Imported here so the app never ships the toolbar's request code.
+              import('~/toolbar/shared/toolbarFetch').then(({ toolbarFetch }) => toolbarFetch(apiURL, 'GET'))
+            : props.exportToken
+              ? fetch(apiURL, { headers: { Authorization: `Bearer ${props.exportToken}` } })
+              : fetch(apiURL))
+    } catch (e) {
+        if (props.context === 'toolbar') {
+            throw new ToolbarRequestError('Network error while loading heatmap data')
+        }
+        throw e
+    }
+
+    if (props.context === 'toolbar' && response.status === 403 && options.authenticateOn403) {
+        getToolbarRuntime()?.authenticate()
+    }
+
+    if (response.status !== 200) {
+        const message = await parseHeatmapErrorMessage(response)
+        if (props.context === 'toolbar') {
+            throw new ToolbarRequestError(message, response.status)
+        }
+        throw new Error(message)
+    }
+
+    return response
+}
+
+export function heatmapApiPath(context: HeatmapDataLogicProps['context'], endpoint: '' | 'events/'): string {
+    if (context === 'toolbar') {
+        // The toolbar's token is scoped to one team, so pin that team. Without a session there is no team, and
+        // toolbarFetch refuses the request before it is sent.
+        const project = getToolbarRuntime()?.project()
+        return project ? toolbarScopedPath(project, 'team', `heatmaps/${endpoint}`) : `/api/heatmap/${endpoint}`
+    }
+    if (context === 'in-app') {
+        // The unscoped /api/heatmap/ route resolves the team from the user's *global* current
+        // project, which any other tab can change, so pin the team this page was loaded for
+        // instead. The app context team is also set on export renders (team_for_public_context).
+        const teamId = getAppContext()?.current_team?.id
+        if (teamId != null) {
+            return `/api/projects/${teamId}/heatmaps/${endpoint}`
+        }
+    }
+    return `/api/heatmap/${endpoint}`
+}
+
+// A row added but not yet pointed at an event carries a null id. It selects nothing, and the API rejects
+// it, so leave those out of the request instead of failing the whole heatmap over a half-filled row.
+export function eventFilterParam(events: CommonFilters['events']): string | undefined {
+    const selected = events?.filter((event) => !!event.id)
+    return selected?.length ? JSON.stringify(selected) : undefined
+}
+
+export type HrefMatchType = 'exact' | 'pattern'
+
+export function isWithinBounds(
+    point: { x: number; y: number; targetFixed: boolean },
+    boundsFilter: HeatmapBoundsFilter | null
+): boolean {
+    if (!boundsFilter) {
+        return true
+    }
+    // points and areas live in different coordinate spaces depending on fixedness, so a
+    // point of the other kind can't be meaningfully tested against this area — exclude it
+    if (point.targetFixed !== boundsFilter.areaFixed) {
+        return false
+    }
+    const { bounds } = boundsFilter
+    return point.x >= bounds.left && point.x <= bounds.right && point.y >= bounds.top && point.y <= bounds.bottom
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface heatmapDataLogicValues {
+    analysisWidth: number
+    areaEvents: HeatmapEventsResponse | null
+    areaEventsLoading: boolean
+    areaEventsLoadingMore: boolean
+    commonFilters: CommonFilters
+    dateRange: string | null
+    dateRangeOverride: HeatmapDateRangeOverride | null
+    effectiveCommonFilters: CommonFilters
+    filteredHeatmapElements: HeatmapElement[]
+    heatmapBoundsFilter: HeatmapBoundsFilter | null
+    heatmapColorPalette: string | null
+    heatmapElements: HeatmapElement[]
+    heatmapEmpty: boolean
+    heatmapFilters: HeatmapFilters
+    heatmapFixedPositionMode: HeatmapFixedPositionMode
+    heatmapJsData: HeatmapJsData
+    heatmapTooltipNoun: string
+    heatmapTooltipSuppressed: boolean
+    heightOverride: number
+    historyView: HeatmapHistoryView | null
+    href: string | null
+    hrefMatchType: HrefMatchType
+    isHeightCapped: boolean
+    isReady: boolean
+    maxYFromEvents: number
+    rawHeatmap: HeatmapResponseType | null
+    rawHeatmapLoading: boolean
+    selectedArea: HeatmapArea | null
+    showEventsPanel: boolean
+    viewportRange: {
+        max: number
+        min: number
+    }
+    widthOverride: number
+    windowHeight: number
+    windowWidth: number
+    windowWidthOverride: number | null
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface heatmapDataLogicActions {
+    clearSelectedArea: () => {
+        value: true
+    }
+    loadAreaEvents: (_: any) => any
+    loadAreaEventsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadAreaEventsSuccess: (
+        areaEvents: HeatmapEventsResponse | null,
+        payload?: any
+    ) => {
+        areaEvents: HeatmapEventsResponse | null
+        payload?: any
+    }
+    loadHeatmap: () => {
+        value: true
+    }
+    loadHeatmapFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    loadHeatmapSuccess: (
+        rawHeatmap: HeatmapResponseType | null,
+        payload?: {
+            value: true
+        }
+    ) => {
+        rawHeatmap: HeatmapResponseType | null
+        payload?: {
+            value: true
+        }
+    }
+    loadMoreAreaEvents: () => {
+        value: true
+    }
+    loadMoreAreaEventsSuccess: (payload: HeatmapEventsResponse) => {
+        payload: HeatmapEventsResponse
+    }
+    patchHeatmapFilters: (filters: Partial<HeatmapFilters>) => {
+        filters: Partial<HeatmapFilters>
+    }
+    resetHeatmapData: () => any
+    resetHeatmapDataFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    resetHeatmapDataSuccess: (
+        rawHeatmap: {
+            results: never[]
+        },
+        payload?: any
+    ) => {
+        rawHeatmap: {
+            results: never[]
+        }
+        payload?: any
+    }
+    setCommonFilters: (filters: CommonFilters) => {
+        filters: CommonFilters
+    }
+    setHeatmapBoundsFilter: (boundsFilter: HeatmapBoundsFilter | null) => {
+        boundsFilter: HeatmapBoundsFilter | null
+    }
+    setHeatmapColorPalette: (palette: string | null) => {
+        palette: string | null
+    }
+    setHeatmapFilters: (filters: HeatmapFilters) => {
+        filters: HeatmapFilters
+    }
+    setHeatmapFixedPositionMode: (mode: HeatmapFixedPositionMode) => {
+        mode: HeatmapFixedPositionMode
+    }
+    setHeatmapTooltipSuppressed: (suppressed: boolean) => {
+        suppressed: boolean
+    }
+    setHistoryView: (view: HeatmapHistoryView | null) => {
+        view: HeatmapHistoryView | null
+    }
+    setHref: (href: string) => {
+        href: string
+    }
+    setHrefMatchType: (matchType: HrefMatchType) => {
+        matchType: HrefMatchType
+    }
+    setIsReady: (isReady: boolean) => {
+        isReady: boolean
+    }
+    setSelectedArea: (area: HeatmapArea | null) => {
+        area: HeatmapArea | null
+    }
+    setShowEventsPanel: (show: boolean) => {
+        show: boolean
+    }
+    setWindowWidthOverride: (widthOverride: number | null) => {
+        widthOverride: number | null
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface heatmapDataLogicMeta {
+    key: 'in-app' | 'toolbar'
+    __keaTypeGenInternalSelectorTypes: {
+        dateRangeOverride: (historyView: HeatmapHistoryView | null) => HeatmapDateRangeOverride | null
+        effectiveCommonFilters: (
+            commonFilters: CommonFilters,
+            dateRangeOverride: HeatmapDateRangeOverride | null
+        ) => CommonFilters
+        dateRange: (commonFilters: CommonFilters) => string | null
+        heatmapElements: (rawHeatmap: HeatmapResponseType | null) => HeatmapElement[]
+        analysisWidth: (
+            windowWidthOverride: number | null,
+            windowWidth: number,
+            historyView: HeatmapHistoryView | null
+        ) => number
+        viewportRange: (
+            heatmapFilters: HeatmapFilters,
+            analysisWidth: number
+        ) => {
+            max: number
+            min: number
+        }
+        widthOverride: (analysisWidth: number) => number
+        heatmapTooltipNoun: (heatmapFilters: HeatmapFilters) => string
+        heatmapEmpty: (rawHeatmap: HeatmapResponseType | null, rawHeatmapLoading: boolean) => boolean
+        maxYFromEvents: (heatmapElements: HeatmapElement[]) => number
+        heightOverride: (maxYFromEvents: number, windowHeight: number) => number
+        isHeightCapped: (maxYFromEvents: number) => boolean
+        filteredHeatmapElements: (
+            heatmapElements: HeatmapElement[],
+            analysisWidth: number,
+            heatmapBoundsFilter: HeatmapBoundsFilter | null
+        ) => HeatmapElement[]
+        heatmapJsData: (
+            filteredHeatmapElements: HeatmapElement[],
+            analysisWidth: number,
+            heatmapFixedPositionMode: HeatmapFixedPositionMode
+        ) => HeatmapJsData
+    }
+}
+
+export type heatmapDataLogicType = MakeLogicType<
+    heatmapDataLogicValues,
+    heatmapDataLogicActions,
+    HeatmapDataLogicProps,
+    heatmapDataLogicMeta
+>
+
+export const heatmapDataLogic = kea<heatmapDataLogicType>([
+    path((key) => ['lib', 'components', 'heatmap', 'heatmapDataLogic', key]),
+    props({ context: 'toolbar', exportToken: null } as HeatmapDataLogicProps),
+    key((props) => props.context),
+    actions({
+        loadHeatmap: true,
+        setCommonFilters: (filters: CommonFilters) => ({ filters }),
+        setHistoryView: (view: HeatmapHistoryView | null) => ({ view }),
+        setHeatmapFilters: (filters: HeatmapFilters) => ({ filters }),
+        patchHeatmapFilters: (filters: Partial<HeatmapFilters>) => ({ filters }),
+        setHeatmapFixedPositionMode: (mode: HeatmapFixedPositionMode) => ({ mode }),
+        setHeatmapColorPalette: (palette: string | null) => ({ palette }),
+        setHeatmapTooltipSuppressed: (suppressed: boolean) => ({ suppressed }),
+        setHref: (href: string) => ({ href }),
+        setHrefMatchType: (matchType: HrefMatchType) => ({ matchType }),
+        setWindowWidthOverride: (widthOverride: number | null) => ({ widthOverride }),
+        setHeatmapBoundsFilter: (boundsFilter: HeatmapBoundsFilter | null) => ({ boundsFilter }),
+        setIsReady: (isReady: boolean) => ({ isReady }),
+        // Click-to-view-events actions
+        setSelectedArea: (area: HeatmapArea | null) => ({ area }),
+        clearSelectedArea: true,
+        setShowEventsPanel: (show: boolean) => ({ show }),
+        loadMoreAreaEvents: true,
+        loadMoreAreaEventsSuccess: (payload: HeatmapEventsResponse) => ({ payload }),
+    }),
+    windowValues(() => ({
+        windowWidth: (window: Window) => window.innerWidth,
+        windowHeight: (window: Window) => window.innerHeight,
+    })),
+    reducers({
+        hrefMatchType: [
+            'exact' as HrefMatchType,
+            {
+                setHrefMatchType: (_, { matchType }) => matchType,
+            },
+        ],
+        commonFilters: [
+            { date_from: '-7d' } as CommonFilters,
+            { persist: true },
+            {
+                setCommonFilters: (_, { filters }) => filters,
+            },
+        ],
+        historyView: [null as HeatmapHistoryView | null, { setHistoryView: (_, { view }) => view }],
+        heatmapFilters: [
+            DEFAULT_HEATMAP_FILTERS,
+            { persist: true },
+            {
+                setHeatmapFilters: (_, { filters }) => filters,
+                patchHeatmapFilters: (state, { filters }) => ({ ...state, ...filters }),
+            },
+        ],
+        heatmapFixedPositionMode: [
+            'fixed' as HeatmapFixedPositionMode,
+            { persist: true },
+            {
+                setHeatmapFixedPositionMode: (_, { mode }) => mode,
+            },
+        ],
+        heatmapColorPalette: [
+            'default' as string | null,
+            { persist: true },
+            {
+                setHeatmapColorPalette: (_, { palette }) => palette,
+            },
+        ],
+        // e.g. while the clickmap overlay shows its own element tooltip
+        heatmapTooltipSuppressed: [
+            false,
+            {
+                setHeatmapTooltipSuppressed: (_, { suppressed }) => suppressed,
+            },
+        ],
+        href: [
+            null as string | null,
+            {
+                setHref: (_, { href }) => {
+                    return href
+                },
+            },
+        ],
+        windowWidthOverride: [
+            null as number | null,
+            { persist: true },
+            {
+                setWindowWidthOverride: (_, { widthOverride }) => widthOverride,
+            },
+        ],
+        // deliberately not persisted: the bounds describe an element on the page currently
+        // being viewed, so they'd be meaningless (and misleading) on the next page
+        heatmapBoundsFilter: [
+            null as HeatmapBoundsFilter | null,
+            {
+                setHeatmapBoundsFilter: (_, { boundsFilter }) => boundsFilter,
+            },
+        ],
+        isReady: [
+            false as boolean,
+            {
+                setIsReady: (_, { isReady }) => isReady,
+                loadHeatmapSuccess: (state, { rawHeatmap }) => (rawHeatmap ? true : state),
+                loadHeatmapFailure: () => true,
+            },
+        ],
+        selectedArea: [
+            null as HeatmapArea | null,
+            {
+                setSelectedArea: (_, { area }) => area,
+                clearSelectedArea: () => null,
+            },
+        ],
+        showEventsPanel: [
+            false as boolean,
+            {
+                setShowEventsPanel: (_, { show }) => show,
+                clearSelectedArea: () => false,
+            },
+        ],
+        areaEventsLoadingMore: [
+            false as boolean,
+            {
+                loadMoreAreaEvents: () => true,
+                loadMoreAreaEventsSuccess: () => false,
+            },
+        ],
+        // Additional reducers for areaEvents (loader is defined below)
+        areaEvents: [
+            null as HeatmapEventsResponse | null,
+            {
+                loadMoreAreaEventsSuccess: (_, { payload }) => payload,
+                clearSelectedArea: () => null,
+            },
+        ],
+    }),
+    loaders(({ values, props, actions }) => ({
+        rawHeatmap: [
+            null as HeatmapResponseType | null,
+            {
+                resetHeatmapData: () => ({ results: [] }),
+                loadHeatmap: async (_, breakpoint) => {
+                    await breakpoint(150)
+
+                    if (!values.href || !values.href.trim().length) {
+                        return null
+                    }
+                    if (!values.heatmapFilters.enabled) {
+                        return null
+                    }
+
+                    actions.setIsReady(false)
+
+                    const { date_from, date_to, filter_test_accounts, cohort_ids, events } =
+                        values.effectiveCommonFilters
+                    const { type, aggregation } = values.heatmapFilters
+
+                    // toolbar fetch collapses queryparams but this URL has multiple with the same name
+                    const apiURL = `${heatmapApiPath(props.context, '')}${encodeParams(
+                        {
+                            type,
+                            date_from,
+                            date_to,
+                            timestamp_from: values.dateRangeOverride?.timestamp_from,
+                            timestamp_to: values.dateRangeOverride?.timestamp_to,
+                            url_exact: values.hrefMatchType === 'exact' ? values.href : undefined,
+                            url_pattern: values.hrefMatchType === 'pattern' ? values.href : undefined,
+                            viewport_width_min: values.viewportRange.min,
+                            viewport_width_max: values.viewportRange.max,
+                            aggregation,
+                            filter_test_accounts,
+                            cohort_ids: cohort_ids && cohort_ids.length > 0 ? JSON.stringify(cohort_ids) : undefined,
+                            events: eventFilterParam(events),
+                            limit: UNBOUNDED_HEATMAP_LIMIT,
+                        },
+                        '?'
+                    )}`
+
+                    // if we export the heatmap, we need to add the export token to the headers
+                    const response = await fetchHeatmapData(props, apiURL, { authenticateOn403: true })
+                    breakpoint()
+
+                    const data = await response.json()
+                    return data
+                },
+            },
+        ],
+        areaEvents: [
+            null as HeatmapEventsResponse | null,
+            {
+                loadAreaEvents: async (_, breakpoint) => {
+                    const area = values.selectedArea
+                    if (!area || !values.href) {
+                        return null
+                    }
+
+                    await breakpoint(100)
+
+                    const { date_from, date_to, filter_test_accounts, cohort_ids, events } =
+                        values.effectiveCommonFilters
+                    const { type } = values.heatmapFilters
+
+                    const apiURL = `${heatmapApiPath(props.context, 'events/')}${encodeParams(
+                        {
+                            type,
+                            date_from,
+                            date_to,
+                            timestamp_from: values.dateRangeOverride?.timestamp_from,
+                            timestamp_to: values.dateRangeOverride?.timestamp_to,
+                            url_exact: values.hrefMatchType === 'exact' ? values.href : undefined,
+                            url_pattern: values.hrefMatchType === 'pattern' ? values.href : undefined,
+                            viewport_width_min: values.viewportRange.min,
+                            viewport_width_max: values.viewportRange.max,
+                            filter_test_accounts,
+                            cohort_ids: cohort_ids && cohort_ids.length > 0 ? cohort_ids : undefined,
+                            events: eventFilterParam(events),
+                            points: JSON.stringify(area.points),
+                        },
+                        '?'
+                    )}`
+
+                    const response = await fetchHeatmapData(props, apiURL)
+                    breakpoint()
+
+                    return await response.json()
+                },
+            },
+        ],
+    })),
+    selectors(({ props }) => ({
+        dateRangeOverride: [
+            (s) => [s.historyView],
+            (view: HeatmapHistoryView | null): HeatmapDateRangeOverride | null => view?.dateRange ?? null,
+        ],
+        effectiveCommonFilters: [
+            (s) => [s.commonFilters, s.dateRangeOverride],
+            (commonFilters: CommonFilters, dateRangeOverride: HeatmapDateRangeOverride | null): CommonFilters =>
+                dateRangeOverride
+                    ? { ...commonFilters, date_from: dateRangeOverride.date_from, date_to: dateRangeOverride.date_to }
+                    : commonFilters,
+        ],
+        dateRange: [
+            (s) => [s.commonFilters],
+            (commonFilters: Partial<FilterType>) => {
+                return dateFilterToText(commonFilters.date_from, commonFilters.date_to, 'Last 7 days')
+            },
+        ],
+
+        heatmapElements: [
+            (s) => [s.rawHeatmap],
+            (rawHeatmap: HeatmapResponseType | null): HeatmapElement[] => {
+                if (!rawHeatmap) {
+                    return []
+                }
+
+                const elements: HeatmapElement[] = []
+
+                rawHeatmap?.results.forEach((element) => {
+                    if ('scroll_depth_bucket' in element) {
+                        elements.push({
+                            count: element.cumulative_count,
+                            xPercentage: 0,
+                            targetFixed: false,
+                            y: element.scroll_depth_bucket,
+                        })
+                    } else {
+                        elements.push({
+                            count: element.count,
+                            xPercentage: element.pointer_relative_x,
+                            targetFixed: element.pointer_target_fixed,
+                            y: element.pointer_y,
+                        })
+                    }
+                })
+
+                return elements
+            },
+        ],
+
+        // The viewport width this heatmap is being analyzed at. Both the rendered preview and the
+        // viewport filter sent to the API must read this one value, because a preview at one width
+        // over data collected at another places interactions where they never happened. In-app the
+        // preview is a fixed-width frame picked with the screen width control, so the query has to
+        // match that width and not the width of the analyst's own browser. In the toolbar the
+        // overlay sits on the real page, so the live window width is the right anchor.
+        analysisWidth: [
+            (s) => [s.windowWidthOverride, s.windowWidth, s.historyView],
+            (windowWidthOverride: number | null, windowWidth: number, historyView: HeatmapHistoryView | null): number =>
+                historyView?.width ??
+                windowWidthOverride ??
+                (props.context === 'in-app' ? DEFAULT_HEATMAP_WIDTH : windowWidth),
+        ],
+
+        viewportRange: [
+            (s) => [s.heatmapFilters, s.analysisWidth],
+            (heatmapFilters: HeatmapFilters, analysisWidth: number) =>
+                calculateViewportRange(heatmapFilters, analysisWidth),
+        ],
+
+        widthOverride: [(s) => [s.analysisWidth], (analysisWidth: number): number => analysisWidth],
+
+        heatmapTooltipNoun: [
+            (s) => [s.heatmapFilters],
+            (heatmapFilters: HeatmapFilters) => {
+                if (heatmapFilters.aggregation === 'unique_visitors') {
+                    return 'visitor'
+                }
+                return (HEATMAP_TYPES[heatmapFilters.type ?? 'click'] ?? HEATMAP_TYPES.click).noun
+            },
+        ],
+
+        heatmapEmpty: [
+            (s) => [s.rawHeatmap, s.rawHeatmapLoading],
+            (rawHeatmap: HeatmapResponseType | null, rawHeatmapLoading: boolean) => {
+                return rawHeatmap?.results.length === 0 && !rawHeatmapLoading
+            },
+        ],
+
+        maxYFromEvents: [
+            (s) => [s.heatmapElements],
+            (heatmapElements: HeatmapElement[]): number => {
+                if (!heatmapElements || heatmapElements.length === 0) {
+                    return 0
+                }
+                return Math.max(...heatmapElements.map((el: HeatmapElement) => el.y))
+            },
+        ],
+
+        // Derived height - maximum of calculated height from events and viewport height
+        heightOverride: [
+            (s) => [s.maxYFromEvents, s.windowHeight],
+            (maxYFromEvents: number, windowHeight: number): number => {
+                if (maxYFromEvents > 0) {
+                    const calculatedHeight = Math.ceil((maxYFromEvents + 100) / 100) * 100
+                    return Math.min(Math.max(calculatedHeight, windowHeight), MAX_HEATMAP_HEIGHT)
+                }
+                return Math.max(DEFAULT_HEATMAP_HEIGHT, windowHeight)
+            },
+        ],
+
+        // True when captured points extend past the rendered canvas cap, so the overlay is clipped
+        isHeightCapped: [
+            (s) => [s.maxYFromEvents],
+            (maxYFromEvents: number): boolean => {
+                if (maxYFromEvents <= 0) {
+                    return false
+                }
+                const calculatedHeight = Math.ceil((maxYFromEvents + 100) / 100) * 100
+                return calculatedHeight > MAX_HEATMAP_HEIGHT
+            },
+        ],
+
+        // the one place the area bounds filter applies, so rendering (heatmapJsData) and
+        // click-to-view-events hit testing can't disagree about which points exist
+        filteredHeatmapElements: [
+            (s) => [s.heatmapElements, s.analysisWidth, s.heatmapBoundsFilter],
+            (
+                heatmapElements: HeatmapElement[],
+                analysisWidth: number,
+                heatmapBoundsFilter: HeatmapBoundsFilter | null
+            ): HeatmapElement[] => {
+                if (!heatmapBoundsFilter) {
+                    return heatmapElements
+                }
+                return heatmapElements.filter((element) =>
+                    isWithinBounds(
+                        {
+                            x: Math.round(element.xPercentage * analysisWidth),
+                            y: Math.round(element.y),
+                            targetFixed: element.targetFixed,
+                        },
+                        heatmapBoundsFilter
+                    )
+                )
+            },
+        ],
+
+        heatmapJsData: [
+            (s) => [s.filteredHeatmapElements, s.analysisWidth, s.heatmapFixedPositionMode],
+            (
+                filteredHeatmapElements: HeatmapElement[],
+                analysisWidth: number,
+                heatmapFixedPositionMode: HeatmapFixedPositionMode
+            ): HeatmapJsData => {
+                const data = filteredHeatmapElements.reduce((acc, element) => {
+                    if (heatmapFixedPositionMode === 'hidden' && element.targetFixed) {
+                        return acc
+                    }
+
+                    const y = Math.round(element.y)
+                    const x = Math.round(element.xPercentage * analysisWidth)
+
+                    acc.push({ x, y, value: element.count })
+                    return acc
+                }, [] as HeatmapJsDataPoint[])
+
+                // Max is the highest value in the data set we have
+                const max = data.reduce((max, { value }) => Math.max(max, value), 0)
+
+                // TODO: Group based on some sensible resolutions (we can then use this for a hover state to show more detail)
+
+                return {
+                    min: 0,
+                    max,
+                    data,
+                }
+            },
+        ],
+    })),
+    listeners(({ actions, values, props }) => ({
+        setCommonFilters: () => {
+            // The open drill-down lists interactions for the filters it was opened with. Close it so it
+            // can't show sessions the new filters exclude; the user reselects a hotspot on the new overlay.
+            actions.clearSelectedArea()
+            actions.loadHeatmap()
+        },
+        setHistoryView: () => {
+            actions.clearSelectedArea()
+            actions.setIsReady(false)
+            actions.resetHeatmapData()
+            actions.loadHeatmap()
+        },
+        setHeatmapFilters: () => {
+            actions.loadHeatmap()
+        },
+        patchHeatmapFilters: ({ filters }) => {
+            // Clear old data when switching heatmap types
+            if (filters.type) {
+                actions.resetHeatmapData()
+            }
+            actions.loadHeatmap()
+        },
+        setHref: () => {
+            actions.loadHeatmap()
+        },
+        setSelectedArea: ({ area }) => {
+            if (area) {
+                actions.loadAreaEvents({})
+                actions.setShowEventsPanel(true)
+            }
+        },
+        loadMoreAreaEvents: async () => {
+            const area = values.selectedArea
+            const currentEvents = values.areaEvents
+            if (!area || !values.href || !currentEvents?.results) {
+                return
+            }
+
+            const { date_from, date_to, filter_test_accounts, cohort_ids, events } = values.effectiveCommonFilters
+            const { type } = values.heatmapFilters
+            const nextOffset = currentEvents.results.length
+
+            const apiURL = `${heatmapApiPath(props.context, 'events/')}${encodeParams(
+                {
+                    type,
+                    date_from,
+                    date_to,
+                    timestamp_from: values.dateRangeOverride?.timestamp_from,
+                    timestamp_to: values.dateRangeOverride?.timestamp_to,
+                    url_exact: values.hrefMatchType === 'exact' ? values.href : undefined,
+                    url_pattern: values.hrefMatchType === 'pattern' ? values.href : undefined,
+                    viewport_width_min: values.viewportRange.min,
+                    viewport_width_max: values.viewportRange.max,
+                    filter_test_accounts,
+                    cohort_ids: cohort_ids && cohort_ids.length > 0 ? cohort_ids : undefined,
+                    events: eventFilterParam(events),
+                    points: JSON.stringify(area.points),
+                    offset: nextOffset,
+                },
+                '?'
+            )}`
+
+            let response: Response
+            try {
+                response = await fetchHeatmapData(props, apiURL)
+            } catch (e) {
+                lemonToast.error(e instanceof Error ? e.message : 'Failed to load more events')
+                return
+            }
+
+            const newData: HeatmapEventsResponse = await response.json()
+
+            actions.loadMoreAreaEventsSuccess({
+                results: [...currentEvents.results, ...(newData.results || [])],
+                total_count: newData.total_count,
+                has_more: newData.has_more,
+            })
+        },
+        loadHeatmapFailure: ({ error }) => {
+            lemonToast.error(error || 'Heatmap query failed')
+        },
+        loadAreaEventsFailure: ({ error }) => {
+            lemonToast.error(error || 'Failed to load events for selected area')
+        },
+    })),
+    subscriptions(({ actions }) => ({
+        analysisWidth: () => {
+            actions.loadHeatmap()
+        },
+    })),
+])

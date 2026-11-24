@@ -1,0 +1,263 @@
+import { Command, type Icon, MagnifyingGlass } from "@phosphor-icons/react";
+import { DotsCircleSpinner } from "@posthog/ui/primitives/DotsCircleSpinner";
+import type { ToolCall, ToolCallContent } from "../../types";
+import { iconForToolKind } from "./toolIcons";
+
+/** Tool icon by agent tool name, for tools without a generic `kind`. */
+const toolNameIcons: Record<string, Icon> = {
+  ToolSearch: MagnifyingGlass,
+  Skill: Command,
+};
+
+/** Resolve the leading icon for a tool call: name override → kind → Wrench fallback. */
+export function iconForToolCall(
+  toolCall: ToolCall,
+  agentToolName?: string,
+): Icon {
+  return (
+    (agentToolName && toolNameIcons[agentToolName]) ||
+    iconForToolKind(toolCall.kind)
+  );
+}
+
+export function ToolTitle({
+  children,
+  className,
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <span
+      className={`min-w-0 truncate text-muted-foreground text-sm ${className ?? ""}`}
+    >
+      {children}
+    </span>
+  );
+}
+
+export function StatusIndicators({
+  isFailed,
+  wasCancelled,
+}: {
+  isFailed?: boolean;
+  wasCancelled?: boolean;
+}) {
+  return (
+    <>
+      {isFailed && (
+        <span className="shrink-0 whitespace-nowrap text-[13px] text-gray-10">
+          (Failed)
+        </span>
+      )}
+      {wasCancelled && (
+        <span className="shrink-0 whitespace-nowrap text-[13px] text-gray-10">
+          (Cancelled)
+        </span>
+      )}
+    </>
+  );
+}
+
+export function useToolCallStatus(
+  status: ToolCall["status"],
+  turnCancelled?: boolean,
+  turnComplete?: boolean,
+) {
+  const isIncomplete = status === "pending" || status === "in_progress";
+  const isLoading = isIncomplete && !turnCancelled && !turnComplete;
+  const isFailed = status === "failed";
+  const wasCancelled = isIncomplete && turnCancelled;
+  const isComplete = status === "completed";
+
+  return { isIncomplete, isLoading, isFailed, wasCancelled, isComplete };
+}
+
+function extractText(item: ToolCallContent | undefined): string | undefined {
+  if (item?.type === "content" && item.content.type === "text") {
+    return item.content.text;
+  }
+  return undefined;
+}
+
+export function getContentText(
+  content: ToolCall["content"],
+): string | undefined {
+  if (!content?.length) return undefined;
+  for (const item of content) {
+    const text = extractText(item);
+    if (text !== undefined) return text;
+  }
+  return undefined;
+}
+
+export interface ImageContentData {
+  base64: string;
+  mimeType: string;
+}
+
+export function getContentImage(
+  content: ToolCall["content"],
+): ImageContentData | undefined {
+  if (!content?.length) return undefined;
+  for (const item of content) {
+    if (item.type === "content" && item.content.type === "image") {
+      const { data, mimeType } = item.content;
+      if (typeof data === "string" && typeof mimeType === "string") {
+        return { base64: data, mimeType };
+      }
+    }
+  }
+  return undefined;
+}
+
+export function getReadToolContent(
+  content: ToolCall["content"],
+): string | undefined {
+  const raw = getContentText(content);
+  if (!raw) return undefined;
+
+  let text = raw;
+  text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "");
+  text = text.replace(/^```\w*\n?/, "").replace(/\n?```\s*$/, "");
+  text = text
+    .split("\n")
+    .map((line) => line.replace(/^\s*\d+→/, ""))
+    .join("\n");
+  text = text.trim();
+
+  return text || undefined;
+}
+
+const INPUT_PREVIEW_MAX_LENGTH = 60;
+
+export function compactInput(rawInput: unknown): string | undefined {
+  if (!rawInput || typeof rawInput !== "object") return undefined;
+  try {
+    const json = JSON.stringify(rawInput);
+    if (json === "{}") return undefined;
+    if (json.length <= INPUT_PREVIEW_MAX_LENGTH) return json;
+    return `${json.slice(0, INPUT_PREVIEW_MAX_LENGTH)}...`;
+  } catch {
+    return undefined;
+  }
+}
+
+export function formatInput(rawInput: unknown): string | undefined {
+  if (!rawInput || typeof rawInput !== "object") return undefined;
+  try {
+    const json = JSON.stringify(rawInput, null, 2);
+    if (json === "{}") return undefined;
+    return json;
+  } catch {
+    return undefined;
+  }
+}
+
+export function stripCodeFences(text: string): string {
+  return text.replace(/^```\w*\n?/, "").replace(/\n?```\s*$/, "");
+}
+
+export function truncateText(
+  text: string,
+  maxLength: number,
+  ellipsis = "…",
+): string {
+  if (typeof text !== "string") return String(text);
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}${ellipsis}`;
+}
+
+export function getFilename(path: string): string {
+  if (typeof path !== "string") return String(path);
+  return path.split("/").pop() ?? path;
+}
+
+export type DiffContent = Extract<ToolCallContent, { type: "diff" }>;
+
+export function findDiffContent(
+  content: ToolCallContent[] | null | undefined,
+): DiffContent | undefined {
+  return content?.find((c): c is DiffContent => c.type === "diff");
+}
+
+export interface ResourceLinkData {
+  uri?: string;
+  name?: string;
+  description?: string;
+}
+
+export function findResourceLink(
+  content: ToolCall["content"],
+): ResourceLinkData | undefined {
+  if (!content?.length) return undefined;
+  const item = content[0];
+  if (item.type === "content" && item.content.type === "resource_link") {
+    return item.content as { type: "resource_link" } & ResourceLinkData;
+  }
+  return undefined;
+}
+
+export interface ToolViewProps {
+  toolCall: ToolCall;
+  turnCancelled?: boolean;
+  turnComplete?: boolean;
+  expanded?: boolean;
+}
+
+const ICON_SIZE = 12;
+const ICON_CLASS = "text-gray-12";
+
+function Spinner({ className = ICON_CLASS }: { className?: string }) {
+  return <DotsCircleSpinner size={ICON_SIZE} className={className} />;
+}
+
+export function LoadingIcon({
+  icon: IconComponent,
+  isLoading,
+  className = ICON_CLASS,
+}: {
+  icon: Icon;
+  isLoading: boolean;
+  className?: string;
+}) {
+  if (isLoading) return <Spinner className={className} />;
+  return <IconComponent size={ICON_SIZE} className={className} />;
+}
+
+/** Expandable body for a generic tool call: its formatted input, then its text output. */
+export function toolCallDetails({
+  rawInput,
+  content,
+  isComplete,
+  isFailed,
+}: {
+  rawInput: unknown;
+  content: ToolCall["content"];
+  isComplete: boolean;
+  isFailed: boolean;
+}): React.ReactNode | undefined {
+  const fullInput = formatInput(rawInput);
+  const output = stripCodeFences(getContentText(content) ?? "");
+  // A failed call keeps its output because the error text lives in `content`.
+  const showOutput = (isComplete || isFailed) && output.trim().length > 0;
+  if (!fullInput && !showOutput) return undefined;
+  return (
+    <>
+      {fullInput && <ContentPre>{fullInput}</ContentPre>}
+      {showOutput && <ContentPre>{output}</ContentPre>}
+    </>
+  );
+}
+
+export function ContentPre({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="max-h-64 rounded-sm border border-border">
+      <div className="scroll-mask-2 max-h-64 overflow-auto bg-muted/50 p-3">
+        <pre className="m-0 whitespace-pre-wrap break-all font-mono text-xs">
+          {children}
+        </pre>
+      </div>
+    </div>
+  );
+}

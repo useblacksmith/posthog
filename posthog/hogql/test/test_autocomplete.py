@@ -1,0 +1,976 @@
+from typing import Optional
+
+from posthog.test.base import APIBaseTest, ClickhouseTestMixin
+from unittest import TestCase
+from unittest.mock import patch
+
+from parameterized import parameterized
+
+from posthog.schema import (
+    AutocompleteCompletionItemKind,
+    HogLanguage,
+    HogQLAutocomplete,
+    HogQLAutocompleteResponse,
+    HogQLQuery,
+)
+
+from posthog.hogql import ast
+from posthog.hogql.autocomplete import get_hogql_autocomplete
+from posthog.hogql.database.database import Database
+from posthog.hogql.database.models import FloatDatabaseField, StringDatabaseField, TableNode
+from posthog.hogql.database.schema.events import EventsTable
+from posthog.hogql.database.schema.persons import PERSONS_FIELDS
+from posthog.hogql.errors import TableAccessDeniedError
+
+from posthog.models.team import Team
+
+from products.data_modeling.backend.facade.models import DataWarehouseSavedQuery
+from products.event_definitions.backend.models.property_definition import PropertyDefinition
+from products.product_analytics.backend.facade.models import InsightVariable
+from products.warehouse_sources.backend.facade.models import (
+    DataWarehouseCredential,
+    DataWarehouseTable,
+    ExternalDataSource,
+)
+from products.warehouse_sources.backend.facade.types import ExternalDataSourceType
+
+
+class TestTableCatalogAutocomplete(TestCase):
+    @parameterized.expand(
+        [
+            ("", "events"),
+            ("", "posthog.static_cohort_people"),
+            ("ev", "events"),
+            ("po", "posthog.metric_samples"),
+            ("tr", "posthog.trace_spans"),
+            ("posthog.", "metric_samples"),
+            ("posthog.tr", "trace_spans"),
+            ("posthog.met", "metric_samples"),
+            ("posthog.ev", "events"),
+            ("POSTHOG.tr", "trace_spans"),
+        ]
+    )
+    def test_suggests_names_with_namespace_relative_insert_text(self, typed: str, expected: str) -> None:
+        query = f"SELECT * FROM {typed}"
+        start = len(query) - len(typed.rsplit(".", 1)[-1])
+        response = get_hogql_autocomplete(
+            HogQLAutocomplete(query=query, language=HogLanguage.HOG_QL, startPosition=start, endPosition=len(query)),
+            Team(id=1),
+            database_arg=Database(),
+        )
+        suggestion = next(item for item in response.suggestions if item.label == expected)
+        assert suggestion.insertText == expected
+        if "." not in typed:
+            assert "trace_spans" not in [item.label for item in response.suggestions]
+            assert "static_cohort_people" not in [item.label for item in response.suggestions]
+
+    @parameterized.expand([("posthog",), ("example",), ("example.nested",)])
+    def test_new_schema_tables_are_discoverable_without_an_allowlist(self, namespace: str) -> None:
+        database = Database()
+        parent = database.tables
+        for segment in namespace.split("."):
+            parent = parent.children.setdefault(segment, TableNode(name=segment))
+        parent.children["sample_table"] = TableNode(name="sample_table", table=EventsTable())
+        database.tables.add_child(
+            TableNode.create_nested_for_chain([f"other_{namespace}", "sample_table"], EventsTable())
+        )
+        query = f"SELECT * FROM {namespace}.sa"
+        response = get_hogql_autocomplete(
+            HogQLAutocomplete(
+                query=query, language=HogLanguage.HOG_QL, startPosition=len(query) - 2, endPosition=len(query)
+            ),
+            Team(id=1),
+            database_arg=database,
+        )
+        names = {item.insertText for item in response.suggestions}
+        if namespace == "posthog":
+            assert "sample_table" in names
+            assert "other_posthog.sample_table" not in names
+        else:
+            assert names == {"sample_table"}
+
+    @parameterized.expand([("events",), ("posthog.trace_spans",)])
+    def test_denied_warehouse_name_does_not_hide_a_resolvable_table(self, table_name: str) -> None:
+        database = Database()
+        table = database.get_table(table_name)
+        assert database._is_warehouse_table_denied(DataWarehouseTable(name=table_name))
+        assert database.get_table(table_name) is table
+        query = "SELECT * FROM "
+        response = get_hogql_autocomplete(
+            HogQLAutocomplete(
+                query=query, language=HogLanguage.HOG_QL, startPosition=len(query), endPosition=len(query)
+            ),
+            Team(id=1),
+            database_arg=database,
+        )
+        assert table_name in {item.insertText for item in response.suggestions}
+
+    @parameterized.expand([("hidden",), ("denied",), ("direct",)])
+    def test_unavailable_namespace_tables_are_not_suggested(self, restriction: str) -> None:
+        database = Database()
+        if restriction == "hidden":
+            database.tables.children["posthog"].children["trace_spans"].hidden = True
+        elif restriction == "denied":
+            del database.tables.children["posthog"].children["trace_spans"]
+            assert database._is_warehouse_table_denied(DataWarehouseTable(name="posthog.trace_spans"))
+            with self.assertRaises(TableAccessDeniedError):
+                database.get_table("posthog.trace_spans")
+        else:
+            database._connection_id = "test-connection"
+            database.apply_schema_scope()
+        query = "SELECT * FROM posthog.tr"
+        response = get_hogql_autocomplete(
+            HogQLAutocomplete(
+                query=query, language=HogLanguage.HOG_QL, startPosition=len(query) - 2, endPosition=len(query)
+            ),
+            Team(id=1),
+            database_arg=database,
+        )
+        assert {"trace_spans", "posthog.trace_spans"}.isdisjoint(item.label for item in response.suggestions)
+
+
+class TestAutocomplete(ClickhouseTestMixin, APIBaseTest):
+    def _create_properties(self):
+        PropertyDefinition.objects.create(
+            team=self.team,
+            name="some_event_value",
+            property_type="String",
+            type=PropertyDefinition.Type.EVENT,
+        )
+        PropertyDefinition.objects.create(
+            team=self.team,
+            name="some_person_value",
+            property_type="String",
+            type=PropertyDefinition.Type.PERSON,
+        )
+
+    def _select(
+        self, query: str, start: int, end: int, database: Optional[Database] = None
+    ) -> HogQLAutocompleteResponse:
+        autocomplete = HogQLAutocomplete(
+            kind="HogQLAutocomplete", query=query, language=HogLanguage.HOG_QL, startPosition=start, endPosition=end
+        )
+        return get_hogql_autocomplete(query=autocomplete, team=self.team, database_arg=database)
+
+    def _expr(self, query: str, start: int, end: int, database: Optional[Database] = None) -> HogQLAutocompleteResponse:
+        autocomplete = HogQLAutocomplete(
+            kind="HogQLAutocomplete",
+            query=query,
+            language=HogLanguage.HOG_QL_EXPR,
+            sourceQuery=HogQLQuery(query="select * from events"),
+            startPosition=start,
+            endPosition=end,
+        )
+        return get_hogql_autocomplete(query=autocomplete, team=self.team, database_arg=database)
+
+    def _template(
+        self, query: str, start: int, end: int, database: Optional[Database] = None
+    ) -> HogQLAutocompleteResponse:
+        autocomplete = HogQLAutocomplete(
+            kind="HogQLAutocomplete",
+            query=query,
+            language=HogLanguage.HOG_TEMPLATE,
+            globals={"event": "$pageview"},
+            startPosition=start,
+            endPosition=end,
+        )
+        return get_hogql_autocomplete(query=autocomplete, team=self.team, database_arg=database)
+
+    def _json(self, query: str, start: int, end: int, database: Optional[Database] = None) -> HogQLAutocompleteResponse:
+        autocomplete = HogQLAutocomplete(
+            kind="HogQLAutocomplete",
+            query=query,
+            language=HogLanguage.HOG_JSON,
+            globals={"event": "$pageview"},
+            startPosition=start,
+            endPosition=end,
+        )
+        return get_hogql_autocomplete(query=autocomplete, team=self.team, database_arg=database)
+
+    def _at_cursor(
+        self, language: HogLanguage, query_with_cursor: str, database: Optional[Database] = None
+    ) -> HogQLAutocompleteResponse:
+        # "|" marks where the cursor sits, and is stripped before the query is sent
+        position = query_with_cursor.index("|")
+        autocomplete = HogQLAutocomplete(
+            kind="HogQLAutocomplete",
+            query=query_with_cursor.replace("|", "", 1),
+            language=language,
+            globals={"event": "$pageview", "person": {"properties": {"email": "tim@posthog.com", "name": "Tim"}}},
+            startPosition=position,
+            endPosition=position,
+        )
+        return get_hogql_autocomplete(query=autocomplete, team=self.team, database_arg=database)
+
+    def _program(
+        self, query: str, start: int, end: int, database: Optional[Database] = None
+    ) -> HogQLAutocompleteResponse:
+        autocomplete = HogQLAutocomplete(
+            kind="HogQLAutocomplete",
+            query=query,
+            language=HogLanguage.HOG,
+            globals={"event": "$pageview"},
+            startPosition=start,
+            endPosition=end,
+        )
+        return get_hogql_autocomplete(query=autocomplete, team=self.team, database_arg=database)
+
+    def test_autocomplete(self):
+        query = "select * from events"
+        results = self._select(query=query, start=0, end=0)
+        assert len(results.suggestions) == 0
+
+    def test_autocomplete_events_suggestions(self):
+        query = "select  from events"
+        results = self._select(query=query, start=7, end=7)
+        assert len(results.suggestions) != 0
+
+    @parameterized.expand(
+        [
+            (
+                "function",
+                "select  from events",
+                7,
+                7,
+                "toDateTime",
+                "toDateTime()",
+                AutocompleteCompletionItemKind.FUNCTION,
+            ),
+            (
+                "case_snippet",
+                "select  from events",
+                7,
+                7,
+                "CASE WHEN",
+                "CASE WHEN condition THEN result ELSE other END",
+                AutocompleteCompletionItemKind.SNIPPET,
+            ),
+            (
+                "case_snippet_partial_word",
+                "select ca",
+                7,
+                9,
+                "CASE WHEN",
+                "CASE WHEN condition THEN result ELSE other END",
+                AutocompleteCompletionItemKind.SNIPPET,
+            ),
+        ]
+    )
+    def test_autocomplete_functions(
+        self,
+        _name: str,
+        query: str,
+        start: int,
+        end: int,
+        label: str,
+        insert_text: str,
+        kind: AutocompleteCompletionItemKind,
+    ):
+        results = self._select(query=query, start=start, end=end)
+        assert any(
+            suggestion.label == label and suggestion.insertText == insert_text and suggestion.kind == kind
+            for suggestion in results.suggestions
+        )
+
+    def test_autocomplete_includes_direct_connection_functions(self):
+        database = Database.create_for(team=self.team)
+        database._direct_connection_metadata = {"available_functions": ["icu_collate_nl"]}
+
+        query = "select  from events"
+        results = self._select(query=query, start=7, end=7, database=database)
+
+        assert "icu_collate_nl" in [suggestion.label for suggestion in results.suggestions]
+        assert "icu_collate_nl()" in [suggestion.insertText for suggestion in results.suggestions]
+
+    def test_autocomplete_matches_partial_direct_connection_function_without_from(self):
+        database = Database()
+        database._direct_connection_metadata = {"available_functions": ["icu_collate_nl"]}
+
+        query = "select icu"
+        results = self._select(query=query, start=7, end=10, database=database)
+
+        assert "icu_collate_nl" in [suggestion.label for suggestion in results.suggestions]
+
+    def test_autocomplete_includes_introspected_table_functions_in_from(self):
+        database = Database.create_for(team=self.team)
+        database._direct_connection_metadata = {
+            "available_table_functions": ["unnest", "regexp_matches", "generate_series"],
+        }
+
+        query = "select * from "
+        results = self._select(query=query, start=14, end=14, database=database)
+
+        labels = [suggestion.label for suggestion in results.suggestions]
+        insert_texts = {suggestion.insertText for suggestion in results.suggestions}
+        details_by_label = {suggestion.label: suggestion.detail for suggestion in results.suggestions}
+
+        assert "unnest" in labels
+        assert "regexp_matches" in labels
+        assert "generate_series" in labels
+        assert "unnest()" in insert_texts
+        assert details_by_label["unnest"] == "Table function"
+
+    def test_autocomplete_skips_table_functions_without_metadata(self):
+        database = Database.create_for(team=self.team)
+
+        query = "select * from "
+        results = self._select(query=query, start=14, end=14, database=database)
+
+        for suggestion in results.suggestions:
+            assert suggestion.detail != "Table function"
+
+    def test_autocomplete_persons_suggestions(self):
+        query = "select  from persons"
+        results = self._select(query=query, start=7, end=7)
+        assert len(results.suggestions) != 0
+
+    def test_autocomplete_assume_events_table(self):
+        query = "select "
+        results = self._select(query=query, start=7, end=7)
+        assert len(results.suggestions) != 0
+        assert "event" in [suggestion.label for suggestion in results.suggestions]
+
+    def test_autocomplete_events_properties(self):
+        self._create_properties()
+
+        query = "select properties. from events"
+        results = self._select(query=query, start=18, end=18)
+        assert len(results.suggestions) == 1
+        assert results.suggestions[0].label == "some_event_value"
+
+    def test_autocomplete_events_properties_omits_person_property_setters(self):
+        self._create_properties()
+        for name in ("$set", "$set_once"):
+            PropertyDefinition.objects.create(
+                team=self.team,
+                name=name,
+                property_type="String",
+                type=PropertyDefinition.Type.EVENT,
+            )
+
+        query = "select properties. from events"
+        results = self._select(query=query, start=18, end=18)
+        assert [suggestion.label for suggestion in results.suggestions] == ["some_event_value"]
+
+    @parameterized.expand(
+        [
+            ("event_properties", "event", 23, ["$browser"]),
+            ("other_properties_bag", "inputs", 24, ["$browser", "$set", "$set_once"]),
+        ]
+    )
+    def test_autocomplete_hog_globals_omit_person_property_setters(
+        self, _name: str, root: str, cursor: int, expected: list[str]
+    ):
+        database = Database.create_for(team=self.team)
+
+        autocomplete = HogQLAutocomplete(
+            kind="HogQLAutocomplete",
+            query=f"print({root}.properties.)",
+            language=HogLanguage.HOG,
+            globals={root: {"properties": {"$browser": "Chrome", "$set": {}, "$set_once": {}}}},
+            startPosition=cursor,
+            endPosition=cursor,
+        )
+        results = get_hogql_autocomplete(query=autocomplete, team=self.team, database_arg=database)
+        assert [suggestion.label for suggestion in results.suggestions] == expected
+
+    def test_autocomplete_persons_properties(self):
+        self._create_properties()
+
+        query = "select properties. from persons"
+        results = self._select(query=query, start=18, end=18)
+        assert len(results.suggestions) == 1
+        assert results.suggestions[0].label == "some_person_value"
+
+    @parameterized.expand(
+        [
+            ("group_join", "select group_1.properties. from events", 26, ["group_1_value"]),
+            ("group_subtable", "select goe_1.properties. from events", 24, ["group_1_value"]),
+            ("groups_table", "select properties. from groups", 18, ["group_0_value", "group_1_value"]),
+        ]
+    )
+    def test_autocomplete_group_properties(self, _name: str, query: str, cursor: int, expected: list[str]):
+        for group_type_index in (0, 1):
+            PropertyDefinition.objects.create(
+                team=self.team,
+                name=f"group_{group_type_index}_value",
+                property_type="String",
+                type=PropertyDefinition.Type.GROUP,
+                group_type_index=group_type_index,
+            )
+
+        results = self._select(query=query, start=cursor, end=cursor)
+        assert [suggestion.label for suggestion in results.suggestions] == expected
+
+    def test_autocomplete_lazy_join(self):
+        query = "select pdi. from events"
+        results = self._select(query=query, start=11, end=11)
+        assert len(results.suggestions) == 4
+
+    def test_autocomplete_virtual_table(self):
+        query = "select poe. from events"
+        results = self._select(query=query, start=11, end=11)
+        assert len(results.suggestions) != 0
+
+    def test_autocomplete_events_properties_partial_matching(self):
+        self._create_properties()
+
+        query = "select properties.some_ from events"
+        results = self._select(query=query, start=18, end=23)
+        assert len(results.suggestions) == 1
+        assert results.suggestions[0].label == "some_event_value"
+
+        query = "select properties.SOME_ from events"
+        results = self._select(query=query, start=18, end=23)
+        assert [s.label for s in results.suggestions] == ["some_event_value"]
+
+    def test_autocomplete_nested_tables(self):
+        # Inner table
+        query = "select event, (select  from persons) as blah from events"
+        results = self._select(query=query, start=22, end=22)
+
+        keys = list(PERSONS_FIELDS.keys())
+
+        for index, key in enumerate(keys):
+            assert results.suggestions[index].label == key
+
+        # Outer table
+        query = "select , (select id from persons) as blah from events"
+        results = self._select(query=query, start=7, end=7)
+
+        keys = [key for key, field in EventsTable().fields.items() if not field.hidden]
+
+        for index, key in enumerate(keys):
+            assert results.suggestions[index].label == key
+
+    def test_autocomplete_table_name(self):
+        query = "select event from "
+        results = self._select(query=query, start=18, end=18)
+        assert len(results.suggestions) != 0
+
+    def test_autocomplete_table_name_dot_notation(self):
+        query = "select event from events."
+        results = self._select(query=query, start=25, end=25)
+        assert len(results.suggestions) == 0
+
+    def test_autocomplete_recursive_fields(self):
+        self._create_properties()
+
+        query = "select pdi.person.properties. from events"
+        results = self._select(query=query, start=29, end=29)
+        assert len(results.suggestions) == 1
+        assert results.suggestions[0].label == "some_person_value"
+
+    def test_autocomplete_subquery_cte(self):
+        query = "select e from (select event from events)"
+        results = self._select(query=query, start=7, end=8)
+        assert results.suggestions[0].label == "event"
+        assert "properties" not in [suggestion.label for suggestion in results.suggestions]
+
+    def test_autocomplete_with_cte(self):
+        query = "with blah as (select event from events) select e from blah"
+        results = self._select(query=query, start=47, end=48)
+        assert results.suggestions[0].label == "event"
+        assert "properties" not in [suggestion.label for suggestion in results.suggestions]
+
+    def test_autocomplete_cte_alias(self):
+        query = "select p from (select event as potato from events)"
+        results = self._select(query=query, start=7, end=8)
+        assert results.suggestions[0].label == "potato"
+        assert "event" not in [suggestion.label for suggestion in results.suggestions]
+        assert "properties" not in [suggestion.label for suggestion in results.suggestions]
+
+    def test_autocomplete_cte_constant_type(self):
+        query = "select p from (select 'hello' as potato from events)"
+        results = self._select(query=query, start=7, end=8)
+        assert results.suggestions[0].label == "potato"
+        assert "event" not in [suggestion.label for suggestion in results.suggestions]
+        assert "properties" not in [suggestion.label for suggestion in results.suggestions]
+
+    def test_autocomplete_field_traversers(self):
+        query = "select person. from events"
+        results = self._select(query=query, start=14, end=14)
+        assert len(results.suggestions) != 0
+
+    def test_autocomplete_table_alias(self):
+        query = "select  from events e"
+        results = self._select(query=query, start=7, end=7)
+        assert len(results.suggestions) != 0
+        assert results.suggestions[0].label == "e"
+
+    def test_autocomplete_complete_list(self):
+        query = "select event from events"
+        results = self._select(query=query, start=7, end=12)
+        assert results.incomplete_list is False
+
+    def test_autocomplete_properties_list_with_under_220_properties(self):
+        for index in range(20):
+            PropertyDefinition.objects.create(
+                team=self.team,
+                name=f"some_event_value_{index}",
+                property_type="String",
+                type=PropertyDefinition.Type.EVENT,
+            )
+
+        query = "select properties. from events"
+        results = self._select(query=query, start=18, end=18)
+        assert results.incomplete_list is False
+
+    def test_autocomplete_properties_list_with_over_220_properties(self):
+        for index in range(221):
+            PropertyDefinition.objects.create(
+                team=self.team,
+                name=f"some_event_value_{index}",
+                property_type="String",
+                type=PropertyDefinition.Type.EVENT,
+            )
+
+        query = "select properties. from events"
+        results = self._select(query=query, start=18, end=18)
+        assert results.incomplete_list is True
+
+    def test_autocomplete_joined_tables(self):
+        query = "select p. from events e left join persons p on e.person_id = p.id"
+        results = self._select(query=query, start=9, end=9)
+
+        assert len(results.suggestions) != 0
+
+        keys = list(PERSONS_FIELDS.keys())
+
+        for index, key in enumerate(keys):
+            assert results.suggestions[index].label == key
+
+    def test_autocomplete_joined_table_contraints(self):
+        query = "select p.id from events e left join persons p on e.person_id = p."
+        results = self._select(query=query, start=65, end=65)
+
+        assert len(results.suggestions) != 0
+
+        keys = list(PERSONS_FIELDS.keys())
+
+        for index, key in enumerate(keys):
+            assert results.suggestions[index].label == key
+
+    def test_autocomplete_joined_tables_aliases(self):
+        query = "select  from events e left join persons p on e.person_id = p.id"
+        results = self._select(query=query, start=7, end=7)
+
+        assert len(results.suggestions) == 2
+        assert results.suggestions[0].label == "e"
+        assert results.suggestions[1].label == "p"
+
+    def test_autocomplete_non_existing_alias(self):
+        query = "select o. from events e"
+        results = self._select(query=query, start=9, end=9)
+
+        assert len(results.suggestions) == 0
+
+    def test_autocomplete_events_hidden_field(self):
+        database = Database.create_for(team=self.team)
+        database.get_table("events").fields["event"] = StringDatabaseField(name="event", hidden=True)
+
+        query = "select  from events"
+        results = self._select(query=query, start=7, end=7, database=database)
+
+        for suggestion in results.suggestions:
+            assert suggestion.label != "event"
+
+    def test_autocomplete_special_characters(self):
+        database = Database.create_for(team=self.team)
+        database.get_table("events").fields["event-name"] = StringDatabaseField(name="event-name")
+
+        query = "select  from events"
+        results = self._select(query=query, start=7, end=7, database=database)
+
+        suggestions = list(filter(lambda x: x.label == "event-name", results.suggestions))
+        assert len(suggestions) == 1
+
+        suggestion = suggestions[0]
+        assert suggestion is not None
+        assert suggestion.label == "event-name"
+        assert suggestion.insertText == "`event-name`"
+
+    def test_autocomplete_expressions(self):
+        database = Database.create_for(team=self.team)
+
+        query = "person."
+        results = self._expr(query=query, start=7, end=7, database=database)
+
+        suggestions = list(filter(lambda x: x.label == "created_at", results.suggestions))
+        assert len(suggestions) == 1
+
+        suggestion = suggestions[0]
+        assert suggestion is not None
+        assert suggestion.label == "created_at"
+        assert suggestion.insertText == "created_at"
+
+    def test_autocomplete_ranks_functions_by_comparison_fit(self):
+        # Without ranking the function list is alphabetical, so `xor` and `varSamp` sit alongside
+        # `now` when the user is completing the right side of a timestamp comparison.
+        query = "select * from events where timestamp > "
+        results = self._select(query=query, start=len(query), end=len(query))
+
+        sort_text = {
+            suggestion.label: suggestion.sortText
+            for suggestion in results.suggestions
+            if suggestion.kind == AutocompleteCompletionItemKind.FUNCTION
+        }
+
+        now_sort_text = sort_text["now"]
+        to_datetime_sort_text = sort_text["toDateTime"]
+        xor_sort_text = sort_text["xor"]
+        assert now_sort_text is not None
+        assert to_datetime_sort_text is not None
+        assert xor_sort_text is not None
+        assert now_sort_text < xor_sort_text
+        assert to_datetime_sort_text < xor_sort_text
+
+        # Ranking orders functions against each other, never against the table's own columns. The
+        # editor sorts variables under "1" and functions under "2", so a ranked function has to keep
+        # the function prefix or a well-fitting function jumps above every field.
+        field_sort_text = {
+            suggestion.label: suggestion.sortText
+            for suggestion in results.suggestions
+            if suggestion.kind == AutocompleteCompletionItemKind.VARIABLE
+        }
+        assert field_sort_text["event"] is None
+        assert now_sort_text.startswith("2-")
+
+    def test_autocomplete_leaves_functions_unranked_without_an_expected_type(self):
+        # No comparison means no expectation, so ranking stays off and the editor keeps its own
+        # ordering. Guards against emitting a confident order we cannot justify.
+        query = "select  from events"
+        results = self._select(query=query, start=7, end=7)
+
+        functions = [
+            suggestion
+            for suggestion in results.suggestions
+            if suggestion.kind == AutocompleteCompletionItemKind.FUNCTION
+        ]
+
+        assert len(functions) > 0
+        assert all(suggestion.sortText is None for suggestion in functions)
+
+    def test_autocomplete_details_carry_nullability(self):
+        # Completions read the structured runtime type, so a nullable column is visibly nullable in
+        # the editor. Reverting to a DatabaseField isinstance ladder flattens `Nullable(Boolean)` to
+        # `Boolean`, which is exactly the distinction that makes a NULL guard look redundant.
+        database = Database.create_for(team=self.team)
+        database.get_table("events").fields["nullable_score"] = FloatDatabaseField(name="nullable_score", nullable=True)
+
+        results = self._select(query="select  from events", start=7, end=7, database=database)
+        details = {suggestion.label: suggestion.detail for suggestion in results.suggestions}
+
+        assert details["nullable_score"] == "Nullable(Float64)"
+        assert details["event"] == "String"
+
+    def test_autocomplete_resolve_expression_type(self):
+        database = Database.create_for(team=self.team)
+
+        database.get_table("events").fields["expr_field"] = ast.ExpressionField(
+            name="expr_field",
+            isolate_scope=True,
+            expr=ast.Call(name="toDateTime", args=[ast.Constant(value="2025-01-01")]),
+        )
+
+        query = "select  from events"
+        results = self._select(query=query, start=7, end=7, database=database)
+
+        suggestions = list(filter(lambda x: x.label == "expr_field", results.suggestions))
+        assert len(suggestions) == 1
+
+        suggestion = suggestions[0]
+        assert suggestion is not None
+        assert suggestion.label == "expr_field"
+        assert suggestion.insertText == "expr_field"
+        # `toDateTime` on a string prints to `parseDateTime64BestEffortOrNull`, so the result really
+        # can be NULL. The detail flattened that away until completions started reading runtime types.
+        assert suggestion.detail == "Nullable(DateTime)"
+
+    def test_autocomplete_template_strings(self):
+        database = Database.create_for(team=self.team)
+
+        query = "this isn't a string {concat(eve)} <- this is"
+        results = self._template(query=query, start=28, end=31, database=database)
+
+        suggestions = list(filter(lambda x: x.label == "event", results.suggestions))
+        assert len(suggestions) == 1
+
+        suggestion = suggestions[0]
+        assert suggestion is not None
+        assert suggestion.label == "event"
+        assert suggestion.insertText == "event"
+
+        results = self._template(query=query, start=5, end=5, database=database)
+        assert len(results.suggestions) == 0
+
+        results = self._template(query=query, start=5, end=6, database=database)
+        assert len(results.suggestions) == 0
+
+    def test_autocomplete_template_strings_skip_the_schema_build(self):
+        query = "this isn't a string {concat(eve)} <- this is"
+
+        with patch.object(Database, "create_for", wraps=Database.create_for) as create_for:
+            results = self._template(query=query, start=28, end=31)
+
+        create_for.assert_not_called()
+        assert "event" in [suggestion.label for suggestion in results.suggestions]
+
+    def test_autocomplete_template_json(self):
+        database = Database.create_for(team=self.team)
+
+        query = '{ "key": "val_{event.distinct_id}_ue" }'
+        results = self._json(query=query, start=15, end=20, database=database)
+
+        suggestions = list(filter(lambda x: x.label == "event", results.suggestions))
+        assert len(suggestions) == 1
+
+        suggestion = suggestions[0]
+        assert suggestion is not None
+        assert suggestion.label == "event"
+        assert suggestion.insertText == "event"
+
+        results = self._json(query=query, start=5, end=5, database=database)
+        assert len(results.suggestions) == 0
+
+        results = self._json(query=query, start=5, end=6, database=database)
+        assert len(results.suggestions) == 0
+
+    @parameterized.expand(
+        [
+            ("hog_template", HogLanguage.HOG_TEMPLATE, "Hi {person.|} bye", ["properties"]),
+            ("hog_template_nested", HogLanguage.HOG_TEMPLATE, "Hi {person.properties.|} bye", ["email", "name"]),
+            ("liquid", HogLanguage.LIQUID, "Hi {{ person.| }} bye", ["properties"]),
+            ("liquid_nested", HogLanguage.LIQUID, "Hi {{ person.properties.| }} bye", ["email", "name"]),
+            ("hog_json", HogLanguage.HOG_JSON, '{"message": "Hi {person.|} bye"}', ["properties"]),
+            ("hog_json_nested", HogLanguage.HOG_JSON, '{"message": "Hi {person.properties.|} bye"}', ["email", "name"]),
+        ]
+    )
+    def test_autocomplete_template_drills_into_globals(
+        self, _name: str, language: HogLanguage, query: str, expected_labels: list[str]
+    ):
+        results = self._at_cursor(language, query, database=Database.create_for(team=self.team))
+
+        assert [suggestion.label for suggestion in results.suggestions] == expected_labels
+
+    @parameterized.expand(
+        [
+            ("hog_template_first", HogLanguage.HOG_TEMPLATE, "Hi {pe|rson.properties.email}", ["event", "person"]),
+            ("hog_template_middle", HogLanguage.HOG_TEMPLATE, "Hi {person.pro|perties.email}", ["properties"]),
+            ("hog_template_last", HogLanguage.HOG_TEMPLATE, "Hi {person.properties.em|ail}", ["email", "name"]),
+            ("liquid_first", HogLanguage.LIQUID, "Hi {{ pe|rson.properties.email }}", ["event", "person"]),
+            ("liquid_middle", HogLanguage.LIQUID, "Hi {{ person.pro|perties.email }}", ["properties"]),
+            ("liquid_last", HogLanguage.LIQUID, "Hi {{ person.properties.em|ail }}", ["email", "name"]),
+            (
+                "hog_json_first",
+                HogLanguage.HOG_JSON,
+                '{"message": "Hi {pe|rson.properties.email}"}',
+                ["event", "person"],
+            ),
+            ("hog_json_middle", HogLanguage.HOG_JSON, '{"message": "Hi {person.pro|perties.email}"}', ["properties"]),
+            ("hog_json_last", HogLanguage.HOG_JSON, '{"message": "Hi {person.properties.em|ail}"}', ["email", "name"]),
+            # Dots outside the extracted JSON string value must not count as chain levels
+            (
+                "hog_json_after_dotted_rows",
+                HogLanguage.HOG_JSON,
+                '{\n  "url": "https://example.com/a.b",\n  "message": "Hi {person.pro|perties.email}"\n}',
+                ["properties"],
+            ),
+        ]
+    )
+    def test_autocomplete_template_suggests_the_level_of_the_chain_element_under_the_cursor(
+        self, _name: str, language: HogLanguage, query: str, expected_labels: list[str]
+    ):
+        results = self._at_cursor(language, query, database=Database.create_for(team=self.team))
+
+        # Hog templates also offer every Hog function, which is not what this pins down
+        assert [
+            suggestion.label
+            for suggestion in results.suggestions
+            if suggestion.kind == AutocompleteCompletionItemKind.VARIABLE
+        ] == expected_labels
+
+    @parameterized.expand(
+        [
+            ("hog_template_empty", HogLanguage.HOG_TEMPLATE, "Hi there {|}"),
+            ("hog_template_start", HogLanguage.HOG_TEMPLATE, "Hi {| person.properties.email} bye"),
+            ("liquid_empty", HogLanguage.LIQUID, "Hi there {{ |}}"),
+            ("liquid_start", HogLanguage.LIQUID, "Hi {{| person.properties.email }} bye"),
+            ("hog_json_empty", HogLanguage.HOG_JSON, '{"message": "Hi {|}"}'),
+        ]
+    )
+    def test_autocomplete_template_suggests_top_level_globals_at_the_start_of_an_expression(
+        self, _name: str, language: HogLanguage, query: str
+    ):
+        results = self._at_cursor(language, query, database=Database.create_for(team=self.team))
+
+        assert {"event", "person"} <= {suggestion.label for suggestion in results.suggestions}
+
+    @parameterized.expand(
+        [
+            ("hog_template_before", HogLanguage.HOG_TEMPLATE, "H|i {person.properties.email} bye"),
+            ("hog_template_after", HogLanguage.HOG_TEMPLATE, "Hi {person.properties.email}| bye"),
+            ("liquid_before", HogLanguage.LIQUID, "H|i {{ person.properties.email }} bye"),
+            ("liquid_after", HogLanguage.LIQUID, "Hi {{ person.properties.email }}| bye"),
+        ]
+    )
+    def test_autocomplete_template_has_no_suggestions_outside_braces(
+        self, _name: str, language: HogLanguage, query: str
+    ):
+        results = self._at_cursor(language, query, database=Database.create_for(team=self.team))
+
+        assert results.suggestions == []
+
+    def test_autocomplete_hog(self):
+        database = Database.create_for(team=self.team)
+
+        # 1
+        query = "let var1 := 3; let otherVar := 5; print(v)"
+        results = self._program(query=query, start=41, end=41, database=database)
+
+        suggestions = list(filter(lambda x: x.kind == AutocompleteCompletionItemKind.VARIABLE, results.suggestions))
+        assert sorted([suggestion.label for suggestion in suggestions]) == ["event", "otherVar", "var1"]
+
+        suggestions = list(filter(lambda x: x.kind == AutocompleteCompletionItemKind.FUNCTION, results.suggestions))
+        assert len(suggestions) > 0
+
+        # 2
+        query = "let var1 := 3; let otherVar := 5; print(v)"
+        results = self._program(query=query, start=16, end=16, database=database)
+
+        suggestions = list(filter(lambda x: x.kind == AutocompleteCompletionItemKind.VARIABLE, results.suggestions))
+        assert sorted([suggestion.label for suggestion in suggestions]) == ["event", "var1"]
+
+        # 3
+        query = "let var1 := 3; let otherVar := 5; print(v)"
+        results = self._program(query=query, start=34, end=34, database=database)
+
+        suggestions = list(filter(lambda x: x.kind == AutocompleteCompletionItemKind.VARIABLE, results.suggestions))
+        assert sorted([suggestion.label for suggestion in suggestions]) == ["event", "otherVar", "var1"]
+
+    def test_autocomplete_variables(self):
+        InsightVariable.objects.create(team=self.team, name="Variable 1", code_name="variable_1")
+        query = "select {}"
+        results = self._select(query=query, start=8, end=8)
+
+        assert len(results.suggestions) == 1
+        assert results.suggestions[0].label == "variables.variable_1"
+
+    def test_autocomplete_variables_partial(self):
+        InsightVariable.objects.create(team=self.team, name="Variable 1", code_name="variable_1")
+        query = "select {vari}"
+        results = self._select(query=query, start=8, end=12)
+
+        assert len(results.suggestions) == 1
+        assert results.suggestions[0].label == "variables.variable_1"
+
+    @parameterized.expand(
+        [
+            ("select", "select {variables.}", 8, 18, ["variable_1"]),
+            ("expr", "{variables.}", 1, 11, []),
+        ]
+    )
+    def test_autocomplete_variables_prefix(self, language, query, start, end, expected_labels):
+        InsightVariable.objects.create(team=self.team, name="Variable 1", code_name="variable_1")
+        autocomplete = self._select if language == "select" else self._expr
+        results = autocomplete(query=query, start=start, end=end)
+
+        assert [suggestion.label for suggestion in results.suggestions] == expected_labels
+
+    def test_autocomplete_warehouse_table(self):
+        credentials = DataWarehouseCredential.objects.create(team=self.team, access_key="key", access_secret="secret")
+        DataWarehouseTable.objects.create(
+            team=self.team,
+            name="some_table",
+            format="CSV",
+            url_pattern="http://localhost/file.csv",
+            credential=credentials,
+        )
+        query = "select * from "
+        results = self._select(query=query, start=14, end=14)
+
+        assert "some_table" in [x.label for x in results.suggestions]
+
+    def test_autocomplete_warehouse_table_with_source_dot_notation(self):
+        credentials = DataWarehouseCredential.objects.create(team=self.team, access_key="key", access_secret="secret")
+        source = ExternalDataSource.objects.create(team=self.team, source_type=ExternalDataSourceType.STRIPE)
+        DataWarehouseTable.objects.create(
+            team=self.team,
+            name="some_table",
+            format="CSV",
+            url_pattern="http://localhost/file.csv",
+            credential=credentials,
+            external_data_source=source,
+        )
+        query = "select * from "
+        results = self._select(query=query, start=14, end=14)
+
+        assert "stripe.some_table" in [x.label for x in results.suggestions]
+
+        query = "select * from STRIPE."
+        results = self._select(query=query, start=21, end=21)
+
+        assert "some_table" in [x.label for x in results.suggestions]
+
+    def test_autocomplete_warehouse_table_with_source_and_prefix_dot_notation(self):
+        credentials = DataWarehouseCredential.objects.create(team=self.team, access_key="key", access_secret="secret")
+        source = ExternalDataSource.objects.create(
+            team=self.team, source_type=ExternalDataSourceType.STRIPE, prefix="prefix"
+        )
+        DataWarehouseTable.objects.create(
+            team=self.team,
+            name="some_table",
+            format="CSV",
+            url_pattern="http://localhost/file.csv",
+            credential=credentials,
+            external_data_source=source,
+        )
+        query = "select * from "
+        results = self._select(query=query, start=14, end=14)
+
+        assert "stripe.prefix.some_table" in [x.label for x in results.suggestions]
+
+    def test_autocomplete_warehouse_view(self):
+        DataWarehouseSavedQuery.objects.create(
+            team=self.team,
+            name="some_view",
+            query={"query": "select * from events"},
+        )
+        query = "select * from "
+        results = self._select(query=query, start=14, end=14)
+
+        assert "some_view" in [x.label for x in results.suggestions]
+
+    def test_autocomplete_deleted_warehouse_view(self):
+        DataWarehouseSavedQuery.objects.create(
+            team=self.team,
+            name="DELETED",
+            query={"query": "select * from events"},
+            deleted=True,
+            deleted_name="some_view",
+        )
+        query = "select * from "
+        results = self._select(query=query, start=14, end=14)
+
+        assert "some_view" not in [x.label for x in results.suggestions]
+        assert "DELETED" not in [x.label for x in results.suggestions]
+
+    @parameterized.expand(
+        [
+            ("empty", ""),
+            # An unquoted reserved keyword used as an alias makes the source query unparseable.
+            ("reserved_keyword_alias", "select 1 as team_id"),
+        ]
+    )
+    def test_autocomplete_degrades_gracefully_for_bad_source_query(self, _name: str, source_query: str):
+        autocomplete = HogQLAutocomplete(
+            kind="HogQLAutocomplete",
+            query="SELECT * FROM e",
+            language=HogLanguage.HOG_QL,
+            sourceQuery=HogQLQuery(query=source_query),
+            startPosition=15,
+            endPosition=15,
+        )
+        results = get_hogql_autocomplete(query=autocomplete, team=self.team)
+
+        assert "events" in [suggestion.label for suggestion in results.suggestions]

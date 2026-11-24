@@ -1,0 +1,220 @@
+import './CohortCriteriaRowBuilder.scss'
+
+import clsx from 'clsx'
+import { useActions, useValues } from 'kea'
+import { Field as KeaField } from 'kea-forms'
+
+import { IconCopy, IconTrash } from '@posthog/icons'
+import { LemonDivider, Tooltip } from '@posthog/lemon-ui'
+
+import { moveAnnouncementUrl } from 'lib/components/TaxonomicFilter/utils/hiddenEvents'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { getFeatureFlagPayload } from 'lib/logic/featureFlagLogic'
+import { CohortLogicProps, cohortEditLogic } from 'scenes/cohorts/cohortEditLogic'
+import { getRowShape } from 'scenes/cohorts/CohortFilters/constants'
+import { renderField } from 'scenes/cohorts/CohortFilters/renderField'
+import { BehavioralFilterType, CohortFieldProps, Field, FilterType } from 'scenes/cohorts/CohortFilters/types'
+import { cleanCriteria } from 'scenes/cohorts/cohortUtils'
+import { storesFlagCallsOutsideEvents } from 'scenes/feature-flags/flagEvaluationsTable'
+import { teamLogic } from 'scenes/teamLogic'
+
+import { AnyCohortCriteriaType, BehavioralEventType, FilterLogicalOperator } from '~/types'
+
+import {
+    criterionFlagCallProblem,
+    flagCallProblemText,
+} from 'products/cohorts/frontend/criteria/flagCallCriterionProblem'
+
+export interface CohortCriteriaRowBuilderProps {
+    id: CohortLogicProps['id']
+    criteria: AnyCohortCriteriaType
+    type: BehavioralFilterType
+    groupIndex: number
+    index: number
+    logicalOperator: FilterLogicalOperator
+    hideDeleteIcon?: boolean
+    onChangeType?: (nextType: BehavioralFilterType) => void
+}
+
+export function CohortCriteriaRowBuilder({
+    type,
+    groupIndex,
+    index,
+    logicalOperator,
+    criteria,
+    hideDeleteIcon = false,
+    onChangeType,
+}: CohortCriteriaRowBuilderProps): JSX.Element {
+    const { setCriteria, duplicateFilter, removeFilter } = useActions(cohortEditLogic)
+    const { cohort } = useValues(cohortEditLogic)
+    const { currentTeam } = useValues(teamLogic)
+    const moveNoticesEnabled = useFeatureFlag('FLAG_CALLED_MOVE_NOTICES')
+    const announcementUrl = moveAnnouncementUrl(getFeatureFlagPayload(FEATURE_FLAGS.FLAG_CALLED_MOVE_NOTICES))
+    const flagCallProblem = moveNoticesEnabled ? criterionFlagCallProblem(cohort, criteria) : null
+    // Falling back to another row's fields would let an edit merge into the unmapped criterion,
+    // which cleanCriteria then strips to undefined. An empty row keeps the type selector as the
+    // recovery path.
+    const rowShape = getRowShape(type)
+    const rowFields = rowShape?.fields ?? []
+
+    const renderFieldComponent = (_field: Field, i: number): JSX.Element => {
+        return (
+            <div key={_field.fieldKey ?? i}>
+                {renderField[_field.type]({
+                    fieldKey: _field.fieldKey,
+                    criteria,
+                    ...(_field.type === FilterType.Text ? { value: _field.defaultValue } : {}),
+                    ...(_field.groupTypeFieldKey ? { groupTypeFieldKey: _field.groupTypeFieldKey } : {}),
+                    onChange: (newCriteria) => setCriteria(newCriteria, groupIndex, index),
+                    groupIndex,
+                    index,
+                } as CohortFieldProps)}
+            </div>
+        )
+    }
+
+    return (
+        <div className="CohortCriteriaRow">
+            {index !== 0 && <LogicalRowDivider logicalOperator={logicalOperator} />}
+            <KeaField
+                name="id"
+                template={({ error, kids }) => {
+                    return (
+                        <>
+                            <div
+                                className={clsx(
+                                    'CohortCriteriaRow__Criteria',
+                                    error && `CohortCriteriaRow__Criteria--error`
+                                )}
+                            >
+                                {kids as React.ReactNode}
+                                {error && (
+                                    <LemonBanner className="my-2" type="error">
+                                        {error}
+                                    </LemonBanner>
+                                )}
+                            </div>
+                        </>
+                    )
+                }}
+            >
+                <>
+                    <div className="flex flex-nowrap items-center mb-1">
+                        <KeaField
+                            name="value"
+                            template={({ error, kids }) => {
+                                return (
+                                    <>
+                                        <div
+                                            className={clsx(
+                                                'CohortCriteriaRow__Criteria__Field',
+                                                error && `CohortCriteriaRow__Criteria__Field--error`
+                                            )}
+                                        >
+                                            {kids as React.ReactNode}
+                                        </div>
+                                    </>
+                                )
+                            }}
+                        >
+                            <>
+                                <div>
+                                    {renderField[FilterType.Behavioral]({
+                                        fieldKey: 'value',
+                                        criteria,
+                                        placeholder: 'Choose criterion',
+                                        onChange: (newCriteria) => {
+                                            setCriteria(cleanCriteria(newCriteria, true), groupIndex, index)
+                                            onChangeType?.(newCriteria['value'] ?? BehavioralEventType.PerformEvent)
+                                        },
+                                    })}
+                                </div>
+                            </>
+                        </KeaField>
+                        <div className="CohortCriteriaRow__inline-divider" />
+                        <LemonButton icon={<IconCopy />} onClick={() => duplicateFilter(groupIndex, index)} />
+                        {!hideDeleteIcon && (
+                            <LemonButton icon={<IconTrash />} onClick={() => removeFilter(groupIndex, index)} />
+                        )}
+                    </div>
+                    {!rowShape && (
+                        <LemonBanner className="my-2" type="warning">
+                            This criterion isn't valid. Choose a new one to replace it.
+                        </LemonBanner>
+                    )}
+                    {/* The arrow points at the fields, so it has nothing to point at on an empty row. */}
+                    {rowFields.length > 0 && (
+                        <div className="flex">
+                            <span className="CohortCriteriaRow__Criteria__arrow">&#8627;</span>
+                            <div className="flex flex-wrap items-center min-w-0">
+                                {rowFields.map((field, i) => {
+                                    return (
+                                        !field.hide &&
+                                        (field.fieldKey ? (
+                                            <KeaField
+                                                key={i}
+                                                name={field.fieldKey}
+                                                template={({ error, kids }) => {
+                                                    return (
+                                                        <>
+                                                            <div
+                                                                className={clsx(
+                                                                    'CohortCriteriaRow__Criteria__Field',
+                                                                    error && `CohortCriteriaRow__Criteria__Field--error`
+                                                                )}
+                                                            >
+                                                                {kids as React.ReactNode}
+                                                            </div>
+                                                        </>
+                                                    )
+                                                }}
+                                            >
+                                                <>{renderFieldComponent(field, i)}</>
+                                            </KeaField>
+                                        ) : (
+                                            <div key={i} className="CohortCriteriaRow__Criteria__Field">
+                                                {renderFieldComponent(field, i)}
+                                            </div>
+                                        ))
+                                    )
+                                })}
+                            </div>
+                        </div>
+                    )}
+                    {flagCallProblem !== null && (
+                        <LemonBanner
+                            className="my-2"
+                            type="warning"
+                            action={
+                                announcementUrl
+                                    ? { children: 'Learn more', to: announcementUrl, targetBlank: true }
+                                    : undefined
+                            }
+                        >
+                            {flagCallProblemText(flagCallProblem, storesFlagCallsOutsideEvents(currentTeam))}
+                        </LemonBanner>
+                    )}
+                </>
+            </KeaField>
+        </div>
+    )
+}
+
+export interface LogicalRowDividerProps {
+    logicalOperator: FilterLogicalOperator
+    tooltip?: string
+}
+
+export function LogicalRowDivider({ logicalOperator, tooltip }: LogicalRowDividerProps): JSX.Element {
+    const label = tooltip ? (
+        <Tooltip title={tooltip} openOnClick placement="right">
+            <span tabIndex={0}>{logicalOperator}</span>
+        </Tooltip>
+    ) : (
+        logicalOperator
+    )
+    return <LemonDivider className="logical-row-divider my-4" label={label} />
+}

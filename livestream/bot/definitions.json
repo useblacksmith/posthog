@@ -1,0 +1,2816 @@
+[
+  {
+    "pattern": "GPTBot",
+    "name": "GPTBot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Google-CloudVertexBot",
+    "name": "Google Cloud Vertex",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Google-Extended",
+    "name": "Google AI",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "GoogleOther",
+    "name": "GoogleOther",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Claude-SearchBot",
+    "name": "Claude Search",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Claude-User",
+    "name": "Claude User",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ClaudeBot",
+    "name": "Claude",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Claude-Web",
+    "name": "Claude Web",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "anthropic-ai",
+    "name": "Anthropic",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Perplexity-User",
+    "name": "Perplexity User",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "PerplexityBot",
+    "name": "Perplexity",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "CCBot",
+    "name": "Common Crawl",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "meta-externalagent",
+    "name": "Meta AI",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Bytespider",
+    "name": "ByteDance",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "TikTokSpider",
+    "name": "TikTok AI",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "cohere-ai",
+    "name": "Cohere",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Diffbot",
+    "name": "Diffbot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "omgili",
+    "name": "Webz.io",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Webzio-Extended",
+    "name": "Webz.io Extended",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Timpibot",
+    "name": "Timpi",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Amazonbot",
+    "name": "Amazon",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "PetalBot",
+    "name": "Petal",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Brightbot",
+    "name": "Brightbot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "amazon-kendra",
+    "name": "Amazon Kendra",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "OAI-SearchBot",
+    "name": "OpenAI Search",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Applebot-Extended",
+    "name": "Apple AI",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ExaSearchBot/",
+    "name": "Exa Search",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Kimi-SearchBot/",
+    "name": "Kimi Search",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "MistralAI-Index/",
+    "name": "Mistral AI Index",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "LinerBot/",
+    "name": "Liner Search",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "PhindBot",
+    "name": "Phind",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "TavilyBot",
+    "name": "Tavily",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ChatGPT-User",
+    "name": "ChatGPT",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "meta-externalfetcher",
+    "name": "Meta Fetcher",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Meta-ExternalFetcher",
+    "name": "Meta Fetcher",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "DuckAssistBot",
+    "name": "DuckDuckGo AI",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "MistralAI-User",
+    "name": "Mistral AI",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Manus-User",
+    "name": "Manus",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Google-NotebookLM",
+    "name": "NotebookLM",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Shap-User",
+    "name": "Shap",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "claude-code/",
+    "name": "Claude Code",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "GitHubCopilot",
+    "name": "GitHub Copilot",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "OpenCode-User/",
+    "name": "OpenCode",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "GoogleAgent-URLContext",
+    "name": "Gemini URL Context",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Google-Jetski-Antigravity",
+    "name": "Antigravity",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "qodercli",
+    "name": "Qoder",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "KiroServer/",
+    "name": "Kiro",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Augment-WebFetch/",
+    "name": "Augment",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "QwenCode/",
+    "name": "Qwen Code",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ZCode-WebFetch/",
+    "name": "ZCode",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "deepseek-harness/",
+    "name": "DeepSeek Harness",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ExaUser/",
+    "name": "Exa User",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "amazon-Quick-on-behalf-of-",
+    "name": "Amazon Quick",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "grok-agent/",
+    "name": "Grok",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "PerplexityUser/",
+    "name": "Perplexity User",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Kimi-User/",
+    "name": "Kimi",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Liner-User/",
+    "name": "Liner",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Gemini-Deep-Research",
+    "name": "Gemini Deep Research",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Amzn-User/",
+    "name": "Amazon User",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "kagi-fetcher",
+    "name": "Kagi",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Mozilla-Tabstack/",
+    "name": "Tabstack",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "desktop.hog.dev",
+    "name": "PostHog Desktop",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "mobile.hog.dev",
+    "name": "PostHog Mobile",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "agent.hog.dev",
+    "name": "PostHog Desktop Agent",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "cloud.hog.dev",
+    "name": "PostHog Desktop Cloud",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Applebot/",
+    "name": "Applebot",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Googlebot",
+    "name": "Googlebot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "bingbot",
+    "name": "Bingbot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Bingbot",
+    "name": "Bingbot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "YandexBot",
+    "name": "Yandex",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Baiduspider",
+    "name": "Baidu",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "DuckDuckBot",
+    "name": "DuckDuckGo",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Slurp",
+    "name": "Yahoo",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Yeti/",
+    "name": "Naver",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "YisouSpider",
+    "name": "Yisou",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Sogou web spider",
+    "name": "Sogou",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "pageburst",
+    "name": "Pageburst",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "360Spider",
+    "name": "360 Spider",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Qwantbot",
+    "name": "Qwant",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "YouBot",
+    "name": "You.com",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "DataForSeoBot",
+    "name": "DataForSeo",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AwarioBot",
+    "name": "Awario",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ArchiveTeam ArchiveBot",
+    "name": "ArchiveTeam ArchiveBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AdsBot-Google",
+    "name": "Google Ads",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-InspectionTool",
+    "name": "Google Inspection",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-Food",
+    "name": "Google Food",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-Adwords",
+    "name": "Google Adwords",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AhrefsSiteAudit",
+    "name": "Ahrefs Site Audit",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AhrefsBot",
+    "name": "Ahrefs",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Barkrowler",
+    "name": "Barkrowler",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SemrushBot",
+    "name": "Semrush",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SERankingBacklinksBot",
+    "name": "SE Ranking",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "MJ12bot",
+    "name": "Majestic",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "DotBot",
+    "name": "Moz",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Lighthouse",
+    "name": "Lighthouse",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "MeltwaterNews",
+    "name": "Meltwater",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SiteAuditBot",
+    "name": "Semrush Site Audit",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Screaming Frog SEO Spider",
+    "name": "Screaming Frog",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PTST",
+    "name": "WebPageTest",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "FacebookBot",
+    "name": "Facebook Bot",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "facebookexternalhit",
+    "name": "Facebook",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Twitterbot",
+    "name": "Twitter",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "LinkedInBot",
+    "name": "LinkedIn",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Pinterest",
+    "name": "Pinterest",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Slackbot",
+    "name": "Slack",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Slack-ImgProxy",
+    "name": "Slack Image Proxy",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "TelegramBot",
+    "name": "Telegram",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "WhatsApp",
+    "name": "WhatsApp",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "GoogleImageProxy",
+    "name": "Google Image Proxy",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Iframely",
+    "name": "Iframely",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SkypeUriPreview",
+    "name": "Skype Preview",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Pingdom",
+    "name": "Pingdom",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "UptimeRobot",
+    "name": "UptimeRobot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Site24x7",
+    "name": "Site24x7",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "StatusCake",
+    "name": "StatusCake",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-Ads-Conversions",
+    "name": "Google Ads Conversions",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Datadog",
+    "name": "Datadog",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "GrafanaSyntheticMonitoring",
+    "name": "Grafana Synthetic",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "DMBrowser",
+    "name": "Doctom Monitor",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "DigitalOcean Uptime Probe",
+    "name": "DigitalOcean Uptime",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "HubSpot",
+    "name": "HubSpot Crawler",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "curl/",
+    "name": "curl",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Wget",
+    "name": "Wget",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "python-requests",
+    "name": "Python Requests",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "axios",
+    "name": "Axios",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "node-fetch",
+    "name": "Node Fetch",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Go-http-client",
+    "name": "Go HTTP",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "okhttp",
+    "name": "OkHttp",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Apache-HttpClient",
+    "name": "Apache HTTP",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "libwww-perl",
+    "name": "LWP",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Scrapy",
+    "name": "Scrapy",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "httpx",
+    "name": "httpx",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Google-Apps-Script",
+    "name": "Google Apps Script",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "undici",
+    "name": "undici",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Bun/",
+    "name": "Bun",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Deno/",
+    "name": "Deno",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Python-urllib/",
+    "name": "Python urllib",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "GuzzleHttp/",
+    "name": "Guzzle",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "reqwest/",
+    "name": "reqwest",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "lua-resty-http/",
+    "name": "lua-resty-http",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "PostmanRuntime/",
+    "name": "Postman",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "PowerShell/",
+    "name": "PowerShell",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "aria2/",
+    "name": "aria2",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "HTTrack",
+    "name": "HTTrack",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "crawl4ai",
+    "name": "Crawl4AI",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Vercel Edge Functions",
+    "name": "Vercel Edge Functions",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Google-Cloud-Scheduler",
+    "name": "Google Cloud Scheduler",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Google-Cloud-Tasks",
+    "name": "Google Cloud Tasks",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "PlayStore-Google",
+    "name": "Google Play Store",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Amazon CloudFront",
+    "name": "Amazon CloudFront",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AmazonProductDiscovery",
+    "name": "Amazon Product Discovery",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-BusinessLinkVerification",
+    "name": "Google Business Link",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Storebot-Google",
+    "name": "Google Storebot",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-Read-Aloud",
+    "name": "Google Read Aloud",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-Appointments",
+    "name": "Google Appointments",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-Actions",
+    "name": "Google Actions",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "OneTrust",
+    "name": "OneTrust",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Checkly",
+    "name": "Checkly",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "RuxitSynthetic",
+    "name": "dynatrace-monitor",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-AdWords-Express",
+    "name": "Google-AdWords-Express",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "meta-externalads",
+    "name": "meta-externalads",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-Safety",
+    "name": "Google-Safety",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "GTmetrix",
+    "name": "GTmetrix",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "TwilioKnowledge",
+    "name": "Twilio Knowledge",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Google-Agent",
+    "name": "Google-Agent",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Google-Structured-Data-Testing",
+    "name": "Google Schema Markup Testing Tool",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "google-structured-data-testing-tool",
+    "name": "google-structured-data-testing-tool",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "adbeat",
+    "name": "Adbeat",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SEBot-WA",
+    "name": "SE Ranking Bot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Ads-Naver",
+    "name": "adsnaver",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Better Uptime Bot",
+    "name": "Better Stack",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "woorankreview",
+    "name": "WooRank",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Viber",
+    "name": "viber-crawler",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Taboolabot",
+    "name": "Taboola",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Archive-It",
+    "name": "Internet Archive - Archive-It",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "seo4ajax.com",
+    "name": "seo4ajax",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "CookieHubScan",
+    "name": "cookiehub-scan",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "BitSightBot",
+    "name": "BitSight",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ArchiveBox",
+    "name": "ArchiveBox",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Dataprovider",
+    "name": "Dataprovider.com",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "BingPreview",
+    "name": "Bing Preview",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Convertify",
+    "name": "Convertify",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "GoogleAgent-Mariner",
+    "name": "GoogleAgent-Mariner",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "DareBoost",
+    "name": "dareboost-crawler",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AccessibleWebBot",
+    "name": "Accessible Web Bot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Stripebot",
+    "name": "Stripebot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Bluesky",
+    "name": "Bluesky",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "TagInspector",
+    "name": "Tag Inspector",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "oast",
+    "name": "Interactsh",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "CookieScript",
+    "name": "CookieScript",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Mediapartners",
+    "name": "google-adsense-googlebot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "OhDear",
+    "name": "OhDearBot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Siteimprove",
+    "name": "Siteimprove",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SnapchatAds",
+    "name": "SnapchatAdsBot",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "MarketGoo",
+    "name": "marketgoo",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "oncrawl",
+    "name": "oncrawl",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "kinsta-bot",
+    "name": "Kinsta",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "CensysInspect",
+    "name": "CensysInspectBot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SeznamBot",
+    "name": "SeznamBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "WPMU DEV",
+    "name": "WPMU DEV",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google Web Preview",
+    "name": "google-preview",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Catchpoint",
+    "name": "catchpoint",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Snap URL Preview Service",
+    "name": "SnapURLPreviewBot",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Blackboard",
+    "name": "blackboard-crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Foregenix",
+    "name": "Foregenix ThreatView/WebScan",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "FirecrawlAgent",
+    "name": "FirecrawlAgent",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Seekport",
+    "name": "seekport-crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ev-crawler",
+    "name": "Headline",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "bitdiscovery",
+    "name": "Tenable.asm",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SecurityHeaders",
+    "name": "SecurityHeaders",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "vercel-screenshot",
+    "name": "Vercel Screenshot Bot",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AppEngine-Google",
+    "name": "google-appengine",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "InternetMeasurement",
+    "name": "InternetMeasurementBot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "GoogleDocs",
+    "name": "Google Docs",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "linkchecker.pro",
+    "name": "LinkChecker Bot",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "zgrab",
+    "name": "zgrab",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "amazon-QBusiness",
+    "name": "Amazon Q",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "aiohttp",
+    "name": "python-aiohttp",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "WellKnownBot",
+    "name": "wellknown-crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "OKX-dolphin-crawler",
+    "name": "OKX-dolphin-crawler",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "BrightEdge Crawler",
+    "name": "BrightEdge Bot",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Asana",
+    "name": "Asana",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-PageRenderer",
+    "name": "Google PageRenderer",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "charlotte",
+    "name": "Charlotte",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AmazonSellerInitiatedListing",
+    "name": "Amazon Seller Initiated Listing",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Splunk Synthetics",
+    "name": "Splunk Synthetics",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Detectify",
+    "name": "Detectify",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Ghost Inspector",
+    "name": "Ghost Inspector",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Monsidobot",
+    "name": "Monsido",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SearchAtlas Bot",
+    "name": "SearchAtlas",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "VelenPublicWebCrawler",
+    "name": "Velen",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Cookiebot",
+    "name": "Cookiebot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "nmap",
+    "name": "nmap",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "MicrosoftPreview",
+    "name": "Microsoft Preview",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Chrome Privacy Preserving Prefetch Proxy",
+    "name": "Chrome Prefetch Proxy",
+    "category": "http_client",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Lightpanda",
+    "name": "Lightpanda",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Mozlila/",
+    "name": "Mozlila Typo Bot",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": ") AppleWebKit/537.36 Chrome/",
+    "name": "Malformed Chrome UA",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "HeadlessChrome",
+    "name": "Headless Chrome",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "PhantomJS",
+    "name": "PhantomJS",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Puppeteer",
+    "name": "Puppeteer",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Playwright",
+    "name": "Playwright",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "Selenium",
+    "name": "Selenium",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "SlimerJS",
+    "name": "SlimerJS",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "wkhtmltopdf",
+    "name": "wkhtmltopdf",
+    "category": "headless_browser",
+    "traffic_type": "Automation"
+  },
+  {
+    "pattern": "ClueWeb-Crawler",
+    "name": "ClueWeb",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "mwmbl",
+    "name": "Mwmbl",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "MojeekBot",
+    "name": "Mojeek",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "meta-webindexer",
+    "name": "Meta Web Indexer",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "archive.org_bot",
+    "name": "Internet Archive",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "jobcrawler",
+    "name": "jobcrawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "url-crawler",
+    "name": "url-crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "FlamingoBot",
+    "name": "FlamingoBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "heritrix",
+    "name": "Heritrix",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "crawlcrawl-actors",
+    "name": "crawlcrawl",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "crawler_eb_germany",
+    "name": "crawler_eb_germany",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Inkeep-Crawler",
+    "name": "Inkeep",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "KhojifyBot",
+    "name": "Khojify",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "AzureAI-SearchBot",
+    "name": "Azure AI Search",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "GrowthXBot",
+    "name": "GrowthX",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "RegieBrainBot",
+    "name": "Regie.ai",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "IntelvaneBot",
+    "name": "Intelvane",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ModelContextProtocol",
+    "name": "Model Context Protocol",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Amazon-Bedrock-AgentCore-Browser",
+    "name": "Amazon Bedrock AgentCore",
+    "category": "ai_assistant",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ResearchBot",
+    "name": "ResearchBot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ShapBot",
+    "name": "Shap",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ABEvalBot",
+    "name": "ABEvalBot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "OzDocsCrawler",
+    "name": "OzDocs",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "polygazer",
+    "name": "polygazer",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "BIC-Probe",
+    "name": "BIC Probe",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "AIWebIndex",
+    "name": "AIWebIndex",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "MBCrawler",
+    "name": "Monitor Backlinks",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AffsignalCrawler",
+    "name": "Affsignal",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "RankyDockyBot",
+    "name": "RankyDocky",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "pricingbrief-bot",
+    "name": "PricingBrief",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SolvedEarthPriceBot",
+    "name": "SolvedEarth Price Bot",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SiteavailObservatory",
+    "name": "Siteavail",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "appzbot",
+    "name": "appzbot",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Optimize Pilot Research Bot",
+    "name": "Optimize Pilot",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "KalleWorks-Monitor",
+    "name": "KalleWorks",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "LosClouds-Monitor",
+    "name": "LosClouds",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Exit1-Website-Monitor",
+    "name": "Exit1",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "UptimeWizardBot",
+    "name": "UptimeWizard",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PreflightBot",
+    "name": "Preflight",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "MerchantSecurityScanner",
+    "name": "Stripe Merchant Security Scanner",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Discordbot",
+    "name": "Discord",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "VioscaleAIBot",
+    "name": "Vioscale AI",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Amzn-SearchBot",
+    "name": "Amazon Search",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "LeapwaveVIP",
+    "name": "Leapwave",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "docs-puller",
+    "name": "docs-puller",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ToolchestBot",
+    "name": "Toolchest",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "scopy-docs-crawler",
+    "name": "scopy docs crawler",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "unstale-collector",
+    "name": "unstale",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "llms-txt-sync",
+    "name": "llms-txt-sync",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "PromptingBot",
+    "name": "PromptingBot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "llm-code-docs-scraper",
+    "name": "LLM code docs scraper",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "whichapi-bot",
+    "name": "WhichAPI",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Codex-YCB2B",
+    "name": "Codex public research",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "PostHog-BusinessKnowledge",
+    "name": "PostHog BusinessKnowledge",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "LlmsTxtBot",
+    "name": "LlmsTxtBot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "every-api/",
+    "name": "Every API",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "RightAIChoiceBot",
+    "name": "Right AI Choice",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "FlashBrain",
+    "name": "FlashBrain",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "NagetBot",
+    "name": "NagetBot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ContextRocketBot",
+    "name": "ContextRocket",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "AgentNativeSearchBot",
+    "name": "Agent Native Search",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ElevenlabsCrawler",
+    "name": "ElevenLabs Crawler",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "rag-customer-support-ingest",
+    "name": "rag-customer-support-ingest",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "OmnichannelWebsiteIngestionBot",
+    "name": "Omnichannel Website Ingestion",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "llms-txt-check/",
+    "name": "llms-txt-check",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ref-tools-crawler",
+    "name": "Ref",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "LinkupBot",
+    "name": "Linkup",
+    "category": "ai_search",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "redCactiBot",
+    "name": "redCactiBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "BelleaireCrawler",
+    "name": "BelleaireCrawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PersimmonDesignResearch",
+    "name": "Persimmon Design Research",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "barkReleasesBot",
+    "name": "barkReleasesBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "prospector/",
+    "name": "Prospector",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "YandexRenderResourcesBot",
+    "name": "Yandex Render Resources",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "YandexAccessibilityBot",
+    "name": "Yandex Accessibility",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "rewebbot",
+    "name": "rewebbot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Querit-SearchBot",
+    "name": "Querit Search",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ImpactVibeDesignResearch",
+    "name": "ImpactVibe Design Research",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "crawl-engine",
+    "name": "crawl-engine",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "CompanyFeedServer",
+    "name": "CompanyFeedServer",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "BranchenbuchBot",
+    "name": "BranchenbuchBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ReachBot",
+    "name": "ReachBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "IbouBot",
+    "name": "IbouBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Hypeline",
+    "name": "Hypeline",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "OldSchoolBot",
+    "name": "OldSchoolBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "TutusooBot",
+    "name": "TutusooBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "HiringRadarBot",
+    "name": "HiringRadar",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "slopsearch-linux-crawler",
+    "name": "slopsearch",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ForgeYourPathAiJobCrawler",
+    "name": "ForgeYourPath Job Crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "OkaraBot",
+    "name": "OkaraBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "DesignMD-Extract-Bot",
+    "name": "DesignMD Extract",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "LyonlBot",
+    "name": "LyonlBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Sokjan Crawler",
+    "name": "Sokjan Crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ScryBot",
+    "name": "ScryBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Heexybot",
+    "name": "Heexybot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "bne.es_bot",
+    "name": "Biblioteca Nacional de Espa\u00f1a",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Zetlyn",
+    "name": "Zetlyn",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "algorand-platform-newspaper",
+    "name": "Algorand platform newspaper",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "VendiditBot",
+    "name": "Vendidit",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Zee Company Intelligence",
+    "name": "Zee Company Intelligence",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "NicheStuffBot",
+    "name": "NicheStuff",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Axiom-DocBot",
+    "name": "Axiom DocBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "RealPressBot",
+    "name": "RealPressBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "StraddleLibraryBot",
+    "name": "Straddle Library",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "LurantaBot",
+    "name": "Luranta",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "UnstenciledBot",
+    "name": "Unstenciled",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "InloraBot",
+    "name": "Inlora",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "EfficientRustCrawler",
+    "name": "Efficient Rust Crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "DatalenkCreatorResearch",
+    "name": "Datalenk Creator Research",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Wrzutka-Bot",
+    "name": "Wrzutka",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Polon/",
+    "name": "Polon",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Babel42Bot",
+    "name": "Babel42",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "jscrawler",
+    "name": "jscrawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PolycoreSupabaseDetector",
+    "name": "Polycore Supabase Detector",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "UnboundCompute-PublicSnapshot",
+    "name": "UnboundCompute Public Snapshot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "swissAItalentBot",
+    "name": "swissAItalentBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AtlasSearchBot",
+    "name": "AtlasSearch",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "KakaoBot",
+    "name": "KakaoBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ibou-search",
+    "name": "Ibou Search",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "matnx.com/bot",
+    "name": "AtlasBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "DittaBot",
+    "name": "DittaBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "T2Bot/",
+    "name": "T2Bot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "CitePackBot",
+    "name": "CitePack",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ContextFetchBot",
+    "name": "ContextFetch",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "MachBot/",
+    "name": "MachBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "KERN-OSINT-Crawler",
+    "name": "KERN OSINT Crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "NCKU-CSIE-WebMining",
+    "name": "NCKU CSIE WebMining Crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PoliasBot",
+    "name": "PoliasBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "DevParekhResearch",
+    "name": "DevParekhResearch",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "TalarionSearchBot",
+    "name": "Talarion Search",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SofyaBot",
+    "name": "SofyaBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PkgSeer Documentation Crawler",
+    "name": "PkgSeer Documentation Crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "WorklynSearchBot",
+    "name": "Worklyn Search",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SterkinmatchesLeadgen",
+    "name": "Sterkinmatches Leadgen",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Brevva/",
+    "name": "Brevva",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "FastCrawler/",
+    "name": "FastCrawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "GTMStackResearch",
+    "name": "GTMStack Research",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "JobSearchBot",
+    "name": "JobSearchBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Walsingham/",
+    "name": "Walsingham",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SubBegoneBot",
+    "name": "SubBegoneBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "scrape-site/",
+    "name": "scrape-site",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "RevnoxBot",
+    "name": "RevnoxBot",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AlterionLabs/",
+    "name": "AlterionLabs",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "usehardal-analytics-crawler",
+    "name": "Hardal Analytics Crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Yoinka-Events",
+    "name": "Yoinka Events",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "LaunchReadyCodeBot",
+    "name": "LaunchReadyCodeBot",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PricingArchiveBot",
+    "name": "PricingArchiveBot",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SEOMasterBot",
+    "name": "SEOMasterBot",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "CanICancelIt-LinkCheck",
+    "name": "CanICancelIt LinkCheck",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "serpstatbot",
+    "name": "Serpstat",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "StackPick",
+    "name": "StackPick",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "UXXRAYBot",
+    "name": "UXXRAY",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "NoFluffGraderBot",
+    "name": "NoFluff Grader",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PagePilot-SiteAudit",
+    "name": "PagePilot Site Audit",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "double-ats-customer-discoverer",
+    "name": "Double ATS Customer Discoverer",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "BenchRankBot",
+    "name": "BenchRank",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "QlyzeBot",
+    "name": "Qlyze",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AutozellaBot",
+    "name": "Autozella",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "DottpaceAudit",
+    "name": "Dottpace Audit",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Clearscopebot",
+    "name": "Clearscope",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PagePeeker",
+    "name": "PagePeeker",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Synapse (bot",
+    "name": "Synapse",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Unfurlist",
+    "name": "Unfurlist",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "heap.page source monitor",
+    "name": "heap.page",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PulseWatch-Prober",
+    "name": "PulseWatch",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Scryer/",
+    "name": "Scryer",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "UnusualAgentAudit",
+    "name": "UnusualAgentAudit",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "VersionWatchBot",
+    "name": "VersionWatch",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "a14y/",
+    "name": "a14y",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "UptimeLensBot",
+    "name": "UptimeLens",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "InterruptIndexBot",
+    "name": "InterruptIndex",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "CurbCutScanner",
+    "name": "CurbCut Scanner",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "VantageBot",
+    "name": "VantageBot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "NimbusBlocklistSync",
+    "name": "Nimbus Blocklist Sync",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "latency.app/bot",
+    "name": "Latency",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "HonestClaw-Scanner",
+    "name": "HonestClaw Scanner",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PricingWatchBot",
+    "name": "PricingWatchBot",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ORBIQ Research Lab",
+    "name": "ORBIQ Research Lab",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "StackClarityWatcher",
+    "name": "StackClarity Watcher",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "RimetryStatusBot",
+    "name": "Rimetry Status",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "MrAnandPortfolio",
+    "name": "MrAnandPortfolio",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "PostHogImageFetcherBot",
+    "name": "PostHog Image Fetcher",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "1nsight-logo-fetcher",
+    "name": "1nsight Logo Fetcher",
+    "category": "http_client",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "KimiBot/",
+    "name": "Kimi",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "MistralAI-Training/",
+    "name": "Mistral AI Training",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "AI2Bot",
+    "name": "AI2 Bot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Ai2Bot",
+    "name": "AI2 Bot",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Context7-Crawler/",
+    "name": "Context7",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Cloudflare-AutoRAG",
+    "name": "Cloudflare AI Search",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Cloudflare-AI-Search",
+    "name": "Cloudflare AI Search",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "amazon-bedrock-knowledgebase-on-behalf-of-",
+    "name": "Amazon Bedrock Knowledge Bases",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "atlassian-bot",
+    "name": "Atlassian",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ImagesiftBot",
+    "name": "Imagesift",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "SBIntuitionsBot",
+    "name": "SB Intuitions",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "img2dataset",
+    "name": "img2dataset",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "img2downloader",
+    "name": "img2dataset",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "laion-huggingface-processor",
+    "name": "LAION",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "ICC-Crawler/",
+    "name": "ICC Crawler",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "PostHogCrawler",
+    "name": "PostHog Crawler",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Reflectionbot",
+    "name": "Reflection AI",
+    "category": "ai_crawler",
+    "traffic_type": "AI Agent"
+  },
+  {
+    "pattern": "Coveobot",
+    "name": "Coveo",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "coccoc",
+    "name": "Coc Coc",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Algolia Crawler",
+    "name": "Algolia Crawler",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "ia_archiver",
+    "name": "Internet Archive",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Turnitin",
+    "name": "Turnitin",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "FeedFetcher-Google",
+    "name": "Google Feedfetcher",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "AmazonSelectionExplorerBot",
+    "name": "Amazon Selection Explorer",
+    "category": "search_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Facebot",
+    "name": "Facebot",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "googlemessages/",
+    "name": "Google Messages",
+    "category": "social_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "OAI-AdsBot/",
+    "name": "OpenAI Ads",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-Display-Ads-Bot",
+    "name": "Google Display Ads",
+    "category": "seo_crawler",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "lychee/",
+    "name": "lychee",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Consul Health Check",
+    "name": "Consul Health Check",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google-Site-Verification/",
+    "name": "Google Site Verification",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Google Search Console",
+    "name": "Google Search Console",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "CloudflareObservatory/",
+    "name": "Cloudflare Observatory",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "SentryUptimeBot",
+    "name": "Sentry Uptime",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Amazon-Route53-Health-Check-Service",
+    "name": "Amazon Route 53 Health Check",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "GoogleStackdriverMonitoring-UptimeChecks",
+    "name": "Google Cloud Uptime Checks",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "HetrixTools",
+    "name": "HetrixTools",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "projectdiscovery/nuclei",
+    "name": "Nuclei",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Acunetix",
+    "name": "Acunetix",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "l9scan/",
+    "name": "LeakIX",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "Cortex-Xpanse",
+    "name": "Cortex Xpanse",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  },
+  {
+    "pattern": "NetcraftSurveyAgent",
+    "name": "Netcraft",
+    "category": "monitoring",
+    "traffic_type": "Bot"
+  }
+]

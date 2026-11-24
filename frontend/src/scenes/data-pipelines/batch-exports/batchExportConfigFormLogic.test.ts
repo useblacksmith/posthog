@@ -1,0 +1,1566 @@
+import { router } from 'kea-router'
+import { expectLogic, partial } from 'kea-test-utils'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { useMocks } from '~/mocks/jest'
+import { MockResolverInfo } from '~/mocks/utils'
+import { initKeaTests } from '~/test/init'
+import { BatchExportConfiguration, BatchExportServiceSnowflake } from '~/types'
+
+import {
+    BatchExportConfigFormLogicProps,
+    DEFAULT_EXCLUDE_EVENTS,
+    batchExportConfigFormLogic,
+    getDefaultConfiguration,
+} from './batchExportConfigFormLogic'
+
+// Builds a BatchExportConfiguration with shared defaults so each fixture only declares its destination.
+function fixture<T extends BatchExportConfiguration['destination']>(
+    id: string,
+    name: string,
+    destination: T
+): BatchExportConfiguration {
+    return {
+        id,
+        team_id: 997,
+        name,
+        destination: destination as BatchExportConfiguration['destination'],
+        interval: 'hour',
+        timezone: null,
+        offset_day: null,
+        offset_hour: null,
+        created_at: '2024-01-01T00:00:00Z',
+        start_at: null,
+        end_at: null,
+        paused: false,
+        model: 'events',
+        filters: [],
+    }
+}
+
+// AwsS3 and S3Compatible exports are integration-backed: credentials, and the S3-compatible
+// endpoint URL, live on the integration rather than in the config.
+const AWS_S3_CONFIG = {
+    bucket_name: 'test-bucket',
+    region: 'us-east-1',
+    prefix: 'posthog-events/',
+    exclude_events: [],
+    include_events: [],
+    compression: 'zstd',
+    encryption: null,
+    kms_key_id: null,
+    file_format: 'Parquet',
+    max_file_size_mb: null,
+}
+
+const AWS_S3_BATCH_EXPORT = fixture('test-aws-s3-id', 'AWS S3 Export', {
+    type: 'AwsS3',
+    integration: 31,
+    config: AWS_S3_CONFIG,
+})
+
+// Saved with gzip, which is valid for both Parquet and JSONLines, unlike the zstd above that the
+// form has to clear when switching format. Lets the compression tests cover both paths.
+const AWS_S3_GZIP_BATCH_EXPORT = fixture('test-aws-s3-gzip-id', 'AWS S3 gzip Export', {
+    type: 'AwsS3',
+    integration: 31,
+    config: { ...AWS_S3_CONFIG, compression: 'gzip' },
+})
+
+const AWS_S3_LEGACY_EXTENSION_BATCH_EXPORT = fixture('test-aws-s3-legacy-ext-id', 'AWS S3 legacy extension Export', {
+    type: 'AwsS3',
+    integration: 31,
+    config: { ...AWS_S3_CONFIG, legacy_parquet_extension: true },
+})
+
+const S3_COMPATIBLE_BATCH_EXPORT = fixture('test-s3-compatible-id', 'S3-compatible Export', {
+    type: 'S3Compatible',
+    integration: 32,
+    config: {
+        bucket_name: 'test-bucket',
+        region: 'auto',
+        prefix: 'posthog-events/',
+        exclude_events: [],
+        include_events: [],
+        compression: 'zstd',
+        use_virtual_style_addressing: false,
+        file_format: 'Parquet',
+        max_file_size_mb: null,
+        legacy_parquet_extension: false,
+    },
+})
+
+// BigQuery exports are integration-backed: the config carries `integration` and the
+// credentials live on the integration, not in the config.
+const BIGQUERY_BATCH_EXPORT = fixture('test-bq-id', 'BigQuery Export', {
+    type: 'BigQuery',
+    integration: 7,
+    config: {
+        dataset_id: 'test_dataset',
+        table_id: 'events',
+        exclude_events: [],
+        include_events: [],
+        use_json_type: false,
+    },
+})
+
+// A BigQuery export whose stored config still carries pre-Integration leftovers: the frontend-only
+// `json_config_file` and credentials that now live on the integration. These must be stripped on
+// save — the backend rejects any config key not on the destination's allowlist.
+const BIGQUERY_STALE_BATCH_EXPORT = fixture('test-bq-stale-id', 'BigQuery Stale Export', {
+    type: 'BigQuery',
+    integration: 7,
+    config: {
+        dataset_id: 'test_dataset',
+        table_id: 'events',
+        use_json_type: false,
+        exclude_events: [],
+        include_events: [],
+        json_config_file: [{}],
+        private_key: 'stale-private-key',
+        project_id: 'stale-project',
+    } as any,
+})
+
+const POSTGRES_BATCH_EXPORT = fixture('fixture-postgres', 'Postgres Export', {
+    type: 'Postgres',
+    config: {
+        user: 'pg-user',
+        password: 'pg-pass',
+        host: 'pg-host',
+        port: 5432,
+        database: 'pg-db',
+        schema: 'public',
+        table_name: 'events',
+        has_self_signed_cert: false,
+        exclude_events: [],
+        include_events: [],
+    },
+})
+
+const SNOWFLAKE_BATCH_EXPORT = fixture('fixture-snowflake', 'Snowflake Export', {
+    type: 'Snowflake',
+    integration: 51,
+    config: {
+        database: 'sf-db',
+        warehouse: 'sf-wh',
+        schema: 'public',
+        table_name: 'events',
+        role: 'sf-role',
+        exclude_events: [],
+        include_events: [],
+    },
+})
+
+// A migrated export: credentials moved to the integration, but the account and authentication
+// values they came with are still in the stored config. The stale keys are deliberate.
+const SNOWFLAKE_STALE_CONFIG = {
+    database: 'sf-db',
+    warehouse: 'sf-wh',
+    schema: 'public',
+    table_name: 'events',
+    role: null,
+    exclude_events: [],
+    include_events: [],
+    account: 'sf-account',
+    user: 'sf-user',
+    authentication_type: 'password',
+    password: 'sf-pass',
+    private_key: null,
+    private_key_passphrase: null,
+    // `satisfies` keeps the real fields checked; the index signature admits the stale keys.
+} satisfies BatchExportServiceSnowflake['config'] & Record<string, unknown>
+
+const SNOWFLAKE_STALE_BATCH_EXPORT = fixture('fixture-snowflake-stale', 'Snowflake Stale Export', {
+    type: 'Snowflake',
+    integration: 51,
+    config: SNOWFLAKE_STALE_CONFIG,
+})
+
+// Note: `authorization_mode` is intentionally absent from these Redshift fixtures' config —
+// it is a form-only field and is dropped on save.
+const REDSHIFT_INSERT_BATCH_EXPORT = fixture('fixture-redshift-insert', 'Redshift INSERT Export', {
+    type: 'Redshift',
+    config: {
+        user: 'rs-user',
+        password: 'rs-pass',
+        host: 'rs-host',
+        port: 5439,
+        database: 'rs-db',
+        schema: 'public',
+        table_name: 'events',
+        properties_data_type: 'SUPER' as any,
+        mode: 'INSERT',
+        copy_inputs: null,
+        exclude_events: [],
+        include_events: [],
+    } as any,
+})
+
+// Redshift exports created before the COPY option existed store no `mode` at all.
+const REDSHIFT_NO_MODE_BATCH_EXPORT = fixture('fixture-redshift-no-mode', 'Redshift Legacy Export', {
+    type: 'Redshift',
+    config: {
+        user: 'rs-user',
+        password: 'rs-pass',
+        host: 'rs-host',
+        port: 5439,
+        database: 'rs-db',
+        schema: 'public',
+        table_name: 'events',
+        properties_data_type: 'SUPER' as any,
+        exclude_events: [],
+        include_events: [],
+    } as any,
+})
+
+const REDSHIFT_COPY_IAM_BATCH_EXPORT = fixture('fixture-redshift-copy-iam', 'Redshift COPY IAM Export', {
+    type: 'Redshift',
+    config: {
+        user: 'rs-user',
+        password: 'rs-pass',
+        host: 'rs-host',
+        port: 5439,
+        database: 'rs-db',
+        schema: 'public',
+        table_name: 'events',
+        properties_data_type: 'SUPER' as any,
+        mode: 'COPY',
+        copy_inputs: {
+            s3_bucket: 'rs-staging',
+            s3_key_prefix: 'rs/copy/',
+            region_name: 'us-east-1',
+            authorization: 'arn:aws:iam::123:role/rs-copy',
+            bucket_credentials: 31,
+        },
+        exclude_events: [],
+        include_events: [],
+    } as any,
+})
+
+const HTTP_BATCH_EXPORT = fixture('fixture-http', 'HTTP Export', {
+    type: 'HTTP',
+    config: {
+        url: 'https://us.i.posthog.com/batch/',
+        token: 'phc_test',
+        exclude_events: [],
+        include_events: [],
+    },
+})
+
+const DATABRICKS_BATCH_EXPORT = fixture('fixture-databricks', 'Databricks Export', {
+    type: 'Databricks',
+    integration: 42,
+    config: {
+        http_path: '/sql/1.0/warehouses/abc123',
+        catalog: 'workspace',
+        schema: 'default',
+        table_name: 'events',
+        use_variant_type: true,
+        exclude_events: [],
+        include_events: [],
+    },
+})
+
+const AZUREBLOB_BATCH_EXPORT = fixture('fixture-azureblob', 'Azure Blob Export', {
+    type: 'AzureBlob',
+    integration: 99,
+    config: {
+        container_name: 'my-container',
+        prefix: 'posthog/events/',
+        compression: 'zstd',
+        file_format: 'Parquet',
+        max_file_size_mb: null,
+        legacy_parquet_extension: false,
+        exclude_events: [],
+        include_events: [],
+    },
+})
+
+// Only a plain Redshift connection stores its own host. AWS ones mint temporary credentials for a
+// cluster endpoint the export has to carry itself, so `host` is required alongside them.
+const AWS_REDSHIFT_INTEGRATION = {
+    id: 21,
+    kind: 'aws-redshift',
+    display_name: 'prod-redshift (AWS role)',
+    config: { name: 'prod-redshift', aws_role_arn: 'arn:aws:iam::123456789012:role/rs', user: 'awsuser' },
+    created_at: '2024-01-01T00:00:00Z',
+}
+
+const PLAIN_REDSHIFT_INTEGRATION = {
+    id: 22,
+    kind: 'aws-redshift',
+    display_name: 'posthog@rs-host',
+    config: { host: 'rs-host', port: 5439, user: 'posthog', ssl_mode: 'require' },
+    created_at: '2024-01-01T00:00:00Z',
+}
+
+const S3_STAGING_INTEGRATION = {
+    id: 31,
+    kind: 'aws-s3',
+    display_name: 'staging-bucket-creds',
+    config: { name: 'staging-bucket-creds', aws_account_id: '123456789012' },
+    created_at: '2024-01-01T00:00:00Z',
+}
+
+const S3_READER_INTEGRATION = {
+    id: 32,
+    kind: 'aws-s3',
+    display_name: 'redshift-reader',
+    config: { name: 'redshift-reader', aws_role_arn: 'arn:aws:iam::123456789012:role/reader' },
+    created_at: '2024-01-01T00:00:00Z',
+}
+
+// Integration-backed COPY: both staging and read-back credentials are integration ids, and they
+// differ, so this covers the number branch of copy_inputs on the way in and out.
+const REDSHIFT_COPY_INTEGRATIONS_BATCH_EXPORT = fixture(
+    'fixture-redshift-copy-integrations',
+    'Redshift COPY Integrations Export',
+    {
+        type: 'Redshift',
+        integration: AWS_REDSHIFT_INTEGRATION.id,
+        config: {
+            host: 'rs-host',
+            port: 5439,
+            database: 'rs-db',
+            schema: 'public',
+            table_name: 'events',
+            properties_data_type: 'super',
+            mode: 'COPY',
+            copy_inputs: {
+                s3_bucket: 'rs-staging',
+                s3_key_prefix: 'rs/copy/',
+                region_name: 'us-east-1',
+                bucket_credentials: S3_STAGING_INTEGRATION.id,
+                authorization: S3_READER_INTEGRATION.id,
+            },
+            exclude_events: [],
+            include_events: [],
+        } as any,
+    }
+)
+
+const REDSHIFT_COPY_LEGACY_BATCH_EXPORTS = [
+    { name: 'both', bucketCredentials: {}, authorization: {} },
+    { name: 'bucket', bucketCredentials: {}, authorization: 'arn:aws:iam::000000000000:role/test-copy' },
+    { name: 'authorization', bucketCredentials: S3_STAGING_INTEGRATION.id, authorization: {} },
+    {
+        name: 'unstripped',
+        bucketCredentials: { aws_access_key_id: 'test-bucket-key', aws_secret_access_key: 'test-bucket-secret' },
+        authorization: { aws_access_key_id: 'test-reader-key', aws_secret_access_key: 'test-reader-secret' },
+    },
+].map(({ name, bucketCredentials, authorization }) =>
+    fixture(`fixture-redshift-legacy-${name}`, `Legacy Redshift ${name}`, {
+        ...REDSHIFT_COPY_INTEGRATIONS_BATCH_EXPORT.destination,
+        config: {
+            ...REDSHIFT_COPY_INTEGRATIONS_BATCH_EXPORT.destination.config,
+            copy_inputs: {
+                s3_bucket: 'rs-staging',
+                s3_key_prefix: 'rs/copy/',
+                region_name: 'us-east-1',
+                bucket_credentials: bucketCredentials,
+                authorization,
+            },
+        },
+    } as any)
+)
+
+const HOGQL_BATCH_EXPORT: BatchExportConfiguration = {
+    ...fixture('test-hogql-id', 'HogQL Export', { type: 'AwsS3', integration: 31, config: AWS_S3_CONFIG }),
+    model: 'hogql',
+    hogql_query: 'SELECT event FROM events WHERE timestamp >= {data_interval_start}',
+    hogql_modifiers: { convertToProjectTimezone: false },
+}
+
+// Single map keyed by id; used to register GET + PATCH mocks dynamically below.
+const ALL_BATCH_EXPORTS: BatchExportConfiguration[] = [
+    AWS_S3_BATCH_EXPORT,
+    HOGQL_BATCH_EXPORT,
+    AWS_S3_GZIP_BATCH_EXPORT,
+    AWS_S3_LEGACY_EXTENSION_BATCH_EXPORT,
+    S3_COMPATIBLE_BATCH_EXPORT,
+    BIGQUERY_BATCH_EXPORT,
+    BIGQUERY_STALE_BATCH_EXPORT,
+    POSTGRES_BATCH_EXPORT,
+    SNOWFLAKE_BATCH_EXPORT,
+    SNOWFLAKE_STALE_BATCH_EXPORT,
+    REDSHIFT_INSERT_BATCH_EXPORT,
+    REDSHIFT_NO_MODE_BATCH_EXPORT,
+    REDSHIFT_COPY_IAM_BATCH_EXPORT,
+    ...REDSHIFT_COPY_LEGACY_BATCH_EXPORTS,
+    REDSHIFT_COPY_INTEGRATIONS_BATCH_EXPORT,
+    HTTP_BATCH_EXPORT,
+    DATABRICKS_BATCH_EXPORT,
+    AZUREBLOB_BATCH_EXPORT,
+]
+
+const SAVE_FAILS_ID = 'test-save-fails-id'
+const SAVE_FAILS_DETAIL = 'Prefix is not valid'
+const HOGQL_SAVE_FAILS_ID = 'test-hogql-save-fails-id'
+const HOGQL_SAVE_FAILS_DETAIL = 'Invalid HogQL query: Unable to resolve field: not_a_column'
+
+jest.mock('@posthog/lemon-ui', () => ({
+    ...jest.requireActual('@posthog/lemon-ui'),
+    lemonToast: {
+        error: jest.fn(),
+        success: jest.fn(),
+    },
+}))
+
+jest.mock('lib/utils/product-intents', () => ({
+    addProductIntent: jest.fn().mockResolvedValue(null),
+}))
+
+describe('batchExportConfigFormLogic', () => {
+    let logic: ReturnType<typeof batchExportConfigFormLogic.build>
+    let lastPostBody: Record<string, any> | null = null
+    let lastPatchBody: Record<string, any> | null = null
+    const patchBodiesById: Record<string, Record<string, any>> = {}
+
+    beforeEach(() => {
+        lastPostBody = null
+        lastPatchBody = null
+        for (const id of Object.keys(patchBodiesById)) {
+            delete patchBodiesById[id]
+        }
+        // Register a GET + PATCH mock for every fixture so any round-trip test can load its
+        // own fixture by id and look up the captured request body via patchBodiesById[fx.id].
+        const getMocks: Record<string, BatchExportConfiguration> = {}
+        const patchMocks: Record<string, (info: MockResolverInfo) => Promise<[number, BatchExportConfiguration]>> = {}
+        for (const fx of ALL_BATCH_EXPORTS) {
+            getMocks[`/api/environments/:team_id/batch_exports/${fx.id}`] = fx
+            patchMocks[`/api/environments/:team_id/batch_exports/${fx.id}/`] = async ({ request }) => {
+                const body = (await request.json()) as Record<string, any>
+                lastPatchBody = body
+                patchBodiesById[fx.id] = body
+                return [200, fx]
+            }
+        }
+        // Same shape as the AwsS3 fixture, but its PATCH always fails, for the save-error path.
+        getMocks[`/api/environments/:team_id/batch_exports/${SAVE_FAILS_ID}`] = {
+            ...AWS_S3_BATCH_EXPORT,
+            id: SAVE_FAILS_ID,
+        }
+        patchMocks[`/api/environments/:team_id/batch_exports/${SAVE_FAILS_ID}/`] = async () =>
+            [400, { detail: SAVE_FAILS_DETAIL }] as unknown as [number, BatchExportConfiguration]
+        // A HogQL export whose PATCH fails on the query, the way the API reports an invalid query.
+        getMocks[`/api/environments/:team_id/batch_exports/${HOGQL_SAVE_FAILS_ID}`] = {
+            ...HOGQL_BATCH_EXPORT,
+            id: HOGQL_SAVE_FAILS_ID,
+        }
+        patchMocks[`/api/environments/:team_id/batch_exports/${HOGQL_SAVE_FAILS_ID}/`] = async () =>
+            [
+                400,
+                {
+                    type: 'validation_error',
+                    code: 'invalid_input',
+                    detail: HOGQL_SAVE_FAILS_DETAIL,
+                    attr: 'hogql_query',
+                },
+            ] as unknown as [number, BatchExportConfiguration]
+        useMocks({
+            get: {
+                ...getMocks,
+                '/api/environments/:team_id/batch_exports/test': { steps: [] },
+                '/api/projects/:team_id/integrations/': {
+                    count: 4,
+                    results: [
+                        AWS_REDSHIFT_INTEGRATION,
+                        PLAIN_REDSHIFT_INTEGRATION,
+                        S3_STAGING_INTEGRATION,
+                        S3_READER_INTEGRATION,
+                    ],
+                },
+            },
+            post: {
+                '/api/environments/:team_id/batch_exports/': async ({ request }) => {
+                    lastPostBody = (await request.json()) as Record<string, any>
+                    return [200, { ...AWS_S3_BATCH_EXPORT, id: 'new-export-id' }]
+                },
+            },
+            patch: patchMocks,
+        })
+        initKeaTests()
+    })
+
+    async function initLogic(props: BatchExportConfigFormLogicProps): Promise<void> {
+        await expectLogic(teamLogic).toFinishAllListeners()
+        logic = batchExportConfigFormLogic(props)
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+    }
+
+    describe('new batch export config initialization', () => {
+        it('sets isNew to true and loads defaults', async () => {
+            await initLogic({ service: 'AwsS3', id: null })
+
+            await expectLogic(logic).toMatchValues({
+                isNew: true,
+                configuration: partial({
+                    destination: 'AwsS3',
+                    file_format: 'Parquet',
+                    compression: 'zstd',
+                    paused: true,
+                    model: 'events',
+                }),
+            })
+        })
+    })
+
+    describe('existing batch export config loading', () => {
+        it('loads configuration from API', async () => {
+            await initLogic({ service: null, id: AWS_S3_BATCH_EXPORT.id })
+
+            await expectLogic(logic).toMatchValues({
+                isNew: false,
+                configuration: partial({
+                    destination: 'AwsS3',
+                    name: 'AWS S3 Export',
+                    bucket_name: 'test-bucket',
+                    region: 'us-east-1',
+                    prefix: 'posthog-events/',
+                }),
+            })
+        })
+    })
+
+    describe('required fields validation', () => {
+        const GENERAL_REQUIRED_FIELDS = ['interval', 'name', 'model']
+        it.each([
+            {
+                // AwsS3 exports authenticate via an integration, not inline credentials.
+                service: 'AwsS3' as const,
+                fields: ['integration_id', 'bucket_name', 'region', 'prefix', 'file_format'],
+            },
+            {
+                // S3Compatible exports authenticate via an integration; endpoint_url lives on it.
+                service: 'S3Compatible' as const,
+                fields: ['integration_id', 'bucket_name', 'region', 'prefix', 'file_format'],
+            },
+            {
+                service: 'Postgres' as const,
+                fields: ['integration_id', 'database', 'schema', 'table_name'],
+            },
+            {
+                // New Redshift exports authenticate via an integration, and default to COPY, which
+                // stages files through an S3 connection. `host` only joins once a connection is
+                // picked, since a plain one carries its own.
+                service: 'Redshift' as const,
+                fields: [
+                    'integration_id',
+                    'database',
+                    'schema',
+                    'table_name',
+                    'redshift_s3_bucket',
+                    'redshift_s3_bucket_region_name',
+                    'redshift_s3_integration_id',
+                ],
+            },
+            {
+                // New Snowflake exports authenticate via an integration, not inline credentials.
+                service: 'Snowflake' as const,
+                fields: ['integration_id', 'database', 'warehouse', 'schema', 'table_name'],
+            },
+            { service: 'BigQuery' as const, fields: ['integration_id', 'dataset_id', 'table_id'] },
+            { service: 'HTTP' as const, fields: ['url', 'token'] },
+            {
+                service: 'Databricks' as const,
+                fields: ['integration_id', 'http_path', 'catalog', 'schema', 'table_name'],
+            },
+            { service: 'AzureBlob' as const, fields: ['integration_id', 'container_name', 'file_format'] },
+        ])('rejects empty form for $service', async ({ service, fields }) => {
+            await initLogic({ service, id: null })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            }).toDispatchActions(['submitConfiguration', 'submitConfigurationFailure'])
+
+            const defaults = getDefaultConfiguration(service)
+            const errors = logic.values.configurationErrors
+            for (const field of [...GENERAL_REQUIRED_FIELDS, ...fields]) {
+                // Fields pre-filled by getDefaultConfiguration (name, model, file_format) shouldn't
+                // error; every other required field must surface a "required" message.
+                const expectedError = defaults[field] ? undefined : 'This field is required'
+                expect(errors[field]).toBe(expectedError)
+            }
+        })
+    })
+
+    describe('S3 bucket name validation', () => {
+        it.each([
+            { bucket: 'MyBucket', error: 'Bucket name must be lowercase' },
+            { bucket: 'my bucket', error: 'Bucket name cannot contain whitespace' },
+            { bucket: 'my..bucket', error: 'Bucket name cannot contain consecutive periods' },
+            { bucket: '192.168.1.1', error: 'Bucket name cannot be formatted as an IP address' },
+            { bucket: 'my-valid-bucket', error: undefined },
+            { bucket: 'my.valid.bucket', error: undefined },
+        ])('bucket "$bucket" → $error', async ({ bucket, error }) => {
+            await initLogic({ service: 'AwsS3', id: null })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                bucket_name: bucket,
+                region: 'us-east-1',
+                prefix: 'test/',
+                integration_id: 31,
+                file_format: 'Parquet',
+                interval: 'hour',
+                name: 'Test Export',
+                model: 'events',
+            })
+
+            logic.actions.submitConfiguration()
+            await expectLogic(logic).toFinishAllListeners()
+
+            const errors = logic.values.configurationErrors
+            expect(errors.bucket_name).toBe(error)
+        })
+    })
+
+    describe('AzureBlob container name validation', () => {
+        it.each([
+            {
+                container: 'My-Container',
+                error: 'Must be lowercase letters, numbers, and hyphens; start and end with letter or number',
+            },
+            { container: 'my--container', error: 'Cannot contain consecutive hyphens' },
+            { container: 'my-container', error: undefined },
+            { container: 'mycontainer1', error: undefined },
+        ])('container "$container" → $error', async ({ container, error }) => {
+            await initLogic({ service: 'AzureBlob', id: null })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                integration_id: 11,
+                container_name: container,
+                interval: 'hour',
+                name: 'Test Export',
+                model: 'events',
+            })
+
+            logic.actions.submitConfiguration()
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.configurationErrors.container_name).toBe(error)
+        })
+    })
+
+    describe('compression resets when file_format changes', () => {
+        it.each([
+            { newFormat: 'JSONLines', expected: null },
+            { newFormat: 'Parquet', expected: 'zstd' },
+        ])('new export: switching to $newFormat sets compression to $expected', async ({ newFormat, expected }) => {
+            await initLogic({ service: 'AwsS3', id: null })
+
+            logic.actions.setConfigurationValue('file_format', newFormat)
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.configuration.compression).toBe(expected)
+        })
+
+        it.each([
+            { startCompression: 'snappy', expected: null },
+            { startCompression: 'gzip', expected: 'gzip' },
+        ])(
+            'existing export: Parquet/$startCompression -> JSONLines yields $expected',
+            async ({ startCompression, expected }) => {
+                await initLogic({ service: null, id: AWS_S3_BATCH_EXPORT.id })
+                logic.actions.setConfigurationValues({ compression: startCompression })
+                await expectLogic(logic).toFinishAllListeners()
+
+                logic.actions.setConfigurationValue('file_format', 'JSONLines')
+                await expectLogic(logic).toFinishAllListeners()
+
+                expect(logic.values.configuration.compression).toBe(expected)
+            }
+        )
+
+        it('existing export: Parquet/zstd -> JSONLines -> Parquet restores the saved zstd codec', async () => {
+            // AWS_S3_BATCH_EXPORT is saved with Parquet/zstd; zstd is invalid for JSONLines, so it's
+            // cleared on the way out and must come back from the saved config — not default to zstd by
+            // coincidence.
+            await initLogic({ service: null, id: AWS_S3_BATCH_EXPORT.id })
+            expect(logic.values.configuration.compression).toBe('zstd')
+
+            logic.actions.setConfigurationValue('file_format', 'JSONLines')
+            await expectLogic(logic).toFinishAllListeners()
+            expect(logic.values.configuration.compression).toBeNull()
+
+            logic.actions.setConfigurationValue('file_format', 'Parquet')
+            await expectLogic(logic).toFinishAllListeners()
+            expect(logic.values.configuration.compression).toBe('zstd')
+        })
+
+        it('existing export: Parquet/gzip survives a JSONLines round-trip (valid for both formats)', async () => {
+            await initLogic({ service: null, id: AWS_S3_GZIP_BATCH_EXPORT.id })
+            expect(logic.values.configuration.compression).toBe('gzip')
+
+            logic.actions.setConfigurationValue('file_format', 'JSONLines')
+            await expectLogic(logic).toFinishAllListeners()
+            expect(logic.values.configuration.compression).toBe('gzip')
+
+            logic.actions.setConfigurationValue('file_format', 'Parquet')
+            await expectLogic(logic).toFinishAllListeners()
+            expect(logic.values.configuration.compression).toBe('gzip')
+        })
+    })
+
+    describe('invalid persisted compression is dropped on save', () => {
+        it('clears a JSONLines+zstd combination when saving an unrelated edit', async () => {
+            await initLogic({ service: null, id: AWS_S3_BATCH_EXPORT.id })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                file_format: 'JSONLines',
+                compression: 'zstd',
+                prefix: 'updated-prefix/',
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            }).toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+
+            expect(lastPatchBody!.destination.config.file_format).toBe('JSONLines')
+            expect(lastPatchBody!.destination.config.compression).toBeNull()
+            expect(lastPatchBody!.destination.config.prefix).toBe('updated-prefix/')
+        })
+    })
+
+    describe('Redshift bucket validation only runs in COPY mode', () => {
+        // Validates that Redshift's mode-conditional validation only kicks in for COPY mode.
+        // INSERT mode shouldn't validate the (irrelevant) bucket name field.
+        it.each([
+            { mode: 'INSERT', expected: undefined },
+            { mode: 'COPY', expected: 'Bucket name must be lowercase' },
+        ])('mode=$mode → bucket error: $expected', async ({ mode, expected }) => {
+            await initLogic({ service: 'Redshift', id: null })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                integration_id: AWS_REDSHIFT_INTEGRATION.id,
+                host: 'rs-host',
+                port: 5439,
+                database: 'rs-db',
+                schema: 'public',
+                table_name: 'events',
+                mode,
+                redshift_s3_bucket: 'INVALID-BUCKET',
+                redshift_s3_key_prefix: 'rs/',
+                redshift_s3_bucket_region_name: 'us-east-1',
+                redshift_s3_integration_id: S3_STAGING_INTEGRATION.id,
+                interval: 'hour',
+                name: 'Test Export',
+                model: 'events',
+            })
+
+            logic.actions.submitConfiguration()
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.configurationErrors.redshift_s3_bucket).toBe(expected)
+        })
+    })
+
+    describe('Redshift host requirement follows the picked connection', () => {
+        // A plain Redshift connection stores its own host, an AWS one does not. Getting this wrong
+        // either blocks plain-connection users from saving, or lets AWS-connection exports save
+        // without the cluster endpoint they need at run time.
+        it.each([
+            { name: 'AWS connection', integration: AWS_REDSHIFT_INTEGRATION, expected: 'This field is required' },
+            { name: 'plain connection', integration: PLAIN_REDSHIFT_INTEGRATION, expected: undefined },
+        ])('$name → host error: $expected', async ({ integration, expected }) => {
+            await initLogic({ service: 'Redshift', id: null })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                integration_id: integration.id,
+                mode: 'INSERT',
+                database: 'rs-db',
+                schema: 'public',
+                table_name: 'events',
+                interval: 'hour',
+                name: 'Test Export',
+                model: 'events',
+            })
+
+            logic.actions.submitConfiguration()
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.configurationErrors.host).toBe(expected)
+        })
+    })
+
+    describe('Redshift COPY → INSERT drops the staging copy_inputs', () => {
+        // Loading a COPY export flattens copy_inputs into redshift_* form fields. Switching the
+        // mode to INSERT must null out copy_inputs (matching a native INSERT export) rather than
+        // leaking the original nested staging object back into the payload.
+        it('nulls copy_inputs in the saved config when switching to INSERT', async () => {
+            await initLogic({ service: null, id: REDSHIFT_COPY_IAM_BATCH_EXPORT.id })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                mode: 'INSERT',
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+                .toFinishAllListeners()
+
+            const body = patchBodiesById[REDSHIFT_COPY_IAM_BATCH_EXPORT.id]
+            expect(body.destination).toEqual({
+                type: 'Redshift',
+                config: {
+                    user: 'rs-user',
+                    password: 'rs-pass',
+                    host: 'rs-host',
+                    port: 5439,
+                    database: 'rs-db',
+                    schema: 'public',
+                    table_name: 'events',
+                    properties_data_type: 'SUPER',
+                    mode: 'INSERT',
+                    copy_inputs: null,
+                    exclude_events: [],
+                    include_events: [],
+                },
+            })
+        })
+    })
+
+    describe('legacy Redshift COPY credentials', () => {
+        it.each(REDSHIFT_COPY_LEGACY_BATCH_EXPORTS)('omits stored keys when saving $name', async (fixture) => {
+            await initLogic({ service: null, id: fixture.id })
+            logic.actions.setConfigurationValue('table_name', 'updated_events')
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+                .toFinishAllListeners()
+
+            const config = patchBodiesById[fixture.id].destination.config
+            expect(config.table_name).toBe('updated_events')
+            const storedCopyInputs = (fixture.destination.config as any).copy_inputs
+            const expectedCopyInputs = { ...storedCopyInputs }
+            for (const field of ['bucket_credentials', 'authorization']) {
+                if (typeof expectedCopyInputs[field] === 'object') {
+                    delete expectedCopyInputs[field]
+                }
+            }
+            expect(config.copy_inputs).toEqual(expectedCopyInputs)
+            expect(JSON.stringify(config)).not.toContain('aws_access_key_id')
+            expect(JSON.stringify(config)).not.toContain('aws_secret_access_key')
+            expect(Object.keys(config).filter((key) => key.startsWith('redshift_'))).toEqual([])
+        })
+
+        it.each([
+            { mode: undefined, expectedAuthorization: undefined },
+            { mode: 'SameConnection', expectedAuthorization: S3_STAGING_INTEGRATION.id },
+            { mode: 'DifferentConnection', expectedAuthorization: S3_READER_INTEGRATION.id },
+            { mode: 'IAMRole', expectedAuthorization: 'arn:aws:iam::000000000000:role/test-copy' },
+        ])('replaces selected legacy credentials with $mode', async ({ mode, expectedAuthorization }) => {
+            const fixture = REDSHIFT_COPY_LEGACY_BATCH_EXPORTS[0]
+            await initLogic({ service: null, id: fixture.id })
+            logic.actions.setConfigurationValues({
+                redshift_s3_integration_id: S3_STAGING_INTEGRATION.id,
+                authorization_mode: mode,
+                redshift_authorization_integration_id: S3_READER_INTEGRATION.id,
+                redshift_iam_role: 'arn:aws:iam::000000000000:role/test-copy',
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+                .toFinishAllListeners()
+
+            const copyInputs = patchBodiesById[fixture.id].destination.config.copy_inputs
+            expect(copyInputs).toEqual({
+                s3_bucket: 'rs-staging',
+                s3_key_prefix: 'rs/copy/',
+                region_name: 'us-east-1',
+                bucket_credentials: S3_STAGING_INTEGRATION.id,
+                ...(expectedAuthorization === undefined ? {} : { authorization: expectedAuthorization }),
+            })
+        })
+
+        it('requires a connection when legacy authorization changes to the same connection', async () => {
+            const fixture = REDSHIFT_COPY_LEGACY_BATCH_EXPORTS[0]
+            await initLogic({ service: null, id: fixture.id })
+            logic.actions.setConfigurationValue('authorization_mode', 'SameConnection')
+
+            logic.actions.submitConfiguration()
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.configurationErrors.redshift_s3_integration_id).toBe('This field is required')
+            expect(patchBodiesById[fixture.id]).toBeUndefined()
+        })
+    })
+
+    describe('Redshift export with no stored mode', () => {
+        // Exports predating the COPY option store no `mode`. Without a default the Command select
+        // renders blank, so the user has to guess which value reproduces what the export already
+        // does. INSERT is that value, and saving writes it back.
+        it('defaults to INSERT and persists it on save', async () => {
+            await initLogic({ service: null, id: REDSHIFT_NO_MODE_BATCH_EXPORT.id })
+
+            expect(logic.values.configuration.mode).toBe('INSERT')
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+                .toFinishAllListeners()
+
+            const body = patchBodiesById[REDSHIFT_NO_MODE_BATCH_EXPORT.id]
+            expect(body.destination.config.mode).toBe('INSERT')
+            expect(body.destination.config.copy_inputs).toBeNull()
+        })
+    })
+
+    describe('successful update', () => {
+        it('sends changed field plus untouched fixture defaults', async () => {
+            await initLogic({ service: null, id: AWS_S3_BATCH_EXPORT.id })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                prefix: 'updated-prefix/',
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            }).toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+
+            // Derived from the fixture so default changes don't break this test. The exact match also
+            // pins that the linked integration is re-sent (the backend rejects an S3 update without
+            // one) and that no credentials leak back into config.
+            expect(lastPatchBody!.destination).toEqual({
+                type: 'AwsS3',
+                integration: 31,
+                config: {
+                    ...AWS_S3_BATCH_EXPORT.destination.config,
+                    prefix: 'updated-prefix/',
+                },
+            })
+        })
+    })
+
+    describe('failed update', () => {
+        // A rejected save produced no toast and no inline error, so the button appeared to do
+        // nothing. The edits stay on the form for a retry, which makes the toast the only signal
+        // the user gets.
+        it('surfaces the API error and keeps the unsaved changes', async () => {
+            await initLogic({ service: null, id: SAVE_FAILS_ID })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                prefix: 'updated-prefix/',
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'submitConfigurationFailure'])
+                .toFinishAllListeners()
+
+            expect(lemonToast.error).toHaveBeenCalledWith(SAVE_FAILS_DETAIL)
+            expect(logic.values.configurationChanged).toBe(true)
+            expect(logic.values.configurationManualErrors).toEqual({})
+        })
+
+        // The toast can be far from the query editor, so the API's field error also shows under the field. kea-forms
+        // treats it as a form error, so an edit must clear it, or the next save never reaches the API. A model change
+        // hides the query field, so it must clear the error too.
+        it.each([
+            ['the query changes', 'hogql_query', 'SELECT event FROM events'],
+            ['the model changes', 'model', 'events'],
+        ])('shows a field error from the API under its field until %s', async (_, field, value) => {
+            await initLogic({ service: null, id: HOGQL_SAVE_FAILS_ID })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'submitConfigurationFailure'])
+                .toFinishAllListeners()
+
+            expect(lemonToast.error).toHaveBeenCalledWith(HOGQL_SAVE_FAILS_DETAIL)
+            // configurationErrors is what the field renders, so it must hold the error, not only configurationAllErrors
+            expect(logic.values.configurationErrors.hogql_query).toEqual(HOGQL_SAVE_FAILS_DETAIL)
+
+            logic.actions.setConfigurationValue(field, value)
+
+            expect(logic.values.configurationErrors.hogql_query).toBeUndefined()
+            expect(logic.values.configurationHasErrors).toBe(false)
+        })
+    })
+
+    describe('getDefaultConfiguration', () => {
+        it.each([
+            {
+                service: 'AwsS3',
+                expected: {
+                    destination: 'AwsS3',
+                    file_format: 'Parquet',
+                    compression: 'zstd',
+                    paused: true,
+                    model: 'events',
+                },
+            },
+            {
+                service: 'S3Compatible',
+                expected: {
+                    destination: 'S3Compatible',
+                    file_format: 'Parquet',
+                    compression: 'zstd',
+                    paused: true,
+                    model: 'events',
+                },
+            },
+            {
+                service: 'Snowflake',
+                expected: { destination: 'Snowflake', paused: true, model: 'events' },
+            },
+            {
+                service: 'Redshift',
+                expected: {
+                    destination: 'Redshift',
+                    mode: 'COPY',
+                    authorization_mode: 'SameConnection',
+                    properties_data_type: 'super',
+                    paused: true,
+                    model: 'events',
+                },
+            },
+            {
+                service: 'Databricks',
+                expected: {
+                    destination: 'Databricks',
+                    use_variant_type: true,
+                    http_path: '/sql/1.0/warehouses/',
+                    paused: true,
+                    model: 'events',
+                },
+            },
+            {
+                service: 'AzureBlob',
+                expected: {
+                    destination: 'AzureBlob',
+                    file_format: 'Parquet',
+                    compression: 'zstd',
+                    paused: true,
+                    model: 'events',
+                },
+            },
+            {
+                service: 'Postgres',
+                expected: { destination: 'Postgres', paused: true, model: 'events' },
+            },
+            {
+                service: 'BigQuery',
+                expected: { destination: 'BigQuery', paused: true, model: 'events' },
+            },
+        ])('returns correct defaults for $service', ({ service, expected }) => {
+            const config = getDefaultConfiguration(service)
+            expect(config).toEqual(expect.objectContaining(expected))
+            expect(config.exclude_events).toEqual(['$feature_flag_called'])
+        })
+    })
+
+    // For each destination, fill in only the required fields and assert the exact create payload.
+    // Guards against destinations silently changing their default config or required-field set.
+    describe('create with required fields per destination', () => {
+        it.each([
+            {
+                // AwsS3 exports authenticate via an integration; credentials live on it, and
+                // endpoint_url / use_virtual_style_addressing must not leak into the payload.
+                name: 'AwsS3',
+                service: 'AwsS3' as const,
+                requiredValues: {
+                    integration_id: 21,
+                    bucket_name: 'my-bucket',
+                    region: 'us-east-1',
+                    prefix: 'test/',
+                },
+                expectedDestination: {
+                    type: 'AwsS3',
+                    integration: 21,
+                    config: {
+                        bucket_name: 'my-bucket',
+                        region: 'us-east-1',
+                        prefix: 'test/',
+                        file_format: 'Parquet',
+                        compression: 'zstd',
+                    },
+                },
+            },
+            {
+                // S3Compatible exports authenticate via an integration (which carries endpoint_url);
+                // no inline credentials, no leaked encryption / kms_key_id.
+                name: 'S3Compatible',
+                service: 'S3Compatible' as const,
+                requiredValues: {
+                    integration_id: 22,
+                    bucket_name: 'my-bucket',
+                    region: 'auto',
+                    prefix: 'test/',
+                },
+                expectedDestination: {
+                    type: 'S3Compatible',
+                    integration: 22,
+                    config: {
+                        bucket_name: 'my-bucket',
+                        region: 'auto',
+                        prefix: 'test/',
+                        file_format: 'Parquet',
+                        compression: 'zstd',
+                    },
+                },
+            },
+            {
+                name: 'Postgres',
+                service: 'Postgres' as const,
+                requiredValues: {
+                    integration_id: 13,
+                    database: 'pg-db',
+                    schema: 'public',
+                    table_name: 'events',
+                },
+                expectedDestination: {
+                    type: 'Postgres',
+                    integration: 13,
+                    config: {
+                        database: 'pg-db',
+                        schema: 'public',
+                        table_name: 'events',
+                    },
+                },
+            },
+            {
+                // New Snowflake exports authenticate via an integration; account/user/credentials live
+                // on it and must not leak into the payload.
+                name: 'Snowflake',
+                service: 'Snowflake' as const,
+                requiredValues: {
+                    integration_id: 31,
+                    database: 'sf-db',
+                    warehouse: 'sf-wh',
+                    schema: 'public',
+                    table_name: 'events',
+                },
+                expectedDestination: {
+                    type: 'Snowflake',
+                    integration: 31,
+                    config: {
+                        database: 'sf-db',
+                        warehouse: 'sf-wh',
+                        schema: 'public',
+                        table_name: 'events',
+                    },
+                },
+            },
+            {
+                // Default COPY: one S3 connection stages the files and Redshift reads them back
+                // through the same one, so both copy_inputs credentials carry that id.
+                name: 'Redshift (default COPY, same S3 connection)',
+                service: 'Redshift' as const,
+                requiredValues: {
+                    integration_id: AWS_REDSHIFT_INTEGRATION.id,
+                    host: 'rs-host',
+                    port: 5439,
+                    database: 'rs-db',
+                    schema: 'public',
+                    table_name: 'events',
+                    redshift_s3_bucket: 'rs-staging',
+                    redshift_s3_key_prefix: 'rs/copy/',
+                    redshift_s3_bucket_region_name: 'us-east-1',
+                    redshift_s3_integration_id: S3_STAGING_INTEGRATION.id,
+                },
+                expectedDestination: {
+                    type: 'Redshift',
+                    integration: AWS_REDSHIFT_INTEGRATION.id,
+                    config: {
+                        host: 'rs-host',
+                        port: 5439,
+                        database: 'rs-db',
+                        schema: 'public',
+                        table_name: 'events',
+                        properties_data_type: 'super',
+                        mode: 'COPY',
+                        copy_inputs: {
+                            s3_bucket: 'rs-staging',
+                            s3_key_prefix: 'rs/copy/',
+                            region_name: 'us-east-1',
+                            bucket_credentials: S3_STAGING_INTEGRATION.id,
+                            authorization: S3_STAGING_INTEGRATION.id,
+                        },
+                    },
+                },
+            },
+            {
+                // A blank S3 key prefix is valid: the backend defaults a missing prefix to the
+                // bucket root. The form must not require it, and must omit it from the payload when
+                // unset so the backend applies that default.
+                name: 'Redshift (COPY, blank S3 key prefix stages at bucket root)',
+                service: 'Redshift' as const,
+                requiredValues: {
+                    integration_id: AWS_REDSHIFT_INTEGRATION.id,
+                    host: 'rs-host',
+                    database: 'rs-db',
+                    schema: 'public',
+                    table_name: 'events',
+                    redshift_s3_bucket: 'rs-staging',
+                    redshift_s3_bucket_region_name: 'us-east-1',
+                    redshift_s3_integration_id: S3_STAGING_INTEGRATION.id,
+                },
+                expectedDestination: {
+                    type: 'Redshift',
+                    integration: AWS_REDSHIFT_INTEGRATION.id,
+                    config: {
+                        host: 'rs-host',
+                        database: 'rs-db',
+                        schema: 'public',
+                        table_name: 'events',
+                        properties_data_type: 'super',
+                        mode: 'COPY',
+                        copy_inputs: {
+                            s3_bucket: 'rs-staging',
+                            region_name: 'us-east-1',
+                            bucket_credentials: S3_STAGING_INTEGRATION.id,
+                            authorization: S3_STAGING_INTEGRATION.id,
+                        },
+                    },
+                },
+            },
+            {
+                name: 'Redshift (COPY, different S3 connection for Redshift)',
+                service: 'Redshift' as const,
+                requiredValues: {
+                    integration_id: AWS_REDSHIFT_INTEGRATION.id,
+                    host: 'rs-host',
+                    database: 'rs-db',
+                    schema: 'public',
+                    table_name: 'events',
+                    redshift_s3_bucket: 'rs-staging',
+                    redshift_s3_key_prefix: 'rs/copy/',
+                    redshift_s3_bucket_region_name: 'us-east-1',
+                    redshift_s3_integration_id: S3_STAGING_INTEGRATION.id,
+                    authorization_mode: 'DifferentConnection',
+                    redshift_authorization_integration_id: S3_READER_INTEGRATION.id,
+                },
+                expectedDestination: {
+                    type: 'Redshift',
+                    integration: AWS_REDSHIFT_INTEGRATION.id,
+                    config: {
+                        host: 'rs-host',
+                        database: 'rs-db',
+                        schema: 'public',
+                        table_name: 'events',
+                        properties_data_type: 'super',
+                        mode: 'COPY',
+                        copy_inputs: {
+                            s3_bucket: 'rs-staging',
+                            s3_key_prefix: 'rs/copy/',
+                            region_name: 'us-east-1',
+                            bucket_credentials: S3_STAGING_INTEGRATION.id,
+                            authorization: S3_READER_INTEGRATION.id,
+                        },
+                    },
+                },
+            },
+            {
+                name: 'Redshift (COPY, cluster IAM role)',
+                service: 'Redshift' as const,
+                requiredValues: {
+                    integration_id: AWS_REDSHIFT_INTEGRATION.id,
+                    host: 'rs-host',
+                    database: 'rs-db',
+                    schema: 'public',
+                    table_name: 'events',
+                    redshift_s3_bucket: 'rs-staging',
+                    redshift_s3_key_prefix: 'rs/copy/',
+                    redshift_s3_bucket_region_name: 'us-east-1',
+                    redshift_s3_integration_id: S3_STAGING_INTEGRATION.id,
+                    authorization_mode: 'IAMRole',
+                    redshift_iam_role: 'arn:aws:iam::123:role/rs',
+                },
+                expectedDestination: {
+                    type: 'Redshift',
+                    integration: AWS_REDSHIFT_INTEGRATION.id,
+                    config: {
+                        host: 'rs-host',
+                        database: 'rs-db',
+                        schema: 'public',
+                        table_name: 'events',
+                        properties_data_type: 'super',
+                        mode: 'COPY',
+                        copy_inputs: {
+                            s3_bucket: 'rs-staging',
+                            s3_key_prefix: 'rs/copy/',
+                            region_name: 'us-east-1',
+                            bucket_credentials: S3_STAGING_INTEGRATION.id,
+                            authorization: 'arn:aws:iam::123:role/rs',
+                        },
+                    },
+                },
+            },
+            {
+                name: 'HTTP',
+                service: 'HTTP' as const,
+                requiredValues: {
+                    url: 'https://us.i.posthog.com/batch/',
+                    token: 'phc_xxx',
+                },
+                expectedDestination: {
+                    type: 'HTTP',
+                    config: {
+                        url: 'https://us.i.posthog.com/batch/',
+                        token: 'phc_xxx',
+                    },
+                },
+            },
+            {
+                name: 'Databricks',
+                service: 'Databricks' as const,
+                requiredValues: {
+                    integration_id: 7,
+                    http_path: '/sql/1.0/warehouses/abc',
+                    catalog: 'workspace',
+                    schema: 'default',
+                    table_name: 'events',
+                },
+                expectedDestination: {
+                    type: 'Databricks',
+                    integration: 7,
+                    config: {
+                        http_path: '/sql/1.0/warehouses/abc',
+                        catalog: 'workspace',
+                        schema: 'default',
+                        table_name: 'events',
+                        use_variant_type: true,
+                    },
+                },
+            },
+            {
+                name: 'AzureBlob',
+                service: 'AzureBlob' as const,
+                requiredValues: {
+                    integration_id: 11,
+                    container_name: 'my-container',
+                },
+                expectedDestination: {
+                    type: 'AzureBlob',
+                    integration: 11,
+                    config: {
+                        container_name: 'my-container',
+                        file_format: 'Parquet',
+                        compression: 'zstd',
+                    },
+                },
+            },
+            {
+                name: 'BigQuery',
+                service: 'BigQuery' as const,
+                requiredValues: {
+                    integration_id: 5,
+                    dataset_id: 'ds',
+                    table_id: 'events',
+                },
+                expectedDestination: {
+                    type: 'BigQuery',
+                    integration: 5,
+                    config: {
+                        dataset_id: 'ds',
+                        table_id: 'events',
+                    },
+                },
+            },
+        ])('create $name sends expected payload', async ({ service, requiredValues, expectedDestination }) => {
+            await initLogic({ service, id: null })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                interval: 'hour',
+                name: `Test ${service} Export`,
+                model: 'events',
+                ...requiredValues,
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+                .toFinishAllListeners()
+
+            expect(lastPostBody).not.toBeNull()
+            // exclude_events is a base config key shared by every destination, so it's merged in here
+            // rather than repeated in each case above.
+            expect(lastPostBody!.destination).toEqual({
+                ...expectedDestination,
+                config: { exclude_events: DEFAULT_EXCLUDE_EVENTS, ...expectedDestination.config },
+            })
+            expect(router.values.location.pathname).toContain(urls.batchExport('new-export-id'))
+        })
+    })
+
+    describe('round-trip: load and save preserves destination config', () => {
+        it.each([
+            { name: 'AwsS3', fixture: AWS_S3_BATCH_EXPORT },
+            { name: 'AwsS3 (HogQL model)', fixture: HOGQL_BATCH_EXPORT },
+            { name: 'S3Compatible', fixture: S3_COMPATIBLE_BATCH_EXPORT },
+            { name: 'BigQuery', fixture: BIGQUERY_BATCH_EXPORT },
+            { name: 'Postgres', fixture: POSTGRES_BATCH_EXPORT },
+            { name: 'Snowflake', fixture: SNOWFLAKE_BATCH_EXPORT },
+            { name: 'Redshift (INSERT)', fixture: REDSHIFT_INSERT_BATCH_EXPORT },
+            { name: 'Redshift (COPY + IAM)', fixture: REDSHIFT_COPY_IAM_BATCH_EXPORT },
+            { name: 'Redshift (COPY + integrations)', fixture: REDSHIFT_COPY_INTEGRATIONS_BATCH_EXPORT },
+            { name: 'HTTP', fixture: HTTP_BATCH_EXPORT },
+            { name: 'Databricks', fixture: DATABRICKS_BATCH_EXPORT },
+            { name: 'AzureBlob', fixture: AZUREBLOB_BATCH_EXPORT },
+        ])('$name round-trips without modifying destination', async ({ fixture }) => {
+            await initLogic({ service: null, id: fixture.id })
+
+            // Submit immediately without changes — captures whether deserialize+serialize is symmetrical.
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+                .toFinishAllListeners()
+
+            const body = patchBodiesById[fixture.id]
+            expect(body).not.toBeUndefined()
+            expect(body.destination).toEqual(fixture.destination)
+            // Only the 'hogql' model edits the query and its modifiers, so other models must not send them
+            expect(body.hogql_query).toEqual(fixture.hogql_query)
+            expect(body.hogql_modifiers).toEqual(fixture.hogql_modifiers)
+        })
+
+        it.each([
+            { model: 'events', fixture: AWS_S3_BATCH_EXPORT, sendsFilters: true },
+            { model: 'persons', fixture: AWS_S3_BATCH_EXPORT, sendsFilters: false },
+            { model: 'sessions', fixture: AWS_S3_BATCH_EXPORT, sendsFilters: false },
+            { model: 'hogql', fixture: HOGQL_BATCH_EXPORT, sendsFilters: false },
+        ])('sends event filters only for the events model ($model)', async ({ model, fixture, sendsFilters }) => {
+            const filters = [{ key: '$browser', operator: 'exact', type: 'event', value: ['Firefox'] }]
+            await initLogic({ service: null, id: fixture.id })
+            logic.actions.setConfigurationValue('model', model)
+            logic.actions.setConfigurationValue('filters', filters)
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+                .toFinishAllListeners()
+
+            if (sendsFilters) {
+                expect(patchBodiesById[fixture.id].filters).toEqual(filters)
+            } else {
+                expect(patchBodiesById[fixture.id]).not.toHaveProperty('filters')
+            }
+        })
+    })
+
+    // The model select and the sections below it follow `selectedModel`, while a save sends `configuration.model`.
+    // If a reset moved only one of them, the form would show the query editor and save an events export.
+    it('resets the selected model with the form', async () => {
+        await initLogic({ service: 'AwsS3', id: null })
+        logic.actions.setConfigurationValue('model', 'hogql')
+        expect(logic.values.selectedModel).toEqual('hogql')
+
+        logic.actions.resetConfiguration(getDefaultConfiguration('AwsS3'))
+
+        expect(logic.values.selectedModel).toEqual('events')
+    })
+
+    describe('HogQL query validation', () => {
+        it.each([
+            ['accepts a single statement', 'SELECT event FROM events', undefined],
+            ['accepts a trailing semicolon', 'SELECT event FROM events;', undefined],
+            [
+                'rejects more than one statement',
+                'SELECT event FROM events; SELECT 1',
+                'A batch export runs a single query. Remove the extra statements separated by semicolons.',
+            ],
+            ['requires a query', '', 'This field is required'],
+        ])('%s', async (_, hogqlQuery, expectedError) => {
+            await initLogic({ service: null, id: HOGQL_BATCH_EXPORT.id })
+
+            logic.actions.setConfigurationValue('hogql_query', hogqlQuery)
+
+            expect(logic.values.configurationValidationErrors.hogql_query).toEqual(expectedError)
+        })
+    })
+
+    describe('Parquet extension opt-in', () => {
+        it('sends the switched-off value so new files drop the codec suffix', async () => {
+            await initLogic({ service: null, id: AWS_S3_LEGACY_EXTENSION_BATCH_EXPORT.id })
+
+            logic.actions.setConfigurationValues({
+                ...logic.values.configuration,
+                legacy_parquet_extension: false,
+            })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            }).toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+
+            expect(lastPatchBody!.destination.config.legacy_parquet_extension).toBe(false)
+        })
+    })
+
+    describe('strips stale/legacy config fields not in the destination allowlist', () => {
+        // Pre-Integration configs can still hold credential fields that now live on the integration.
+        // Editing such an export must not re-send them, or the backend rejects the PATCH with
+        // "Configuration has unknown field/s".
+        it.each([
+            {
+                name: 'BigQuery drops json_config_file and inline credentials',
+                fixture: BIGQUERY_STALE_BATCH_EXPORT,
+                expectedDestination: {
+                    type: 'BigQuery',
+                    integration: 7,
+                    config: {
+                        dataset_id: 'test_dataset',
+                        table_id: 'events',
+                        use_json_type: false,
+                        exclude_events: [],
+                        include_events: [],
+                    },
+                },
+            },
+            {
+                name: 'Snowflake drops the account and credentials left behind by the migration',
+                fixture: SNOWFLAKE_STALE_BATCH_EXPORT,
+                expectedDestination: {
+                    type: 'Snowflake',
+                    integration: 51,
+                    config: {
+                        database: 'sf-db',
+                        warehouse: 'sf-wh',
+                        schema: 'public',
+                        table_name: 'events',
+                        role: null,
+                        exclude_events: [],
+                        include_events: [],
+                    },
+                },
+            },
+        ])('$name', async ({ fixture, expectedDestination }) => {
+            await initLogic({ service: null, id: fixture.id })
+
+            await expectLogic(logic, () => {
+                logic.actions.submitConfiguration()
+            })
+                .toDispatchActions(['submitConfiguration', 'updateBatchExportConfigSuccess'])
+                .toFinishAllListeners()
+
+            const body = patchBodiesById[fixture.id]
+            expect(body).not.toBeUndefined()
+            expect(body.destination).toEqual(expectedDestination)
+        })
+    })
+})

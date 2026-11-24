@@ -1,0 +1,126 @@
+import { useActions, useValues } from 'kea'
+
+import { NotFound } from 'lib/components/NotFound'
+
+import { useThreadSkin } from '../../../hooks/useThreadSkin'
+import { taskDetailSceneLogic } from '../taskDetailSceneLogic'
+import { QuillTaskNotRunEmpty } from './QuillTaskNotRunEmpty'
+import { TaskErrorBanner } from './TaskErrorBanner'
+import { TaskRunChat } from './TaskRunChat'
+import { TaskRunLoadingSkeleton } from './TaskRunLoadingSkeleton'
+
+/**
+ * Run-log slot state machine. Reads `taskDetailSceneLogic` directly (no prop drilling) and resolves to
+ * exactly one of: an error banner, a `NotFound`, the shared `RunLogSkeleton`, an empty state, or the live
+ * `TaskRunChat`. The skeleton is the only loading affordance here — once it hands off to `TaskRunChat`, the
+ * eager `RunSurface` shows the same `RunLogSkeleton` during its own bootstrap, so the transition is seamless.
+ */
+export function TaskRunLog({
+    taskId,
+    optimisticStreamKey,
+    optimisticRunId,
+    interactionKey,
+    autoFocus,
+}: {
+    taskId: string
+    /** Client `streamKey` of an optimistic-create stream to adopt — set only during the create handoff. */
+    optimisticStreamKey?: string
+    /** Run id created by the optimistic flow, before the runs list has loaded it. */
+    optimisticRunId?: string
+    interactionKey?: string
+    autoFocus?: boolean
+}): JSX.Element | null {
+    const logic = taskDetailSceneLogic({ taskId })
+    const {
+        runs,
+        selectedRun,
+        selectedRunId,
+        runsError,
+        selectedRunError,
+        selectedRunNotFound,
+        isRunPending,
+        isTaskPending,
+        runContinuation,
+    } = useValues(logic)
+    const { loadTaskRuns, loadSelectedTaskRun, clearContinuationDraft } = useActions(logic)
+    const skin = useThreadSkin()
+
+    if (runContinuation && selectedRunId === runContinuation.run.id) {
+        return (
+            <div className="flex-1 min-h-0">
+                <TaskRunChat
+                    taskId={taskId}
+                    runId={runContinuation.run.id}
+                    streamKey={runContinuation.streamKey}
+                    initialDraft={runContinuation.draft}
+                    onDraftAdopted={() => clearContinuationDraft(runContinuation.run.id)}
+                />
+            </div>
+        )
+    }
+
+    // Optimistic-create handoff: render the run immediately on the seeded stream, bypassing the runs-list
+    // load (no skeleton re-flash). `selectedRunId ?? optimisticRunId` tracks the live id — the created run
+    // up front, then `selectedRunId` once the runs list resolves it (same id), then any later new run.
+    const effectiveRunId = selectedRunId ?? optimisticRunId
+    if (optimisticStreamKey && effectiveRunId) {
+        return (
+            <div className="flex-1 min-h-0">
+                <TaskRunChat
+                    taskId={taskId}
+                    runId={effectiveRunId}
+                    streamKey={optimisticStreamKey}
+                    interactionKey={effectiveRunId === optimisticRunId ? interactionKey : undefined}
+                    autoFocus={effectiveRunId === optimisticRunId && autoFocus}
+                />
+            </div>
+        )
+    }
+
+    if (runsError) {
+        return (
+            <TaskErrorBanner
+                title="We couldn't load this task's runs."
+                message={runsError}
+                onRetry={loadTaskRuns}
+                dataAttr="task-runs-load-error"
+            />
+        )
+    }
+    if (selectedRunError) {
+        return (
+            <TaskErrorBanner
+                title="We couldn't load this task's runs."
+                message={selectedRunError}
+                onRetry={loadSelectedTaskRun}
+                dataAttr="task-runs-load-error"
+            />
+        )
+    }
+    if (selectedRunNotFound) {
+        return <NotFound object="task run" className="m-0 py-8" />
+    }
+    if (isRunPending || isTaskPending) {
+        return <TaskRunLoadingSkeleton />
+    }
+    if (runs.length === 0 && !selectedRunId) {
+        if (skin === 'quill') {
+            return <QuillTaskNotRunEmpty taskId={taskId} />
+        }
+        return (
+            <div className="text-center py-16">
+                <p className="text-muted">This task hasn't been run yet</p>
+            </div>
+        )
+    }
+    if (selectedRun) {
+        // The viewer owns scroll edge-to-edge; this box just bounds the height. No `overflow-hidden`/negative
+        // margins — content is kept off the scrollbar via the viewer's `threadRowClassName`, not by clipping here.
+        return (
+            <div className="flex-1 min-h-0">
+                <TaskRunChat taskId={taskId} runId={selectedRun.id} />
+            </div>
+        )
+    }
+    return selectedRunId ? <TaskRunLoadingSkeleton /> : null
+}

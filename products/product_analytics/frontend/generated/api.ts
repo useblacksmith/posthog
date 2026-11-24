@@ -1,0 +1,1239 @@
+import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * To modify these types, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+import type {
+    ActivityLogPaginatedResponseApi,
+    BulkUpdateTagsRequestApi,
+    BulkUpdateTagsResponseApi,
+    ChartExplanationApi,
+    ColumnConfigurationApi,
+    ColumnConfigurationsListParams,
+    ElementApi,
+    ElementStatsResponseApi,
+    ElementValueApi,
+    ElementsListParams,
+    ElementsStatsRetrieveParams,
+    ElementsValuesListParams,
+    EventsDeletedApi,
+    EventsRetentionApi,
+    EventsRetentionDeletionCountParams,
+    EventsRetentionUpdateApi,
+    InsightApi,
+    InsightBulkDeleteRequestApi,
+    InsightBulkDeleteResponseApi,
+    InsightBulkRestoreResponseApi,
+    InsightBulkSetTestAccountFilterRequestApi,
+    InsightBulkSetTestAccountFilterResponseApi,
+    InsightDataChecksApi,
+    InsightDataChecksRequestApi,
+    InsightExplanationCreateApi,
+    InsightViewedRequestApi,
+    InsightsActivityRetrieveParams,
+    InsightsAllActivityRetrieveParams,
+    InsightsBulkDeleteCreateParams,
+    InsightsBulkRestoreCreateParams,
+    InsightsBulkSetTestAccountFilterCreateParams,
+    InsightsBulkUpdateTagsCreateParams,
+    InsightsCancelCreateParams,
+    InsightsCreateParams,
+    InsightsDataChecksCreateParams,
+    InsightsDataChecksRetrieveParams,
+    InsightsDestroyParams,
+    InsightsGenerateMetadataCreateParams,
+    InsightsListParams,
+    InsightsMyLastViewedRetrieveParams,
+    InsightsPartialUpdateParams,
+    InsightsRetrieveParams,
+    InsightsTrendingRetrieveParams,
+    InsightsUpdateParams,
+    InsightsViewedCreateParams,
+    OrganizationEventsRetentionApi,
+    OrganizationEventsRetentionDeletionCountParams,
+    OrganizationEventsRetentionDowngradeDeletionCountParams,
+    PaginatedColumnConfigurationListApi,
+    PaginatedElementListApi,
+    PaginatedInsightListApi,
+    PaginatedTrendingInsightListApi,
+    PatchedColumnConfigurationApi,
+    PatchedElementApi,
+    PatchedInsightApi,
+    PathsV2SegmentToFunnelRequestApi,
+    PathsV2SegmentToFunnelResponseApi,
+} from './api.schemas'
+
+// https://stackoverflow.com/questions/49579094/typescript-conditional-types-filter-out-readonly-properties-pick-only-requir/49579497#49579497
+type IfEquals<X, Y, A = X, B = never> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2 ? A : B
+
+type WritableKeys<T> = {
+    [P in keyof T]-?: IfEquals<{ [Q in P]: T[P] }, { -readonly [Q in P]: T[P] }, P>
+}[keyof T]
+
+type UnionToIntersection<U> = (U extends any ? (k: U) => void : never) extends (k: infer I) => void ? I : never
+type DistributeReadOnlyOverUnions<T> = T extends any ? NonReadonly<T> : never
+
+type Writable<T> = Pick<T, WritableKeys<T>>
+type NonReadonly<T> = [T] extends [UnionToIntersection<T>]
+    ? {
+          [P in keyof Writable<T>]: T[P] extends object ? NonReadonly<NonNullable<T[P]>> : T[P]
+      }
+    : DistributeReadOnlyOverUnions<T>
+
+export const getOrganizationEventsRetentionRetrieveUrl = (organizationId: string) => {
+    return `/api/organizations/${organizationId}/events_retention_setting/`
+}
+
+/**
+ * Returns the events retention period that every project without its own period uses, the default period while none is set, and the periods an organization admin can set.
+ * @summary Get the organization's events retention period
+ */
+export const organizationEventsRetentionRetrieve = async (
+    organizationId: string,
+    options?: RequestInit
+): Promise<OrganizationEventsRetentionApi> => {
+    return apiMutator<OrganizationEventsRetentionApi>(getOrganizationEventsRetentionRetrieveUrl(organizationId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getOrganizationEventsRetentionUpdateUrl = (organizationId: string) => {
+    return `/api/organizations/${organizationId}/events_retention_setting/`
+}
+
+/**
+ * Sets how long every project without its own period keeps events. The period has to be one of retention_months_choices. Older events are deleted at the next monthly cleanup and can't be restored. Organization admins only.
+ * @summary Set the organization's events retention period
+ */
+export const organizationEventsRetentionUpdate = async (
+    organizationId: string,
+    eventsRetentionUpdateApi: EventsRetentionUpdateApi,
+    options?: RequestInit
+): Promise<OrganizationEventsRetentionApi> => {
+    return apiMutator<OrganizationEventsRetentionApi>(getOrganizationEventsRetentionUpdateUrl(organizationId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(eventsRetentionUpdateApi),
+    })
+}
+
+export const getOrganizationEventsRetentionDeletionCountUrl = (
+    organizationId: string,
+    params: OrganizationEventsRetentionDeletionCountParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/organizations/${organizationId}/events_retention_setting/deletion_count/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/events_retention_setting/deletion_count/`
+}
+
+/**
+ * Counts the events that the next monthly cleanup deletes if the organization keeps events for retention_months, summed over the projects without their own period. Organization admins only.
+ * @summary Count the events the organization's period would delete
+ */
+export const organizationEventsRetentionDeletionCount = async (
+    organizationId: string,
+    params: OrganizationEventsRetentionDeletionCountParams,
+    options?: RequestInit
+): Promise<EventsDeletedApi> => {
+    return apiMutator<EventsDeletedApi>(getOrganizationEventsRetentionDeletionCountUrl(organizationId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getOrganizationEventsRetentionDowngradeDeletionCountUrl = (
+    organizationId: string,
+    params: OrganizationEventsRetentionDowngradeDeletionCountParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/organizations/${organizationId}/events_retention_setting/downgrade_deletion_count/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/events_retention_setting/downgrade_deletion_count/`
+}
+
+/**
+ * Counts the events that the deletion pass after a plan downgrade deletes if the organization's events retention drops to retention_months, whether or not deletion is rolled out to the organization yet. Sums the projects whose period is longer than retention_months. Organization admins only.
+ * @summary Count the events a downgrade to a shorter period would delete
+ */
+export const organizationEventsRetentionDowngradeDeletionCount = async (
+    organizationId: string,
+    params: OrganizationEventsRetentionDowngradeDeletionCountParams,
+    options?: RequestInit
+): Promise<EventsDeletedApi> => {
+    return apiMutator<EventsDeletedApi>(
+        getOrganizationEventsRetentionDowngradeDeletionCountUrl(organizationId, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getColumnConfigurationsListUrl = (projectId: string, params?: ColumnConfigurationsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/column_configurations/?${stringifiedParams}`
+        : `/api/projects/${projectId}/column_configurations/`
+}
+
+export const columnConfigurationsList = async (
+    projectId: string,
+    params?: ColumnConfigurationsListParams,
+    options?: RequestInit
+): Promise<PaginatedColumnConfigurationListApi> => {
+    return apiMutator<PaginatedColumnConfigurationListApi>(getColumnConfigurationsListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getColumnConfigurationsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/column_configurations/`
+}
+
+export const columnConfigurationsCreate = async (
+    projectId: string,
+    columnConfigurationApi: NonReadonly<ColumnConfigurationApi>,
+    options?: RequestInit
+): Promise<ColumnConfigurationApi> => {
+    return apiMutator<ColumnConfigurationApi>(getColumnConfigurationsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(columnConfigurationApi),
+    })
+}
+
+export const getColumnConfigurationsRetrieveUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/column_configurations/${id}/`
+}
+
+export const columnConfigurationsRetrieve = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<ColumnConfigurationApi> => {
+    return apiMutator<ColumnConfigurationApi>(getColumnConfigurationsRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getColumnConfigurationsUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/column_configurations/${id}/`
+}
+
+export const columnConfigurationsUpdate = async (
+    projectId: string,
+    id: string,
+    columnConfigurationApi: NonReadonly<ColumnConfigurationApi>,
+    options?: RequestInit
+): Promise<ColumnConfigurationApi> => {
+    return apiMutator<ColumnConfigurationApi>(getColumnConfigurationsUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(columnConfigurationApi),
+    })
+}
+
+export const getColumnConfigurationsPartialUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/column_configurations/${id}/`
+}
+
+export const columnConfigurationsPartialUpdate = async (
+    projectId: string,
+    id: string,
+    patchedColumnConfigurationApi?: NonReadonly<PatchedColumnConfigurationApi>,
+    options?: RequestInit
+): Promise<ColumnConfigurationApi> => {
+    return apiMutator<ColumnConfigurationApi>(getColumnConfigurationsPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedColumnConfigurationApi),
+    })
+}
+
+export const getColumnConfigurationsDestroyUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/column_configurations/${id}/`
+}
+
+export const columnConfigurationsDestroy = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getColumnConfigurationsDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getElementsListUrl = (projectId: string, params?: ElementsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/elements/?${stringifiedParams}`
+        : `/api/projects/${projectId}/elements/`
+}
+
+export const elementsList = async (
+    projectId: string,
+    params?: ElementsListParams,
+    options?: RequestInit
+): Promise<PaginatedElementListApi> => {
+    return apiMutator<PaginatedElementListApi>(getElementsListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getElementsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/elements/`
+}
+
+export const elementsCreate = async (
+    projectId: string,
+    elementApi?: ElementApi,
+    options?: RequestInit
+): Promise<ElementApi> => {
+    return apiMutator<ElementApi>(getElementsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(elementApi),
+    })
+}
+
+export const getElementsRetrieveUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/elements/${id}/`
+}
+
+export const elementsRetrieve = async (projectId: string, id: number, options?: RequestInit): Promise<ElementApi> => {
+    return apiMutator<ElementApi>(getElementsRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getElementsUpdateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/elements/${id}/`
+}
+
+export const elementsUpdate = async (
+    projectId: string,
+    id: number,
+    elementApi?: ElementApi,
+    options?: RequestInit
+): Promise<ElementApi> => {
+    return apiMutator<ElementApi>(getElementsUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(elementApi),
+    })
+}
+
+export const getElementsPartialUpdateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/elements/${id}/`
+}
+
+export const elementsPartialUpdate = async (
+    projectId: string,
+    id: number,
+    patchedElementApi?: PatchedElementApi,
+    options?: RequestInit
+): Promise<ElementApi> => {
+    return apiMutator<ElementApi>(getElementsPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedElementApi),
+    })
+}
+
+export const getElementsDestroyUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/elements/${id}/`
+}
+
+export const elementsDestroy = async (projectId: string, id: number, options?: RequestInit): Promise<void> => {
+    return apiMutator<void>(getElementsDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getElementsStatsRetrieveUrl = (projectId: string, params?: ElementsStatsRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/elements/stats/?${stringifiedParams}`
+        : `/api/projects/${projectId}/elements/stats/`
+}
+
+/**
+ * Counts of $autocapture, $rageclick, and $dead_click events grouped by the element chain
+ * they occurred on, ordered by count. Defaults to all three event types; narrow with the
+ * include parameter.
+ */
+export const elementsStatsRetrieve = async (
+    projectId: string,
+    params?: ElementsStatsRetrieveParams,
+    options?: RequestInit
+): Promise<ElementStatsResponseApi> => {
+    return apiMutator<ElementStatsResponseApi>(getElementsStatsRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getElementsValuesListUrl = (projectId: string, params: ElementsValuesListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/elements/values/?${stringifiedParams}`
+        : `/api/projects/${projectId}/elements/values/`
+}
+
+export const elementsValuesList = async (
+    projectId: string,
+    params: ElementsValuesListParams,
+    options?: RequestInit
+): Promise<ElementValueApi[]> => {
+    return apiMutator<ElementValueApi[]>(getElementsValuesListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getEventsRetentionRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/events_retention/`
+}
+
+/**
+ * Returns how far back events stay queryable for this project, the periods set for the project and its organization, the periods an admin can set, and the project's next deletion. Both queryable period fields are null while no retention period applies to the project.
+ * @summary Get the events retention period for a project
+ */
+export const eventsRetentionRetrieve = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<EventsRetentionApi> => {
+    return apiMutator<EventsRetentionApi>(getEventsRetentionRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getEventsRetentionUpdateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/events_retention/`
+}
+
+/**
+ * Sets how long this project keeps events, overriding the organization's period. The period has to be one of retention_months_choices. Older events are deleted at the next monthly cleanup and can't be restored. Organization admins only.
+ * @summary Set the events retention period for a project
+ */
+export const eventsRetentionUpdate = async (
+    projectId: string,
+    eventsRetentionUpdateApi: EventsRetentionUpdateApi,
+    options?: RequestInit
+): Promise<EventsRetentionApi> => {
+    return apiMutator<EventsRetentionApi>(getEventsRetentionUpdateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(eventsRetentionUpdateApi),
+    })
+}
+
+export const getEventsRetentionDeletionCountUrl = (projectId: string, params: EventsRetentionDeletionCountParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/events_retention/deletion_count/?${stringifiedParams}`
+        : `/api/projects/${projectId}/events_retention/deletion_count/`
+}
+
+/**
+ * Counts the project's events that the next monthly cleanup deletes if the project keeps events for retention_months. Organization admins only.
+ * @summary Count the events a project's period would delete
+ */
+export const eventsRetentionDeletionCount = async (
+    projectId: string,
+    params: EventsRetentionDeletionCountParams,
+    options?: RequestInit
+): Promise<EventsDeletedApi> => {
+    return apiMutator<EventsDeletedApi>(getEventsRetentionDeletionCountUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsListUrl = (projectId: string, params?: InsightsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/`
+}
+
+export const insightsList = async (
+    projectId: string,
+    params?: InsightsListParams,
+    options?: RequestInit
+): Promise<PaginatedInsightListApi> => {
+    return apiMutator<PaginatedInsightListApi>(getInsightsListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsCreateUrl = (projectId: string, params?: InsightsCreateParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/`
+}
+
+export const insightsCreate = async (
+    projectId: string,
+    insightApi?: NonReadonly<InsightApi>,
+    params?: InsightsCreateParams,
+    options?: RequestInit
+): Promise<InsightApi> => {
+    return apiMutator<InsightApi>(getInsightsCreateUrl(projectId, params), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightApi),
+    })
+}
+
+export const getInsightsExplanationsCreateUrl = (projectId: string, insightId: number) => {
+    return `/api/projects/${projectId}/insights/${insightId}/explanations/`
+}
+
+export const insightsExplanationsCreate = async (
+    projectId: string,
+    insightId: number,
+    insightExplanationCreateApi: InsightExplanationCreateApi,
+    options?: RequestInit
+): Promise<ChartExplanationApi> => {
+    return apiMutator<ChartExplanationApi>(getInsightsExplanationsCreateUrl(projectId, insightId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightExplanationCreateApi),
+    })
+}
+
+export const getInsightsExplanationsRetrieveUrl = (projectId: string, insightId: number, id: string) => {
+    return `/api/projects/${projectId}/insights/${insightId}/explanations/${id}/`
+}
+
+export const insightsExplanationsRetrieve = async (
+    projectId: string,
+    insightId: number,
+    id: string,
+    options?: RequestInit
+): Promise<ChartExplanationApi> => {
+    return apiMutator<ChartExplanationApi>(getInsightsExplanationsRetrieveUrl(projectId, insightId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsExplanationsUpdateUrl = (projectId: string, insightId: number, id: string) => {
+    return `/api/projects/${projectId}/insights/${insightId}/explanations/${id}/`
+}
+
+export const insightsExplanationsUpdate = async (
+    projectId: string,
+    insightId: number,
+    id: string,
+    insightExplanationCreateApi: InsightExplanationCreateApi,
+    options?: RequestInit
+): Promise<ChartExplanationApi> => {
+    return apiMutator<ChartExplanationApi>(getInsightsExplanationsUpdateUrl(projectId, insightId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightExplanationCreateApi),
+    })
+}
+
+export const getInsightsRetrieveUrl = (projectId: string, id: number | string, params?: InsightsRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/${id}/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/${id}/`
+}
+
+export const insightsRetrieve = async (
+    projectId: string,
+    id: number | string,
+    params?: InsightsRetrieveParams,
+    options?: RequestInit
+): Promise<InsightApi> => {
+    return apiMutator<InsightApi>(getInsightsRetrieveUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsUpdateUrl = (projectId: string, id: number | string, params?: InsightsUpdateParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/${id}/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/${id}/`
+}
+
+export const insightsUpdate = async (
+    projectId: string,
+    id: number | string,
+    insightApi?: NonReadonly<InsightApi>,
+    params?: InsightsUpdateParams,
+    options?: RequestInit
+): Promise<InsightApi> => {
+    return apiMutator<InsightApi>(getInsightsUpdateUrl(projectId, id, params), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightApi),
+    })
+}
+
+export const getInsightsPartialUpdateUrl = (
+    projectId: string,
+    id: number | string,
+    params?: InsightsPartialUpdateParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/${id}/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/${id}/`
+}
+
+export const insightsPartialUpdate = async (
+    projectId: string,
+    id: number | string,
+    patchedInsightApi?: NonReadonly<PatchedInsightApi>,
+    params?: InsightsPartialUpdateParams,
+    options?: RequestInit
+): Promise<InsightApi> => {
+    return apiMutator<InsightApi>(getInsightsPartialUpdateUrl(projectId, id, params), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedInsightApi),
+    })
+}
+
+export const getInsightsDestroyUrl = (projectId: string, id: number | string, params?: InsightsDestroyParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/${id}/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/${id}/`
+}
+
+/**
+ * Hard delete of this model is not allowed. Use a patch API call to set "deleted" to true
+ */
+export const insightsDestroy = async (
+    projectId: string,
+    id: number | string,
+    params?: InsightsDestroyParams,
+    options?: RequestInit
+): Promise<unknown> => {
+    return apiMutator<unknown>(getInsightsDestroyUrl(projectId, id, params), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getInsightsActivityRetrieveUrl = (
+    projectId: string,
+    id: number,
+    params?: InsightsActivityRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/${id}/activity/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/${id}/activity/`
+}
+
+/**
+ * Audit trail for a single insight — every change made to it, by whom, and when. Use this when you want the change history of a specific insight; use the project-wide activity endpoint for a broader view.
+ */
+export const insightsActivityRetrieve = async (
+    projectId: string,
+    id: number,
+    params?: InsightsActivityRetrieveParams,
+    options?: RequestInit
+): Promise<ActivityLogPaginatedResponseApi> => {
+    return apiMutator<ActivityLogPaginatedResponseApi>(getInsightsActivityRetrieveUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsDataChecksRetrieveUrl = (
+    projectId: string,
+    id: number | string,
+    params?: InsightsDataChecksRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/${id}/data_checks/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/${id}/data_checks/`
+}
+
+/**
+ * Run the data checks on a saved insight, found by its numeric id or its `short_id`. The checks read the query the insight stores, and work the same way as the checks on a query that is not saved. The `status` is `unsupported` for an insight that still stores legacy `filters` and no query. Nothing is stored.
+ */
+export const insightsDataChecksRetrieve = async (
+    projectId: string,
+    id: number | string,
+    params?: InsightsDataChecksRetrieveParams,
+    options?: RequestInit
+): Promise<InsightDataChecksApi> => {
+    return apiMutator<InsightDataChecksApi>(getInsightsDataChecksRetrieveUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsAllActivityRetrieveUrl = (projectId: string, params?: InsightsAllActivityRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/activity/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/activity/`
+}
+
+/**
+ * Project-wide audit trail across all insights — who created, edited, deleted, or restored insights, what changed (with before/after diffs), and when. Useful for surfacing what people (or agents) have been working on recently.
+ */
+export const insightsAllActivityRetrieve = async (
+    projectId: string,
+    params?: InsightsAllActivityRetrieveParams,
+    options?: RequestInit
+): Promise<ActivityLogPaginatedResponseApi> => {
+    return apiMutator<ActivityLogPaginatedResponseApi>(getInsightsAllActivityRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsBulkDeleteCreateUrl = (projectId: string, params?: InsightsBulkDeleteCreateParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/bulk_delete/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/bulk_delete/`
+}
+
+/**
+ * Soft-delete insights in bulk by ID. Mirrors the single-insight delete: sets deleted=True, soft-deletes the insights' dashboard tiles, and removes their linked alerts. Insights the requester cannot edit are skipped and reported in `skipped`. Reversible via the bulk_restore endpoint.
+ */
+export const insightsBulkDeleteCreate = async (
+    projectId: string,
+    insightBulkDeleteRequestApi: InsightBulkDeleteRequestApi,
+    params?: InsightsBulkDeleteCreateParams,
+    options?: RequestInit
+): Promise<InsightBulkDeleteResponseApi> => {
+    return apiMutator<InsightBulkDeleteResponseApi>(getInsightsBulkDeleteCreateUrl(projectId, params), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightBulkDeleteRequestApi),
+    })
+}
+
+export const getInsightsBulkRestoreCreateUrl = (projectId: string, params?: InsightsBulkRestoreCreateParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/bulk_restore/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/bulk_restore/`
+}
+
+/**
+ * Restore soft-deleted insights in bulk by ID — the inverse of bulk_delete. Sets deleted=False and re-activates the insights' dashboard tiles on dashboards that still exist. Linked alerts are not restored (they are removed on delete). Insights the requester cannot edit are reported in `skipped`.
+ */
+export const insightsBulkRestoreCreate = async (
+    projectId: string,
+    insightBulkDeleteRequestApi: InsightBulkDeleteRequestApi,
+    params?: InsightsBulkRestoreCreateParams,
+    options?: RequestInit
+): Promise<InsightBulkRestoreResponseApi> => {
+    return apiMutator<InsightBulkRestoreResponseApi>(getInsightsBulkRestoreCreateUrl(projectId, params), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightBulkDeleteRequestApi),
+    })
+}
+
+export const getInsightsBulkSetTestAccountFilterCreateUrl = (
+    projectId: string,
+    params?: InsightsBulkSetTestAccountFilterCreateParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/bulk_set_test_account_filter/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/bulk_set_test_account_filter/`
+}
+
+/**
+ * Turn 'filter out internal and test users' on or off for every existing insight in the project. Requires project admin, matching the settings UI that fronts it. The setting of the same name only decides the default for new insights; this applies it to the insights that already exist. Only insights that store a query are changed; insights still holding legacy `filters` are counted in `legacy` and left as they are. Insights with nowhere to put the toggle, such as SQL insights, are left alone, as are insights the requester cannot edit. Dashboards follow their insights unless the dashboard sets its own override. Insights are updated in batches, so a failure part way through leaves the finished batches applied. Retrying is safe and picks up the rest.
+ */
+export const insightsBulkSetTestAccountFilterCreate = async (
+    projectId: string,
+    insightBulkSetTestAccountFilterRequestApi: InsightBulkSetTestAccountFilterRequestApi,
+    params?: InsightsBulkSetTestAccountFilterCreateParams,
+    options?: RequestInit
+): Promise<InsightBulkSetTestAccountFilterResponseApi> => {
+    return apiMutator<InsightBulkSetTestAccountFilterResponseApi>(
+        getInsightsBulkSetTestAccountFilterCreateUrl(projectId, params),
+        {
+            ...options,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(insightBulkSetTestAccountFilterRequestApi),
+        }
+    )
+}
+
+export const getInsightsBulkUpdateTagsCreateUrl = (projectId: string, params?: InsightsBulkUpdateTagsCreateParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/bulk_update_tags/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/bulk_update_tags/`
+}
+
+/**
+ * Bulk update tags on multiple objects.
+ *
+ * PAT access: this action has no ``required_scopes=`` on the decorator —
+ * inheriting viewsets must add ``"bulk_update_tags"`` to their
+ * ``scope_object_write_actions`` list to accept personal API keys.
+ * Without that opt-in, ``APIScopePermission`` rejects PAT requests with
+ * "This action does not support personal API key access". Done per-viewset
+ * so granting ``<scope>:write`` for one resource doesn't leak access to
+ * sibling resources that share this mixin.
+ *
+ * Accepts:
+ * - {"ids": [...], "action": "add"|"remove"|"set", "tags": ["tag1", "tag2"]}
+ *
+ * Actions:
+ * - "add": Add tags to existing tags on each object
+ * - "remove": Remove specific tags from each object
+ * - "set": Replace all tags on each object with the provided list
+ */
+export const insightsBulkUpdateTagsCreate = async (
+    projectId: string,
+    bulkUpdateTagsRequestApi: BulkUpdateTagsRequestApi,
+    params?: InsightsBulkUpdateTagsCreateParams,
+    options?: RequestInit
+): Promise<BulkUpdateTagsResponseApi> => {
+    return apiMutator<BulkUpdateTagsResponseApi>(getInsightsBulkUpdateTagsCreateUrl(projectId, params), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(bulkUpdateTagsRequestApi),
+    })
+}
+
+export const getInsightsCancelCreateUrl = (projectId: string, params?: InsightsCancelCreateParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/cancel/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/cancel/`
+}
+
+export const insightsCancelCreate = async (
+    projectId: string,
+    insightApi?: NonReadonly<InsightApi>,
+    params?: InsightsCancelCreateParams,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getInsightsCancelCreateUrl(projectId, params), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightApi),
+    })
+}
+
+export const getInsightsDataChecksCreateUrl = (projectId: string, params?: InsightsDataChecksCreateParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/data_checks/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/data_checks/`
+}
+
+/**
+ * Check the events behind an insight for the common ways they mislead: internal and test users, local development traffic, bots and crawlers, and events sent twice. Works for trends, funnels, stickiness and lifecycle insights whose series are events. The checks apply the insight's own filters, and read the newest days of its date range, up to 7. The bot and duplicate checks read a sample of those days. For a token, the internal users check matches the emails of the organization's members only with the `organization_member:read` scope, and its verified domains only with `organization:read`. It names the emails it finds only with `person:read`. Nothing is stored. This route runs the query it is sent, so it needs query access as well as insight access. To check a saved insight by its id, send a GET request to `insights/{id}/data_checks/`.
+ */
+export const insightsDataChecksCreate = async (
+    projectId: string,
+    insightDataChecksRequestApi: InsightDataChecksRequestApi,
+    params?: InsightsDataChecksCreateParams,
+    options?: RequestInit
+): Promise<InsightDataChecksApi> => {
+    return apiMutator<InsightDataChecksApi>(getInsightsDataChecksCreateUrl(projectId, params), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightDataChecksRequestApi),
+    })
+}
+
+export const getInsightsGenerateMetadataCreateUrl = (
+    projectId: string,
+    params?: InsightsGenerateMetadataCreateParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/generate_metadata/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/generate_metadata/`
+}
+
+/**
+ * Generate an AI-suggested name and description for an insight based on its query configuration.
+ */
+export const insightsGenerateMetadataCreate = async (
+    projectId: string,
+    insightApi?: NonReadonly<InsightApi>,
+    params?: InsightsGenerateMetadataCreateParams,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getInsightsGenerateMetadataCreateUrl(projectId, params), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightApi),
+    })
+}
+
+export const getInsightsMyLastViewedRetrieveUrl = (projectId: string, params?: InsightsMyLastViewedRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/my_last_viewed/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/my_last_viewed/`
+}
+
+/**
+ * Returns basic details about the last 5 insights viewed by this user. Most recently viewed first.
+ */
+export const insightsMyLastViewedRetrieve = async (
+    projectId: string,
+    params?: InsightsMyLastViewedRetrieveParams,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getInsightsMyLastViewedRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsTrendingRetrieveUrl = (projectId: string, params?: InsightsTrendingRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/trending/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/trending/`
+}
+
+/**
+ * Returns insights ranked by view count over the last N days (default 7), highest first. Each result includes the same metadata as the standard insights list, plus a `view_count` and up to 3 recent `viewers`. Useful for surfacing the most-used insights in a project.
+ */
+export const insightsTrendingRetrieve = async (
+    projectId: string,
+    params?: InsightsTrendingRetrieveParams,
+    options?: RequestInit
+): Promise<PaginatedTrendingInsightListApi> => {
+    return apiMutator<PaginatedTrendingInsightListApi>(getInsightsTrendingRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getInsightsViewedCreateUrl = (projectId: string, params?: InsightsViewedCreateParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/insights/viewed/?${stringifiedParams}`
+        : `/api/projects/${projectId}/insights/viewed/`
+}
+
+/**
+ * Record that the current user has just viewed one or more insights. Submitted ids that do not belong to the current project or that point at deleted insights are silently dropped, as are views from impersonated staff-support sessions. Returns 201 on success regardless of how many ids were retained.
+ */
+export const insightsViewedCreate = async (
+    projectId: string,
+    insightViewedRequestApi: InsightViewedRequestApi,
+    params?: InsightsViewedCreateParams,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getInsightsViewedCreateUrl(projectId, params), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(insightViewedRequestApi),
+    })
+}
+
+export const getPathsV2SegmentToFunnelCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/paths_v2/segment_to_funnel/`
+}
+
+/**
+ * Converts a displayed journeys segment into the funnel query that reproduces its unique-actor count exactly. In open mode only a single edge converts (a two-step funnel with the inactivity gap as conversion window); in anchored mode any anchor-rooted chain converts (window W). The funnel is returned as JSON and is not executed or persisted here.
+ * @summary Convert a journey segment to a funnel
+ */
+export const pathsV2SegmentToFunnelCreate = async (
+    projectId: string,
+    pathsV2SegmentToFunnelRequestApi: PathsV2SegmentToFunnelRequestApi,
+    options?: RequestInit
+): Promise<PathsV2SegmentToFunnelResponseApi> => {
+    return apiMutator<PathsV2SegmentToFunnelResponseApi>(getPathsV2SegmentToFunnelCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(pathsV2SegmentToFunnelRequestApi),
+    })
+}

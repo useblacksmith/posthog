@@ -1,0 +1,691 @@
+from datetime import datetime
+from typing import cast
+
+from posthog.test.base import BaseTest
+from unittest.mock import Mock, patch
+
+from django.core.exceptions import ValidationError
+from django.test import SimpleTestCase
+
+from parameterized import parameterized
+
+from posthog.schema import DateRange, MarketingAnalyticsDrillDownLevel, NativeMarketingSource
+
+from posthog.hogql_queries.utils.query_date_range import QueryDateRange
+from posthog.models.team.team import DEFAULT_CURRENCY, Team
+
+from products.marketing_analytics.backend.hogql_queries.adapters.base import (
+    BingAdsConfig,
+    GoogleAdsConfig,
+    HierarchicalNativeAdsConfig,
+    LinkedinAdsConfig,
+    MetaAdsConfig,
+    PinterestAdsConfig,
+    QueryContext,
+    RedditAdsConfig,
+    SnapchatAdsConfig,
+    TikTokAdsConfig,
+)
+from products.marketing_analytics.backend.hogql_queries.adapters.factory import MarketingSourceFactory
+from products.marketing_analytics.backend.hogql_queries.adapters.file_source import FileSourceAdapter
+from products.marketing_analytics.backend.hogql_queries.adapters.meta_ads import MetaAdsAdapter
+from products.marketing_analytics.backend.hogql_queries.adapters.self_managed import (
+    AWSAdapter,
+    AzureAdapter,
+    CloudflareR2Adapter,
+    GoogleCloudAdapter,
+    SelfManagedAdapter,
+)
+from products.marketing_analytics.backend.hogql_queries.constants import TABLE_PATTERNS
+from products.warehouse_sources.backend.facade.models import (
+    DataWarehouseCredential,
+    DataWarehouseTable,
+    ExternalDataSchema,
+    ExternalDataSource,
+)
+
+
+class FactoryTestMixin:
+    team: Team
+
+    def _make_factory(self) -> MarketingSourceFactory:
+        date_range = QueryDateRange(
+            date_range=DateRange(date_from="2024-01-01", date_to="2024-01-31"),
+            team=self.team,
+            interval=None,
+            now=datetime.now(),
+        )
+        context = QueryContext(date_range=date_range, team=self.team, base_currency=DEFAULT_CURRENCY)
+        return MarketingSourceFactory(context=context)
+
+
+class TestMarketingSourceFactoryCustomSourceMappings(BaseTest):
+    """Test suite for MarketingSourceFactory custom source mapping functionality"""
+
+    def setUp(self):
+        super().setUp()
+        self.config = self.team.marketing_analytics_config
+
+    def test_get_all_source_identifier_mappings_without_team_config(self):
+        """Test that factory returns only adapter defaults when no team config provided"""
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings()
+
+        assert "google" in mappings
+        assert "youtube" in mappings["google"]
+        assert "adwords" in mappings["google"]
+        assert "meta" in mappings or "facebook" in mappings
+
+    def test_get_all_source_identifier_mappings_with_empty_custom_mappings(self):
+        """Test that factory handles empty custom_source_mappings correctly"""
+        self.config.custom_source_mappings = {}
+        self.config.save()
+
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings(team_config=self.config)
+
+        assert "google" in mappings
+        assert "youtube" in mappings["google"]
+
+    def test_get_all_source_identifier_mappings_merges_custom_sources_googleads(self):
+        """Test that custom sources for GoogleAds are merged with adapter defaults"""
+        self.config.custom_source_mappings = {"GoogleAds": ["partner_a", "custom_source_1"]}
+        self.config.save()
+
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings(team_config=self.config)
+
+        assert "google" in mappings
+        assert "partner_a" in mappings["google"]
+        assert "custom_source_1" in mappings["google"]
+
+    def test_get_all_source_identifier_mappings_merges_custom_sources_metaads(self):
+        """Test that custom sources for MetaAds are merged with adapter defaults"""
+        self.config.custom_source_mappings = {"MetaAds": ["influencer_campaign"]}
+        self.config.save()
+
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings(team_config=self.config)
+
+        assert "meta" in mappings or "facebook" in mappings
+        primary_meta_key = "meta" if "meta" in mappings else "facebook"
+        assert "influencer_campaign" in mappings[primary_meta_key]
+
+    def test_get_all_source_identifier_mappings_merges_custom_sources_tiktokads(self):
+        """Test that custom sources for TikTokAds are merged with adapter defaults"""
+        self.config.custom_source_mappings = {"TikTokAds": ["tiktok_partner"]}
+        self.config.save()
+
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings(team_config=self.config)
+
+        assert "tiktok" in mappings
+        assert "tiktok_partner" in mappings["tiktok"]
+
+    def test_get_all_source_identifier_mappings_merges_custom_sources_linkedinads(self):
+        """Test that custom sources for LinkedinAds are merged with adapter defaults"""
+        self.config.custom_source_mappings = {"LinkedinAds": ["linkedin_custom"]}
+        self.config.save()
+
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings(team_config=self.config)
+
+        assert "linkedin" in mappings
+        assert "linkedin_custom" in mappings["linkedin"]
+
+    def test_get_all_source_identifier_mappings_preserves_adapter_defaults(self):
+        """Test that custom sources don't replace adapter defaults, only extend them"""
+        self.config.custom_source_mappings = {"GoogleAds": ["partner_a"]}
+        self.config.save()
+
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings(team_config=self.config)
+
+        assert "google" in mappings
+        assert "youtube" in mappings["google"]
+        assert "adwords" in mappings["google"]
+        assert "partner_a" in mappings["google"]
+
+    def test_get_all_source_identifier_mappings_multiple_integrations(self):
+        """Test that custom sources work for multiple integrations simultaneously"""
+        self.config.custom_source_mappings = {
+            "GoogleAds": ["google_partner_a", "google_partner_b"],
+            "MetaAds": ["meta_influencer_x"],
+            "TikTokAds": ["tiktok_custom"],
+        }
+        self.config.save()
+
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings(team_config=self.config)
+
+        assert "google_partner_a" in mappings["google"]
+        assert "google_partner_b" in mappings["google"]
+        assert "meta_influencer_x" in mappings.get("meta", mappings.get("facebook", []))
+        assert "tiktok_custom" in mappings["tiktok"]
+
+    def test_get_all_source_identifier_mappings_invalid_integration_type(self):
+        """Test that invalid integration types are silently ignored"""
+        self.config.custom_source_mappings = {
+            "GoogleAds": ["partner_a"],
+            "InvalidIntegration": ["should_be_ignored"],
+        }
+        self.config.save()
+
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings(team_config=self.config)
+
+        assert "partner_a" in mappings["google"]
+        assert "should_be_ignored" not in str(mappings)
+
+    def test_get_all_source_identifier_mappings_duplicate_sources_within_integration_rejected(self):
+        """Test that duplicate sources within same integration are rejected"""
+
+        with self.assertRaises(ValidationError) as cm:
+            self.config.custom_source_mappings = {
+                "GoogleAds": ["partner_a", "partner_a", "partner_b"],
+            }
+
+        assert "appears multiple times" in str(cm.exception)
+
+    def test_get_all_source_identifier_mappings_integration_without_source_mapping(self):
+        """Test that integrations without get_source_identifier_mapping are handled"""
+        self.config.custom_source_mappings = {
+            "BigQuery": ["custom_source"],
+        }
+        self.config.save()
+
+        mappings = MarketingSourceFactory.get_all_source_identifier_mappings(team_config=self.config)
+
+        assert "custom_source" not in str(mappings)
+
+
+class TestMetaAdsConfigDiscovery(FactoryTestMixin, BaseTest):
+    """Test suite for native config discovery of optional ad-group / ad tables.
+
+    The factory must correctly populate `adset_table` / `adset_stats_table` /
+    `ad_table` / `ad_stats_table` slots based on the user's synced schemas.
+    Missing optional tables → those slots stay None → adapter's `supports_level`
+    returns False at AD_GROUP / AD respectively.
+    """
+
+    def _make_table(self, schema_name: str) -> DataWarehouseTable:
+        """Build a DataWarehouseTable mock with name `metaads_<schema_name>`. The
+        factory's `_extract_schema_name` strips the `metaads_` prefix to get the
+        canonical schema name, which is what we match against MetaAdsResource.
+        """
+        table = Mock()
+        table.name = f"metaads_{schema_name}"
+        return cast(DataWarehouseTable, table)
+
+    def _make_source(self) -> Mock:
+        source = Mock()
+        source.id = "meta_source_id"
+        source.source_type = "MetaAds"
+        return source
+
+    def _create_meta_config(
+        self, factory: MarketingSourceFactory, tables: list[DataWarehouseTable]
+    ) -> MetaAdsConfig | None:
+        """Wrapper around the unified `_create_native_config` that pins the source-specific
+        params (NativeMarketingSource + config class) so the test bodies stay focused on
+        which warehouse tables are present."""
+        # `_create_native_config` is generic over the config subclass at runtime but its
+        # static return type is the common base; cast to narrow for the tests.
+        return cast(
+            MetaAdsConfig | None,
+            factory._create_native_config(self._make_source(), tables, NativeMarketingSource.META_ADS, MetaAdsConfig),
+        )
+
+    def test_meta_only_campaign_tables_yields_config_with_no_optional_tables(self):
+        """Bare-minimum sync (campaigns + campaign_stats) → adapter loads but
+        cannot serve AD_GROUP / AD."""
+        factory = self._make_factory()
+        tables = [self._make_table("campaigns"), self._make_table("campaign_stats")]
+
+        config = self._create_meta_config(factory, tables)
+
+        assert config is not None
+        assert config.campaign_table.name == "metaads_campaigns"
+        assert config.stats_table.name == "metaads_campaign_stats"
+        assert config.adset_table is None
+        assert config.adset_stats_table is None
+        assert config.ad_table is None
+        assert config.ad_stats_table is None
+
+    def test_meta_with_full_hierarchy_yields_all_six_tables(self):
+        """All Meta resources synced → all six slots populated → adapter supports
+        every drill-down level."""
+        factory = self._make_factory()
+        tables = [
+            self._make_table("campaigns"),
+            self._make_table("campaign_stats"),
+            self._make_table("adsets"),
+            self._make_table("adset_stats"),
+            self._make_table("ads"),
+            self._make_table("ad_stats"),
+        ]
+
+        config = self._create_meta_config(factory, tables)
+
+        assert config is not None
+        assert config.adset_table is not None and config.adset_table.name == "metaads_adsets"
+        assert config.adset_stats_table is not None and config.adset_stats_table.name == "metaads_adset_stats"
+        assert config.ad_table is not None and config.ad_table.name == "metaads_ads"
+        assert config.ad_stats_table is not None and config.ad_stats_table.name == "metaads_ad_stats"
+
+    def test_meta_with_only_adset_tables_supports_ad_group_but_not_ad(self):
+        """Partial hierarchy (adsets but no ads) → AD_GROUP works, AD doesn't."""
+        factory = self._make_factory()
+        tables = [
+            self._make_table("campaigns"),
+            self._make_table("campaign_stats"),
+            self._make_table("adsets"),
+            self._make_table("adset_stats"),
+        ]
+
+        config = self._create_meta_config(factory, tables)
+        assert config is not None
+        adapter = MetaAdsAdapter(config=config, context=factory.context)
+
+        assert adapter.supports_level(MarketingAnalyticsDrillDownLevel.CAMPAIGN)
+        assert adapter.supports_level(MarketingAnalyticsDrillDownLevel.AD_GROUP)
+        assert not adapter.supports_level(MarketingAnalyticsDrillDownLevel.AD)
+
+    def test_meta_without_required_campaign_tables_returns_none(self):
+        """Missing campaigns or campaign_stats → adapter can't load at all."""
+        factory = self._make_factory()
+        tables_no_stats = [self._make_table("campaigns")]
+        assert self._create_meta_config(factory, tables_no_stats) is None
+
+        tables_no_campaign = [self._make_table("campaign_stats")]
+        assert self._create_meta_config(factory, tables_no_campaign) is None
+
+
+class TestNativeHierarchicalConfigDiscovery(FactoryTestMixin, BaseTest):
+    """Verifies `_create_native_config` populates adset/ad slots for every native source
+    that has a hierarchy entry. Without this, a working sync looks dead in the UI: the
+    factory loads a campaign-only config and `supports_level(AD_GROUP/AD)` returns False.
+    """
+
+    # (source_type, NativeMarketingSource, ConfigClass, prefix, schema names per slot).
+    # The schemas mirror NATIVE_SOURCE_HIERARCHY_SCHEMA_NAMES + the source's stats keyword.
+    _FIXTURES = [
+        (
+            "GoogleAds",
+            NativeMarketingSource.GOOGLE_ADS,
+            GoogleAdsConfig,
+            "googleads",
+            {
+                "campaign": "campaign",
+                "stats": "campaign_overview_stats",
+                "adset": "ad_group",
+                "adset_stats": "ad_group_stats",
+                "ad": "ad",
+                "ad_stats": "ad_stats",
+            },
+        ),
+        (
+            "TikTokAds",
+            NativeMarketingSource.TIK_TOK_ADS,
+            TikTokAdsConfig,
+            "tiktokads",
+            {
+                "campaign": "campaigns",
+                "stats": "campaign_report",
+                "adset": "ad_groups",
+                "adset_stats": "ad_group_report",
+                "ad": "ads",
+                "ad_stats": "ad_report",
+            },
+        ),
+        (
+            "RedditAds",
+            NativeMarketingSource.REDDIT_ADS,
+            RedditAdsConfig,
+            "redditads",
+            {
+                "campaign": "campaigns",
+                "stats": "campaign_report",
+                "adset": "ad_groups",
+                "adset_stats": "ad_group_report",
+                "ad": "ads",
+                "ad_stats": "ad_report",
+            },
+        ),
+        (
+            "PinterestAds",
+            NativeMarketingSource.PINTEREST_ADS,
+            PinterestAdsConfig,
+            "pinterestads",
+            {
+                "campaign": "campaigns",
+                "stats": "campaign_analytics",
+                "adset": "ad_groups",
+                "adset_stats": "ad_group_analytics",
+                "ad": "ads",
+                "ad_stats": "ad_analytics",
+            },
+        ),
+        (
+            "SnapchatAds",
+            NativeMarketingSource.SNAPCHAT_ADS,
+            SnapchatAdsConfig,
+            "snapchatads",
+            {
+                "campaign": "campaigns",
+                "stats": "campaign_stats_daily",
+                "adset": "ad_squads",
+                "adset_stats": "ad_squad_stats_daily",
+                "ad": "ads",
+                "ad_stats": "ad_stats_daily",
+            },
+        ),
+        # Bing uses the unified entity+stats mode: performance reports embed entity
+        # columns so adset/adset_stats and ad/ad_stats resolve to the same schema
+        # (and the factory wires the same DataWarehouseTable into both slots).
+        (
+            "BingAds",
+            NativeMarketingSource.BING_ADS,
+            BingAdsConfig,
+            "bingads",
+            {
+                "campaign": "campaigns",
+                "stats": "campaign_performance_report",
+                "adset": "ad_group_performance_report",
+                "adset_stats": "ad_group_performance_report",
+                "ad": "ad_performance_report",
+                "ad_stats": "ad_performance_report",
+            },
+        ),
+        (
+            "MetaAds",
+            NativeMarketingSource.META_ADS,
+            MetaAdsConfig,
+            "metaads",
+            {
+                "campaign": "campaigns",
+                "stats": "campaign_stats",
+                "adset": "adsets",
+                "adset_stats": "adset_stats",
+                "ad": "ads",
+                "ad_stats": "ad_stats",
+            },
+        ),
+        (
+            "LinkedinAds",
+            NativeMarketingSource.LINKEDIN_ADS,
+            LinkedinAdsConfig,
+            "linkedinads",
+            {
+                "campaign": "campaign_groups",
+                "stats": "campaign_group_stats",
+                "adset": "campaigns",
+                "adset_stats": "campaign_stats",
+                "ad": "creatives",
+                "ad_stats": "creative_stats",
+            },
+        ),
+    ]
+
+    def _make_table(self, prefix: str, schema_name: str) -> DataWarehouseTable:
+        table = Mock()
+        table.name = f"{prefix}_{schema_name}"
+        return cast(DataWarehouseTable, table)
+
+    def _make_source(self, source_type: str) -> Mock:
+        source = Mock()
+        source.id = f"{source_type}_source_id"
+        source.source_type = source_type
+        return source
+
+    @parameterized.expand([(spec[0], *spec) for spec in _FIXTURES])
+    def test_full_hierarchy_populates_all_slots(
+        self,
+        _name,
+        source_type: str,
+        native_source: NativeMarketingSource,
+        config_class: type[HierarchicalNativeAdsConfig],
+        prefix: str,
+        schemas: dict[str, str],
+    ):
+        """When the user has every schema synced (campaign + stats + adset + adset_stats +
+        ad + ad_stats), the factory must populate all six slots so the adapter's
+        `supports_level` returns True at AD_GROUP and AD.
+
+        For unified entity+stats sources (Bing), one DataWarehouseTable backs both the
+        entity slot and the stats slot — the assertion below checks slot identity, not
+        just non-None, so a regression that broke the `if adset_unified: ...` wiring
+        would surface here.
+        """
+        factory = self._make_factory()
+        # Deduplicate by schema: in production each schema is one DataWarehouseTable,
+        # and unified-mode sources reuse the same table for both entity and stats slots.
+        unique_schemas = list(
+            dict.fromkeys(schemas[k] for k in ("campaign", "stats", "adset", "adset_stats", "ad", "ad_stats"))
+        )
+        tables = [self._make_table(prefix, schema) for schema in unique_schemas]
+
+        config = factory._create_native_config(self._make_source(source_type), tables, native_source, config_class)
+
+        assert config is not None, f"{source_type} should produce a config from a full hierarchy"
+        assert config.adset_table is not None, f"{source_type}: adset_table not detected"
+        assert config.adset_stats_table is not None, f"{source_type}: adset_stats_table not detected"
+        assert config.ad_table is not None, f"{source_type}: ad_table not detected"
+        assert config.ad_stats_table is not None, f"{source_type}: ad_stats_table not detected"
+        if schemas["adset"] == schemas["adset_stats"]:
+            assert config.adset_table is config.adset_stats_table, (
+                f"{source_type}: unified mode should wire the same DataWarehouseTable into both adset slots"
+            )
+        if schemas["ad"] == schemas["ad_stats"]:
+            assert config.ad_table is config.ad_stats_table, (
+                f"{source_type}: unified mode should wire the same DataWarehouseTable into both ad slots"
+            )
+
+    @parameterized.expand([(spec[0], *spec) for spec in _FIXTURES])
+    def test_only_adset_tables_supports_ad_group_but_not_ad(
+        self,
+        _name,
+        source_type: str,
+        native_source: NativeMarketingSource,
+        config_class: type[HierarchicalNativeAdsConfig],
+        prefix: str,
+        schemas: dict[str, str],
+    ):
+        factory = self._make_factory()
+        unique_schemas = list(dict.fromkeys(schemas[k] for k in ("campaign", "stats", "adset", "adset_stats")))
+        tables = [self._make_table(prefix, schema) for schema in unique_schemas]
+
+        config = factory._create_native_config(self._make_source(source_type), tables, native_source, config_class)
+
+        assert config is not None
+        assert config.adset_table is not None
+        assert config.adset_stats_table is not None
+        assert config.ad_table is None
+        assert config.ad_stats_table is None
+        if schemas["adset"] == schemas["adset_stats"]:
+            assert config.adset_table is config.adset_stats_table, (
+                f"{source_type}: unified mode should wire the same DataWarehouseTable into both adset slots"
+            )
+
+
+class TestNativeCampaignTableResolution(FactoryTestMixin, BaseTest):
+    def _make_source(self, prefix: str = "") -> Mock:
+        source = Mock()
+        source.id = "googleads_source_id"
+        source.source_type = "GoogleAds"
+        source.prefix = prefix
+        return source
+
+    def _make_table(self, schema_name: str, prefix: str = "") -> DataWarehouseTable:
+        table = Mock()
+        # Duplicates `build_table_name`, which warehouse_sources keeps out of its public
+        # interface — this format is what the factory parses back apart, so it has to match.
+        table.name = f"{prefix}googleads_{schema_name}".lower()
+        return cast(DataWarehouseTable, table)
+
+    def _create_config(self, tables: list[DataWarehouseTable]) -> GoogleAdsConfig | None:
+        return cast(
+            GoogleAdsConfig | None,
+            self._make_factory()._create_native_config(
+                self._make_source(), tables, NativeMarketingSource.GOOGLE_ADS, GoogleAdsConfig
+            ),
+        )
+
+    @parameterized.expand([("budget_last", False), ("budget_first", True)])
+    def test_campaign_budget_never_wins_the_campaign_slot(self, _name: str, reverse: bool):
+        """`campaign_budget` contains the `campaign` keyword but has no campaign columns,
+        so binding it made every marketing analytics query fail to resolve with
+        `Field not found: campaign_id`. It used to win whenever it came last, and the
+        queryset supplying these tables has no ordering.
+        """
+        campaign = self._make_table("campaign")
+        stats = self._make_table("campaign_overview_stats")
+        budget = self._make_table("campaign_budget")
+        tables = [campaign, stats, budget]
+
+        config = self._create_config(list(reversed(tables)) if reverse else tables)
+
+        assert config is not None
+        assert config.campaign_table is campaign
+        assert config.stats_table is stats
+
+    def test_campaign_budget_without_campaign_yields_no_config(self):
+        """The state already-affected projects are in: `campaign_budget` synced, `campaign`
+        not. Nothing can serve the campaign slot, so the source must be dropped rather
+        than wired up to a table that will fail to resolve at query time.
+        """
+        tables = [self._make_table("campaign_budget"), self._make_table("campaign_overview_stats")]
+
+        assert self._create_config(tables) is None
+
+    @parameterized.expand([("plain", "analytics_"), ("prefix_repeats_source_type", "googleads_")])
+    def test_user_prefix_is_stripped_before_matching(self, _name: str, prefix: str):
+        """The source prefix is free text, so it can repeat the source type. Exact matching
+        only works if the schema name survives prefix stripping in both cases.
+        """
+        campaign = self._make_table("campaign", prefix=prefix)
+        stats = self._make_table("campaign_overview_stats", prefix=prefix)
+
+        config = self._create_config([campaign, stats])
+
+        assert config is not None
+        assert config.campaign_table is campaign
+        assert config.stats_table is stats
+
+    @parameterized.expand([("plain", ""), ("prefixed", "example_")])
+    def test_rokt_report_supplies_both_campaign_and_stats(self, _name: str, prefix: str) -> None:
+        source = Mock(id="rokt-source", source_type="RoktAds")
+        table = DataWarehouseTable(name=f"{prefix}roktads_campaignperformance")
+        config = self._make_factory()._create_native_config(
+            source, [table], NativeMarketingSource.ROKT_ADS, HierarchicalNativeAdsConfig
+        )
+        assert config is not None
+        assert config.campaign_table is table
+        assert config.stats_table is table
+
+
+class TestNativeSourceKillSwitch(SimpleTestCase):
+    @parameterized.expand([(False,), (True,)])
+    def test_factory_excludes_disabled_sources_from_discovery_and_validation(self, enabled: bool) -> None:
+        team = Team(id=1)
+        factory = MarketingSourceFactory.__new__(MarketingSourceFactory)
+        factory.context = Mock(spec=QueryContext, team=team)
+        factory.logger = Mock()
+        factory._warehouse_tables = []
+        factory._external_sources = []
+        factory._tables_by_source_id = {}
+        for source_type in ("GoogleAds", "AppleSearchAds", "OpenAIAds", "AmazonAds", "RoktAds", "TwitterAds"):
+            source = ExternalDataSource(source_type=source_type)
+            patterns = TABLE_PATTERNS[NativeMarketingSource(source_type)]
+            tables = [
+                DataWarehouseTable(name=f"{source_type}_{name}", external_data_source=source)
+                for name in {patterns["campaign_table_name"], patterns["stats_table_keywords"][0]}
+            ]
+            factory._external_sources.append(source)
+            factory._warehouse_tables.extend(tables)
+            factory._tables_by_source_id[str(source.id)] = tables
+
+        with patch(
+            "products.marketing_analytics.backend.services.native_integrations.get_feature_flag_or_none",
+            return_value=enabled,
+        ):
+            adapters = factory.create_adapters()
+
+        assert [adapter.get_source_type() for adapter in adapters] == (
+            ["GoogleAds", "AppleSearchAds", "OpenAIAds", "AmazonAds", "RoktAds", "TwitterAds"]
+            if enabled
+            else ["GoogleAds"]
+        )
+        errors = factory.get_validation_errors(adapters)
+        assert set(errors) == ({adapter.config.source_id for adapter in adapters[1:]} if enabled else set())
+        assert all(messages for messages in errors.values())
+        factory.logger.exception.assert_not_called()
+
+
+_BUCKET_PROVIDERS: list[tuple[str, str, type[SelfManagedAdapter]]] = [
+    ("AmazonS3", "https://example-bucket.s3.amazonaws.com/spend/*.csv", AWSAdapter),
+    ("GoogleCloudStorage", "https://storage.googleapis.com/example-bucket/spend/*.csv", GoogleCloudAdapter),
+    ("AzureBlob", "https://example.blob.core.windows.net/spend/*.csv", AzureAdapter),
+    ("CloudflareR2", "https://example.r2.cloudflarestorage.com/example-bucket/spend/*.csv", CloudflareR2Adapter),
+]
+_POSTHOG_STORAGE_URL = "https://example-warehouse.s3.amazonaws.com/team_1/example_spend/*.parquet"
+_TABLE_STATES = ["never_migrated", "migrated_not_adopted", "adopted", "new_managed_table"]
+
+
+class TestFileSourceTableDiscovery(BaseTest):
+    def _create_table_state(self, state: str, source_type: str, customer_url: str) -> tuple[DataWarehouseTable, str]:
+        managed = state in ("adopted", "new_managed_table")
+        source = None
+        if state != "never_migrated":
+            source = ExternalDataSource.objects.create(
+                team=self.team, source_id="example", connection_id="example", source_type=source_type
+            )
+        table = DataWarehouseTable.raw_objects.create(
+            team=self.team,
+            name="example_spend",
+            format="CSVWithNames",
+            url_pattern=_POSTHOG_STORAGE_URL if managed else customer_url,
+            credential=None
+            if managed
+            else DataWarehouseCredential.objects.create(team=self.team, access_key="key", access_secret="secret"),
+            external_data_source=source if managed else None,
+        )
+        schema = None
+        if source is not None:
+            schema = ExternalDataSchema.objects.create(
+                team=self.team, source=source, name="example_spend", table=table if managed else None
+            )
+        mapping_key = str(schema.id) if state == "new_managed_table" and schema else str(table.id)
+        self.team.marketing_analytics_config.sources_map = {
+            mapping_key: {"campaign": "campaign", "source": "source", "cost": "spend", "date": "day"}
+        }
+        self.team.marketing_analytics_config.save()
+        return table, mapping_key
+
+    def _make_factory(self, table: DataWarehouseTable) -> MarketingSourceFactory:
+        database = Mock(get_warehouse_table_names=Mock(return_value=[table.name]))
+        context = QueryContext(date_range=None, team=self.team, base_currency=DEFAULT_CURRENCY, database=database)
+        return MarketingSourceFactory(context=context)
+
+    @parameterized.expand(
+        [
+            (f"{state}_{source_type}", state, source_type, customer_url, self_managed_adapter)
+            for source_type, customer_url, self_managed_adapter in _BUCKET_PROVIDERS
+            for state in _TABLE_STATES
+        ]
+        + [(f"{state}_FileUpload", state, "FileUpload", "", SelfManagedAdapter) for state in _TABLE_STATES[2:]]
+    )
+    def test_table_gets_one_adapter_with_its_mapping(
+        self,
+        _name: str,
+        state: str,
+        source_type: str,
+        customer_url: str,
+        self_managed_adapter: type[SelfManagedAdapter],
+    ) -> None:
+        table, mapping_key = self._create_table_state(state, source_type, customer_url)
+        factory = self._make_factory(table)
+
+        adapters = factory.create_adapters(raise_on_error=True)
+
+        assert len(adapters) == 1
+        adapter = adapters[0]
+        if state in ("adopted", "new_managed_table"):
+            assert type(adapter) is FileSourceAdapter
+            assert adapter.get_source_type() == source_type
+        else:
+            assert type(adapter) is self_managed_adapter
+        assert adapter.config.source_id == mapping_key
+        assert adapter.config.source_map.cost == "spend"
+        assert factory.get_valid_adapters(adapters) == adapters

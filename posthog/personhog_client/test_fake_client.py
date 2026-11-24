@@ -1,0 +1,1139 @@
+import json
+
+import pytest
+
+import grpc
+from parameterized import parameterized
+from personhog.lifecycle.v1 import lifecycle_pb2
+from personhog.types.v1 import cohort_pb2, common_pb2, group_pb2, person_pb2
+
+from posthog.personhog_client.fake_client import FakePersonHogClient, fake_personhog_client
+from posthog.personhog_client.interceptor import semantic_refusal_reason
+
+
+class TestFakePersonHogClientPersons:
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_person(team_id=1, person_id=10, uuid="abc-123", distinct_ids=["user@example.com", "anon-1"])
+        self.client.add_person(team_id=1, person_id=20, uuid="def-456", distinct_ids=["user2@example.com"])
+
+    def test_get_person_found(self):
+        resp = self.client.get_person(person_pb2.GetPersonRequest(team_id=1, person_id=10))
+        assert resp.person.uuid == "abc-123"
+
+    def test_get_person_missing(self):
+        resp = self.client.get_person(person_pb2.GetPersonRequest(team_id=1, person_id=999))
+        assert not resp.HasField("person")
+
+    def test_get_person_wrong_team(self):
+        resp = self.client.get_person(person_pb2.GetPersonRequest(team_id=99, person_id=10))
+        assert not resp.HasField("person")
+
+    def test_get_persons_partial(self):
+        resp = self.client.get_persons(person_pb2.GetPersonsRequest(team_id=1, person_ids=[10, 999]))
+        assert len(resp.persons) == 1
+        assert resp.persons[0].id == 10
+        assert list(resp.missing_ids) == [999]
+
+    def test_get_person_by_uuid(self):
+        resp = self.client.get_person_by_uuid(person_pb2.GetPersonByUuidRequest(team_id=1, uuid="def-456"))
+        assert resp.person.id == 20
+
+    def test_get_person_by_distinct_id(self):
+        resp = self.client.get_person_by_distinct_id(
+            person_pb2.GetPersonByDistinctIdRequest(team_id=1, distinct_id="user@example.com")
+        )
+        assert resp.person.id == 10
+
+    def test_get_distinct_ids_for_person(self):
+        resp = self.client.get_distinct_ids_for_person(
+            person_pb2.GetDistinctIdsForPersonRequest(team_id=1, person_id=10)
+        )
+        assert [d.distinct_id for d in resp.distinct_ids] == ["user@example.com", "anon-1"]
+
+    def test_get_distinct_ids_for_person_missing(self):
+        resp = self.client.get_distinct_ids_for_person(
+            person_pb2.GetDistinctIdsForPersonRequest(team_id=1, person_id=999)
+        )
+        assert len(resp.distinct_ids) == 0
+
+    def test_get_distinct_ids_for_persons(self):
+        resp = self.client.get_distinct_ids_for_persons(
+            person_pb2.GetDistinctIdsForPersonsRequest(team_id=1, person_ids=[10, 20])
+        )
+        assert len(resp.person_distinct_ids) == 2
+        assert resp.person_distinct_ids[0].person_id == 10
+        assert len(resp.person_distinct_ids[0].distinct_ids) == 2
+
+    def test_limited_fetch_orders_identified_first(self):
+        # Mirrors personhog-replica: the anonymous-shaped id is seeded first, but a limited
+        # fetch must order identified ids first so they survive the limit.
+        anon = "0190f8e1-1234-7abc-89de-f0123456789a"
+        self.client.add_person(team_id=1, person_id=30, uuid="ghi-789", distinct_ids=[anon, "id@example.com"])
+
+        single = self.client.get_distinct_ids_for_person(
+            person_pb2.GetDistinctIdsForPersonRequest(team_id=1, person_id=30, limit=1)
+        )
+        bulk = self.client.get_distinct_ids_for_persons(
+            person_pb2.GetDistinctIdsForPersonsRequest(team_id=1, person_ids=[30], limit_per_person=1)
+        )
+
+        assert [d.distinct_id for d in single.distinct_ids] == ["id@example.com"]
+        assert [d.distinct_id for d in bulk.person_distinct_ids[0].distinct_ids] == ["id@example.com"]
+
+    def test_get_persons_by_distinct_ids_in_team(self):
+        resp = self.client.get_persons_by_distinct_ids_in_team(
+            person_pb2.GetPersonsByDistinctIdsInTeamRequest(
+                team_id=1, distinct_ids=["user@example.com", "anon-1", "user2@example.com"]
+            )
+        )
+        # The real service returns one result per requested distinct_id (no dedup by person).
+        # "user@example.com" and "anon-1" both map to person 10, so we get 3 results.
+        assert len(resp.results) == 3
+        assert [(r.distinct_id, r.person.id) for r in resp.results] == [
+            ("user@example.com", 10),
+            ("anon-1", 10),
+            ("user2@example.com", 20),
+        ]
+
+
+class TestFakePersonHogClientGroups:
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_group(team_id=1, group_type_index=0, group_key="org:1", group_properties={"name": "Acme"})
+        self.client.add_group(team_id=1, group_type_index=0, group_key="org:2")
+
+    def test_get_group_found(self):
+        resp = self.client.get_group(group_pb2.GetGroupRequest(team_id=1, group_type_index=0, group_key="org:1"))
+        assert json.loads(resp.group.group_properties) == {"name": "Acme"}
+
+    def test_get_group_missing(self):
+        resp = self.client.get_group(group_pb2.GetGroupRequest(team_id=1, group_type_index=0, group_key="org:99"))
+        assert not resp.HasField("group")
+
+    def test_get_groups(self):
+        resp = self.client.get_groups(
+            group_pb2.GetGroupsRequest(
+                team_id=1,
+                group_identifiers=[
+                    common_pb2.GroupIdentifier(group_type_index=0, group_key="org:1"),
+                    common_pb2.GroupIdentifier(group_type_index=0, group_key="org:missing"),
+                ],
+            )
+        )
+        assert len(resp.groups) == 1
+        assert len(resp.missing_groups) == 1
+
+    def test_get_groups_batch(self):
+        resp = self.client.get_groups_batch(
+            group_pb2.GetGroupsBatchRequest(
+                keys=[
+                    common_pb2.GroupKey(team_id=1, group_type_index=0, group_key="org:1"),
+                    common_pb2.GroupKey(team_id=1, group_type_index=0, group_key="org:2"),
+                ]
+            )
+        )
+        assert len(resp.results) == 2
+
+
+class TestFakePersonHogClientGroupTypeMappings:
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_group_type_mapping(
+            project_id=100,
+            team_id=1,
+            group_type="organization",
+            group_type_index=0,
+            name_singular="Organization",
+        )
+        self.client.add_group_type_mapping(project_id=100, team_id=1, group_type="company", group_type_index=1)
+
+    def test_by_project_id(self):
+        resp = self.client.get_group_type_mappings_by_project_id(
+            group_pb2.GetGroupTypeMappingsByProjectIdRequest(project_id=100)
+        )
+        assert len(resp.mappings) == 2
+        assert resp.mappings[0].group_type == "organization"
+
+    def test_by_project_id_empty(self):
+        resp = self.client.get_group_type_mappings_by_project_id(
+            group_pb2.GetGroupTypeMappingsByProjectIdRequest(project_id=999)
+        )
+        assert len(resp.mappings) == 0
+
+    def test_by_team_id(self):
+        resp = self.client.get_group_type_mappings_by_team_id(group_pb2.GetGroupTypeMappingsByTeamIdRequest(team_id=1))
+        assert len(resp.mappings) == 2
+
+    def test_by_project_ids_batch(self):
+        resp = self.client.get_group_type_mappings_by_project_ids(
+            group_pb2.GetGroupTypeMappingsByProjectIdsRequest(project_ids=[100, 999])
+        )
+        assert len(resp.results) == 2
+        assert len(resp.results[0].mappings) == 2
+        assert len(resp.results[1].mappings) == 0
+
+    def test_by_team_ids_batch(self):
+        resp = self.client.get_group_type_mappings_by_team_ids(
+            group_pb2.GetGroupTypeMappingsByTeamIdsRequest(team_ids=[1, 999])
+        )
+        assert len(resp.results) == 2
+        assert len(resp.results[0].mappings) == 2
+        assert len(resp.results[1].mappings) == 0
+
+
+class TestFakePersonHogClientCohorts:
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_cohort_membership(person_id=10, cohort_id=1, is_member=True)
+        self.client.add_cohort_membership(person_id=10, cohort_id=2, is_member=False)
+
+    def test_check_membership(self):
+        resp = self.client.check_cohort_membership(
+            cohort_pb2.CheckCohortMembershipRequest(person_id=10, cohort_ids=[1, 2])
+        )
+        assert len(resp.memberships) == 2
+        by_id = {m.cohort_id: m.is_member for m in resp.memberships}
+        assert by_id == {1: True, 2: False}
+
+    def test_check_membership_filters_cohort_ids(self):
+        resp = self.client.check_cohort_membership(
+            cohort_pb2.CheckCohortMembershipRequest(person_id=10, cohort_ids=[1])
+        )
+        assert len(resp.memberships) == 1
+
+    def test_check_membership_unknown_person(self):
+        resp = self.client.check_cohort_membership(
+            cohort_pb2.CheckCohortMembershipRequest(person_id=999, cohort_ids=[1])
+        )
+        assert len(resp.memberships) == 0
+
+    @parameterized.expand(
+        [
+            ("subset", [10, 11], 2, {12}),
+            ("skips_non_members_and_repeats", [10, 10, 99], 1, {11, 12}),
+            ("empty", [], 0, {10, 11, 12}),
+        ]
+    )
+    def test_delete_cohort_members_by_person_ids(self, _name, person_ids, expected_deleted, expected_remaining):
+        for cohort_id in (5, 6):
+            self.client.insert_cohort_members(
+                cohort_pb2.InsertCohortMembersRequest(cohort_id=cohort_id, person_ids=[10, 11, 12])
+            )
+
+        resp = self.client.delete_cohort_members_by_person_ids(
+            cohort_pb2.DeleteCohortMembersByPersonIdsRequest(cohort_id=5, person_ids=person_ids)
+        )
+
+        assert resp.deleted_count == expected_deleted
+        remaining = self.client.list_cohort_member_ids(cohort_pb2.ListCohortMemberIdsRequest(cohort_id=5))
+        assert set(remaining.person_ids) == expected_remaining
+        other = self.client.list_cohort_member_ids(cohort_pb2.ListCohortMemberIdsRequest(cohort_id=6))
+        assert set(other.person_ids) == {10, 11, 12}
+        memberships = self.client.check_cohort_membership(
+            cohort_pb2.CheckCohortMembershipRequest(person_id=10, cohort_ids=[5, 6])
+        )
+        expected_memberships = {5, 6} if 10 in expected_remaining else {6}
+        assert {m.cohort_id for m in memberships.memberships} == expected_memberships
+
+    @parameterized.expand(
+        [
+            (
+                "delete_distinct",
+                "delete_cohort_members_by_person_ids",
+                cohort_pb2.DeleteCohortMembersByPersonIdsRequest,
+                list(range(1, 10_002)),
+            ),
+            (
+                "delete_repeated",
+                "delete_cohort_members_by_person_ids",
+                cohort_pb2.DeleteCohortMembersByPersonIdsRequest,
+                [10] * 10_001,
+            ),
+            (
+                "insert_distinct",
+                "insert_cohort_members",
+                cohort_pb2.InsertCohortMembersRequest,
+                list(range(1, 10_002)),
+            ),
+            ("insert_repeated", "insert_cohort_members", cohort_pb2.InsertCohortMembersRequest, [10] * 10_001),
+        ]
+    )
+    def test_cohort_member_rpcs_reject_more_ids_than_the_service_accepts(
+        self, _name, method_name, request_cls, person_ids
+    ):
+        # The service refuses the request, so a fake that accepted it would pass tests production fails.
+        with pytest.raises(grpc.RpcError) as excinfo:
+            getattr(self.client, method_name)(request_cls(cohort_id=5, person_ids=person_ids))
+        assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert "Maximum 10000 person IDs per request" in (excinfo.value.details() or "")
+
+
+class TestCallTracking:
+    def test_assert_called(self):
+        client = FakePersonHogClient()
+        client.get_group_type_mappings_by_project_id(group_pb2.GetGroupTypeMappingsByProjectIdRequest(project_id=1))
+        calls = client.assert_called("get_group_type_mappings_by_project_id", times=1)
+        assert calls[0].request.project_id == 1
+
+    def test_assert_called_fails(self):
+        client = FakePersonHogClient()
+        with pytest.raises(AssertionError, match="never called"):
+            client.assert_called("get_person")
+
+    def test_assert_not_called(self):
+        client = FakePersonHogClient()
+        client.assert_not_called("get_person")
+
+    def test_assert_not_called_fails(self):
+        client = FakePersonHogClient()
+        client.get_person(person_pb2.GetPersonRequest(team_id=1, person_id=1))
+        with pytest.raises(AssertionError, match="called 1 time"):
+            client.assert_not_called("get_person")
+
+
+class TestFakePersonHogClientGroupWrites:
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_group(team_id=1, group_type_index=0, group_key="org:1", group_properties={"name": "Acme"})
+
+    def test_create_group(self):
+        resp = self.client.create_group(
+            group_pb2.CreateGroupRequest(
+                team_id=1,
+                group_type_index=0,
+                group_key="org:new",
+                group_properties=b'{"foo": "bar"}',
+                created_at=1000,
+            )
+        )
+        assert resp.group.id > 0
+        assert resp.group.group_key == "org:new"
+        assert resp.group.team_id == 1
+        assert resp.group.created_at == 1000
+        assert resp.group.version == 0
+        fetched = self.client.get_group(group_pb2.GetGroupRequest(team_id=1, group_type_index=0, group_key="org:new"))
+        assert fetched.group.id == resp.group.id
+
+    def test_create_group_returns_existing_group_on_duplicate_key(self):
+        existing = self.client.get_group(group_pb2.GetGroupRequest(team_id=1, group_type_index=0, group_key="org:1"))
+
+        resp = self.client.create_group(
+            group_pb2.CreateGroupRequest(
+                team_id=1, group_type_index=0, group_key="org:1", group_properties=b'{"name": "Other"}'
+            )
+        )
+
+        assert resp.group == existing.group
+
+    def test_create_group_auto_increment_id(self):
+        resp1 = self.client.create_group(group_pb2.CreateGroupRequest(team_id=1, group_type_index=1, group_key="k1"))
+        resp2 = self.client.create_group(group_pb2.CreateGroupRequest(team_id=1, group_type_index=2, group_key="k2"))
+        assert resp2.group.id > resp1.group.id
+
+    def test_update_group_properties(self):
+        self.client.update_group(
+            group_pb2.UpdateGroupRequest(
+                team_id=1,
+                group_type_index=0,
+                group_key="org:1",
+                update_mask=["group_properties"],
+                group_properties=b'{"name": "Updated"}',
+            )
+        )
+        fetched = self.client.get_group(group_pb2.GetGroupRequest(team_id=1, group_type_index=0, group_key="org:1"))
+        assert json.loads(fetched.group.group_properties) == {"name": "Updated"}
+        assert fetched.group.version == 1
+
+    def test_update_group_not_found_raises(self):
+        import grpc
+
+        with pytest.raises(grpc.RpcError):
+            self.client.update_group(
+                group_pb2.UpdateGroupRequest(
+                    team_id=1,
+                    group_type_index=0,
+                    group_key="nonexistent",
+                    update_mask=["group_properties"],
+                )
+            )
+
+    def test_update_group_increments_version(self):
+        self.client.update_group(
+            group_pb2.UpdateGroupRequest(
+                team_id=1,
+                group_type_index=0,
+                group_key="org:1",
+                update_mask=["group_properties"],
+                group_properties=b"{}",
+            )
+        )
+        self.client.update_group(
+            group_pb2.UpdateGroupRequest(
+                team_id=1,
+                group_type_index=0,
+                group_key="org:1",
+                update_mask=["group_properties"],
+                group_properties=b"{}",
+            )
+        )
+        fetched = self.client.get_group(group_pb2.GetGroupRequest(team_id=1, group_type_index=0, group_key="org:1"))
+        assert fetched.group.version == 2
+
+    def test_delete_groups_batch_for_team(self):
+        self.client.add_group(team_id=1, group_type_index=0, group_key="org:2")
+        resp = self.client.delete_groups_batch_for_team(
+            group_pb2.DeleteGroupsBatchForTeamRequest(team_id=1, batch_size=10)
+        )
+        assert resp.deleted_count == 2
+        fetched = self.client.get_group(group_pb2.GetGroupRequest(team_id=1, group_type_index=0, group_key="org:1"))
+        assert not fetched.HasField("group")
+
+    def test_delete_groups_batch_respects_batch_size(self):
+        self.client.add_group(team_id=1, group_type_index=0, group_key="org:2")
+        self.client.add_group(team_id=1, group_type_index=0, group_key="org:3")
+        resp = self.client.delete_groups_batch_for_team(
+            group_pb2.DeleteGroupsBatchForTeamRequest(team_id=1, batch_size=2)
+        )
+        assert resp.deleted_count == 2
+        remaining = self.client.get_groups(
+            group_pb2.GetGroupsRequest(
+                team_id=1,
+                group_identifiers=[
+                    common_pb2.GroupIdentifier(group_type_index=0, group_key="org:1"),
+                    common_pb2.GroupIdentifier(group_type_index=0, group_key="org:2"),
+                    common_pb2.GroupIdentifier(group_type_index=0, group_key="org:3"),
+                ],
+            )
+        )
+        assert len(remaining.groups) == 1
+
+    def test_delete_groups_batch_wrong_team(self):
+        resp = self.client.delete_groups_batch_for_team(
+            group_pb2.DeleteGroupsBatchForTeamRequest(team_id=999, batch_size=10)
+        )
+        assert resp.deleted_count == 0
+        fetched = self.client.get_group(group_pb2.GetGroupRequest(team_id=1, group_type_index=0, group_key="org:1"))
+        assert fetched.group.group_key == "org:1"
+
+
+class TestFakePersonHogClientGroupTypeMappingWrites:
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_group_type_mapping(
+            project_id=100,
+            team_id=1,
+            group_type="organization",
+            group_type_index=0,
+            name_singular="Organization",
+            detail_dashboard_id=42,
+        )
+        self.client.add_group_type_mapping(project_id=100, team_id=1, group_type="company", group_type_index=1)
+
+    def test_get_group_type_mapping_by_dashboard_id_found(self):
+        resp = self.client.get_group_type_mapping_by_dashboard_id(
+            group_pb2.GetGroupTypeMappingByDashboardIdRequest(team_id=1, dashboard_id=42)
+        )
+        assert resp.mapping.group_type == "organization"
+
+    def test_get_group_type_mapping_by_dashboard_id_not_found(self):
+        resp = self.client.get_group_type_mapping_by_dashboard_id(
+            group_pb2.GetGroupTypeMappingByDashboardIdRequest(team_id=1, dashboard_id=999)
+        )
+        assert not resp.HasField("mapping")
+
+    def test_get_group_type_mapping_by_dashboard_id_wrong_team(self):
+        resp = self.client.get_group_type_mapping_by_dashboard_id(
+            group_pb2.GetGroupTypeMappingByDashboardIdRequest(team_id=99, dashboard_id=42)
+        )
+        assert not resp.HasField("mapping")
+
+    def test_update_group_type_mapping_name(self):
+        self.client.update_group_type_mapping(
+            group_pb2.UpdateGroupTypeMappingRequest(
+                project_id=100,
+                group_type_index=0,
+                update_mask=["name_singular", "name_plural"],
+                name_singular="Org",
+                name_plural="Orgs",
+            )
+        )
+        resp = self.client.get_group_type_mappings_by_project_id(
+            group_pb2.GetGroupTypeMappingsByProjectIdRequest(project_id=100)
+        )
+        org_mapping = next(m for m in resp.mappings if m.group_type_index == 0)
+        assert org_mapping.name_singular == "Org"
+        assert org_mapping.name_plural == "Orgs"
+
+    def test_update_group_type_mapping_dashboard_id(self):
+        self.client.update_group_type_mapping(
+            group_pb2.UpdateGroupTypeMappingRequest(
+                project_id=100,
+                group_type_index=0,
+                update_mask=["detail_dashboard_id"],
+                detail_dashboard_id=99,
+            )
+        )
+        resp = self.client.get_group_type_mapping_by_dashboard_id(
+            group_pb2.GetGroupTypeMappingByDashboardIdRequest(team_id=1, dashboard_id=99)
+        )
+        assert resp.mapping.group_type == "organization"
+
+    def test_update_group_type_mapping_not_found_raises(self):
+        import grpc
+
+        with pytest.raises(grpc.RpcError):
+            self.client.update_group_type_mapping(
+                group_pb2.UpdateGroupTypeMappingRequest(
+                    project_id=100,
+                    group_type_index=99,
+                    update_mask=["name_singular"],
+                    name_singular="X",
+                )
+            )
+
+    def test_delete_group_type_mapping(self):
+        resp = self.client.delete_group_type_mapping(
+            group_pb2.DeleteGroupTypeMappingRequest(project_id=100, group_type_index=0)
+        )
+        assert resp.deleted is True
+        remaining = self.client.get_group_type_mappings_by_project_id(
+            group_pb2.GetGroupTypeMappingsByProjectIdRequest(project_id=100)
+        )
+        assert len(remaining.mappings) == 1
+        assert remaining.mappings[0].group_type == "company"
+
+    def test_delete_group_type_mapping_not_found(self):
+        resp = self.client.delete_group_type_mapping(
+            group_pb2.DeleteGroupTypeMappingRequest(project_id=100, group_type_index=99)
+        )
+        assert resp.deleted is False
+
+    def test_delete_group_type_mapping_removes_from_team_index(self):
+        self.client.delete_group_type_mapping(
+            group_pb2.DeleteGroupTypeMappingRequest(project_id=100, group_type_index=0)
+        )
+        by_team = self.client.get_group_type_mappings_by_team_id(
+            group_pb2.GetGroupTypeMappingsByTeamIdRequest(team_id=1)
+        )
+        assert len(by_team.mappings) == 1
+        assert by_team.mappings[0].group_type == "company"
+
+    def test_delete_group_type_mappings_batch_for_team(self):
+        resp = self.client.delete_group_type_mappings_batch_for_team(
+            group_pb2.DeleteGroupTypeMappingsBatchForTeamRequest(team_id=1, batch_size=10)
+        )
+        assert resp.deleted_count == 2
+        remaining = self.client.get_group_type_mappings_by_project_id(
+            group_pb2.GetGroupTypeMappingsByProjectIdRequest(project_id=100)
+        )
+        assert len(remaining.mappings) == 0
+
+    def test_delete_group_type_mappings_batch_wrong_team(self):
+        resp = self.client.delete_group_type_mappings_batch_for_team(
+            group_pb2.DeleteGroupTypeMappingsBatchForTeamRequest(team_id=999, batch_size=10)
+        )
+        assert resp.deleted_count == 0
+
+
+class TestFakePersonhogClientContextManager:
+    def test_patches_get_personhog_client(self):
+        with fake_personhog_client() as fake:
+            fake.add_group_type_mapping(project_id=1, group_type="org", group_type_index=0)
+
+            from posthog.personhog_client.client import get_personhog_client
+
+            client = get_personhog_client()
+            assert client is fake
+
+
+class TestFakePersonHogClientDeleteTombstonedPersons:
+    TEAM_ID = 7
+
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_person(
+            team_id=self.TEAM_ID,
+            person_id=1,
+            uuid="tombstoned",
+            distinct_ids=["t-1", "t-2"],
+            is_deleted=True,
+            tombstoned_distinct_ids=["t-1", "t-2"],
+        )
+        self.client.add_person(team_id=self.TEAM_ID, person_id=2, uuid="live", distinct_ids=["l-1"])
+        self.client.add_person(
+            team_id=self.TEAM_ID,
+            person_id=3,
+            uuid="blocked",
+            distinct_ids=["b-1", "b-2"],
+            is_deleted=True,
+            tombstoned_distinct_ids=["b-1"],
+        )
+        self.client.add_person(
+            team_id=self.TEAM_ID,
+            person_id=4,
+            uuid="big",
+            distinct_ids=[f"o-{i}" for i in range(5)],
+            is_deleted=True,
+            tombstoned_distinct_ids=[f"o-{i}" for i in range(5)],
+        )
+
+    def _delete(self, *uuids: str, max_rows: int = 0) -> person_pb2.DeleteTombstonedPersonsResponse:
+        return self.client.delete_tombstoned_persons(
+            person_pb2.DeleteTombstonedPersonsRequest(team_id=self.TEAM_ID, person_uuids=list(uuids), max_rows=max_rows)
+        )
+
+    def _present(self, uuid: str) -> bool:
+        return self.client.stored_person(self.TEAM_ID, uuid) is not None
+
+    def _mapped(self, distinct_id: str) -> bool:
+        return self.client.stored_person_by_distinct_id(self.TEAM_ID, distinct_id) is not None
+
+    @pytest.mark.parametrize(
+        "uuid,expected,expect_present",
+        [
+            ("tombstoned", person_pb2.DeleteTombstonedPersonsResponse(deleted_count=1, rows_deleted=2), False),
+            ("live", person_pb2.DeleteTombstonedPersonsResponse(skipped_live_count=1), True),
+            ("blocked", person_pb2.DeleteTombstonedPersonsResponse(blocked_person_uuids=["blocked"]), True),
+            ("big", person_pb2.DeleteTombstonedPersonsResponse(deleted_count=1, rows_deleted=5), False),
+            ("unknown", person_pb2.DeleteTombstonedPersonsResponse(), False),
+        ],
+    )
+    def test_each_outcome(self, uuid, expected, expect_present):
+        # The same uuid twice must not double any count or list.
+        assert self._delete(uuid, uuid) == expected
+        assert self._present(uuid) == expect_present
+
+    @pytest.mark.parametrize(
+        "bounds,expected,expect_present",
+        [
+            (
+                [("newer", 3)],
+                person_pb2.DeleteTombstonedPersonsResponse(deleted_count=1, rows_deleted=1, version_guard_applied=True),
+                False,
+            ),
+            (
+                [("newer", 2)],
+                person_pb2.DeleteTombstonedPersonsResponse(skipped_version_count=1, version_guard_applied=True),
+                True,
+            ),
+            (
+                [("newer", 5), ("newer", 2)],
+                person_pb2.DeleteTombstonedPersonsResponse(skipped_version_count=1, version_guard_applied=True),
+                True,
+            ),
+            (
+                [("live", 0)],
+                person_pb2.DeleteTombstonedPersonsResponse(skipped_live_count=1, version_guard_applied=True),
+                True,
+            ),
+        ],
+    )
+    def test_bounded_persons_delete_only_at_or_below_their_bound(self, bounds, expected, expect_present):
+        self.client.add_person(
+            team_id=self.TEAM_ID,
+            person_id=5,
+            uuid="newer",
+            version=3,
+            distinct_ids=["n-1"],
+            is_deleted=True,
+            tombstoned_distinct_ids=["n-1"],
+        )
+        resp = self.client.delete_tombstoned_persons(
+            person_pb2.DeleteTombstonedPersonsRequest(
+                team_id=self.TEAM_ID,
+                bounded_persons=[
+                    person_pb2.VersionBoundedPerson(person_uuid=uuid, max_version=bound) for uuid, bound in bounds
+                ],
+            )
+        )
+        assert resp == expected
+        assert self._present(bounds[0][0]) == expect_present
+
+    def test_a_person_over_the_budget_is_trimmed_across_calls_then_deleted(self):
+        pending = person_pb2.DeleteTombstonedPersonsResponse(pending_person_uuids=["big"], rows_deleted=2)
+
+        assert self._delete("big", max_rows=2) == pending
+        assert self._delete("big", max_rows=2) == pending
+        assert self._delete("big", max_rows=2) == person_pb2.DeleteTombstonedPersonsResponse(
+            deleted_count=1, rows_deleted=1
+        )
+        assert not self._present("big")
+        assert not self._mapped("o-0")
+
+    def test_small_persons_in_the_same_request_never_wait_behind_a_big_one(self):
+        # tombstoned (2 rows) and blocked (2 rows) are admitted first, in id order, leaving 2
+        # rows of the budget for the big person's trim step.
+        resp = self._delete("big", "tombstoned", "live", "blocked", max_rows=6)
+
+        assert resp == person_pb2.DeleteTombstonedPersonsResponse(
+            deleted_count=1,
+            skipped_live_count=1,
+            blocked_person_uuids=["blocked"],
+            pending_person_uuids=["big"],
+            rows_deleted=4,
+        )
+        assert not self._present("tombstoned")
+        assert self._present("big") and self._present("blocked")
+
+    def test_a_big_person_with_a_live_distinct_id_is_blocked_with_nothing_deleted(self):
+        self.client.add_person(
+            team_id=self.TEAM_ID,
+            person_id=5,
+            uuid="big-live",
+            distinct_ids=[f"x-{i}" for i in range(5)],
+            is_deleted=True,
+            tombstoned_distinct_ids=[f"x-{i}" for i in range(1, 5)],
+        )
+
+        resp = self._delete("big-live", max_rows=2)
+
+        assert resp == person_pb2.DeleteTombstonedPersonsResponse(blocked_person_uuids=["big-live"])
+        for distinct_id in ("x-0", "x-4"):
+            assert self._mapped(distinct_id)
+
+    def test_max_rows_defaults_and_clamps_like_the_server(self):
+        self.client.tombstoned_delete_max_rows = 3
+
+        assert self._delete("big", max_rows=0) == person_pb2.DeleteTombstonedPersonsResponse(
+            pending_person_uuids=["big"], rows_deleted=3
+        )
+        assert self._delete("big", max_rows=1) == person_pb2.DeleteTombstonedPersonsResponse(
+            pending_person_uuids=["big"], rows_deleted=1
+        )
+        assert self._delete("big", max_rows=100) == person_pb2.DeleteTombstonedPersonsResponse(
+            deleted_count=1, rows_deleted=1
+        )
+
+    def test_deleting_removes_distinct_id_mappings_and_cohort_rows_and_is_idempotent(self):
+        self.client.add_cohort_membership(person_id=1, cohort_id=9)
+
+        assert self._delete("tombstoned").deleted_count == 1
+
+        assert not self._mapped("t-1")
+        membership = self.client.check_cohort_membership(
+            cohort_pb2.CheckCohortMembershipRequest(person_id=1, cohort_ids=[9])
+        )
+        assert list(membership.memberships) == []
+        assert self.client.count_cohort_members(cohort_pb2.CountCohortMembersRequest(cohort_ids=[9])).count == 0
+        assert self._delete("tombstoned") == person_pb2.DeleteTombstonedPersonsResponse()
+
+    def test_a_re_added_distinct_id_resolves_to_its_new_person(self):
+        self.client.delete_persons(
+            person_pb2.DeletePersonsRequest(
+                team_id=self.TEAM_ID, person_uuids=["live"], mode=person_pb2.DELETE_PERSONS_MODE_TOMBSTONE
+            )
+        )
+        hidden = self.client.get_person_by_distinct_id(
+            person_pb2.GetPersonByDistinctIdRequest(team_id=self.TEAM_ID, distinct_id="l-1")
+        )
+        assert not hidden.HasField("person")
+
+        self.client.add_person(team_id=self.TEAM_ID, person_id=9, uuid="revived", distinct_ids=["l-1"])
+
+        resolved = self.client.get_person_by_distinct_id(
+            person_pb2.GetPersonByDistinctIdRequest(team_id=self.TEAM_ID, distinct_id="l-1")
+        )
+        assert resolved.person.uuid == "revived"
+
+    def test_wrong_team_touches_nothing(self):
+        resp = self.client.delete_tombstoned_persons(
+            person_pb2.DeleteTombstonedPersonsRequest(team_id=self.TEAM_ID + 1, person_uuids=["tombstoned"])
+        )
+
+        assert resp == person_pb2.DeleteTombstonedPersonsResponse()
+        assert self._present("tombstoned")
+
+    @pytest.mark.parametrize(
+        "mode,message",
+        [
+            (person_pb2.DELETE_PERSONS_MODE_HARD, "HARD"),
+            (99, "Unknown DeletePersonsMode 99"),
+        ],
+    )
+    def test_delete_persons_rejects_hard_and_unknown_modes(self, mode, message):
+        with pytest.raises(ValueError, match=message):
+            self.client.delete_persons(
+                person_pb2.DeletePersonsRequest(team_id=self.TEAM_ID, person_uuids=["live"], mode=mode)
+            )
+
+        stored = self.client.stored_person(self.TEAM_ID, "live")
+        assert stored is not None and not stored.is_deleted
+
+    @pytest.mark.parametrize(
+        "mode", [person_pb2.DELETE_PERSONS_MODE_UNSPECIFIED, person_pb2.DELETE_PERSONS_MODE_TOMBSTONE]
+    )
+    def test_delete_persons_tombstone_mode_keeps_rows_and_reports_versions(self, mode):
+        resp = self.client.delete_persons(
+            person_pb2.DeletePersonsRequest(
+                team_id=self.TEAM_ID,
+                person_uuids=["live", "tombstoned"],
+                mode=mode,
+            )
+        )
+
+        # The live person reports what it wrote. The already tombstoned one is not counted, but it
+        # is reported with the versions it holds, like the replica, so a retry can republish them.
+        assert resp.tombstoned
+        assert resp.deleted_count == 1
+        assert [t.person_uuid for t in resp.tombstones] == ["live", "tombstoned"]
+        assert resp.tombstones[0].version == 1
+        assert [(d.distinct_id, d.version) for d in resp.tombstones[0].distinct_ids] == [("l-1", 1)]
+        assert [(d.distinct_id, d.version) for d in resp.tombstones[1].distinct_ids] == [("t-1", 0), ("t-2", 0)]
+        stored = self.client.stored_person(self.TEAM_ID, "live")
+        assert stored is not None and stored.is_deleted
+        assert stored.version == 1
+
+
+class TestFakePersonHogClientVersionRpcs:
+    TEAM_ID = 7
+    OTHER_TEAM_ID = 8
+
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_person(
+            team_id=self.TEAM_ID,
+            person_id=1,
+            uuid="live",
+            version=2,
+            distinct_ids=["live-did"],
+            distinct_id_versions={"live-did": 1},
+        )
+        self.client.add_person(team_id=self.TEAM_ID, person_id=2, uuid="tomb-low", version=3, is_deleted=True)
+        self.client.add_person(
+            team_id=self.TEAM_ID,
+            person_id=3,
+            uuid="tomb-high",
+            version=9,
+            is_deleted=True,
+            distinct_ids=["tomb-did"],
+            distinct_id_versions={"tomb-did": 4},
+            tombstoned_distinct_ids=["tomb-did"],
+        )
+        self.client.add_person(
+            team_id=self.OTHER_TEAM_ID, person_id=4, uuid="elsewhere", version=1, distinct_ids=["elsewhere-did"]
+        )
+
+    def _ensure_persons(self, *floors: tuple[str, int]) -> list[person_pb2.PersonVersionFloorResult]:
+        response = self.client.ensure_person_version_floors(
+            person_pb2.EnsurePersonVersionFloorsRequest(
+                team_id=self.TEAM_ID,
+                floors=[person_pb2.PersonVersionFloor(person_uuid=u, min_version=m) for u, m in floors],
+            )
+        )
+        return list(response.results)
+
+    def test_ensure_person_floors_classifies_each_row_and_raises_only_tombstones_below_the_floor(self):
+        live = person_pb2.VERSION_FLOOR_OUTCOME_LIVE
+        raised = person_pb2.VERSION_FLOOR_OUTCOME_TOMBSTONE_RAISED
+        at_floor = person_pb2.VERSION_FLOOR_OUTCOME_TOMBSTONE_AT_FLOOR
+        inserted = person_pb2.VERSION_FLOOR_OUTCOME_TOMBSTONE_INSERTED
+        floors = (("live", 5), ("tomb-low", 5), ("tomb-high", 5), ("missing", 5), ("elsewhere", 5))
+
+        result = person_pb2.PersonVersionFloorResult
+        assert self._ensure_persons(*floors) == [
+            result(person_uuid="live", outcome=live, version=2),
+            result(person_uuid="tomb-low", outcome=raised, version=5),
+            result(person_uuid="tomb-high", outcome=at_floor, version=9),
+            result(person_uuid="missing", outcome=inserted, version=5),
+            result(person_uuid="elsewhere", outcome=inserted, version=5),
+        ]
+        live_person = self.client.stored_person(self.TEAM_ID, "live")
+        assert live_person is not None and (live_person.is_deleted, live_person.version) == (False, 2)
+        missing = self.client.stored_person(self.TEAM_ID, "missing")
+        assert missing is not None and missing.is_deleted
+        other_team = self.client.stored_person(self.OTHER_TEAM_ID, "elsewhere")
+        assert other_team is not None and other_team.version == 1
+        assert [r.outcome for r in self._ensure_persons(*floors)] == [
+            live,
+            at_floor,
+            at_floor,
+            at_floor,
+            at_floor,
+        ]
+
+    @pytest.mark.parametrize(
+        "keys,min_version,error",
+        [
+            ([f"k-{i}" for i in range(251)], 0, "Maximum 250"),
+            (["k", "k"], 0, "Duplicate key"),
+            (["k"], -1, "must not be negative"),
+        ],
+    )
+    def test_rejects_batches_the_replica_rejects(self, keys, min_version, error):
+        with pytest.raises(ValueError, match=error):
+            self._ensure_persons(*((k, min_version) for k in keys))
+        assert self.client.stored_person(self.TEAM_ID, keys[0]) is None
+
+
+class TestFakePersonHogClientRepairWrites:
+    TEAM_ID = 7
+    LIVE = "00000000-0000-0000-0000-000000000001"
+    OTHER = "00000000-0000-0000-0000-000000000002"
+    TOMB = "00000000-0000-0000-0000-000000000003"
+    MISSING = "00000000-0000-0000-0000-000000000004"
+
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_person(team_id=self.TEAM_ID, person_id=1, uuid=self.LIVE, version=2, distinct_ids=["live-did"])
+        self.client.add_person(team_id=self.TEAM_ID, person_id=2, uuid=self.OTHER, distinct_ids=["other-did"])
+        self.client.add_person(
+            team_id=self.TEAM_ID,
+            person_id=3,
+            uuid=self.TOMB,
+            version=4,
+            is_deleted=True,
+            distinct_ids=["stray-did"],
+        )
+
+    def _write(
+        self, *writes: tuple[str, person_pb2.DistinctIdWriteAction, str, int]
+    ) -> list[person_pb2.DistinctIdWriteResult]:
+        response = self.client.write_distinct_ids(
+            person_pb2.WriteDistinctIdsRequest(
+                team_id=self.TEAM_ID,
+                writes=[
+                    person_pb2.DistinctIdWrite(distinct_id=d, action=a, person_uuid=u, min_version=m)
+                    for d, a, u, m in writes
+                ],
+            )
+        )
+        return list(response.results)
+
+    def test_raise_person_floors_raises_only_live_persons(self):
+        response = self.client.raise_person_version_floors(
+            person_pb2.RaisePersonVersionFloorsRequest(
+                team_id=self.TEAM_ID,
+                floors=[
+                    person_pb2.PersonVersionFloor(person_uuid=u, min_version=5)
+                    for u in (self.LIVE, self.TOMB, self.MISSING)
+                ],
+            )
+        )
+        assert [(r.outcome, r.version) for r in response.results] == [
+            (person_pb2.RAISE_OUTCOME_RAISED, 5),
+            (person_pb2.RAISE_OUTCOME_NOT_LIVE, 4),
+            (person_pb2.RAISE_OUTCOME_MISSING, 0),
+        ]
+
+    def test_restore_inserts_only_absent_uuids(self):
+        response = self.client.restore_persons(
+            person_pb2.RestorePersonsRequest(
+                team_id=self.TEAM_ID,
+                persons=[
+                    person_pb2.RestoredPerson(person_uuid=u, properties=b'{"plan": "free"}', version=6)
+                    for u in (self.MISSING, self.LIVE, self.TOMB)
+                ],
+            )
+        )
+        assert [r.outcome for r in response.results] == [
+            person_pb2.RESTORE_OUTCOME_INSERTED,
+            person_pb2.RESTORE_OUTCOME_EXISTS_LIVE,
+            person_pb2.RESTORE_OUTCOME_EXISTS_TOMBSTONED,
+        ]
+        restored = self.client.stored_person(self.TEAM_ID, self.MISSING)
+        assert restored is not None and json.loads(restored.properties) == {"plan": "free"} and restored.version == 6
+
+    def test_restore_inserts_listed_distinct_ids_and_skips_a_person_none_of_them_could_reach(self):
+        holder = "00000000-0000-0000-0000-000000000009"
+        self.client.add_person(team_id=self.TEAM_ID, person_id=9, uuid=holder, distinct_ids=["taken", "taken-2"])
+        reachable, unreachable = "00000000-0000-0000-0000-000000000005", "00000000-0000-0000-0000-000000000006"
+
+        def ids(*dids: str) -> list[person_pb2.RestoredDistinctId]:
+            return [person_pb2.RestoredDistinctId(distinct_id=d, version=4) for d in dids]
+
+        response = self.client.restore_persons(
+            person_pb2.RestorePersonsRequest(
+                team_id=self.TEAM_ID,
+                persons=[
+                    person_pb2.RestoredPerson(
+                        person_uuid=reachable, properties=b"{}", distinct_ids=ids("new", "taken")
+                    ),
+                    person_pb2.RestoredPerson(person_uuid=unreachable, properties=b"{}", distinct_ids=ids("taken-2")),
+                ],
+            )
+        )
+
+        assert [(r.outcome, list(r.restored_distinct_ids)) for r in response.results] == [
+            (person_pb2.RESTORE_OUTCOME_INSERTED, ["new"]),
+            (person_pb2.RESTORE_OUTCOME_NO_DISTINCT_ID, []),
+        ]
+        assert self.client.stored_person(self.TEAM_ID, unreachable) is None
+        stored = self.client.get_distinct_id_rows(
+            person_pb2.GetDistinctIdRowsRequest(team_id=self.TEAM_ID, distinct_ids=["new", "taken"])
+        )
+        rows = {r.distinct_id: (r.person_uuid, r.version) for r in stored.rows}
+        assert rows == {"new": (reachable, 4), "taken": (holder, 0)}
+
+    def test_write_distinct_ids_applies_each_write_only_from_its_expected_state(self):
+        insert = person_pb2.DISTINCT_ID_WRITE_ACTION_INSERT
+        raise_ = person_pb2.DISTINCT_ID_WRITE_ACTION_RAISE
+        tombstone = person_pb2.DISTINCT_ID_WRITE_ACTION_TOMBSTONE
+        applied = person_pb2.DISTINCT_ID_WRITE_OUTCOME_APPLIED
+        failed = person_pb2.DISTINCT_ID_WRITE_OUTCOME_PRECONDITION_FAILED
+        not_live = person_pb2.DISTINCT_ID_WRITE_OUTCOME_PERSON_NOT_LIVE
+
+        results = self._write(
+            ("new-did", insert, self.LIVE, 5),
+            ("other-did", insert, self.LIVE, 5),
+            ("dead-did", insert, self.TOMB, 5),
+            ("live-did", raise_, self.LIVE, 3),
+            ("other-did-2", raise_, self.LIVE, 3),
+            ("dead-did-raise", raise_, self.TOMB, 3),
+            ("stray-did", tombstone, self.TOMB, 4),
+        )
+        assert [
+            (
+                r.distinct_id,
+                r.outcome,
+                (r.row.person_id, r.row.version, r.row.is_deleted) if r.HasField("row") else None,
+            )
+            for r in results
+        ] == [
+            ("new-did", applied, (1, 5, False)),
+            ("other-did", failed, (2, 0, False)),
+            ("dead-did", not_live, None),
+            ("live-did", applied, (1, 3, False)),
+            ("other-did-2", failed, None),
+            ("dead-did-raise", not_live, None),
+            ("stray-did", applied, (3, 4, True)),
+        ]
+        (live_owner,) = self._write(("other-did", tombstone, self.OTHER, 4))
+        assert (live_owner.outcome, live_owner.row.version, live_owner.row.is_deleted) == (failed, 0, False)
+        (other_owner,) = self._write(("other-did", tombstone, self.TOMB, 4))
+        assert (other_owner.outcome, other_owner.row.is_deleted) == (failed, False)
+        (retried,) = self._write(("stray-did", tombstone, self.TOMB, 4))
+        assert (retried.outcome, retried.row.version, retried.row.is_deleted) == (
+            person_pb2.DISTINCT_ID_WRITE_OUTCOME_UNCHANGED,
+            4,
+            True,
+        )
+
+    def test_rejects_the_whole_batch_before_any_write(self):
+        with pytest.raises(ValueError, match="must not be negative"):
+            self._write(
+                ("first-did", person_pb2.DISTINCT_ID_WRITE_ACTION_INSERT, self.LIVE, 1),
+                ("second-did", person_pb2.DISTINCT_ID_WRITE_ACTION_INSERT, self.LIVE, -1),
+            )
+        assert self.client.stored_person_by_distinct_id(self.TEAM_ID, "first-did") is None
+        with pytest.raises(ValueError, match="Duplicate key"):
+            self.client.raise_person_version_floors(
+                person_pb2.RaisePersonVersionFloorsRequest(
+                    team_id=self.TEAM_ID,
+                    floors=[
+                        person_pb2.PersonVersionFloor(person_uuid=self.LIVE, min_version=9),
+                        person_pb2.PersonVersionFloor(person_uuid=self.LIVE.upper(), min_version=9),
+                    ],
+                )
+            )
+        live = self.client.stored_person(self.TEAM_ID, self.LIVE)
+        assert live is not None and live.version == 2
+
+
+class TestFakePersonHogClientLifecycleDeletes:
+    TEAM_ID = 1
+    OP_A = "11111111-1111-4111-8111-111111111111"
+    OP_B = "22222222-2222-4222-8222-222222222222"
+
+    def setup_method(self):
+        self.client = FakePersonHogClient()
+        self.client.add_person(
+            team_id=self.TEAM_ID, person_id=10, uuid="abc-123", version=4, distinct_ids=["user@example.com", "anon-1"]
+        )
+        self.client.add_person(team_id=self.TEAM_ID, person_id=20, uuid="def-456", distinct_ids=["user2@example.com"])
+        self.client.add_cohort_membership(person_id=10, cohort_id=7)
+
+    def _delete(self, person_ids: list[int], op_id: str = OP_A, team_id: int = TEAM_ID):
+        return self.client.lifecycle.delete_persons(
+            lifecycle_pb2.DeletePersonsRequest(team_id=team_id, person_ids=person_ids, op_id=op_id)
+        )
+
+    def test_reports_one_outcome_per_requested_id_and_tombstones_the_deleted_persons(self):
+        response = self._delete([10, 999, 10, 20])
+
+        assert response.op_id == self.OP_A
+        assert [(r.person_id, r.outcome) for r in response.results] == [
+            (10, lifecycle_pb2.DELETE_PERSON_OUTCOME_DELETED),
+            (999, lifecycle_pb2.DELETE_PERSON_OUTCOME_NOT_FOUND),
+            (10, lifecycle_pb2.DELETE_PERSON_OUTCOME_DELETED),
+            (20, lifecycle_pb2.DELETE_PERSON_OUTCOME_DELETED),
+        ]
+        stored = self.client.stored_person(self.TEAM_ID, "abc-123")
+        assert stored is not None and stored.is_deleted and stored.version == 5
+        assert not self.client.get_person(person_pb2.GetPersonRequest(team_id=self.TEAM_ID, person_id=10)).HasField(
+            "person"
+        )
+        assert not self.client.get_person_by_distinct_id(
+            person_pb2.GetPersonByDistinctIdRequest(team_id=self.TEAM_ID, distinct_id="anon-1")
+        ).HasField("person")
+        assert (
+            self.client.check_cohort_membership(
+                cohort_pb2.CheckCohortMembershipRequest(person_id=10, cohort_ids=[7])
+            ).memberships
+            == []
+        )
+        # The saga leaves no publish-queue row; ClickHouse hears about the delete from the changelog.
+        assert self.client.tombstone_queue == {}
+
+    def test_already_tombstoned_and_held_persons_are_not_touched(self):
+        self._delete([10])
+        self.client.hold_lifecycle_mark(team_id=self.TEAM_ID, person_id=20)
+
+        response = self._delete([10, 20], op_id=self.OP_B)
+
+        assert [r.outcome for r in response.results] == [
+            lifecycle_pb2.DELETE_PERSON_OUTCOME_NOT_FOUND,
+            lifecycle_pb2.DELETE_PERSON_OUTCOME_SKIPPED_CONFLICT,
+        ]
+        stored = self.client.stored_person(self.TEAM_ID, "abc-123")
+        assert stored is not None and stored.version == 5
+        assert self.client.get_person(person_pb2.GetPersonRequest(team_id=self.TEAM_ID, person_id=20)).HasField(
+            "person"
+        )
+
+    def test_retry_with_the_same_op_id_and_request_returns_the_recorded_outcome(self):
+        first = self._delete([10, 20])
+
+        retry = self._delete([10, 20])
+
+        assert retry == first
+        stored = self.client.stored_person(self.TEAM_ID, "abc-123")
+        assert stored is not None and stored.version == 5
+        assert len(self.client.assert_called("lifecycle.delete_persons")) == 2
+
+    @parameterized.expand(
+        [
+            ("different_ids", [10], TEAM_ID),
+            ("different_order", [20, 10], TEAM_ID),
+            ("different_team", [10, 20], 2),
+        ]
+    )
+    def test_same_op_id_with_a_different_request_is_a_definitive_refusal(
+        self, _name: str, person_ids: list[int], team_id: int
+    ):
+        self._delete([10, 20])
+
+        with pytest.raises(grpc.RpcError) as raised:
+            self._delete(person_ids, team_id=team_id)
+
+        assert raised.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        assert semantic_refusal_reason(raised.value) == "op_id_reused"
+
+    @parameterized.expand(
+        [
+            ("empty", [], OP_A, TEAM_ID),
+            ("over_the_cap", list(range(1, 252)), OP_A, TEAM_ID),
+            ("non_positive_id", [10, 0], OP_A, TEAM_ID),
+            ("malformed_op_id", [10], "not-a-uuid", TEAM_ID),
+            ("team_id_out_of_range", [10], OP_A, 2**31),
+        ]
+    )
+    def test_rejects_requests_the_server_would_reject(
+        self, _name: str, person_ids: list[int], op_id: str, team_id: int
+    ):
+        with pytest.raises(grpc.RpcError) as raised:
+            self._delete(person_ids, op_id=op_id, team_id=team_id)
+
+        assert raised.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        stored = self.client.stored_person(self.TEAM_ID, "abc-123")
+        assert stored is not None and not stored.is_deleted

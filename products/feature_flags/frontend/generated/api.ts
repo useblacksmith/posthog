@@ -1,0 +1,1601 @@
+import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * To modify these types, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+import type {
+    ActivityLogPaginatedResponseApi,
+    BulkDeleteRequestApi,
+    BulkDeleteResponseApi,
+    BulkKeysRequestApi,
+    BulkKeysResponseApi,
+    BulkUpdateTagsRequestApi,
+    BulkUpdateTagsResponseApi,
+    CopyFlagsDependencyRequirementsRequestApi,
+    CopyFlagsDependencyRequirementsResponseApi,
+    CopyFlagsRequestApi,
+    CopyFlagsResponseApi,
+    CreateStaticCohortForFlagResponseApi,
+    DependentFlagApi,
+    EvaluationContextSuggestionRequestApi,
+    EvaluationContextSuggestionResponseApi,
+    FeatureFlagApi,
+    FeatureFlagCodeAnalysisApi,
+    FeatureFlagCodeAnalysisStartApi,
+    FeatureFlagCodeAnalysisTargetApi,
+    FeatureFlagCodeCleanupStartApi,
+    FeatureFlagCreateRequestSchemaApi,
+    FeatureFlagRequestUsageListParams,
+    FeatureFlagRequestUsageResponseApi,
+    FeatureFlagRestoreVersionRequestApi,
+    FeatureFlagRollOutToEveryoneRequestApi,
+    FeatureFlagSetActiveRequestApi,
+    FeatureFlagSetReleaseConditionRolloutRequestApi,
+    FeatureFlagStatusResponseApi,
+    FeatureFlagTestEvaluationRequestApi,
+    FeatureFlagTestEvaluationResponseApi,
+    FeatureFlagVersionResponseApi,
+    FeatureFlagsActivityRetrieveParams,
+    FeatureFlagsAllActivityRetrieveParams,
+    FeatureFlagsCodeAnalysisTargetRetrieveParams,
+    FeatureFlagsEvaluationReasonsRetrieveParams,
+    FeatureFlagsListParams,
+    FeatureFlagsMyFlagsRetrieveParams,
+    FeatureFlagsStaffCacheEntryRetrieveParams,
+    FeatureFlagsStaffCacheListParams,
+    FeatureFlagsStaffTeamConfigListParams,
+    FeatureFlagsStaffTeamsListParams,
+    FlagValueResponseApi,
+    FlagValueValuesRetrieveParams,
+    MyFlagsResponseApi,
+    OrgFeatureFlagsKeysParams,
+    OrganizationFeatureFlagKeysResponseApi,
+    OrganizationsProjectsEvaluationContextSuggestionsDestroyParams,
+    PaginatedFeatureFlagListApi,
+    PaginatedScheduledChangeListApi,
+    PatchedFeatureFlagPartialUpdateRequestSchemaApi,
+    PatchedScheduledChangeApi,
+    ScheduledChangeApi,
+    ScheduledChangesListParams,
+    StaffCacheEntryResponseApi,
+    StaffCacheMutationApi,
+    StaffCacheMutationResponseApi,
+    StaffCacheStatusResponseApi,
+    StaffFlagEvaluationsModeMutationApi,
+    StaffFlagEvaluationsModeResponseApi,
+    StaffTeamConfigApi,
+    StaffTeamConfigListResponseApi,
+    StaffTeamConfigMutationApi,
+    StaffTeamSearchResponseApi,
+    StaffWarmRunCancelResponseApi,
+    StaffWarmRunResponseApi,
+    UserBlastRadiusRequestApi,
+    UserBlastRadiusResponseApi,
+} from './api.schemas'
+
+// https://stackoverflow.com/questions/49579094/typescript-conditional-types-filter-out-readonly-properties-pick-only-requir/49579497#49579497
+type IfEquals<X, Y, A = X, B = never> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2 ? A : B
+
+type WritableKeys<T> = {
+    [P in keyof T]-?: IfEquals<{ [Q in P]: T[P] }, { -readonly [Q in P]: T[P] }, P>
+}[keyof T]
+
+type UnionToIntersection<U> = (U extends any ? (k: U) => void : never) extends (k: infer I) => void ? I : never
+type DistributeReadOnlyOverUnions<T> = T extends any ? NonReadonly<T> : never
+
+type Writable<T> = Pick<T, WritableKeys<T>>
+type NonReadonly<T> = [T] extends [UnionToIntersection<T>]
+    ? {
+          [P in keyof Writable<T>]: T[P] extends object ? NonReadonly<NonNullable<T[P]>> : T[P]
+      }
+    : DistributeReadOnlyOverUnions<T>
+
+export const getFeatureFlagsStaffCacheListUrl = (params: FeatureFlagsStaffCacheListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/feature_flags_staff_cache/?${stringifiedParams}`
+        : `/api/feature_flags_staff_cache/`
+}
+
+/**
+ * Staff-only, unscoped status/entry/rebuild/clear for the HyperCache-backed flag caches.
+ *
+ * Rebuild/clear act on two logical targets: 'evaluation' (the /flags cache) and 'definitions'
+ * (the /flags/definitions local-eval cache), independently readable and mutable.
+ *
+ * Reuses the existing cache functions and Celery tasks (the same mechanism signal handlers use
+ * when a flag changes) rather than re-implementing cache-write logic. Registered on the root
+ * router so it is not team-nested; staff act on teams they do not belong to.
+ */
+export const featureFlagsStaffCacheList = async (
+    params: FeatureFlagsStaffCacheListParams,
+    options?: RequestInit
+): Promise<StaffCacheStatusResponseApi> => {
+    return apiMutator<StaffCacheStatusResponseApi>(getFeatureFlagsStaffCacheListUrl(params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsStaffCacheClearCreateUrl = () => {
+    return `/api/feature_flags_staff_cache/clear/`
+}
+
+/**
+ * Staff-only, unscoped status/entry/rebuild/clear for the HyperCache-backed flag caches.
+ *
+ * Rebuild/clear act on two logical targets: 'evaluation' (the /flags cache) and 'definitions'
+ * (the /flags/definitions local-eval cache), independently readable and mutable.
+ *
+ * Reuses the existing cache functions and Celery tasks (the same mechanism signal handlers use
+ * when a flag changes) rather than re-implementing cache-write logic. Registered on the root
+ * router so it is not team-nested; staff act on teams they do not belong to.
+ */
+export const featureFlagsStaffCacheClearCreate = async (
+    staffCacheMutationApi: StaffCacheMutationApi,
+    options?: RequestInit
+): Promise<StaffCacheMutationResponseApi> => {
+    return apiMutator<StaffCacheMutationResponseApi>(getFeatureFlagsStaffCacheClearCreateUrl(), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(staffCacheMutationApi),
+    })
+}
+
+export const getFeatureFlagsStaffCacheEntryRetrieveUrl = (params: FeatureFlagsStaffCacheEntryRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/feature_flags_staff_cache/entry/?${stringifiedParams}`
+        : `/api/feature_flags_staff_cache/entry/`
+}
+
+/**
+ * Staff-only, unscoped status/entry/rebuild/clear for the HyperCache-backed flag caches.
+ *
+ * Rebuild/clear act on two logical targets: 'evaluation' (the /flags cache) and 'definitions'
+ * (the /flags/definitions local-eval cache), independently readable and mutable.
+ *
+ * Reuses the existing cache functions and Celery tasks (the same mechanism signal handlers use
+ * when a flag changes) rather than re-implementing cache-write logic. Registered on the root
+ * router so it is not team-nested; staff act on teams they do not belong to.
+ */
+export const featureFlagsStaffCacheEntryRetrieve = async (
+    params: FeatureFlagsStaffCacheEntryRetrieveParams,
+    options?: RequestInit
+): Promise<StaffCacheEntryResponseApi> => {
+    return apiMutator<StaffCacheEntryResponseApi>(getFeatureFlagsStaffCacheEntryRetrieveUrl(params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsStaffCacheRebuildCreateUrl = () => {
+    return `/api/feature_flags_staff_cache/rebuild/`
+}
+
+/**
+ * Staff-only, unscoped status/entry/rebuild/clear for the HyperCache-backed flag caches.
+ *
+ * Rebuild/clear act on two logical targets: 'evaluation' (the /flags cache) and 'definitions'
+ * (the /flags/definitions local-eval cache), independently readable and mutable.
+ *
+ * Reuses the existing cache functions and Celery tasks (the same mechanism signal handlers use
+ * when a flag changes) rather than re-implementing cache-write logic. Registered on the root
+ * router so it is not team-nested; staff act on teams they do not belong to.
+ */
+export const featureFlagsStaffCacheRebuildCreate = async (
+    staffCacheMutationApi: StaffCacheMutationApi,
+    options?: RequestInit
+): Promise<StaffCacheMutationResponseApi> => {
+    return apiMutator<StaffCacheMutationResponseApi>(getFeatureFlagsStaffCacheRebuildCreateUrl(), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(staffCacheMutationApi),
+    })
+}
+
+export const getFeatureFlagsStaffCacheWarmRunRetrieveUrl = () => {
+    return `/api/feature_flags_staff_cache/warm_run/`
+}
+
+/**
+ * Status of the most recent warm-all run, published by the Rust warmer.
+ */
+export const featureFlagsStaffCacheWarmRunRetrieve = async (
+    options?: RequestInit
+): Promise<StaffWarmRunResponseApi> => {
+    return apiMutator<StaffWarmRunResponseApi>(getFeatureFlagsStaffCacheWarmRunRetrieveUrl(), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsStaffCacheWarmRunCancelCreateUrl = () => {
+    return `/api/feature_flags_staff_cache/warm_run/cancel/`
+}
+
+/**
+ * Request cancellation of the active warm-all run.
+ *
+ * Sets the cancel key the warmer polls between status heartbeats; the run winds down after
+ * in-flight teams finish. Cancelling a stale run is allowed (the key is scoped to the run id,
+ * so a dead process simply never reads it).
+ */
+export const featureFlagsStaffCacheWarmRunCancelCreate = async (
+    options?: RequestInit
+): Promise<StaffWarmRunCancelResponseApi> => {
+    return apiMutator<StaffWarmRunCancelResponseApi>(getFeatureFlagsStaffCacheWarmRunCancelCreateUrl(), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getFeatureFlagsStaffTeamConfigListUrl = (params: FeatureFlagsStaffTeamConfigListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/feature_flags_staff_team_config/?${stringifiedParams}`
+        : `/api/feature_flags_staff_team_config/`
+}
+
+/**
+ * Staff-only, unscoped read/write for TeamFeatureFlagsConfig: behavior rollout gates and the
+ * per-team feature-flag count override.
+ *
+ * set() writes one team only, by design. Rollout settings are changed after staff verify SDK
+ * compatibility, and max_feature_flags_override is a per-customer capacity grant. Neither is a
+ * bulk operation, unlike the cache tools' rebuild and clear. flag_evaluations_mode belongs to the
+ * organization, and only set_flag_evaluations_mode() writes it, for the organizations of the given
+ * teams. It uses the same helpers as the set_flag_evaluations_mode command, including the guard
+ * against lowering an organization, and it writes every organization of a request in one
+ * transaction.
+ *
+ * set() takes partial updates: omit a setting to leave it unchanged, and send
+ * max_feature_flags_override as null to clear the override.
+ *
+ * Registered on the root router so it is not team-nested; staff act on teams they do not
+ * belong to, same as staff_cache.py / staff_teams.py.
+ */
+export const featureFlagsStaffTeamConfigList = async (
+    params: FeatureFlagsStaffTeamConfigListParams,
+    options?: RequestInit
+): Promise<StaffTeamConfigListResponseApi> => {
+    return apiMutator<StaffTeamConfigListResponseApi>(getFeatureFlagsStaffTeamConfigListUrl(params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsStaffTeamConfigSetCreateUrl = () => {
+    return `/api/feature_flags_staff_team_config/set/`
+}
+
+/**
+ * Staff-only, unscoped read/write for TeamFeatureFlagsConfig: behavior rollout gates and the
+ * per-team feature-flag count override.
+ *
+ * set() writes one team only, by design. Rollout settings are changed after staff verify SDK
+ * compatibility, and max_feature_flags_override is a per-customer capacity grant. Neither is a
+ * bulk operation, unlike the cache tools' rebuild and clear. flag_evaluations_mode belongs to the
+ * organization, and only set_flag_evaluations_mode() writes it, for the organizations of the given
+ * teams. It uses the same helpers as the set_flag_evaluations_mode command, including the guard
+ * against lowering an organization, and it writes every organization of a request in one
+ * transaction.
+ *
+ * set() takes partial updates: omit a setting to leave it unchanged, and send
+ * max_feature_flags_override as null to clear the override.
+ *
+ * Registered on the root router so it is not team-nested; staff act on teams they do not
+ * belong to, same as staff_cache.py / staff_teams.py.
+ */
+export const featureFlagsStaffTeamConfigSetCreate = async (
+    staffTeamConfigMutationApi: StaffTeamConfigMutationApi,
+    options?: RequestInit
+): Promise<StaffTeamConfigApi> => {
+    return apiMutator<StaffTeamConfigApi>(getFeatureFlagsStaffTeamConfigSetCreateUrl(), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(staffTeamConfigMutationApi),
+    })
+}
+
+export const getFeatureFlagsStaffTeamConfigSetFlagEvaluationsModeCreateUrl = () => {
+    return `/api/feature_flags_staff_team_config/set_flag_evaluations_mode/`
+}
+
+/**
+ * Staff-only, unscoped read/write for TeamFeatureFlagsConfig: behavior rollout gates and the
+ * per-team feature-flag count override.
+ *
+ * set() writes one team only, by design. Rollout settings are changed after staff verify SDK
+ * compatibility, and max_feature_flags_override is a per-customer capacity grant. Neither is a
+ * bulk operation, unlike the cache tools' rebuild and clear. flag_evaluations_mode belongs to the
+ * organization, and only set_flag_evaluations_mode() writes it, for the organizations of the given
+ * teams. It uses the same helpers as the set_flag_evaluations_mode command, including the guard
+ * against lowering an organization, and it writes every organization of a request in one
+ * transaction.
+ *
+ * set() takes partial updates: omit a setting to leave it unchanged, and send
+ * max_feature_flags_override as null to clear the override.
+ *
+ * Registered on the root router so it is not team-nested; staff act on teams they do not
+ * belong to, same as staff_cache.py / staff_teams.py.
+ */
+export const featureFlagsStaffTeamConfigSetFlagEvaluationsModeCreate = async (
+    staffFlagEvaluationsModeMutationApi: StaffFlagEvaluationsModeMutationApi,
+    options?: RequestInit
+): Promise<StaffFlagEvaluationsModeResponseApi> => {
+    return apiMutator<StaffFlagEvaluationsModeResponseApi>(
+        getFeatureFlagsStaffTeamConfigSetFlagEvaluationsModeCreateUrl(),
+        {
+            ...options,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(staffFlagEvaluationsModeMutationApi),
+        }
+    )
+}
+
+export const getFeatureFlagsStaffTeamsListUrl = (params: FeatureFlagsStaffTeamsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/feature_flags_staff_teams/?${stringifiedParams}`
+        : `/api/feature_flags_staff_teams/`
+}
+
+/**
+ * Staff-only, unscoped team search across every organization.
+ *
+ * Unlike TeamViewSet (membership-scoped via TeamAndOrgViewSetMixin), staff need to look up
+ * teams they do not belong to in order to inspect and rebuild flag caches. Registered on the
+ * root router so it is not team-nested. Exposes the same fields Django admin's TeamAdmin
+ * already shows staff un-redacted, so no new data exposure.
+ */
+export const featureFlagsStaffTeamsList = async (
+    params: FeatureFlagsStaffTeamsListParams,
+    options?: RequestInit
+): Promise<StaffTeamSearchResponseApi> => {
+    return apiMutator<StaffTeamSearchResponseApi>(getFeatureFlagsStaffTeamsListUrl(params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getOrgFeatureFlagsRetrieveUrl = (organizationId: string, featureFlagKey: string) => {
+    return `/api/organizations/${organizationId}/feature_flags/${featureFlagKey}/`
+}
+
+export const orgFeatureFlagsRetrieve = async (
+    organizationId: string,
+    featureFlagKey: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getOrgFeatureFlagsRetrieveUrl(organizationId, featureFlagKey), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsCopyFlagsCreateUrl = (organizationId: string) => {
+    return `/api/organizations/${organizationId}/feature_flags/copy_flags/`
+}
+
+export const featureFlagsCopyFlagsCreate = async (
+    organizationId: string,
+    copyFlagsRequestApi: CopyFlagsRequestApi,
+    options?: RequestInit
+): Promise<CopyFlagsResponseApi> => {
+    return apiMutator<CopyFlagsResponseApi>(getFeatureFlagsCopyFlagsCreateUrl(organizationId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(copyFlagsRequestApi),
+    })
+}
+
+export const getFeatureFlagsCopyFlagsDependencyRequirementsCreateUrl = (organizationId: string) => {
+    return `/api/organizations/${organizationId}/feature_flags/copy_flags/dependency_requirements/`
+}
+
+export const featureFlagsCopyFlagsDependencyRequirementsCreate = async (
+    organizationId: string,
+    copyFlagsDependencyRequirementsRequestApi: CopyFlagsDependencyRequirementsRequestApi,
+    options?: RequestInit
+): Promise<CopyFlagsDependencyRequirementsResponseApi> => {
+    return apiMutator<CopyFlagsDependencyRequirementsResponseApi>(
+        getFeatureFlagsCopyFlagsDependencyRequirementsCreateUrl(organizationId),
+        {
+            ...options,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(copyFlagsDependencyRequirementsRequestApi),
+        }
+    )
+}
+
+export const getOrgFeatureFlagsKeysUrl = (organizationId: string, params?: OrgFeatureFlagsKeysParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/organizations/${organizationId}/feature_flags/keys/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/feature_flags/keys/`
+}
+
+/**
+ * Paginated, de-duplicated list of feature flag keys across the org's compared projects.
+ *
+ * Unlike the project-scoped flag list, this enumerates the union of flag keys across every
+ * compared project, so flags that exist only in another project still appear as rows.
+ */
+export const orgFeatureFlagsKeys = async (
+    organizationId: string,
+    params?: OrgFeatureFlagsKeysParams,
+    options?: RequestInit
+): Promise<OrganizationFeatureFlagKeysResponseApi> => {
+    return apiMutator<OrganizationFeatureFlagKeysResponseApi>(getOrgFeatureFlagsKeysUrl(organizationId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getOrganizationsProjectsEvaluationContextSuggestionsCreateUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/evaluation_context_suggestions/`
+}
+
+/**
+ * Hide an evaluation context name from the flag editor's suggestion list, or restore it.
+ *
+ * POST hides the name; DELETE restores it. The underlying context row and any flags already
+ * using it are never modified — this only controls what gets suggested.
+ */
+export const organizationsProjectsEvaluationContextSuggestionsCreate = async (
+    organizationId: string,
+    id: number,
+    evaluationContextSuggestionRequestApi: EvaluationContextSuggestionRequestApi,
+    options?: RequestInit
+): Promise<EvaluationContextSuggestionResponseApi> => {
+    return apiMutator<EvaluationContextSuggestionResponseApi>(
+        getOrganizationsProjectsEvaluationContextSuggestionsCreateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(evaluationContextSuggestionRequestApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsEvaluationContextSuggestionsDestroyUrl = (
+    organizationId: string,
+    id: number,
+    params: OrganizationsProjectsEvaluationContextSuggestionsDestroyParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/organizations/${organizationId}/projects/${id}/evaluation_context_suggestions/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/projects/${id}/evaluation_context_suggestions/`
+}
+
+/**
+ * Hide an evaluation context name from the flag editor's suggestion list, or restore it.
+ *
+ * POST hides the name; DELETE restores it. The underlying context row and any flags already
+ * using it are never modified — this only controls what gets suggested.
+ */
+export const organizationsProjectsEvaluationContextSuggestionsDestroy = async (
+    organizationId: string,
+    id: number,
+    params: OrganizationsProjectsEvaluationContextSuggestionsDestroyParams,
+    options?: RequestInit
+): Promise<EvaluationContextSuggestionResponseApi> => {
+    return apiMutator<EvaluationContextSuggestionResponseApi>(
+        getOrganizationsProjectsEvaluationContextSuggestionsDestroyUrl(organizationId, id, params),
+        {
+            ...options,
+            method: 'DELETE',
+        }
+    )
+}
+
+export const getFeatureFlagRequestUsageListUrl = (projectId: string, params: FeatureFlagRequestUsageListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/feature_flag_request_usage/?${stringifiedParams}`
+        : `/api/projects/${projectId}/feature_flag_request_usage/`
+}
+
+export const featureFlagRequestUsageList = async (
+    projectId: string,
+    params: FeatureFlagRequestUsageListParams,
+    options?: RequestInit
+): Promise<FeatureFlagRequestUsageResponseApi> => {
+    return apiMutator<FeatureFlagRequestUsageResponseApi>(getFeatureFlagRequestUsageListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsListUrl = (projectId: string, params?: FeatureFlagsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/feature_flags/?${stringifiedParams}`
+        : `/api/projects/${projectId}/feature_flags/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsList = async (
+    projectId: string,
+    params?: FeatureFlagsListParams,
+    options?: RequestInit
+): Promise<PaginatedFeatureFlagListApi> => {
+    return apiMutator<PaginatedFeatureFlagListApi>(getFeatureFlagsListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/feature_flags/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsCreate = async (
+    projectId: string,
+    featureFlagCreateRequestSchemaApi?: FeatureFlagCreateRequestSchemaApi,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagCreateRequestSchemaApi),
+    })
+}
+
+export const getFeatureFlagsRetrieveUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsRetrieve = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsUpdateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsUpdate = async (
+    projectId: string,
+    id: number,
+    featureFlagApi: NonReadonly<FeatureFlagApi>,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagApi),
+    })
+}
+
+export const getFeatureFlagsPartialUpdateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsPartialUpdate = async (
+    projectId: string,
+    id: number,
+    patchedFeatureFlagPartialUpdateRequestSchemaApi?: PatchedFeatureFlagPartialUpdateRequestSchemaApi,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedFeatureFlagPartialUpdateRequestSchemaApi),
+    })
+}
+
+export const getFeatureFlagsDestroyUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/`
+}
+
+/**
+ * Hard delete of this model is not allowed. Use a patch API call to set "deleted" to true
+ */
+export const featureFlagsDestroy = async (projectId: string, id: number, options?: RequestInit): Promise<unknown> => {
+    return apiMutator<unknown>(getFeatureFlagsDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getFeatureFlagsActivityRetrieveUrl = (
+    projectId: string,
+    id: number,
+    params?: FeatureFlagsActivityRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/feature_flags/${id}/activity/?${stringifiedParams}`
+        : `/api/projects/${projectId}/feature_flags/${id}/activity/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsActivityRetrieve = async (
+    projectId: string,
+    id: number,
+    params?: FeatureFlagsActivityRetrieveParams,
+    options?: RequestInit
+): Promise<ActivityLogPaginatedResponseApi> => {
+    return apiMutator<ActivityLogPaginatedResponseApi>(getFeatureFlagsActivityRetrieveUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsAnalyzeCodeCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/analyze_code/`
+}
+
+/**
+ * Start a read-only analysis of where the project's GitHub repository checks this flag.
+ *
+ * An agent clones the repository, finds every check of the flag, and reports the code each outcome runs.
+ * It does not change code or the flag. Returns 400 when no repository can be chosen (see
+ * `code_analysis_target`), 403 when AI data processing is not approved or the request comes from a task
+ * sandbox, and 409 when an analysis is already running.
+ */
+export const featureFlagsAnalyzeCodeCreate = async (
+    projectId: string,
+    id: number,
+    featureFlagCodeAnalysisStartApi?: FeatureFlagCodeAnalysisStartApi,
+    options?: RequestInit
+): Promise<FeatureFlagCodeAnalysisApi> => {
+    return apiMutator<FeatureFlagCodeAnalysisApi>(getFeatureFlagsAnalyzeCodeCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagCodeAnalysisStartApi),
+    })
+}
+
+export const getFeatureFlagsArchiveCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/archive/`
+}
+
+/**
+ * Archive a feature flag, hiding it from the default flag list.
+ *
+ * Sets `archived` to true. An archived flag must be disabled, so an enabled flag also gets
+ * `active` set to false in the same write. Targeting, variants and payloads are left as
+ * they are, and linked experiment and survey history is preserved. Archiving an enabled
+ * flag is refused when other active flags depend on it. An already-archived flag is
+ * returned unchanged.
+ */
+export const featureFlagsArchiveCreate = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsArchiveCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getFeatureFlagsCodeAnalysisRetrieveUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/code_analysis/`
+}
+
+/**
+ * The latest code analysis of this flag: where the project's GitHub repository checks the flag, and
+ * the code each outcome runs.
+ *
+ * Poll until `is_terminal` is true. `result` is filled once the run completes. Returns 404 when the
+ * flag has never been analyzed.
+ */
+export const featureFlagsCodeAnalysisRetrieve = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<FeatureFlagCodeAnalysisApi> => {
+    return apiMutator<FeatureFlagCodeAnalysisApi>(getFeatureFlagsCodeAnalysisRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsCodeAnalysisTargetRetrieveUrl = (
+    projectId: string,
+    id: number,
+    params?: FeatureFlagsCodeAnalysisTargetRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/feature_flags/${id}/code_analysis_target/?${stringifiedParams}`
+        : `/api/projects/${projectId}/feature_flags/${id}/code_analysis_target/`
+}
+
+/**
+ * Repository a code analysis of this flag would read.
+ *
+ * Resolution order: the requested repository, else the one the last analysis used, else the
+ * environment's default flag cleanup repository, else the only connected repository. When the
+ * project has several repositories and none is chosen (`source=ambiguous`), pass one in `repository`.
+ */
+export const featureFlagsCodeAnalysisTargetRetrieve = async (
+    projectId: string,
+    id: number,
+    params?: FeatureFlagsCodeAnalysisTargetRetrieveParams,
+    options?: RequestInit
+): Promise<FeatureFlagCodeAnalysisTargetApi> => {
+    return apiMutator<FeatureFlagCodeAnalysisTargetApi>(
+        getFeatureFlagsCodeAnalysisTargetRetrieveUrl(projectId, id, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getFeatureFlagsCreateStaticCohortForFlagCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/create_static_cohort_for_flag/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsCreateStaticCohortForFlagCreate = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<CreateStaticCohortForFlagResponseApi> => {
+    return apiMutator<CreateStaticCohortForFlagResponseApi>(
+        getFeatureFlagsCreateStaticCohortForFlagCreateUrl(projectId, id),
+        {
+            ...options,
+            method: 'POST',
+        }
+    )
+}
+
+export const getFeatureFlagsDependentFlagsListUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/dependent_flags/`
+}
+
+/**
+ * Get other active flags that depend on this flag.
+ */
+export const featureFlagsDependentFlagsList = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<DependentFlagApi[]> => {
+    return apiMutator<DependentFlagApi[]>(getFeatureFlagsDependentFlagsListUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsDisableCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/disable/`
+}
+
+/**
+ * Disable a feature flag.
+ *
+ * Sets `active` to false and changes nothing else. Targeting, variants, payloads, tags and
+ * archived state are left as they are. Refused when other active flags depend on this one.
+ * An already-disabled flag is returned unchanged.
+ *
+ * A disabled flag stops evaluating for every consumer, including a linked experiment or a
+ * session replay setting. Read the full definition first to report that impact.
+ *
+ * Send the `version` your last read returned. A flag whose `filters.version` is 2 requires
+ * it, and for any flag a change after that version is refused with 409.
+ */
+export const featureFlagsDisableCreate = async (
+    projectId: string,
+    id: number,
+    featureFlagSetActiveRequestApi?: FeatureFlagSetActiveRequestApi,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsDisableCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagSetActiveRequestApi),
+    })
+}
+
+export const getFeatureFlagsEnableCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/enable/`
+}
+
+/**
+ * Enable a feature flag.
+ *
+ * Sets `active` to true and changes nothing else. Targeting, variants, payloads, tags and
+ * archived state are left as they are. An archived flag is refused: unarchive it first. A
+ * flag whose own flag dependencies are disabled or use an unsupported configuration
+ * format is also refused, as is a flag whose release conditions target a deleted cohort.
+ * An already-enabled flag is returned unchanged.
+ *
+ * Send the `version` your last read returned. A flag whose `filters.version` is 2 requires
+ * it, and for any flag a change after that version is refused with 409.
+ */
+export const featureFlagsEnableCreate = async (
+    projectId: string,
+    id: number,
+    featureFlagSetActiveRequestApi?: FeatureFlagSetActiveRequestApi,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsEnableCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagSetActiveRequestApi),
+    })
+}
+
+export const getFeatureFlagsOpenCleanupPrCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/open_cleanup_pr/`
+}
+
+/**
+ * Open a draft pull request that removes this stale flag's checks from the code.
+ *
+ * An agent starts from the checks the latest code analysis found, keeps the code for one outcome, and
+ * opens the pull request in the repository the analysis read. It does not change the flag. Returns 400
+ * when the flag isn't stale, the analysis found no checks, or an outcome must be chosen (see
+ * `cleanup` on `code_analysis`), 403 when AI data processing is not approved or the request comes from a
+ * task sandbox, and 409 when a cleanup pull request is still being opened.
+ */
+export const featureFlagsOpenCleanupPrCreate = async (
+    projectId: string,
+    id: number,
+    featureFlagCodeCleanupStartApi?: FeatureFlagCodeCleanupStartApi,
+    options?: RequestInit
+): Promise<FeatureFlagCodeAnalysisApi> => {
+    return apiMutator<FeatureFlagCodeAnalysisApi>(getFeatureFlagsOpenCleanupPrCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagCodeCleanupStartApi),
+    })
+}
+
+export const getFeatureFlagsRemoteConfigRetrieveUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/remote_config/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsRemoteConfigRetrieve = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getFeatureFlagsRemoteConfigRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsRollOutToEveryoneCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/roll_out_to_everyone/`
+}
+
+/**
+ * Serve a feature flag to every user.
+ *
+ * Adds a release condition with no property filters at 100% and keeps the existing
+ * conditions below it. Payloads, holdout and every other field are left as they are. On a
+ * boolean flag, removing the new condition restores the previous targeting. On a
+ * multivariate flag the variant distribution is rewritten as well, so removing the
+ * condition restores the audience but not the old split. A flag that already leads with
+ * such a condition gains no second one.
+ *
+ * This changes targeting only. A disabled flag still serves nobody, and a holdout is
+ * evaluated before release conditions, so users in one keep getting the holdout variant
+ * instead of the rollout. A flag gated on early access enrollment is refused, because that
+ * gate is evaluated before release conditions too and no targeting change gets past it.
+ *
+ * A multivariate flag needs `variant_key`, and every other flag rejects it. A release
+ * condition decides who the flag serves, not which variant they get, so rolling a
+ * multivariate flag out to everyone also gives the named variant 100% of the variant
+ * distribution and every other variant 0%. To serve everyone and keep the current split
+ * between variants, update the flag instead.
+ *
+ * Send the `version` your last read returned. A change to the flag after that version is
+ * refused with 409. Read the flag again and decide the rollout against its current
+ * definition.
+ */
+export const featureFlagsRollOutToEveryoneCreate = async (
+    projectId: string,
+    id: number,
+    featureFlagRollOutToEveryoneRequestApi: FeatureFlagRollOutToEveryoneRequestApi,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsRollOutToEveryoneCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagRollOutToEveryoneRequestApi),
+    })
+}
+
+export const getFeatureFlagsSetReleaseConditionRolloutCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/set_release_condition_rollout/`
+}
+
+/**
+ * Set what percentage of one release condition's audience a feature flag is served to.
+ *
+ * Changes `rollout_percentage` on the release condition at `condition_index` and nothing
+ * else. The condition's property filters, every other condition, the variants, payloads,
+ * holdout and every remaining field are left as they are.
+ *
+ * Send the `version` your last read returned. A change to the flag after that version is
+ * refused with 409, because a condition index only names the condition you read. Read the
+ * flag again and decide the percentage against its current definition.
+ *
+ * On a multivariate flag this sets how many of the matching users get a variant at all. It
+ * does not change how the variants are split between them.
+ */
+export const featureFlagsSetReleaseConditionRolloutCreate = async (
+    projectId: string,
+    id: number,
+    featureFlagSetReleaseConditionRolloutRequestApi: FeatureFlagSetReleaseConditionRolloutRequestApi,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsSetReleaseConditionRolloutCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagSetReleaseConditionRolloutRequestApi),
+    })
+}
+
+export const getFeatureFlagsStatusRetrieveUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/status/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsStatusRetrieve = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<FeatureFlagStatusResponseApi> => {
+    return apiMutator<FeatureFlagStatusResponseApi>(getFeatureFlagsStatusRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsTestEvaluationCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/test_evaluation/`
+}
+
+/**
+ * Test feature flag evaluation against a specific user at an optional point in time.
+ *
+ * This endpoint allows testing how a feature flag would evaluate for a specific user,
+ * optionally at a historical timestamp. When a timestamp is provided, both the flag
+ * conditions and person properties are evaluated as they existed at that time.
+ */
+export const featureFlagsTestEvaluationCreate = async (
+    projectId: string,
+    id: number,
+    featureFlagTestEvaluationRequestApi?: FeatureFlagTestEvaluationRequestApi,
+    options?: RequestInit
+): Promise<FeatureFlagTestEvaluationResponseApi> => {
+    return apiMutator<FeatureFlagTestEvaluationResponseApi>(getFeatureFlagsTestEvaluationCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagTestEvaluationRequestApi),
+    })
+}
+
+export const getFeatureFlagsUnarchiveCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/unarchive/`
+}
+
+/**
+ * Restore an archived feature flag to the default flag list.
+ *
+ * Sets `archived` to false and changes nothing else. The flag stays disabled; enable it
+ * with a separate call. A flag whose release conditions target a deleted cohort is
+ * refused: remove that condition first. An already-unarchived flag is returned unchanged.
+ */
+export const featureFlagsUnarchiveCreate = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsUnarchiveCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getFeatureFlagsVersionsRetrieveUrl = (projectId: string, id: number, versionNumber: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/versions/${versionNumber}/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsVersionsRetrieve = async (
+    projectId: string,
+    id: number,
+    versionNumber: number,
+    options?: RequestInit
+): Promise<FeatureFlagVersionResponseApi> => {
+    return apiMutator<FeatureFlagVersionResponseApi>(getFeatureFlagsVersionsRetrieveUrl(projectId, id, versionNumber), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsVersionsRestoreCreateUrl = (projectId: string, id: number, versionNumber: number) => {
+    return `/api/projects/${projectId}/feature_flags/${id}/versions/${versionNumber}/restore/`
+}
+
+/**
+ * Restore a past version of a feature flag.
+ *
+ * Sets the flag's release conditions, variants, payloads, name and evaluation options back to
+ * what they were at `version_number`. Read that version first with the versions endpoint to see
+ * what will change. The flag's key, its enabled state, and its archived state stay as they are,
+ * as do tags, evaluation contexts and how its cohorts are defined. The restore is saved as a new
+ * version, so it can be undone by restoring the version before it.
+ *
+ * Send the flag's current `version`. A change after that version is refused with 409. An
+ * approval policy that gates the change opens a change request instead. A restore to a version
+ * that matches the current configuration writes nothing and returns the flag.
+ */
+export const featureFlagsVersionsRestoreCreate = async (
+    projectId: string,
+    id: number,
+    versionNumber: number,
+    featureFlagRestoreVersionRequestApi: FeatureFlagRestoreVersionRequestApi,
+    options?: RequestInit
+): Promise<FeatureFlagApi> => {
+    return apiMutator<FeatureFlagApi>(getFeatureFlagsVersionsRestoreCreateUrl(projectId, id, versionNumber), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(featureFlagRestoreVersionRequestApi),
+    })
+}
+
+export const getFeatureFlagsAllActivityRetrieveUrl = (
+    projectId: string,
+    params?: FeatureFlagsAllActivityRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/feature_flags/activity/?${stringifiedParams}`
+        : `/api/projects/${projectId}/feature_flags/activity/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsAllActivityRetrieve = async (
+    projectId: string,
+    params?: FeatureFlagsAllActivityRetrieveParams,
+    options?: RequestInit
+): Promise<ActivityLogPaginatedResponseApi> => {
+    return apiMutator<ActivityLogPaginatedResponseApi>(getFeatureFlagsAllActivityRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsBulkDeleteCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/feature_flags/bulk_delete/`
+}
+
+/**
+ * Bulk delete feature flags by filter criteria or explicit IDs.
+ *
+ * Accepts either:
+ * - {"filters": {...}} - Same filter params as list endpoint (search, active, type, etc.)
+ * - {"ids": [...]} - Explicit list of flag IDs (no limit)
+ *
+ * Returns same format as bulk_delete for UI compatibility.
+ *
+ * Config version 1 flags are deleted with batched updates, and cache invalidation
+ * runs once at the end. Config version 2 flags are deleted one at a time through
+ * ``update_flag``. Each one bumps its ``version`` and commits on its own.
+ */
+export const featureFlagsBulkDeleteCreate = async (
+    projectId: string,
+    bulkDeleteRequestApi?: BulkDeleteRequestApi,
+    options?: RequestInit
+): Promise<BulkDeleteResponseApi> => {
+    return apiMutator<BulkDeleteResponseApi>(getFeatureFlagsBulkDeleteCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(bulkDeleteRequestApi),
+    })
+}
+
+export const getFeatureFlagsBulkKeysRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/feature_flags/bulk_keys/`
+}
+
+/**
+ * Get feature flag keys by IDs.
+ * Accepts a list of feature flag IDs and returns a mapping of ID to key.
+ */
+export const featureFlagsBulkKeysRetrieve = async (
+    projectId: string,
+    bulkKeysRequestApi?: BulkKeysRequestApi,
+    options?: RequestInit
+): Promise<BulkKeysResponseApi> => {
+    return apiMutator<BulkKeysResponseApi>(getFeatureFlagsBulkKeysRetrieveUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(bulkKeysRequestApi),
+    })
+}
+
+export const getFeatureFlagsBulkUpdateTagsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/feature_flags/bulk_update_tags/`
+}
+
+/**
+ * Bulk update tags on multiple objects.
+ *
+ * PAT access: this action has no ``required_scopes=`` on the decorator —
+ * inheriting viewsets must add ``"bulk_update_tags"`` to their
+ * ``scope_object_write_actions`` list to accept personal API keys.
+ * Without that opt-in, ``APIScopePermission`` rejects PAT requests with
+ * "This action does not support personal API key access". Done per-viewset
+ * so granting ``<scope>:write`` for one resource doesn't leak access to
+ * sibling resources that share this mixin.
+ *
+ * Accepts:
+ * - {"ids": [...], "action": "add"|"remove"|"set", "tags": ["tag1", "tag2"]}
+ *
+ * Actions:
+ * - "add": Add tags to existing tags on each object
+ * - "remove": Remove specific tags from each object
+ * - "set": Replace all tags on each object with the provided list
+ */
+export const featureFlagsBulkUpdateTagsCreate = async (
+    projectId: string,
+    bulkUpdateTagsRequestApi: BulkUpdateTagsRequestApi,
+    options?: RequestInit
+): Promise<BulkUpdateTagsResponseApi> => {
+    return apiMutator<BulkUpdateTagsResponseApi>(getFeatureFlagsBulkUpdateTagsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(bulkUpdateTagsRequestApi),
+    })
+}
+
+export const getFeatureFlagsEvaluationReasonsRetrieveUrl = (
+    projectId: string,
+    params: FeatureFlagsEvaluationReasonsRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/feature_flags/evaluation_reasons/?${stringifiedParams}`
+        : `/api/projects/${projectId}/feature_flags/evaluation_reasons/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsEvaluationReasonsRetrieve = async (
+    projectId: string,
+    params: FeatureFlagsEvaluationReasonsRetrieveParams,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getFeatureFlagsEvaluationReasonsRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsMatchingIdsRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/feature_flags/matching_ids/`
+}
+
+/**
+ * Get IDs of all feature flags matching the current filters.
+ * Uses the same filtering logic as the list endpoint.
+ * Returns only IDs that the user has permission to edit.
+ */
+export const featureFlagsMatchingIdsRetrieve = async (projectId: string, options?: RequestInit): Promise<void> => {
+    return apiMutator<void>(getFeatureFlagsMatchingIdsRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsMyFlagsRetrieveUrl = (projectId: string, params?: FeatureFlagsMyFlagsRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/feature_flags/my_flags/?${stringifiedParams}`
+        : `/api/projects/${projectId}/feature_flags/my_flags/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsMyFlagsRetrieve = async (
+    projectId: string,
+    params?: FeatureFlagsMyFlagsRetrieveParams,
+    options?: RequestInit
+): Promise<MyFlagsResponseApi[]> => {
+    return apiMutator<MyFlagsResponseApi[]>(getFeatureFlagsMyFlagsRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFeatureFlagsUserBlastRadiusCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/feature_flags/user_blast_radius/`
+}
+
+/**
+ * Create, read, update and delete feature flags. [See docs](https://posthog.com/docs/feature-flags) for more information on feature flags.
+ *
+ * If you're looking to use feature flags on your application, you can either use our JavaScript Library or our dedicated endpoint to check if feature flags are enabled for a given user.
+ */
+export const featureFlagsUserBlastRadiusCreate = async (
+    projectId: string,
+    userBlastRadiusRequestApi: UserBlastRadiusRequestApi,
+    options?: RequestInit
+): Promise<UserBlastRadiusResponseApi> => {
+    return apiMutator<UserBlastRadiusResponseApi>(getFeatureFlagsUserBlastRadiusCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(userBlastRadiusRequestApi),
+    })
+}
+
+export const getFlagValueValuesRetrieveUrl = (projectId: string, params?: FlagValueValuesRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/flag_value/values/?${stringifiedParams}`
+        : `/api/projects/${projectId}/flag_value/values/`
+}
+
+/**
+ * Get possible values for a feature flag.
+ *
+ * Query parameters:
+ * - key: The flag ID (required)
+ * Returns:
+ *
+ * - Array of objects with 'name' field containing possible values
+ */
+export const flagValueValuesRetrieve = async (
+    projectId: string,
+    params?: FlagValueValuesRetrieveParams,
+    options?: RequestInit
+): Promise<FlagValueResponseApi> => {
+    return apiMutator<FlagValueResponseApi>(getFlagValueValuesRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getScheduledChangesListUrl = (projectId: string, params?: ScheduledChangesListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/scheduled_changes/?${stringifiedParams}`
+        : `/api/projects/${projectId}/scheduled_changes/`
+}
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const scheduledChangesList = async (
+    projectId: string,
+    params?: ScheduledChangesListParams,
+    options?: RequestInit
+): Promise<PaginatedScheduledChangeListApi> => {
+    return apiMutator<PaginatedScheduledChangeListApi>(getScheduledChangesListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getScheduledChangesCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/scheduled_changes/`
+}
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const scheduledChangesCreate = async (
+    projectId: string,
+    scheduledChangeApi: NonReadonly<ScheduledChangeApi>,
+    options?: RequestInit
+): Promise<ScheduledChangeApi> => {
+    return apiMutator<ScheduledChangeApi>(getScheduledChangesCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(scheduledChangeApi),
+    })
+}
+
+export const getScheduledChangesRetrieveUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/scheduled_changes/${id}/`
+}
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const scheduledChangesRetrieve = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ScheduledChangeApi> => {
+    return apiMutator<ScheduledChangeApi>(getScheduledChangesRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getScheduledChangesUpdateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/scheduled_changes/${id}/`
+}
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const scheduledChangesUpdate = async (
+    projectId: string,
+    id: number,
+    scheduledChangeApi: NonReadonly<ScheduledChangeApi>,
+    options?: RequestInit
+): Promise<ScheduledChangeApi> => {
+    return apiMutator<ScheduledChangeApi>(getScheduledChangesUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(scheduledChangeApi),
+    })
+}
+
+export const getScheduledChangesPartialUpdateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/scheduled_changes/${id}/`
+}
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const scheduledChangesPartialUpdate = async (
+    projectId: string,
+    id: number,
+    patchedScheduledChangeApi?: NonReadonly<PatchedScheduledChangeApi>,
+    options?: RequestInit
+): Promise<ScheduledChangeApi> => {
+    return apiMutator<ScheduledChangeApi>(getScheduledChangesPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedScheduledChangeApi),
+    })
+}
+
+export const getScheduledChangesDestroyUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/scheduled_changes/${id}/`
+}
+
+/**
+ * Create, read, update and delete scheduled changes.
+ */
+export const scheduledChangesDestroy = async (projectId: string, id: number, options?: RequestInit): Promise<void> => {
+    return apiMutator<void>(getScheduledChangesDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}

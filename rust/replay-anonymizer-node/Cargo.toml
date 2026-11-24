@@ -1,0 +1,25 @@
+[package]
+name = "replay-anonymizer-node"
+version = "0.0.1"
+edition = "2021"
+exclude = ["index.node"]
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# `external-buffers`: the JSONL lines cross the FFI as an externally-backed Buffer (no copy).
+# Safe here: the addon only runs in PostHog's Node ingestion workers, never in V8
+# sandboxed-pointer environments (Electron), where external buffers abort the VM.
+neon = { workspace = true, features = ["external-buffers"] }
+# default-features = false: the offline typed-parse module has no place in the ingestion cdylib.
+posthog-replay-anonymizer = { path = "../replay-anonymizer", default-features = false }
+brotlic = "0.8"
+# No text or embedded raster images: SVG text never renders, and nothing beyond the document is read.
+resvg = { version = "0.49", default-features = false }
+roxmltree = "0.21"
+lru = "0.19"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

@@ -1,0 +1,1240 @@
+import re
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, TypeVar
+
+from django.db import IntegrityError, transaction
+from django.db.models import Max, QuerySet
+from django.utils import timezone
+
+from posthog.dataclasses import frozen
+from posthog.models import Team, User
+
+from ..activity_logging import log_skill_activity, skill_activity_item_id, skill_change, version_changes
+from ..bundled_skills import bundled_skill_names
+from ..marketplace.packaging import CODEX_METADATA_PATH, SPEC_DESCRIPTION_MAX_LENGTH, compute_plugin_version
+from ..models.skills import (
+    CATEGORY_BY_NAME_PREFIX,
+    LLMSkill,
+    LLMSkillFile,
+    LLMSkillOwner,
+    annotate_llm_skill_version_history_metadata,
+    category_for_skill_name,
+)
+from .archive_guards import assert_skill_archive_allowed, assert_skill_publish_allowed, run_skill_rename_hooks
+
+_DigestModel = TypeVar("_DigestModel", LLMSkill, LLMSkillFile)
+
+MAX_SKILL_VERSION = 2000
+MAX_SKILL_BODY_BYTES = 1_000_000
+MAX_SKILL_FILE_BYTES = 1_000_000
+MAX_SKILL_FILE_COUNT = 200
+# A digest backfill page holds the full content of every row in it, because a digest cannot be
+# computed without the content. One body or bundled file is allowed to reach MAX_SKILL_BODY_BYTES /
+# MAX_SKILL_FILE_BYTES, so the page is sized against those caps rather than against a row count:
+# 100 rows bounds a page at about 100 MB of content. Raise it with --batch-size for small rows.
+DIGEST_BACKFILL_BATCH_SIZE = 100
+# Skill names that collide with reserved /skills routes and so can't be used: "new" is the create
+# form, and the rest mirror the category-tab slugs registered under /skills/<slug> in
+# products/skills/manifest.tsx — a skill with such a name would be shadowed by its tab route.
+# Here rather than in skill_serializers so the publish path can hold a slug to the same rule without
+# importing the serializers that import it.
+RESERVED_SKILL_NAMES = {"new", "scouts", "review-hog", "community"}
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+MAX_SKILL_NAME_LENGTH = 64
+# Bundled-file paths that would collide with generated artifacts in the exported skill
+# tree / plugin marketplace (the rendered SKILL.md). Compared case-insensitively.
+RESERVED_SKILL_FILE_PATHS = {"skill.md"}
+
+
+def bundled_skill_name_error(value: str) -> str | None:
+    """Why `value` cannot name a new store skill, or None when it can.
+
+    An agent host loads the skills PostHog bundles (products/*/skills, shipped as dist/skills.zip)
+    next to the team's store skills under one flat name space, so a store skill that repeats a
+    bundled name leaves two skills under one name and the host no way to tell which one an agent
+    asked for. The rule holds a name a team claims, not a name that points at a skill the project
+    already holds: the scout harness seeds the canonical `signals-scout-*` skills into every
+    project, so those bundled names are legitimately in use there.
+
+    Returns the message rather than raising it so the REST, MCP tool, community publish and
+    community sync paths can each raise their own error type from the one rule.
+    """
+    if value.lower() not in bundled_skill_names():
+        return None
+    return f"PostHog already ships a skill named '{value}'. Pick a different name."
+
+
+def skill_name_is_well_formed(value: str) -> bool:
+    """The shape half of the skill-name contract, without the reserved-name rule.
+
+    ``fullmatch`` rather than ``match``: ``$`` matches before a trailing newline, so ``match`` would
+    accept ``"safe\n"``. Archive writers use this to skip legacy rows that predate the validator,
+    where a name is a directory and a reserved route name is harmless.
+    """
+    return len(value) <= MAX_SKILL_NAME_LENGTH and SKILL_NAME_PATTERN.fullmatch(value) is not None and "--" not in value
+
+
+def normalize_skill_file_path(value: str) -> str:
+    """Return the canonical relative path for a bundled file, raising ValueError if it has none.
+
+    Here rather than in skill_serializers so the publish path can canonicalize a path the same way
+    without importing the serializers that import it. skill_serializers wraps it as the DRF
+    validator, so the request layer keeps reporting these as field errors.
+    """
+    # Paths become git tree entries (and zip/marketplace paths), so anything that would
+    # produce an empty or ambiguous entry name must be rejected — otherwise a single bad
+    # path synthesizes a corrupt git tree and breaks the whole team's marketplace clone.
+    normalized = value.replace("\\", "/")
+    if not normalized or normalized != normalized.strip():
+        raise ValueError("File path must be a non-empty, trimmed relative path.")
+    if normalized.startswith("/"):
+        raise ValueError("File paths must be relative, not absolute.")
+    if normalized.endswith("/"):
+        raise ValueError("File paths must not end with a slash.")
+    if any(part in ("", ".", "..") for part in normalized.split("/")):
+        raise ValueError("File paths must not contain empty, '.', or '..' segments.")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in normalized):
+        raise ValueError("File paths must not contain control characters.")
+    if normalized.lower() in RESERVED_SKILL_FILE_PATHS:
+        raise ValueError(f"'{value}' is a reserved file path and cannot be used.")
+    # Persist the normalized (forward-slash) form, not the original: backslashes mean "separator"
+    # here, so storing them verbatim would make `references\guide.md` a single flat tree entry
+    # rather than a file under `references/`, and would let the two spellings dodge dedup.
+    return normalized
+
+
+# Stable codes for the reasons a skill cannot be packaged. The archive walks and the read-only
+# `spec_problems` API field both branch on them, so a code is part of the contract; the message is
+# for the author.
+SPEC_PROBLEM_NAME_MALFORMED = "name_malformed"
+SPEC_PROBLEM_DESCRIPTION_EMPTY = "description_empty"
+SPEC_PROBLEM_DESCRIPTION_TOO_LONG = "description_too_long"
+SPEC_PROBLEM_FILE_PATH_INVALID = "file_path_invalid"
+SPEC_PROBLEM_FILE_PATH_NOT_CANONICAL = "file_path_not_canonical"
+SPEC_PROBLEM_FILE_PATH_COLLIDES = "file_path_collides"
+SPEC_PROBLEM_FILE_PATH_SHADOWS_DIRECTORY = "file_path_shadows_directory"
+
+# Entries every packaged skill directory carries, generated from the skill row (see
+# marketplace.packaging.build_skill_tree). A bundled file only takes one of these paths back when it
+# spells it exactly, so the generated entry is replaced rather than duplicated.
+_GENERATED_SKILL_ENTRIES = ("SKILL.md", CODEX_METADATA_PATH)
+
+
+@frozen
+class SkillSpecProblem:
+    code: str
+    message: str
+    file_path: str | None = None
+
+
+def _name_problems(name: str) -> list[SkillSpecProblem]:
+    if skill_name_is_well_formed(name):
+        return []
+    return [
+        SkillSpecProblem(
+            code=SPEC_PROBLEM_NAME_MALFORMED,
+            message=(
+                f"'{name}' cannot be a skill directory name. Use up to {MAX_SKILL_NAME_LENGTH} lowercase letters, "
+                "numbers and hyphens, with no leading, trailing or consecutive hyphens."
+            ),
+        )
+    ]
+
+
+def _description_problems(description: str) -> list[SkillSpecProblem]:
+    problems: list[SkillSpecProblem] = []
+    if len(description) > SPEC_DESCRIPTION_MAX_LENGTH:
+        problems.append(
+            SkillSpecProblem(
+                code=SPEC_PROBLEM_DESCRIPTION_TOO_LONG,
+                message=(
+                    f"The description is {len(description)} characters. Shorten it to "
+                    f"{SPEC_DESCRIPTION_MAX_LENGTH} characters or fewer."
+                ),
+            )
+        )
+    if not description.strip():
+        problems.append(
+            SkillSpecProblem(
+                code=SPEC_PROBLEM_DESCRIPTION_EMPTY,
+                message="Add a description. It tells an agent what the skill does and when to use it.",
+            )
+        )
+    return problems
+
+
+def _shadowing_entry(path: str, claimed: dict[str, str]) -> str | None:
+    """The claimed entry that is a parent directory of ``path``, such as `assets` under `assets/logo.png`."""
+    parts = path.lower().split("/")
+    for depth in range(1, len(parts)):
+        parent = claimed.get("/".join(parts[:depth]))
+        if parent is not None:
+            return parent
+    return None
+
+
+def compute_file_path_problems(file_paths: list[str]) -> list[SkillSpecProblem]:
+    problems: list[SkillSpecProblem] = []
+    # Keyed by the lowercased entry name, valued by the spelling that claimed it, so a collision can
+    # name the entry it collides with. Seeded with the generated entries.
+    claimed: dict[str, str] = {entry.lower(): entry for entry in _GENERATED_SKILL_ENTRIES}
+    for path in file_paths:
+        try:
+            canonical = normalize_skill_file_path(path)
+        except ValueError as err:
+            problems.append(SkillSpecProblem(code=SPEC_PROBLEM_FILE_PATH_INVALID, message=str(err), file_path=path))
+            continue
+        if canonical != path:
+            # A legacy `refs\\guide.md` is archived verbatim, so it lands as one flat file instead of a
+            # file under `refs/`, or collides with `refs/guide.md`.
+            problems.append(
+                SkillSpecProblem(
+                    code=SPEC_PROBLEM_FILE_PATH_NOT_CANONICAL,
+                    message=f"Rename this file to '{canonical}'. The stored path does not unpack to that location.",
+                    file_path=path,
+                )
+            )
+            continue
+        lowered = path.lower()
+        # Only the exact sidecar path replaces the generated one; a case variant such as
+        # `Agents/OpenAI.yaml` keys a second entry and collides instead.
+        if lowered in claimed and path != CODEX_METADATA_PATH:
+            claimant = claimed[lowered]
+            if path == claimant:
+                # A zip can carry one member twice, and the backslash swap on import can collapse
+                # two members onto one path, so the pair is not always a case variant.
+                message = f"Remove this duplicate. Another file already uses the path '{claimant}'."
+            else:
+                message = (
+                    f"Rename this file. It differs from '{claimant}' only in letter case, so the two "
+                    "become one file on a case-insensitive filesystem."
+                )
+            problems.append(SkillSpecProblem(code=SPEC_PROBLEM_FILE_PATH_COLLIDES, message=message, file_path=path))
+            continue
+        claimed[lowered] = path
+    for path in claimed.values():
+        parent = _shadowing_entry(path, claimed)
+        if parent is None:
+            continue
+        # Either side of the pair can be a generated entry, which the author has no row for and
+        # cannot rename. Report the bundled side, because that is the only name they can change.
+        if parent in _GENERATED_SKILL_ENTRIES:
+            message = (
+                f"Move this file out of '{parent}/'. Every skill generates '{parent}', so it cannot "
+                "also be a directory."
+            )
+            culprit = path
+        else:
+            message = f"Rename '{parent}'. It is a file, so this skill cannot also hold '{path}' under it."
+            culprit = parent
+        problems.append(
+            SkillSpecProblem(code=SPEC_PROBLEM_FILE_PATH_SHADOWS_DIRECTORY, message=message, file_path=culprit)
+        )
+    return problems
+
+
+def compute_spec_problems(name: str, description: str, file_paths: list[str]) -> list[SkillSpecProblem]:
+    """Every reason a skill cannot be packaged. Empty means it packages cleanly.
+
+    One rule set for the three consumers: the skills bundle, the plugin marketplace, and the
+    read-only `spec_problems` field that tells the author why the skill is missing from both. A
+    skill with no problems here synthesizes an archive that unpacks on any filesystem, and a git
+    tree real git can clone.
+    """
+    return [*_name_problems(name), *_description_problems(description), *compute_file_path_problems(file_paths)]
+
+
+def check_allowed_tool_name(value: str) -> None:
+    """Raise ValueError when a tool name can't survive the Agent Skills allowed-tools encoding."""
+    # The Agent Skills spec serializes allowed-tools as a single space-separated string, so a tool
+    # name containing whitespace would silently fracture into multiple tools on export/round-trip.
+    if any(ch.isspace() for ch in value):
+        raise ValueError("Tool names cannot contain whitespace.")
+
+
+class LLMSkillNotFoundError(Exception):
+    pass
+
+
+@dataclass
+class LLMSkillVersionConflictError(Exception):
+    current_version: int
+
+
+@dataclass
+class LLMSkillVersionLimitError(Exception):
+    max_version: int
+
+
+@dataclass
+class LLMSkillFileLimitError(Exception):
+    max_count: int
+
+
+@dataclass
+class LLMSkillEditError(Exception):
+    # `file_path` extends this dataclass (rather than a subclass) so the publish view can catch a
+    # single exception type for both body edits and per-file edits. `edit_index` is optional because
+    # path-level failures (e.g. missing file) aren't tied to any particular edit.
+    message: str
+    edit_index: int | None = None
+    file_path: str | None = None
+
+
+class LLMSkillDuplicateNameConflictError(Exception):
+    pass
+
+
+@frozen
+class LLMSkillRenameNotAllowedError(Exception):
+    """The rename would move a skill in or out of a name prefix another product keys its rows on.
+
+    `signals-scout-` and `review-hog-` rows (schedules, pauses, per-user enablement, run history) are
+    keyed on the skill name, and products can't reach into each other to move them. A rename that
+    touches either prefix would leave those rows pointing at a name nothing holds, so it is refused
+    rather than half-applied.
+    """
+
+    prefix: str
+
+
+@frozen
+class LLMSkillDescriptionTooLongError(Exception):
+    max_length: int
+
+
+@dataclass
+class LLMSkillOwnerNotFoundError(Exception):
+    """A user_uuid passed as an owner is not a member of the team (has no access)."""
+
+    user_uuid: str
+
+
+@dataclass
+class LLMSkillFilePathConflictError(Exception):
+    path: str
+
+
+@dataclass
+class LLMSkillFileNotFoundError(Exception):
+    path: str
+
+
+def apply_skill_body_edits(body: str, edits: list[dict[str, str]]) -> str:
+    """Apply sequential find/replace edits to a skill body.
+
+    Each edit's 'old' text must match exactly once in the current body.
+    """
+    text = body
+    for i, edit in enumerate(edits):
+        old = edit["old"]
+        new = edit["new"]
+        count = text.count(old)
+        if count == 0:
+            raise LLMSkillEditError(
+                message="Text to replace was not found in the skill body.",
+                edit_index=i,
+            )
+        if count > 1:
+            raise LLMSkillEditError(
+                message=f"Text to replace matches {count} times — provide more context to make it unique.",
+                edit_index=i,
+            )
+        text = text.replace(old, new, 1)
+
+    if len(text.encode("utf-8")) > MAX_SKILL_BODY_BYTES:
+        raise LLMSkillEditError(
+            message=f"Resulting skill body exceeds the {MAX_SKILL_BODY_BYTES} byte size limit.",
+            edit_index=len(edits) - 1,
+        )
+
+    return text
+
+
+def get_active_skill_queryset(team: Team) -> QuerySet[LLMSkill]:
+    return annotate_llm_skill_version_history_metadata(
+        LLMSkill.objects.filter(team=team, deleted=False).select_related("created_by")
+    )
+
+
+def get_latest_skills_queryset(team: Team) -> QuerySet[LLMSkill]:
+    return get_active_skill_queryset(team).filter(is_latest=True)
+
+
+def team_skills_version(team: Team) -> str:
+    """Keep archived rows in the version so an archive does not expose an older timestamp.
+
+    This is a marketplace version, not a validator for the access-filtered list.
+    In-place writers must update updated_at because QuerySet.update() skips auto_now.
+    """
+    latest = LLMSkill.objects.filter(team=team).aggregate(latest=Max("updated_at"))["latest"]
+    if latest is None:
+        return "1.0.0"
+    elapsed = latest - datetime(1970, 1, 1, tzinfo=UTC)
+    epoch_microseconds = (elapsed.days * 86400 + elapsed.seconds) * 1_000_000 + elapsed.microseconds
+    return compute_plugin_version(epoch_microseconds)
+
+
+def get_skill_by_name_from_db(
+    team: Team,
+    skill_name: str,
+    version: int | None = None,
+    version_id: str | None = None,
+    *,
+    include_archived: bool = False,
+    defer_body: bool = False,
+) -> LLMSkill | None:
+    queryset = get_active_skill_queryset(team).filter(name=skill_name)
+    if defer_body:
+        queryset = queryset.defer("body")
+
+    if version_id is not None:
+        # `include_archived` honours a pin to one immutable version row even after
+        # the skill was archived (soft-deleted across all versions) — so a frozen
+        # agent's fork can still re-freeze against the exact version it shipped.
+        rows = (
+            LLMSkill.objects.filter(team=team, name=skill_name, id=version_id)
+            if include_archived
+            else queryset.filter(id=version_id)
+        )
+        if defer_body:
+            rows = rows.defer("body")
+        if version is not None:
+            rows = rows.filter(version=version)
+        return rows.order_by("created_at", "id").first()
+
+    if version is None:
+        return queryset.filter(is_latest=True).order_by("-version", "-created_at", "-id").first()
+
+    return queryset.filter(version=version).order_by("created_at", "id").first()
+
+
+def resolve_versions_page(
+    team: Team,
+    skill_name: str,
+    *,
+    limit: int,
+    offset: int | None = None,
+    before_version: int | None = None,
+) -> tuple[list[LLMSkill], bool]:
+    queryset = (
+        LLMSkill.objects.filter(team=team, name=skill_name, deleted=False)
+        .select_related("created_by")
+        .order_by("-version", "-created_at", "-id")
+    )
+
+    if before_version is not None:
+        queryset = queryset.filter(version__lt=before_version)
+    elif offset is not None:
+        versions = list(queryset[offset : offset + limit + 1])
+        has_more = len(versions) > limit
+        return versions[:limit], has_more
+
+    versions = list(queryset[: limit + 1])
+    has_more = len(versions) > limit
+    return versions[:limit], has_more
+
+
+def _carry_forward(payload_value: Any, current_value: Any) -> Any:
+    return payload_value if payload_value is not None else current_value
+
+
+# Provenance keys a PostHog harness stamps on the rows it seeds, and reads back as proof that a row
+# is still the content it shipped. `metadata` is a free-form dict any project editor can send, so a
+# caller-supplied value for one of these is a forged attestation: dropping `canonical_hash` from a
+# seeded Signals scout, or writing a hash of the caller's own content, makes an edited scout read as
+# PostHog-shipped and mints a permanent billing exemption for its reports.
+# `source_template*` records which product template a scout's text came from, so a forged one could get the scout overwritten.
+HARNESS_OWNED_METADATA_KEYS = frozenset(
+    {"seeded_by", "canonical_hash", "source", "source_template", "source_template_hash"}
+)
+
+
+def resolve_skill_metadata(payload_value: dict[str, Any] | None, current_value: dict | None) -> dict[str, Any]:
+    """Server-owned provenance comes only from the current persisted row."""
+    current = dict(current_value or {})
+    if payload_value is None:
+        return current
+    resolved = {k: v for k, v in payload_value.items() if k not in HARNESS_OWNED_METADATA_KEYS}
+    resolved.update({k: v for k, v in current.items() if k in HARNESS_OWNED_METADATA_KEYS})
+    return resolved
+
+
+def apply_skill_file_edits(file_content: str, edits: list[dict[str, str]], *, file_path: str) -> str:
+    """Apply sequential find/replace edits to a single bundled skill file.
+
+    Each edit's 'old' text must match exactly once. Result size capped at MAX_SKILL_FILE_BYTES.
+    """
+    text = file_content
+    for i, edit in enumerate(edits):
+        old = edit["old"]
+        new = edit["new"]
+        count = text.count(old)
+        if count == 0:
+            raise LLMSkillEditError(
+                message=f"Text to replace was not found in file '{file_path}'.",
+                edit_index=i,
+                file_path=file_path,
+            )
+        if count > 1:
+            raise LLMSkillEditError(
+                message=(
+                    f"Text to replace matches {count} times in file '{file_path}' — "
+                    "provide more context to make it unique."
+                ),
+                edit_index=i,
+                file_path=file_path,
+            )
+        text = text.replace(old, new, 1)
+
+    if len(text.encode("utf-8")) > MAX_SKILL_FILE_BYTES:
+        raise LLMSkillEditError(
+            message=f"Edited file '{file_path}' exceeds the {MAX_SKILL_FILE_BYTES} byte size limit.",
+            edit_index=len(edits) - 1,
+            file_path=file_path,
+        )
+
+    return text
+
+
+def publish_skill_version(
+    team: Team,
+    *,
+    user: User | None,
+    skill_name: str,
+    body: str | None = None,
+    edits: list[dict[str, str]] | None = None,
+    description: str | None = None,
+    license: str | None = None,
+    compatibility: str | None = None,
+    allowed_tools: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    files: list[dict[str, str]] | None = None,
+    file_edits: list[dict[str, Any]] | None = None,
+    base_version: int,
+    version_description: str | None = None,
+    system_metadata: dict[str, Any] | None = None,
+) -> LLMSkill:
+    """`system_metadata` overwrites server-owned keys, so only server-side code passes it, usually with `user=None`."""
+    with transaction.atomic():
+        current_latest = (
+            LLMSkill.objects.select_for_update()
+            .filter(team=team, name=skill_name, deleted=False, is_latest=True)
+            .order_by("-version", "-created_at", "-id")
+            .first()
+        )
+        if current_latest is None:
+            raise LLMSkillNotFoundError()
+
+        if base_version != current_latest.version:
+            raise LLMSkillVersionConflictError(current_version=current_latest.version)
+        if current_latest.version >= MAX_SKILL_VERSION:
+            raise LLMSkillVersionLimitError(max_version=MAX_SKILL_VERSION)
+
+        resolved_description = description if description is not None else current_latest.description
+        if len(resolved_description) > SPEC_DESCRIPTION_MAX_LENGTH:
+            raise LLMSkillDescriptionTooLongError(max_length=SPEC_DESCRIPTION_MAX_LENGTH)
+
+        if edits is not None:
+            resolved_body = apply_skill_body_edits(current_latest.body, edits)
+        else:
+            resolved_body = _carry_forward(body, current_latest.body)
+
+        resolved_file_edits: dict[str, str] | None = None
+        if file_edits is not None:
+            resolved_file_edits = _resolve_file_edits(current_latest, file_edits)
+
+        LLMSkill.objects.filter(pk=current_latest.pk).update(is_latest=False)
+        published_skill = LLMSkill.objects.create(
+            team=team,
+            name=current_latest.name,
+            description=resolved_description,
+            body=resolved_body,
+            license=_carry_forward(license, current_latest.license),
+            compatibility=_carry_forward(compatibility, current_latest.compatibility),
+            allowed_tools=_carry_forward(allowed_tools, current_latest.allowed_tools),
+            metadata={**resolve_skill_metadata(metadata, current_latest.metadata), **(system_metadata or {})},
+            # Categorization is a property of the skill, not the version — carry it forward so editing
+            # a scout (or any categorized skill) doesn't drop it out of its tab.
+            category=current_latest.category,
+            version=current_latest.version + 1,
+            is_latest=True,
+            version_description=version_description,
+            created_by=user,
+        )
+
+        if files is not None:
+            LLMSkillFile.objects.bulk_create(
+                [
+                    LLMSkillFile(
+                        skill=published_skill,
+                        path=file_data["path"],
+                        content=file_data["content"],
+                        content_type=file_data.get("content_type", "text/plain"),
+                    )
+                    for file_data in files
+                ]
+            )
+        else:
+            _copy_files(current_latest, published_skill, edited_content=resolved_file_edits)
+
+        assert_skill_publish_allowed(team=team, skill=published_skill, user=user)
+
+        log_skill_activity(
+            team=team,
+            user=user,
+            skill_name=published_skill.name,
+            activity="updated",
+            changes=version_changes(current_latest, published_skill),
+        )
+
+        refreshed = get_active_skill_queryset(team).filter(pk=published_skill.pk).first()
+        return refreshed if refreshed is not None else published_skill
+
+
+def _resolve_file_edits(current_skill: LLMSkill, file_edits: list[dict[str, Any]]) -> dict[str, str]:
+    """Apply each file's edits against the current file content; return {path: new_content}."""
+    source_files = {f.path: f for f in LLMSkillFile.objects.filter(skill=current_skill)}
+    resolved: dict[str, str] = {}
+    for entry in file_edits:
+        path = entry["path"]
+        if path not in source_files:
+            raise LLMSkillEditError(
+                message=f"File '{path}' not found in the current skill version.",
+                file_path=path,
+            )
+        resolved[path] = apply_skill_file_edits(
+            source_files[path].content,
+            entry["edits"],
+            file_path=path,
+        )
+    return resolved
+
+
+def _copy_files(
+    source_skill: LLMSkill,
+    target_skill: LLMSkill,
+    *,
+    edited_content: dict[str, str] | None = None,
+) -> None:
+    """Carry files forward to the new version, optionally overriding content for specific paths."""
+    source_files = list(LLMSkillFile.objects.filter(skill=source_skill))
+    if not source_files:
+        return
+    overrides = edited_content or {}
+    LLMSkillFile.objects.bulk_create(
+        [
+            LLMSkillFile(
+                skill=target_skill,
+                path=f.path,
+                content=overrides.get(f.path, f.content),
+                content_type=f.content_type,
+            )
+            for f in source_files
+        ]
+    )
+
+
+def create_skill(
+    team: Team,
+    *,
+    user: User,
+    name: str,
+    description: str,
+    body: str,
+    license: str | None = None,
+    compatibility: str | None = None,
+    allowed_tools: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    files: list[dict[str, str]] | None = None,
+    version_description: str | None = None,
+) -> LLMSkill:
+    if len(description) > SPEC_DESCRIPTION_MAX_LENGTH:
+        raise LLMSkillDescriptionTooLongError(max_length=SPEC_DESCRIPTION_MAX_LENGTH)
+
+    if files and len(files) > MAX_SKILL_FILE_COUNT:
+        raise LLMSkillFileLimitError(max_count=MAX_SKILL_FILE_COUNT)
+
+    if files:
+        seen_paths: set[str] = set()
+        for item in files:
+            path = item["path"]
+            if path in seen_paths:
+                raise LLMSkillFilePathConflictError(path=path)
+            seen_paths.add(path)
+
+    with transaction.atomic():
+        # Lock any existing rows for this (team, name) so a concurrent create can't slip past.
+        existing = list(
+            LLMSkill.objects.select_for_update()
+            .filter(team=team, name=name, deleted=False)
+            .values_list("id", flat=True)
+        )
+        if existing:
+            raise LLMSkillDuplicateNameConflictError()
+
+        try:
+            new_skill = LLMSkill.objects.create(
+                team=team,
+                name=name,
+                description=description,
+                body=body,
+                category=category_for_skill_name(name),
+                license=license or "",
+                compatibility=compatibility or "",
+                allowed_tools=allowed_tools or [],
+                metadata=resolve_skill_metadata(metadata, None),
+                version=1,
+                is_latest=True,
+                version_description=version_description,
+                created_by=user,
+            )
+        except IntegrityError as err:
+            err_str = str(err)
+            if "unique_llm_skill_latest_per_team" in err_str or "unique_llm_skill_version_per_team" in err_str:
+                raise LLMSkillDuplicateNameConflictError() from err
+            raise
+
+        # The creator owns the skill by default — durable, not reconstructed from version history.
+        seed_skill_owner(team, name, user)
+
+        if files:
+            try:
+                LLMSkillFile.objects.bulk_create(
+                    [
+                        LLMSkillFile(
+                            skill=new_skill,
+                            path=item["path"],
+                            content=item.get("content", ""),
+                            content_type=item.get("content_type", "text/plain"),
+                        )
+                        for item in files
+                    ]
+                )
+            except IntegrityError as err:
+                if "unique_skill_file_path" in str(err):
+                    raise LLMSkillFilePathConflictError(path="") from err
+                raise
+
+        log_skill_activity(team=team, user=user, item_id=str(new_skill.pk), skill_name=name, activity="created")
+
+    refreshed = get_active_skill_queryset(team).filter(pk=new_skill.pk).first()
+    return refreshed if refreshed is not None else new_skill
+
+
+def duplicate_skill(
+    team: Team,
+    *,
+    user: User,
+    source_name: str,
+    new_name: str,
+) -> LLMSkill:
+    with transaction.atomic():
+        source_latest = (
+            LLMSkill.objects.select_for_update()
+            .filter(team=team, name=source_name, deleted=False, is_latest=True)
+            .order_by("-version", "-created_at", "-id")
+            .first()
+        )
+        if source_latest is None:
+            raise LLMSkillNotFoundError()
+
+        if LLMSkill.objects.filter(team=team, name=new_name, deleted=False).exists():
+            raise LLMSkillDuplicateNameConflictError()
+        if len(source_latest.description) > SPEC_DESCRIPTION_MAX_LENGTH:
+            raise LLMSkillDescriptionTooLongError(max_length=SPEC_DESCRIPTION_MAX_LENGTH)
+
+        # A duplicate is a brand-new, user-authored skill under a new name, so it inherits nothing
+        # from the source's provenance or classification: the harness seed marker is dropped, and
+        # `category` is derived from the new name exactly like the create paths do (empty unless the
+        # new name carries a registered prefix). Deriving instead of copying keeps a fork of a scout
+        # or canonical from carrying that grouping under an unrelated name, while a copy named into
+        # a registered prefix (e.g. adopting a skill as a ReviewHog perspective) groups like any
+        # other skill of that kind.
+        duplicated_metadata = dict(source_latest.metadata or {})
+        duplicated_metadata.pop("seeded_by", None)
+
+        try:
+            new_skill = LLMSkill.objects.create(
+                team=team,
+                name=new_name,
+                description=source_latest.description,
+                body=source_latest.body,
+                license=source_latest.license,
+                compatibility=source_latest.compatibility,
+                allowed_tools=source_latest.allowed_tools,
+                metadata=duplicated_metadata,
+                category=category_for_skill_name(new_name),
+                version=1,
+                is_latest=True,
+                created_by=user,
+            )
+        except IntegrityError as err:
+            if "unique_llm_skill_latest_per_team" in str(err) or "unique_llm_skill_version_per_team" in str(err):
+                raise LLMSkillDuplicateNameConflictError() from err
+            raise
+
+        # A duplicate is a brand-new, user-authored skill: the duplicating user owns it, not the
+        # source's owners (who never chose to own this fork).
+        seed_skill_owner(team, new_name, user)
+
+        _copy_files(source_latest, new_skill)
+
+        log_skill_activity(
+            team=team,
+            user=user,
+            item_id=str(new_skill.pk),
+            skill_name=new_name,
+            activity="created",
+            changes=[skill_change("duplicated_from", after=source_name)],
+        )
+
+    refreshed = get_active_skill_queryset(team).filter(pk=new_skill.pk).first()
+    return refreshed if refreshed is not None else new_skill
+
+
+def _select_latest_for_write(
+    team: Team,
+    skill_name: str,
+    base_version: int | None,
+) -> LLMSkill:
+    current_latest = (
+        LLMSkill.objects.select_for_update()
+        .filter(team=team, name=skill_name, deleted=False, is_latest=True)
+        .order_by("-version", "-created_at", "-id")
+        .first()
+    )
+    if current_latest is None:
+        raise LLMSkillNotFoundError()
+    if base_version is not None and base_version != current_latest.version:
+        raise LLMSkillVersionConflictError(current_version=current_latest.version)
+    if current_latest.version >= MAX_SKILL_VERSION:
+        raise LLMSkillVersionLimitError(max_version=MAX_SKILL_VERSION)
+    return current_latest
+
+
+def _create_next_version_with_files(
+    team: Team,
+    user: User,
+    current_latest: LLMSkill,
+    next_files: list[LLMSkillFile],
+) -> LLMSkill:
+    if len(current_latest.description) > SPEC_DESCRIPTION_MAX_LENGTH:
+        raise LLMSkillDescriptionTooLongError(max_length=SPEC_DESCRIPTION_MAX_LENGTH)
+
+    LLMSkill.objects.filter(pk=current_latest.pk).update(is_latest=False)
+    next_skill = LLMSkill.objects.create(
+        team=team,
+        name=current_latest.name,
+        description=current_latest.description,
+        body=current_latest.body,
+        license=current_latest.license,
+        compatibility=current_latest.compatibility,
+        allowed_tools=current_latest.allowed_tools,
+        metadata=current_latest.metadata,
+        category=current_latest.category,
+        version=current_latest.version + 1,
+        is_latest=True,
+        created_by=user,
+    )
+    if next_files:
+        LLMSkillFile.objects.bulk_create(
+            [
+                LLMSkillFile(
+                    skill=next_skill,
+                    path=f.path,
+                    content=f.content,
+                    content_type=f.content_type,
+                )
+                for f in next_files
+            ]
+        )
+    assert_skill_publish_allowed(team=team, skill=next_skill, user=user)
+    log_skill_activity(
+        team=team,
+        user=user,
+        skill_name=next_skill.name,
+        activity="updated",
+        changes=version_changes(current_latest, next_skill),
+    )
+    return next_skill
+
+
+def _refresh_with_annotations(team: Team, skill: LLMSkill) -> LLMSkill:
+    refreshed = get_active_skill_queryset(team).filter(pk=skill.pk).first()
+    return refreshed if refreshed is not None else skill
+
+
+def create_skill_file(
+    team: Team,
+    *,
+    user: User,
+    skill_name: str,
+    path: str,
+    content: str,
+    content_type: str = "text/plain",
+    base_version: int | None = None,
+) -> LLMSkill:
+    with transaction.atomic():
+        current_latest = _select_latest_for_write(team, skill_name, base_version)
+        existing_files = list(LLMSkillFile.objects.filter(skill=current_latest))
+        if any(f.path == path for f in existing_files):
+            raise LLMSkillFilePathConflictError(path=path)
+        if len(existing_files) >= MAX_SKILL_FILE_COUNT:
+            raise LLMSkillFileLimitError(max_count=MAX_SKILL_FILE_COUNT)
+
+        next_files = [*existing_files, LLMSkillFile(path=path, content=content, content_type=content_type)]
+        next_skill = _create_next_version_with_files(team, user, current_latest, next_files)
+
+    return _refresh_with_annotations(team, next_skill)
+
+
+def delete_skill_file(
+    team: Team,
+    *,
+    user: User,
+    skill_name: str,
+    path: str,
+    base_version: int | None = None,
+) -> LLMSkill:
+    with transaction.atomic():
+        current_latest = _select_latest_for_write(team, skill_name, base_version)
+        existing_files = list(LLMSkillFile.objects.filter(skill=current_latest))
+        if not any(f.path == path for f in existing_files):
+            raise LLMSkillFileNotFoundError(path=path)
+
+        next_files = [f for f in existing_files if f.path != path]
+        next_skill = _create_next_version_with_files(team, user, current_latest, next_files)
+
+    return _refresh_with_annotations(team, next_skill)
+
+
+def rename_skill_file(
+    team: Team,
+    *,
+    user: User,
+    skill_name: str,
+    old_path: str,
+    new_path: str,
+    base_version: int | None = None,
+) -> LLMSkill:
+    with transaction.atomic():
+        current_latest = _select_latest_for_write(team, skill_name, base_version)
+        existing_files = list(LLMSkillFile.objects.filter(skill=current_latest))
+        if not any(f.path == old_path for f in existing_files):
+            raise LLMSkillFileNotFoundError(path=old_path)
+        if any(f.path == new_path for f in existing_files):
+            raise LLMSkillFilePathConflictError(path=new_path)
+
+        next_files = [
+            LLMSkillFile(
+                path=new_path if f.path == old_path else f.path,
+                content=f.content,
+                content_type=f.content_type,
+            )
+            for f in existing_files
+        ]
+        next_skill = _create_next_version_with_files(team, user, current_latest, next_files)
+
+    return _refresh_with_annotations(team, next_skill)
+
+
+def archive_skill(team: Team, skill_name: str, *, acting_user: User | None, authenticator: object = None) -> list[int]:
+    """Tombstone every version of a logical skill.
+
+    `acting_user` is the person asking, or None for a system path. It is keyword-only and has no
+    default so a new caller has to say which it is: a guard can refuse the archive (see
+    `archive_guards`), and a silent default would let a fresh entrypoint skip that. An endpoint
+    passes its DRF `authenticator` too, so a refusal records how the caller signed in.
+    """
+    with transaction.atomic():
+        # Before the select_for_update below, so a refusal costs no row locks.
+        assert_skill_archive_allowed(team=team, skill_name=skill_name, user=acting_user, authenticator=authenticator)
+        skill_versions = list(
+            LLMSkill.objects.select_for_update()
+            .filter(team=team, name=skill_name, deleted=False)
+            .order_by("version", "created_at", "id")
+            .values_list("version", flat=True)
+        )
+        if not skill_versions:
+            raise LLMSkillNotFoundError()
+        # Read before the update below, which takes every row out of the live set.
+        item_id = skill_activity_item_id(team, skill_name)
+        # Bump updated_at (the .update() bypasses auto_now) so the marketplace plugin version,
+        # derived from max(updated_at) across all team rows, advances on archive too — otherwise
+        # archiving the most-recently-updated skill would regress the version.
+        LLMSkill.objects.filter(team=team, name=skill_name, deleted=False).update(
+            deleted=True,
+            is_latest=False,
+            updated_at=timezone.now(),
+        )
+        # Owners are keyed on the logical `(team, skill_name)`, so they'd otherwise outlive the
+        # archived skill and attach to a later skill that reuses the name. Retire them with it.
+        clear_skill_owners(team, skill_name)
+        log_skill_activity(team=team, user=acting_user, item_id=item_id, skill_name=skill_name, activity="deleted")
+    return skill_versions
+
+
+def _product_owned_name_prefix(name: str) -> str:
+    """The registered prefix `name` carries, or "" when it carries none."""
+    return next((prefix for prefix, _ in CATEGORY_BY_NAME_PREFIX if name.startswith(prefix)), "")
+
+
+def rename_skill(
+    team: Team,
+    *,
+    skill_name: str,
+    new_name: str,
+    acting_user: User | None,
+    authenticator: object = None,
+) -> LLMSkill:
+    """Move a logical skill to `new_name`, keeping its versions, files, and owners.
+
+    Every version row carries the name, and owners are keyed on `(team, skill_name)`, so the rename
+    has to move all of them together or it loses history and ownership — which is exactly what the
+    duplicate-then-archive workaround did. Rows another product keys on the name move through its
+    rename hook (see `archive_guards`), which can also refuse the rename. `acting_user` has no
+    default for the same reason as on `archive_skill`.
+    """
+    blocked_prefix = _product_owned_name_prefix(skill_name) or _product_owned_name_prefix(new_name)
+    if blocked_prefix:
+        raise LLMSkillRenameNotAllowedError(prefix=blocked_prefix)
+
+    with transaction.atomic():
+        locked_versions = list(
+            LLMSkill.objects.select_for_update()
+            .filter(team=team, name=skill_name, deleted=False)
+            .order_by("version", "created_at", "id")
+        )
+        if not locked_versions:
+            raise LLMSkillNotFoundError()
+        if new_name == skill_name:
+            return _renamed_skill_or_missing(team, new_name)
+        if LLMSkill.objects.filter(team=team, name=new_name, deleted=False).exists():
+            raise LLMSkillDuplicateNameConflictError()
+        run_skill_rename_hooks(
+            team=team, skill_name=skill_name, new_name=new_name, user=acting_user, authenticator=authenticator
+        )
+
+        # Stamp each locked row rather than issuing one `.update()`: the name is the first
+        # frontmatter key of the rendered SKILL.md, so a rename changes the bytes a host downloads,
+        # and neither `.update()` nor `bulk_update` calls `save()` to restamp the digest. A stale
+        # digest is invisible to the backfill, which only repairs rows that carry none.
+        # `updated_at` is set by hand because both paths also bypass auto_now, and the marketplace
+        # plugin version is max(updated_at) across all team rows: a renamed skill changes the
+        # directory name in the exported tree, so installs must pick the rename up.
+        renamed_at = timezone.now()
+        for version in locked_versions:
+            version.name = new_name
+            version.updated_at = renamed_at
+            version.stamp_digest()
+        LLMSkill.objects.bulk_update(locked_versions, ["name", "updated_at", *LLMSkill.DIGEST_FIELDS])
+        rename_skill_owners(team, skill_name, new_name)
+        log_skill_activity(
+            team=team,
+            user=acting_user,
+            item_id=str(locked_versions[0].pk),
+            skill_name=new_name,
+            activity="updated",
+            changes=[skill_change("name", before=skill_name, after=new_name)],
+        )
+
+    return _renamed_skill_or_missing(team, new_name)
+
+
+def _renamed_skill_or_missing(team: Team, name: str) -> LLMSkill:
+    skill = get_skill_by_name_from_db(team, name)
+    if skill is None:
+        raise LLMSkillNotFoundError()
+    return skill
+
+
+# --- Skill owners ---------------------------------------------------------------------------------
+# Owners are keyed on the *logical* skill `(team, skill_name)`, so nothing here touches a version row:
+# editing a skill body never changes who owns it. Every read and write goes through `_owner_qs`, which
+# scopes to the *exact* environment team (`canonical=True` skips the child→parent resolution) so owners
+# line up with `LLMSkill`'s environment scoping — see the `LLMSkillOwner` model docstring.
+
+
+def _owner_qs(team: Team) -> "QuerySet[LLMSkillOwner]":
+    """Owner rows scoped to the exact environment team (not the canonical parent).
+
+    `canonical=True` tells `for_team` the id is the scope to filter on as-is; it does not mean the id
+    *is* canonical here — it deliberately bypasses the parent resolution so environment-scoped skills
+    and their owners share one key. Works inside a request and outside one (harness, commands).
+    """
+    return LLMSkillOwner.objects.for_team(team.id, canonical=True)
+
+
+def resolve_owner_users(team: Team, user_uuids: list[str]) -> list[User]:
+    """Resolve owner UUIDs to team members, preserving order and deduping.
+
+    Fail-loud: a UUID that isn't a member with access raises `LLMSkillOwnerNotFoundError` rather than
+    silently dropping — an owner who can't be resolved could never be routed a review anyway, and a
+    quietly-lost owner is exactly the misattribution this primitive exists to prevent.
+    """
+    members = {str(u.uuid): u for u in team.all_users_with_access()}
+    resolved: list[User] = []
+    seen: set[str] = set()
+    for raw_uuid in user_uuids:
+        uuid = str(raw_uuid)
+        if uuid in seen:
+            continue
+        seen.add(uuid)
+        user = members.get(uuid)
+        if user is None:
+            raise LLMSkillOwnerNotFoundError(user_uuid=uuid)
+        resolved.append(user)
+    return resolved
+
+
+def resolve_skill_owners(team: Team, skill_name: str) -> list[User]:
+    """Owners of a logical skill, seed-creator first (earliest `created_at`).
+
+    Restricted to `team.all_users_with_access()`: an owner row survives a member losing access
+    (rows aren't cascade-cleaned on access revocation), and this read path serializes the user
+    through `UserBasicSerializer` on `skill-get` / `skill-list` (both MCP-exposed), so a former
+    member's profile must not keep flowing out — matching the write and scout-prompt paths.
+    """
+    rows = (
+        _owner_qs(team)
+        .filter(skill_name=skill_name, user__in=team.all_users_with_access())
+        .select_related("user")
+        .order_by("created_at", "id")
+    )
+    return [row.user for row in rows]
+
+
+def resolve_skill_owners_for_names(team: Team, skill_names: list[str]) -> dict[str, list[User]]:
+    """Batch `resolve_skill_owners` for many skills in one query — for the list endpoint's N rows.
+
+    Same current-access filter as `resolve_skill_owners` so the list endpoint never leaks a former
+    member's profile or reports an unroutable owner.
+    """
+    if not skill_names:
+        return {}
+    rows = (
+        _owner_qs(team)
+        .filter(skill_name__in=skill_names, user__in=team.all_users_with_access())
+        .select_related("user")
+        .order_by("created_at", "id")
+    )
+    owners_by_name: dict[str, list[User]] = {}
+    for row in rows:
+        owners_by_name.setdefault(row.skill_name, []).append(row.user)
+    return owners_by_name
+
+
+def skill_names_owned_by(team: Team, user_id: int) -> "QuerySet[LLMSkillOwner, str]":
+    """Names of the logical skills one user owns — backs the list endpoint's owner filter.
+
+    Returns a lazy values queryset so the caller can use it as a subquery instead of pulling every
+    name into memory. Same current-access filter as `resolve_skill_owners`: filtering by a user who
+    lost access matches nothing, rather than surfacing skills through a stale owner row.
+    """
+    return (
+        _owner_qs(team)
+        .filter(user_id=user_id, user__in=team.all_users_with_access())
+        .values_list("skill_name", flat=True)
+    )
+
+
+def clear_skill_owners(team: Team, skill_name: str) -> None:
+    """Drop every owner row for a logical skill — called on archive so a later skill that reuses the
+    name (recreate / import / duplicate) doesn't inherit the archived skill's owners."""
+    _owner_qs(team).filter(skill_name=skill_name).delete()
+
+
+def rename_skill_owners(team: Team, skill_name: str, new_name: str) -> None:
+    """Move every owner row of a logical skill onto `new_name`, so a rename keeps its owners.
+
+    Owner rows for `new_name` are dropped first: they can only be leftovers from a name nothing
+    active holds, and the `(team, skill_name, user)` unique constraint would otherwise reject the move.
+    """
+    _owner_qs(team).filter(skill_name=new_name).delete()
+    _owner_qs(team).filter(skill_name=skill_name).update(skill_name=new_name)
+
+
+def seed_skill_owner(team: Team, skill_name: str, user: User) -> None:
+    """Idempotently record `user` as an owner — the default seed on skill creation.
+
+    Routed through `_owner_qs` (not the ambient-context manager) so it works both inside a request and
+    outside one (harness, management commands).
+    """
+    _owner_qs(team).get_or_create(team=team, skill_name=skill_name, user=user)
+
+
+def set_skill_owners(team: Team, skill_name: str, users: list[User], *, acting_user: User | None) -> list[User]:
+    """Replace the owner set for a logical skill with `users` (deduped, order preserved).
+
+    An empty list clears all owners. This is the explicit owner-management op — it is only ever
+    called when a caller passes `owners`, never as a side effect of a body edit.
+    """
+    seen: set[int] = set()
+    ordered: list[User] = []
+    for user in users:
+        if user.pk in seen:
+            continue
+        seen.add(user.pk)
+        ordered.append(user)
+
+    with transaction.atomic():
+        owners_qs = _owner_qs(team).filter(skill_name=skill_name)
+        previous_ids = sorted(owners_qs.values_list("user_id", flat=True))
+        owners_qs.delete()
+        for user in ordered:
+            # One-by-one (not bulk_create) so `save()` runs per row; `_owner_qs` scoping keeps the
+            # write context-independent (works outside a request too).
+            _owner_qs(team).create(team=team, skill_name=skill_name, user=user)
+        next_ids = sorted(seen)
+        if next_ids != previous_ids:
+            log_skill_activity(
+                team=team,
+                user=acting_user,
+                skill_name=skill_name,
+                activity="updated",
+                changes=[skill_change("owners", before=previous_ids, after=next_ids)],
+            )
+    return resolve_skill_owners(team, skill_name)
+
+
+@frozen
+class SkillDigestBackfillCounts:
+    skills: int
+    files: int
+
+
+def backfill_skill_digests(
+    *, batch_size: int = DIGEST_BACKFILL_BATCH_SIZE, recompute: bool = False
+) -> SkillDigestBackfillCounts:
+    """Stamp `sha256`/`size` on rows written before digests existed. Safe to re-run.
+
+    Every write path stamps its own digest, so this only has to reach the history. It walks in
+    primary-key order and writes fixed-size batches, so a team with a long skill history cannot
+    pull the whole table into memory. `recompute` re-stamps rows that already carry a digest,
+    for when the rendered form of a SKILL.md changes.
+    """
+    skills = LLMSkill.objects.all() if recompute else LLMSkill.objects.filter(skill_md_sha256__isnull=True)
+    files = LLMSkillFile.objects.all() if recompute else LLMSkillFile.objects.filter(content_sha256__isnull=True)
+    return SkillDigestBackfillCounts(
+        skills=_backfill_digests(LLMSkill, skills, batch_size), files=_backfill_digests(LLMSkillFile, files, batch_size)
+    )
+
+
+def _backfill_digests(model: type[_DigestModel], queryset: QuerySet[_DigestModel], batch_size: int) -> int:
+    # Cursor on the primary key rather than re-running the "needs a digest" filter: under
+    # `recompute` that filter matches every row, so a fixed `[:batch_size]` slice would never
+    # advance and the walk would never end.
+    cursor: Any = None
+    stamped = 0
+    while True:
+        page = queryset.filter(pk__gt=cursor) if cursor is not None else queryset
+        rows = list(page.order_by("pk")[:batch_size])
+        if not rows:
+            return stamped
+        for row in rows:
+            row.stamp_digest()
+        model.objects.bulk_update(rows, list(model.DIGEST_FIELDS))
+        stamped += len(rows)
+        cursor = rows[-1].pk

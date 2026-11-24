@@ -1,0 +1,713 @@
+import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * To modify these types, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+import type {
+    ActivityLogPaginatedResponseApi,
+    DesktopFeedbackRequestApi,
+    DesktopFeedbackResponseApi,
+    GenerateSurveyTranslationsRequestApi,
+    GenerateSurveyTranslationsResponseApi,
+    PaginatedSurveyListApi,
+    PatchedSurveySerializerCreateUpdateOnlySchemaApi,
+    SiteSnapshotApi,
+    SurveyApi,
+    SurveyGlobalStatsResponseApi,
+    SurveyQuestionLabelsResponseApi,
+    SurveyResponsesListApi,
+    SurveySerializerCreateUpdateOnlyApi,
+    SurveySerializerCreateUpdateOnlySchemaApi,
+    SurveyStatsResponseApi,
+    SurveySummarizeRequestApi,
+    SurveysActivityRetrieveParams,
+    SurveysGlobalStatsRetrieveParams,
+    SurveysListParams,
+    SurveysResponsesListParams,
+    SurveysSiteSnapshotRetrieveParams,
+    SurveysStatsRetrieveParams,
+    SurveysSummarizeResponsesCreateParams,
+} from './api.schemas'
+
+// https://stackoverflow.com/questions/49579094/typescript-conditional-types-filter-out-readonly-properties-pick-only-requir/49579497#49579497
+type IfEquals<X, Y, A = X, B = never> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2 ? A : B
+
+type WritableKeys<T> = {
+    [P in keyof T]-?: IfEquals<{ [Q in P]: T[P] }, { -readonly [Q in P]: T[P] }, P>
+}[keyof T]
+
+type UnionToIntersection<U> = (U extends any ? (k: U) => void : never) extends (k: infer I) => void ? I : never
+type DistributeReadOnlyOverUnions<T> = T extends any ? NonReadonly<T> : never
+
+type Writable<T> = Pick<T, WritableKeys<T>>
+type NonReadonly<T> = [T] extends [UnionToIntersection<T>]
+    ? {
+          [P in keyof Writable<T>]: T[P] extends object ? NonReadonly<NonNullable<T[P]>> : T[P]
+      }
+    : DistributeReadOnlyOverUnions<T>
+
+export const getDesktopFeedbackCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/desktop_feedback/`
+}
+
+/**
+ * Stores selected attachments and submits one response to the PostHog Desktop feedback survey.
+ * @summary Submit Desktop feedback
+ */
+export const desktopFeedbackCreate = async (
+    projectId: string,
+    desktopFeedbackRequestApi: DesktopFeedbackRequestApi,
+    options?: RequestInit
+): Promise<DesktopFeedbackResponseApi> => {
+    const formData = new FormData()
+    formData.append(`response`, desktopFeedbackRequestApi.response)
+    formData.append(`source`, desktopFeedbackRequestApi.source)
+    formData.append(`feedback_view`, desktopFeedbackRequestApi.feedback_view)
+    if (desktopFeedbackRequestApi.feedback_type !== undefined) {
+        formData.append(`feedback_type`, desktopFeedbackRequestApi.feedback_type)
+    }
+    if (desktopFeedbackRequestApi.feedback_task_id !== undefined) {
+        formData.append(`feedback_task_id`, desktopFeedbackRequestApi.feedback_task_id)
+    }
+    if (desktopFeedbackRequestApi.feedback_folder_id !== undefined) {
+        formData.append(`feedback_folder_id`, desktopFeedbackRequestApi.feedback_folder_id)
+    }
+    if (desktopFeedbackRequestApi.feedback_app_logs !== undefined) {
+        formData.append(`feedback_app_logs`, desktopFeedbackRequestApi.feedback_app_logs)
+    }
+    if (desktopFeedbackRequestApi.app_version !== undefined) {
+        formData.append(`app_version`, desktopFeedbackRequestApi.app_version)
+    }
+    if (desktopFeedbackRequestApi.session_id !== undefined) {
+        formData.append(`session_id`, desktopFeedbackRequestApi.session_id)
+    }
+    if (desktopFeedbackRequestApi.screenshot !== undefined) {
+        formData.append(`screenshot`, desktopFeedbackRequestApi.screenshot)
+    }
+    if (desktopFeedbackRequestApi.image_1 !== undefined) {
+        formData.append(`image_1`, desktopFeedbackRequestApi.image_1)
+    }
+    if (desktopFeedbackRequestApi.image_2 !== undefined) {
+        formData.append(`image_2`, desktopFeedbackRequestApi.image_2)
+    }
+
+    return apiMutator<DesktopFeedbackResponseApi>(getDesktopFeedbackCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        body: formData,
+    })
+}
+
+export const getDesktopFeedbackAttachmentsRetrieveUrl = (projectId: string, mediaId: string) => {
+    return `/api/projects/${projectId}/desktop_feedback/attachments/${mediaId}/`
+}
+
+/**
+ * Returns an unexpired attachment to a user with access to the internal feedback project.
+ * @summary Download a Desktop feedback attachment
+ */
+export const desktopFeedbackAttachmentsRetrieve = async (
+    projectId: string,
+    mediaId: string,
+    options?: RequestInit
+): Promise<Blob> => {
+    return apiMutator<Blob>(getDesktopFeedbackAttachmentsRetrieveUrl(projectId, mediaId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysListUrl = (projectId: string, params?: SurveysListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/surveys/?${stringifiedParams}`
+        : `/api/projects/${projectId}/surveys/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysList = async (
+    projectId: string,
+    params?: SurveysListParams,
+    options?: RequestInit
+): Promise<PaginatedSurveyListApi> => {
+    return apiMutator<PaginatedSurveyListApi>(getSurveysListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/surveys/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysCreate = async (
+    projectId: string,
+    surveySerializerCreateUpdateOnlySchemaApi: NonReadonly<SurveySerializerCreateUpdateOnlySchemaApi>,
+    options?: RequestInit
+): Promise<SurveySerializerCreateUpdateOnlyApi> => {
+    return apiMutator<SurveySerializerCreateUpdateOnlyApi>(getSurveysCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(surveySerializerCreateUpdateOnlySchemaApi),
+    })
+}
+
+export const getSurveysRetrieveUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysRetrieve = async (projectId: string, id: string, options?: RequestInit): Promise<SurveyApi> => {
+    return apiMutator<SurveyApi>(getSurveysRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysUpdate = async (
+    projectId: string,
+    id: string,
+    surveySerializerCreateUpdateOnlySchemaApi: NonReadonly<SurveySerializerCreateUpdateOnlySchemaApi>,
+    options?: RequestInit
+): Promise<SurveySerializerCreateUpdateOnlyApi> => {
+    return apiMutator<SurveySerializerCreateUpdateOnlyApi>(getSurveysUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(surveySerializerCreateUpdateOnlySchemaApi),
+    })
+}
+
+export const getSurveysPartialUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysPartialUpdate = async (
+    projectId: string,
+    id: string,
+    patchedSurveySerializerCreateUpdateOnlySchemaApi?: NonReadonly<PatchedSurveySerializerCreateUpdateOnlySchemaApi>,
+    options?: RequestInit
+): Promise<SurveySerializerCreateUpdateOnlyApi> => {
+    return apiMutator<SurveySerializerCreateUpdateOnlyApi>(getSurveysPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedSurveySerializerCreateUpdateOnlySchemaApi),
+    })
+}
+
+export const getSurveysDestroyUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysDestroy = async (projectId: string, id: string, options?: RequestInit): Promise<void> => {
+    return apiMutator<void>(getSurveysDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getSurveysActivityRetrieveUrl = (
+    projectId: string,
+    id: string,
+    params?: SurveysActivityRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/surveys/${id}/activity/?${stringifiedParams}`
+        : `/api/projects/${projectId}/surveys/${id}/activity/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysActivityRetrieve = async (
+    projectId: string,
+    id: string,
+    params?: SurveysActivityRetrieveParams,
+    options?: RequestInit
+): Promise<ActivityLogPaginatedResponseApi> => {
+    return apiMutator<ActivityLogPaginatedResponseApi>(getSurveysActivityRetrieveUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysArchivedResponseUuidsRetrieveUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/archived-response-uuids/`
+}
+
+/**
+ * Get list of archived response UUIDs for HogQL filtering.
+ *
+ * Returns list of UUIDs that the frontend can use to filter out archived responses
+ * in HogQL queries.
+ */
+export const surveysArchivedResponseUuidsRetrieve = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getSurveysArchivedResponseUuidsRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysDuplicateToProjectsCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/duplicate_to_projects/`
+}
+
+/**
+ * Duplicate a survey to multiple projects in a single transaction.
+ *
+ * Accepts a list of target team IDs and creates a copy of the survey in each project.
+ * Every target project must be in the source project's organization, and the caller needs
+ * survey editor access in each one.
+ * Uses an all-or-nothing approach - if any duplication fails, all changes are rolled back.
+ */
+export const surveysDuplicateToProjectsCreate = async (
+    projectId: string,
+    id: string,
+    surveySerializerCreateUpdateOnlyApi: NonReadonly<SurveySerializerCreateUpdateOnlyApi>,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getSurveysDuplicateToProjectsCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(surveySerializerCreateUpdateOnlyApi),
+    })
+}
+
+export const getSurveysGenerateTranslationsCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/generate_translations/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysGenerateTranslationsCreate = async (
+    projectId: string,
+    id: string,
+    generateSurveyTranslationsRequestApi: GenerateSurveyTranslationsRequestApi,
+    options?: RequestInit
+): Promise<GenerateSurveyTranslationsResponseApi> => {
+    return apiMutator<GenerateSurveyTranslationsResponseApi>(getSurveysGenerateTranslationsCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(generateSurveyTranslationsRequestApi),
+    })
+}
+
+export const getSurveysLaunchUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/launch/`
+}
+
+/**
+ * Launch a survey by setting `start_date` to the current time. No-op if the survey is already launched (start_date set in the past) — returns the existing state unchanged. Does not affect archived surveys or surveys with an end_date in the past; unarchive or extend the end_date first.
+ */
+export const surveysLaunch = async (projectId: string, id: string, options?: RequestInit): Promise<SurveyApi> => {
+    return apiMutator<SurveyApi>(getSurveysLaunchUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getSurveysResponsesListUrl = (projectId: string, id: string, params?: SurveysResponsesListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/surveys/${id}/responses/?${stringifiedParams}`
+        : `/api/projects/${projectId}/surveys/${id}/responses/`
+}
+
+/**
+ * List survey responses for a specific survey, with question text resolved server-side so callers do not have to map opaque `$survey_response_<id>` keys. Each row carries `distinct_id`, `session_id`, `submitted_at`, and an `extra` block (device, browser, OS, geoip, current_url, iteration) so agents can cross-pivot to recordings, persons, or paths in a single follow-up call. For person properties at event time, follow up with `persons-get` using the returned `distinct_id` — keeps scopes scoped. Use `question_id` + `score_lte` to fetch NPS detractors and similar score-filtered cohorts.
+ */
+export const surveysResponsesList = async (
+    projectId: string,
+    id: string,
+    params?: SurveysResponsesListParams,
+    options?: RequestInit
+): Promise<SurveyResponsesListApi> => {
+    return apiMutator<SurveyResponsesListApi>(getSurveysResponsesListUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysResponsesArchiveCreateUrl = (projectId: string, id: string, responseUuid: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/responses/${responseUuid}/archive/`
+}
+
+/**
+ * Archive a single survey response.
+ */
+export const surveysResponsesArchiveCreate = async (
+    projectId: string,
+    id: string,
+    responseUuid: string,
+    surveySerializerCreateUpdateOnlyApi: NonReadonly<SurveySerializerCreateUpdateOnlyApi>,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getSurveysResponsesArchiveCreateUrl(projectId, id, responseUuid), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(surveySerializerCreateUpdateOnlyApi),
+    })
+}
+
+export const getSurveysResponsesUnarchiveCreateUrl = (projectId: string, id: string, responseUuid: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/responses/${responseUuid}/unarchive/`
+}
+
+/**
+ * Unarchive a single survey response.
+ */
+export const surveysResponsesUnarchiveCreate = async (
+    projectId: string,
+    id: string,
+    responseUuid: string,
+    surveySerializerCreateUpdateOnlyApi: NonReadonly<SurveySerializerCreateUpdateOnlyApi>,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getSurveysResponsesUnarchiveCreateUrl(projectId, id, responseUuid), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(surveySerializerCreateUpdateOnlyApi),
+    })
+}
+
+export const getSurveysSiteSnapshotRetrieveUrl = (
+    projectId: string,
+    id: string,
+    params: SurveysSiteSnapshotRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/surveys/${id}/site_snapshot/?${stringifiedParams}`
+        : `/api/projects/${projectId}/surveys/${id}/site_snapshot/`
+}
+
+/**
+ * Get an image of the customer's own site for the survey preview. The image is a frame from a recent session recording of a page that matches the survey's URL condition. The first call starts rendering it, so poll until the status is `ready` or `unavailable`.
+ * @summary Get a site snapshot for the draft preview
+ */
+export const surveysSiteSnapshotRetrieve = async (
+    projectId: string,
+    id: string,
+    params: SurveysSiteSnapshotRetrieveParams,
+    options?: RequestInit
+): Promise<SiteSnapshotApi> => {
+    return apiMutator<SiteSnapshotApi>(getSurveysSiteSnapshotRetrieveUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysStatsRetrieveUrl = (projectId: string, id: string, params?: SurveysStatsRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/surveys/${id}/stats/?${stringifiedParams}`
+        : `/api/projects/${projectId}/surveys/${id}/stats/`
+}
+
+/**
+ * Get survey response statistics for a specific survey.
+ *
+ * Args:
+ *     date_from: Optional ISO timestamp (e.g. 2024-01-01T00:00:00Z) or relative date (e.g. -7d) for start date
+ *     date_to: Optional ISO timestamp (e.g. 2024-01-31T23:59:59Z) or relative date for end date
+ *     exclude_archived: Optional boolean to exclude archived responses (default: false, includes archived)
+ *     include_per_question_stats: Optional boolean to include per-question response counts and distributions
+ *
+ * Returns:
+ *     Survey statistics including event counts, unique respondents, and conversion rates
+ */
+export const surveysStatsRetrieve = async (
+    projectId: string,
+    id: string,
+    params?: SurveysStatsRetrieveParams,
+    options?: RequestInit
+): Promise<SurveyStatsResponseApi> => {
+    return apiMutator<SurveyStatsResponseApi>(getSurveysStatsRetrieveUrl(projectId, id, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysStopUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/stop/`
+}
+
+/**
+ * Stop a survey by setting `end_date` to the current time. No new responses are accepted after this; existing responses remain available. No-op if the survey already has an end_date in the past.
+ */
+export const surveysStop = async (projectId: string, id: string, options?: RequestInit): Promise<SurveyApi> => {
+    return apiMutator<SurveyApi>(getSurveysStopUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getSurveysSummarizeResponsesCreateUrl = (
+    projectId: string,
+    id: string,
+    params?: SurveysSummarizeResponsesCreateParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/surveys/${id}/summarize_responses/?${stringifiedParams}`
+        : `/api/projects/${projectId}/surveys/${id}/summarize_responses/`
+}
+
+/**
+ * Summarize survey responses. When `question_index` or `question_id` is provided, returns a per-question theme summary using cached `survey.question_summaries` when fresh. When neither is provided, returns the survey-wide headline summary (delegates to summary_headline). Pass `force_refresh=true` in the body to bypass caches.
+ */
+export const surveysSummarizeResponsesCreate = async (
+    projectId: string,
+    id: string,
+    surveySummarizeRequestApi?: SurveySummarizeRequestApi,
+    params?: SurveysSummarizeResponsesCreateParams,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getSurveysSummarizeResponsesCreateUrl(projectId, id, params), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(surveySummarizeRequestApi),
+    })
+}
+
+export const getSurveysSummaryHeadlineCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/surveys/${id}/summary_headline/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysSummaryHeadlineCreate = async (
+    projectId: string,
+    id: string,
+    surveySerializerCreateUpdateOnlyApi: NonReadonly<SurveySerializerCreateUpdateOnlyApi>,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getSurveysSummaryHeadlineCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(surveySerializerCreateUpdateOnlyApi),
+    })
+}
+
+export const getSurveysAllActivityRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/surveys/activity/`
+}
+
+/**
+ * Mixin for ViewSets to handle approval-gate exceptions raised from decorated serializers.
+ *
+ * Intercepts ApprovalRequired (409) and PolicyConflict (400) raised by the @approval_gate
+ * decorator on serializer methods and converts them into the same responses the viewset path
+ * produces (see decorators._result_to_response), so both paths share one contract.
+ */
+export const surveysAllActivityRetrieve = async (projectId: string, options?: RequestInit): Promise<void> => {
+    return apiMutator<void>(getSurveysAllActivityRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysQuestionLabelsUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/surveys/question_labels/`
+}
+
+/**
+ * Return a slim list of question labels for the team's surveys. Used by the frontend to resolve `$survey_response_<question_id>` property keys into human-readable question text without loading the full survey payload.
+ */
+export const surveysQuestionLabels = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<SurveyQuestionLabelsResponseApi> => {
+    return apiMutator<SurveyQuestionLabelsResponseApi>(getSurveysQuestionLabelsUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysResponsesCountRetrieveUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/surveys/responses_count/`
+}
+
+/**
+ * Get response counts for all surveys.
+ *
+ * Args:
+ *     exclude_archived: Optional boolean to exclude archived responses (default: false, includes archived)
+ *     survey_ids: Optional comma-separated list of survey IDs to filter by
+ *
+ * Returns:
+ *     Dictionary mapping survey IDs to response counts
+ */
+export const surveysResponsesCountRetrieve = async (projectId: string, options?: RequestInit): Promise<void> => {
+    return apiMutator<void>(getSurveysResponsesCountRetrieveUrl(projectId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getSurveysGlobalStatsRetrieveUrl = (projectId: string, params?: SurveysGlobalStatsRetrieveParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/surveys/stats/?${stringifiedParams}`
+        : `/api/projects/${projectId}/surveys/stats/`
+}
+
+/**
+ * Get aggregated response statistics across all surveys.
+ *
+ * Args:
+ *     date_from: Optional ISO timestamp (e.g. 2024-01-01T00:00:00Z) or relative date (e.g. -7d) for start date
+ *     date_to: Optional ISO timestamp (e.g. 2024-01-31T23:59:59Z) or relative date for end date
+ *
+ * Returns:
+ *     Aggregated statistics across all surveys including total counts and rates
+ */
+export const surveysGlobalStatsRetrieve = async (
+    projectId: string,
+    params?: SurveysGlobalStatsRetrieveParams,
+    options?: RequestInit
+): Promise<SurveyGlobalStatsResponseApi> => {
+    return apiMutator<SurveyGlobalStatsResponseApi>(getSurveysGlobalStatsRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
+}

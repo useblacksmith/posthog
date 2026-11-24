@@ -1,0 +1,383 @@
+import { IconCopy, IconSparkles } from '@posthog/icons'
+import { LemonButton, LemonTag, Spinner, Tooltip } from '@posthog/lemon-ui'
+
+import { copyToClipboard } from 'lib/utils/copyToClipboard'
+
+import type { ReplayObservationApi } from '../generated/api.schemas'
+import {
+    type ClassifierScannerConfig,
+    type ScorerScannerConfig,
+    configFromSnapshot,
+    failureKindDescription,
+    ineligibleKindDescription,
+    parseFailureReason,
+    parseIneligibleReason,
+} from '../replay_scanners/types'
+import { citedTextToPlainText, parseCitedSegments } from '../utils/citations'
+import { VERDICT_LABEL, confidenceLevel, isSummaryScannerType, readReasoning } from '../utils/observation'
+import { LabeledRow } from './LabeledRow'
+import { TimestampCitation } from './TimestampCitation'
+
+export function ObservationStatusTag({
+    status,
+    errorReason,
+}: {
+    status: ReplayObservationApi['status']
+    // Required, not optional: an omitted reason silently drops the tooltip that explains a failed or ineligible status.
+    errorReason: string | null
+}): JSX.Element {
+    if (status === 'succeeded') {
+        return <LemonTag type="success">Succeeded</LemonTag>
+    }
+    if (status === 'failed') {
+        // Raw exception text lives in `FailureDetail`.
+        const parsed = errorReason ? parseFailureReason(errorReason) : null
+        const tooltip = parsed ? (
+            <div className="flex flex-col gap-1">
+                <div>{parsed.label}</div>
+                <div className="text-xs opacity-80">{failureKindDescription(parsed.kind)}</div>
+            </div>
+        ) : (
+            errorReason || null
+        )
+        return (
+            <Tooltip title={tooltip}>
+                <LemonTag type="danger">Failed</LemonTag>
+            </Tooltip>
+        )
+    }
+    if (status === 'ineligible') {
+        // Muted, not danger — the session was skipped at the gate, not a scanner failure.
+        const parsed = errorReason ? parseIneligibleReason(errorReason) : null
+        const tooltip = parsed ? (
+            <div className="flex flex-col gap-1">
+                <div>{ineligibleKindDescription(parsed.kind)}</div>
+                {parsed.message && <div className="text-xs opacity-80">{parsed.message}</div>}
+            </div>
+        ) : errorReason ? (
+            <div>{errorReason}</div>
+        ) : null
+        return (
+            <Tooltip title={tooltip}>
+                <LemonTag type="muted">Ineligible</LemonTag>
+            </Tooltip>
+        )
+    }
+    if (status === 'running') {
+        return (
+            <LemonTag type="warning">
+                <Spinner className="mr-1" /> Running
+            </LemonTag>
+        )
+    }
+    return <LemonTag type="default">Pending</LemonTag>
+}
+
+export function readResult(observation: ReplayObservationApi): Record<string, unknown> | null {
+    const output = observation.scanner_result?.model_output
+    return output && typeof output === 'object' ? (output as Record<string, unknown>) : null
+}
+
+/** Dumb renderer for parsed citation segments. Pass `onSeek` to make citation chips interactive; omit for plain-text timestamps. */
+export function CitedText({
+    text,
+    segments,
+    onSeek,
+}: {
+    text: string
+    segments: unknown
+    onSeek?: (timestampMs: number) => void
+}): JSX.Element {
+    const list = parseCitedSegments(text, segments)
+    if (list.length === 0) {
+        return <>{text}</>
+    }
+    return (
+        <>
+            {list.map((segment, i) =>
+                segment.kind === 'text' ? (
+                    <span key={i}>{segment.value}</span>
+                ) : (
+                    <TimestampCitation key={i} timestampMs={segment.timestamp_ms} onSeek={onSeek} />
+                )
+            )}
+        </>
+    )
+}
+
+export function ObservationPrimaryOutput({
+    observation,
+    compact = false,
+    showPrompt = true,
+    onSeek,
+    expandSummary = false,
+    copyable = false,
+    reasoningTooltip = false,
+    largeTitle = false,
+}: {
+    observation: ReplayObservationApi
+    compact?: boolean
+    showPrompt?: boolean
+    /** Called with timestamp_ms when a citation chip is clicked. If omitted, citations render as plain text. */
+    onSeek?: (timestampMs: number) => void
+    /** When true (dock/detail), summarizer body wraps in full; when false (table), single-line truncate. */
+    expandSummary?: boolean
+    /** Shows a copy button on summarizer output: the clipboard gets the title plus the summary with citations as plain timestamps. */
+    copyable?: boolean
+    /** Hovering the result shows its reasoning. For list rows, which have nowhere else to print it. */
+    reasoningTooltip?: boolean
+    /** Sets a summarizer's title at headline size, for the observation page. */
+    largeTitle?: boolean
+}): JSX.Element | null {
+    const snapshot = observation.scanner_snapshot
+    const result = readResult(observation)
+    if (!snapshot || !result) {
+        return null
+    }
+    const scannerType = snapshot.scanner_type
+    const config = configFromSnapshot(snapshot)
+    const prompt = showPrompt ? (config?.prompt ?? null) : null
+    const reasoning = reasoningTooltip ? readReasoning(observation) : null
+    const resultTooltip = reasoning ? citedTextToPlainText(reasoning, result.reasoning_segments) : null
+    const textClass = 'text-sm'
+    const summaryClass = expandSummary
+        ? `${textClass} whitespace-pre-wrap`
+        : compact
+          ? `${textClass} truncate`
+          : textClass
+    const bodyClass = compact ? `${textClass} truncate` : textClass
+    const promptClass = 'text-xs text-muted'
+
+    if (scannerType === 'monitor') {
+        const verdict = result.verdict
+        // Neutral accent, not success-green: a "yes" verdict isn't inherently good.
+        const tagType =
+            verdict === 'yes'
+                ? 'highlight'
+                : verdict === 'no'
+                  ? 'default'
+                  : verdict === 'inconclusive'
+                    ? 'muted'
+                    : 'muted'
+        const tagLabel =
+            verdict === 'yes' || verdict === 'no' || verdict === 'inconclusive' ? VERDICT_LABEL[verdict] : '—'
+        return (
+            <div className="flex flex-col gap-1">
+                <Tooltip title={resultTooltip}>
+                    <LemonTag size="medium" type={tagType} className="self-start">
+                        {tagLabel}
+                    </LemonTag>
+                </Tooltip>
+                {prompt && <span className={promptClass}>{prompt}</span>}
+            </div>
+        )
+    }
+
+    if (isSummaryScannerType(scannerType)) {
+        const title = typeof result.title === 'string' ? result.title : null
+        const summary = typeof result.summary === 'string' ? result.summary : null
+        const showCopy = copyable && summary !== null
+        return (
+            <div className="flex flex-col gap-1">
+                {(title || showCopy) && (
+                    <div className="flex items-start justify-between gap-2">
+                        {title && (
+                            <span className={largeTitle ? 'text-xl font-bold' : `font-semibold ${textClass}`}>
+                                {title}
+                            </span>
+                        )}
+                        {showCopy && (
+                            <LemonButton
+                                size="xsmall"
+                                icon={<IconCopy />}
+                                tooltip="Copy summary"
+                                className="ml-auto -my-1"
+                                onClick={() =>
+                                    void copyToClipboard(
+                                        [title, citedTextToPlainText(summary, result.summary_segments)]
+                                            .filter(Boolean)
+                                            .join('\n\n'),
+                                        'summary'
+                                    )
+                                }
+                                data-attr="vision-copy-summary"
+                            />
+                        )}
+                    </div>
+                )}
+                {summary && (
+                    <span className={summaryClass}>
+                        <CitedText text={summary} segments={result.summary_segments} onSeek={onSeek} />
+                    </span>
+                )}
+            </div>
+        )
+    }
+
+    if (scannerType === 'classifier') {
+        const fixedTags = Array.isArray(result.tags) ? (result.tags as string[]) : []
+        const freeformTags = Array.isArray(result.tags_freeform) ? (result.tags_freeform as string[]) : []
+        const classifierConfig = config as ClassifierScannerConfig | null
+        const configuredTags = Array.isArray(classifierConfig?.tags) ? classifierConfig.tags : []
+        const chosen = new Set(fixedTags)
+        const empty = fixedTags.length === 0 && freeformTags.length === 0
+        const renderVocab = (): JSX.Element[] =>
+            configuredTags.map((tag, index) => {
+                const isChosen = chosen.has(tag)
+                return (
+                    <LemonTag
+                        key={`fixed-${index}-${tag}`}
+                        size="medium"
+                        type={isChosen ? 'option' : 'default'}
+                        className={isChosen ? undefined : 'opacity-50 line-through'}
+                    >
+                        {tag}
+                    </LemonTag>
+                )
+            })
+        const renderFreeform = (): JSX.Element[] =>
+            freeformTags.map((tag, index) => (
+                <LemonTag key={`freeform-${index}-${tag}`} size="medium" type="default" icon={<IconSparkles />}>
+                    {tag}
+                </LemonTag>
+            ))
+        if (compact) {
+            return (
+                <div className="flex flex-col gap-1">
+                    <div className="flex flex-wrap gap-1">
+                        {empty ? (
+                            <span className={`text-muted ${textClass}`}>No categories</span>
+                        ) : (
+                            <>
+                                {fixedTags.map((tag, index) => (
+                                    <LemonTag key={`fixed-${index}-${tag}`} size="medium" type="option">
+                                        {tag}
+                                    </LemonTag>
+                                ))}
+                                {renderFreeform()}
+                            </>
+                        )}
+                    </div>
+                    {prompt && <span className={promptClass}>{prompt}</span>}
+                </div>
+            )
+        }
+        if (configuredTags.length === 0 && empty) {
+            return (
+                <div className="flex flex-col gap-1">
+                    <span className={`text-muted ${textClass}`}>No categories</span>
+                    {prompt && <span className={promptClass}>{prompt}</span>}
+                </div>
+            )
+        }
+        return (
+            <div className="flex flex-col gap-3">
+                <div className="flex flex-wrap items-center gap-1">
+                    {renderVocab()}
+                    {renderFreeform()}
+                </div>
+                {prompt && <span className={promptClass}>{prompt}</span>}
+            </div>
+        )
+    }
+
+    if (scannerType === 'scorer') {
+        const score = typeof result.score === 'number' ? result.score : null
+        const resultLabel = typeof result.label === 'string' ? result.label : null
+        const scale = (config as ScorerScannerConfig | null)?.scale ?? null
+        const scaleMax = typeof scale?.max === 'number' ? scale.max : null
+        const scaleLabel = typeof scale?.label === 'string' ? scale.label : null
+        // Prefer the per-observation label (specific); fall back to the configured scale label (axis name).
+        const displayLabel = resultLabel ?? scaleLabel
+        return (
+            <div className="flex flex-col gap-1">
+                <Tooltip title={resultTooltip}>
+                    <span className={`${textClass} self-start`}>
+                        <span className="font-semibold text-base">{score ?? '—'}</span>
+                        {scaleMax !== null && <span className="text-muted"> / {scaleMax}</span>}
+                        {displayLabel && <span className="text-muted"> — {displayLabel}</span>}
+                    </span>
+                </Tooltip>
+                {prompt && <span className={promptClass}>{prompt}</span>}
+            </div>
+        )
+    }
+
+    // Unknown / generic fallback (also covers summarizers, whose body is `summary`).
+    const summary = typeof result.summary === 'string' ? result.summary : null
+    const userType = typeof result.user_type === 'string' ? result.user_type : null
+    return (
+        <div className="flex flex-col gap-1">
+            {summary && <span className={bodyClass}>{summary}</span>}
+            {userType && (
+                <span className="text-muted text-xs">
+                    <span className="font-medium">User: </span>
+                    {userType}
+                </span>
+            )}
+        </div>
+    )
+}
+
+// A reader opens an observation for the result, not the prompt they configured. Collapse the prompt to one
+// peek line so the verdict and reasoning stay above the fold, but keep it in view so the verdict has context.
+/** Names the metric in the tag, for surfaces with no "Confidence" label of their own. */
+export function ObservationConfidence({ result }: { result: Record<string, unknown> }): JSX.Element | null {
+    if (typeof result.confidence !== 'number') {
+        return null
+    }
+    const { type, label } = confidenceLevel(result.confidence)
+    return (
+        <Tooltip title={`Confidence: ${Math.round(result.confidence * 100)}%`}>
+            <LemonTag type={type}>{`${label} confidence`}</LemonTag>
+        </Tooltip>
+    )
+}
+
+export function ObservationResultSummary({ observation }: { observation: ReplayObservationApi }): JSX.Element {
+    if (observation.status === 'ineligible' || observation.status === 'failed') {
+        return <span className="text-muted text-sm">—</span>
+    }
+    const snapshot = observation.scanner_snapshot
+    const result = readResult(observation)
+    if (!snapshot || !result) {
+        return <span className="text-muted text-sm">—</span>
+    }
+    return <ObservationPrimaryOutput observation={observation} compact showPrompt={false} reasoningTooltip />
+}
+
+export function FailureDetail({ errorReason }: { errorReason: string }): JSX.Element {
+    const parsed = parseFailureReason(errorReason)
+    return (
+        <div className="flex flex-col gap-2">
+            <LabeledRow label="Reason">
+                <p className="text-sm text-default m-0 leading-snug">
+                    {parsed ? failureKindDescription(parsed.kind) : errorReason}
+                </p>
+            </LabeledRow>
+            {parsed?.message && (
+                <LabeledRow label="Details">
+                    <p className="text-sm text-default m-0 leading-snug font-mono">{parsed.message}</p>
+                </LabeledRow>
+            )}
+        </div>
+    )
+}
+
+export function IneligibleDetail({ errorReason }: { errorReason: string }): JSX.Element {
+    const parsed = parseIneligibleReason(errorReason)
+    return (
+        <div className="flex flex-col gap-2">
+            <LabeledRow label="Reason">
+                <p className="text-sm text-default m-0 leading-snug">
+                    {parsed ? ineligibleKindDescription(parsed.kind) : errorReason}
+                </p>
+            </LabeledRow>
+            {parsed?.message && (
+                <LabeledRow label="Details">
+                    <p className="text-sm text-default m-0 leading-snug">{parsed.message}</p>
+                </LabeledRow>
+            )}
+        </div>
+    )
+}

@@ -1,0 +1,1277 @@
+import clsx from 'clsx'
+import {
+    KeyboardEvent,
+    MouseEvent as ReactMouseEvent,
+    PointerEvent as ReactPointerEvent,
+    ReactNode,
+    memo,
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from 'react'
+
+import {
+    IconCollapse,
+    IconDatabase,
+    IconEllipsis,
+    IconExpand,
+    IconEye,
+    IconPencil,
+    IconGraph,
+    IconHide,
+    IconList,
+    IconPeople,
+    IconPlus,
+    IconTrash,
+} from '@posthog/icons'
+import { LemonButton, LemonMenu, LemonTag } from '@posthog/lemon-ui'
+import { PostHogErrorBoundary } from '@posthog/react'
+
+import { IconArrowDown, IconArrowUp } from 'lib/lemon-ui/icons'
+import { Spinner } from 'lib/lemon-ui/Spinner'
+import { findMountedCodeEditorWithin, subscribeToMountedCodeEditors } from 'lib/monaco/mountedCodeEditors'
+
+import { ComponentPanelContext } from './componentPanelContext'
+import {
+    CANVAS_COMPONENT_PANEL_VISIBILITY,
+    ComponentPanel,
+    ComponentPanelVisibility,
+    DEFAULT_COMPONENT_PANEL_VISIBILITY,
+    withPersistedComponentPanelProps,
+} from './componentPanels'
+import { NotebookComponentRunHandler, NotebookComponentRunHandlerContext } from './componentRunHandlers'
+import { useNotebookComponentRunStatus } from './componentRunStatus'
+import {
+    NotebookComponentToolbarExtras,
+    NotebookComponentToolbarExtrasContext,
+    withoutNotebookMenuIcons,
+} from './componentToolbarExtras'
+import { getNotebookObjectProp, getNotebookStringProp, isDiscussionCommentNode } from './documentModel'
+import { InsertMenuSelectionDirection } from './editorTypes'
+import { installNotebookJupyterEditorKeys } from './jupyterEditorKeys'
+import { resolveNotebookJupyterKey, useNotebookJupyterCommands, useNotebookJupyterStoreValue } from './jupyterMode'
+import { getMarkdownNotebookComponentDefinition } from './registry'
+import {
+    NotebookBlockNode,
+    NotebookComponentBlockNode,
+    NotebookComponentDefinition,
+    NotebookComponentProps,
+    NotebookComponentRegistry,
+    NotebookMode,
+} from './types'
+import { getNodeFingerprint } from './utils'
+
+const EDIT_FOCUS_TIMEOUT_MS = 10_000
+const EDIT_FOCUS_RETRY_MS = 50
+
+export type ComponentTitleTone = 'default' | 'insight' | 'sql' | 'data' | 'media' | 'experiment' | 'code' | 'posthog'
+
+export type ComponentTitleDisplay = {
+    label: string
+    tone: ComponentTitleTone
+    icon: ReactNode
+}
+
+export type NotebookComponentShellProps = {
+    node: NotebookComponentBlockNode
+    mode: NotebookMode
+    componentPanels: ComponentPanelVisibility
+    rememberedComponentPanels?: ComponentPanelVisibility
+    persistComponentPanelVisibility: boolean
+    /** Surface-level opt-in for definitions with `viewModeFilters` (read-only canvases). */
+    allowViewModeFilters?: boolean
+    /** Public/shared read-only renders: hide the resource link, whose relative URL resolves
+     * against the viewer's project (wrong project or 404 for logged-in viewers, unusable for
+     * anonymous ones). Mirrors the legacy notebook's `!isShared` gate. */
+    hideResourceLinks?: boolean
+    isSelected: boolean
+    registry: NotebookComponentRegistry
+    toggleComponentPanel: (panel: ComponentPanel) => void
+    setLocalComponentPanels: (nodeId: string, panels: ComponentPanelVisibility) => void
+    rememberComponentPanels: (nodeId: string, panels: ComponentPanelVisibility) => void
+    setBlockRef: (element: HTMLElement | null) => void
+    updateNode: (nodeId: string, updater: (node: NotebookBlockNode) => NotebookBlockNode | null) => void
+    onBtw?: () => void
+    askAIDisabledReason?: string
+    copyNode?: (node: NotebookComponentBlockNode) => void
+    deleteNode: () => void
+    deleteSelectedNotebookBlocks: () => boolean
+    insertParagraphAfterNode: () => void
+    moveFocusToAdjacentNode: (nodeId: string, direction: InsertMenuSelectionDirection, offset: number) => boolean
+}
+
+export function NotebookComponentShell({
+    node,
+    mode,
+    componentPanels,
+    rememberedComponentPanels,
+    persistComponentPanelVisibility,
+    allowViewModeFilters,
+    hideResourceLinks,
+    isSelected,
+    registry,
+    toggleComponentPanel,
+    setLocalComponentPanels,
+    rememberComponentPanels,
+    setBlockRef,
+    updateNode,
+    onBtw,
+    askAIDisabledReason,
+    copyNode,
+    deleteNode,
+    deleteSelectedNotebookBlocks,
+    insertParagraphAfterNode,
+    moveFocusToAdjacentNode,
+}: NotebookComponentShellProps): JSX.Element {
+    const definition = getMarkdownNotebookComponentDefinition(registry, node.tagName)
+    const runStatus = useNotebookComponentRunStatus(node)
+    const errors = [...(node.errors ?? []), ...(definition?.validateProps?.(node.props) ?? [])]
+    const ViewComponent = definition?.ViewComponent
+    const EditComponent = definition?.EditComponent ?? definition?.ViewComponent
+    const ToolbarComponent = definition?.ToolbarComponent
+    // Read-only canvases (e.g. customer profiles) keep the filters toggle: it's the only way to
+    // configure nodes there, matching the legacy notebook's canvas behavior.
+    const isViewModeCanvas = mode === 'view' && !!allowViewModeFilters
+    const showViewModeFilters = isViewModeCanvas && !!definition?.viewModeFilters && !definition.hideModeActions
+    const showEditPanel = (mode === 'edit' || showViewModeFilters) && componentPanels.filters
+    // Plain view mode (shared/read-only notebooks) always shows results; canvases can collapse them.
+    const showViewPanel =
+        ((mode === 'view' && !isViewModeCanvas) || componentPanels.results) &&
+        !(showEditPanel && definition?.exclusiveEditPanel)
+    const showModeActions = mode === 'edit' && !!definition && !definition.hideModeActions
+    // Edit mode already covers folding via the eye/type label, so collapse only shows where those
+    // controls don't render: read-only canvases.
+    const showCollapseToggle = isViewModeCanvas && !!definition && !definition.hideModeActions
+    const canToggleComponentPanels = mode === 'edit'
+    const hasOpenComponentPanel = componentPanels.filters || componentPanels.results
+    const [toolbarExtras, setToolbarExtras] = useState<NotebookComponentToolbarExtras | null>(null)
+    const [runHandler, setRunHandler] = useState<NotebookComponentRunHandler | null>(null)
+    const titleDisplay = getComponentTitleDisplay(node, definition)
+    const toolbarTitle = getComponentToolbarTitle(node, definition, titleDisplay.label)
+    const isTitleEditable = definition?.editableTitle !== false
+    const href = definition?.getHref?.(node) ?? null
+    // Suppress the link on public/shared renders (see hideResourceLinks): its relative URL would
+    // resolve against the viewer's own project rather than the notebook author's.
+    const showResourceLink = !!href && !hideResourceLinks
+    // The user-set title (props.title) wins; the computed contextual title is the watermark/fallback.
+    // A title equal to the component's own label (e.g. code blocks default to "Python") is treated
+    // as "no user title" so the field reads as empty by default.
+    const rawTitle = (getNotebookStringProp(node.props.title) ?? '').trim()
+    const userTitle = rawTitle && rawTitle !== titleDisplay.label ? rawTitle : ''
+    const titlePlaceholder = toolbarTitle ?? (isTitleEditable ? 'Add a title' : titleDisplay.label)
+    const publishedTitle = toolbarExtras?.title?.trim() || null
+    const resolvedTitle = isTitleEditable ? userTitle || toolbarTitle || null : publishedTitle || toolbarTitle || null
+    const titleStatus = isTitleEditable ? null : toolbarExtras?.titleStatus
+    const filtersLabel = componentPanels.filters ? 'Hide filters' : 'Show filters'
+    const resultsLabel = componentPanels.results ? 'Hide results' : 'Show results'
+    const titleClassName = clsx(
+        'MarkdownNotebook__component-title',
+        `MarkdownNotebook__component-title--${titleDisplay.tone}`
+    )
+    const componentPanelState = useMemo(
+        () => ({
+            componentPanels,
+            showEditPanel,
+            showViewPanel,
+        }),
+        [componentPanels, showEditPanel, showViewPanel]
+    )
+    const [titleDraft, setTitleDraft] = useState<string | null>(null)
+    const [isEditingTitle, setIsEditingTitle] = useState(false)
+    const toolbarMenuItems = withoutNotebookMenuIcons([
+        showResourceLink
+            ? {
+                  label: `Open ${titleDisplay.label.charAt(0).toLocaleLowerCase()}${titleDisplay.label.slice(1)}`,
+                  to: href ?? '',
+              }
+            : null,
+        showResourceLink
+            ? {
+                  label: 'Open in new tab',
+                  to: href ?? '',
+                  targetBlank: true,
+              }
+            : null,
+        copyNode ? { label: 'Copy', onClick: () => copyNode(node) } : null,
+        mode === 'edit' && isTitleEditable ? { label: 'Edit title', onClick: () => setIsEditingTitle(true) } : null,
+        ...(mode === 'edit'
+            ? (toolbarExtras?.actions.map((action) => ({
+                  label: action.text,
+                  disabledReason: action.disabledReason,
+                  onClick: action.onClick,
+              })) ?? [])
+            : []),
+        ...(toolbarExtras?.menuItems ?? []),
+        ...(mode === 'edit' ? (toolbarExtras?.editMenuItems ?? []) : []),
+        mode === 'edit' && onBtw ? { label: 'BTW', onClick: onBtw, disabledReason: askAIDisabledReason } : null,
+    ])
+    const hasToolbarMenu = toolbarMenuItems.some(Boolean)
+    // Escape blurs the input, which fires commitTitle synchronously before the titleDraft
+    // state update lands — this ref lets commitTitle see the cancel intent in that same tick
+    const cancellingTitleRef = useRef(false)
+    const titleInputValue = titleDraft ?? userTitle
+    const titleContent = (
+        <>
+            {titleDisplay.icon ? (
+                <span className="MarkdownNotebook__component-title-icon">{titleDisplay.icon}</span>
+            ) : null}
+            <span>{titleDisplay.label}</span>
+        </>
+    )
+    const titleStatusTag = titleStatus ? (
+        <LemonTag
+            type={titleStatus.type}
+            size="small"
+            className="uppercase shrink-0"
+            icon={titleStatus.loading ? <Spinner textColored /> : undefined}
+            disabledReason={titleStatus.loading ? 'Updating status' : undefined}
+            title={titleStatus.tooltip}
+            onClick={
+                titleStatus.loading || !titleStatus.onClick
+                    ? undefined
+                    : (event) => {
+                          event.stopPropagation()
+                          titleStatus.onClick?.()
+                      }
+            }
+        >
+            {titleStatus.label}
+        </LemonTag>
+    ) : null
+    const setComponentPanels = (panels: ComponentPanelVisibility): void => {
+        if (!persistComponentPanelVisibility) {
+            setLocalComponentPanels(node.id, panels)
+            return
+        }
+
+        updateNode(node.id, (currentNode) => {
+            if (currentNode.type !== 'component') {
+                return currentNode
+            }
+
+            const currentDefinition = getMarkdownNotebookComponentDefinition(registry, currentNode.tagName)
+            return withPersistedComponentPanelProps(currentNode, currentDefinition, panels)
+        })
+    }
+    const toggleAllComponentPanels = (): void => {
+        const restoredPanelVisibility =
+            rememberedComponentPanels && (rememberedComponentPanels.filters || rememberedComponentPanels.results)
+                ? rememberedComponentPanels
+                : isViewModeCanvas
+                  ? CANVAS_COMPONENT_PANEL_VISIBILITY
+                  : DEFAULT_COMPONENT_PANEL_VISIBILITY
+        const nextPanelVisibility = hasOpenComponentPanel ? { filters: false, results: false } : restoredPanelVisibility
+
+        if (hasOpenComponentPanel) {
+            rememberComponentPanels(node.id, componentPanels)
+        }
+
+        setComponentPanels(nextPanelVisibility)
+    }
+    const updateProps = useCallback(
+        (props: Partial<NotebookComponentProps>): void => {
+            const propKeysToRemove = new Set(
+                Object.entries(props)
+                    .filter(([, value]) => value === undefined)
+                    .map(([key]) => key)
+            )
+            const nextProps = Object.entries(props).reduce<NotebookComponentProps>((accumulator, [key, value]) => {
+                if (value !== undefined) {
+                    accumulator[key] = value
+                }
+                return accumulator
+            }, {})
+
+            updateNode(node.id, (currentNode) => {
+                if (currentNode.type !== 'component') {
+                    return currentNode
+                }
+                return {
+                    ...currentNode,
+                    // An intentional edit supersedes any malformed source captured at parse time —
+                    // stale `raw` would otherwise win over the new props on serialize
+                    raw: undefined,
+                    errors: undefined,
+                    props: {
+                        ...(definition?.persistNodeId ? { nodeId: currentNode.id } : {}),
+                        ...Object.entries(currentNode.props).reduce<NotebookComponentProps>(
+                            (accumulator, [key, value]) => {
+                                if (!propKeysToRemove.has(key)) {
+                                    accumulator[key] = value
+                                }
+                                return accumulator
+                            },
+                            {}
+                        ),
+                        ...nextProps,
+                    },
+                }
+            })
+        },
+        [definition?.persistNodeId, node.id, updateNode]
+    )
+    const commitTitle = (): void => {
+        if (cancellingTitleRef.current) {
+            cancellingTitleRef.current = false
+            return
+        }
+        if (titleDraft === null) {
+            return
+        }
+        const nextTitle = titleDraft.trim()
+        setTitleDraft(null)
+        if (nextTitle !== userTitle) {
+            updateProps({ title: nextTitle || undefined })
+        }
+    }
+    const handleTitleKeyDown = (event: KeyboardEvent<HTMLInputElement>): void => {
+        if (event.key === 'Enter') {
+            event.preventDefault()
+            event.currentTarget.blur()
+        } else if (event.key === 'Escape') {
+            event.preventDefault()
+            cancellingTitleRef.current = true
+            setTitleDraft(null)
+            event.currentTarget.blur()
+        }
+    }
+    const isRunnableCell = !!runHandler
+
+    const runFromKeyboard = (): boolean => {
+        if (!runHandler || runHandler.disabledReason) {
+            return false
+        }
+
+        runHandler.run()
+        return true
+    }
+
+    const focusCellEditor = (shell: HTMLElement): boolean => {
+        // Focusing the editor wrapper does nothing, because Monaco reads keystrokes from a hidden
+        // input of its own. Keep the bare `textarea` last: an EditContext Monaco also renders one
+        // for IME, and focusing that one leaves the caret outside the editor.
+        const editorInput = shell.querySelector<HTMLElement>(
+            '.monaco-editor .native-edit-context, .monaco-editor textarea.inputarea, .monaco-editor textarea'
+        )
+        if (!editorInput) {
+            return false
+        }
+
+        editorInput.focus()
+        return true
+    }
+
+    const jupyterCommands = useNotebookJupyterCommands()
+    const jupyter = isDiscussionCommentNode(node) ? null : jupyterCommands
+    const isJupyterCell = !!jupyter && jupyter.config.cellTagNames.includes(node.tagName)
+    const jupyterStore = isJupyterCell ? jupyter.store : null
+    const isJupyterActive = useNotebookJupyterStoreValue((state) => !!jupyter && state.activeCellId === node.id)
+    const isJupyterSelected = useNotebookJupyterStoreValue(
+        (state) => !!jupyter && state.selectedCellIds.size > 1 && state.selectedCellIds.has(node.id)
+    )
+    const isJupyterEditFocusRequested = useNotebookJupyterStoreValue(
+        (state) => isJupyterCell && state.editFocusRequestNodeId === node.id
+    )
+    const shellRef = useRef<HTMLDivElement | null>(null)
+    const nodeRef = useRef(node)
+    nodeRef.current = node
+
+    useEffect(() => {
+        if (!jupyterStore) {
+            return
+        }
+        jupyterStore.setRunHandler(node.id, runHandler)
+        return () => jupyterStore.setRunHandler(node.id, null)
+    }, [jupyterStore, node.id, runHandler])
+
+    // A cell added in edit mode mounts its code editor some time after the cell itself, and
+    // Monaco ignores focus until it has finished setting up, so the request retries until the
+    // caret has actually landed in the editor. Timers rather than animation frames, because a
+    // hidden tab never runs a frame.
+    useEffect(() => {
+        if (!jupyterStore || !isJupyterEditFocusRequested) {
+            return
+        }
+        if (nodeRef.current.props.hideInput === true) {
+            shellRef.current?.focus({ preventScroll: true })
+            updateProps({ hideInput: undefined })
+        }
+        const deadline = Date.now() + EDIT_FOCUS_TIMEOUT_MS
+        let timer = 0
+        const tryFocus = (): void => {
+            const shell = shellRef.current
+            if (shell) {
+                focusCellEditor(shell)
+            }
+            const activeElement = document.activeElement
+            const hasEditorFocus =
+                !!shell && !!activeElement?.closest('.monaco-editor') && shell.contains(activeElement)
+            // Focus that moved elsewhere in the meantime was the user's choice; do not pull it back.
+            const userMovedOn =
+                !!shell && !!activeElement && activeElement !== document.body && !shell.contains(activeElement)
+            if (hasEditorFocus || userMovedOn || Date.now() > deadline) {
+                jupyterStore.requestEditFocus(null)
+                return
+            }
+            timer = window.setTimeout(tryFocus, EDIT_FOCUS_RETRY_MS)
+        }
+        tryFocus()
+        return () => window.clearTimeout(timer)
+        // oxlint-disable-next-line exhaustive-deps
+    }, [jupyterStore, isJupyterEditFocusRequested])
+
+    // Jupyter's edit-mode keys live on the cell's code editor. The editor mounts after the cell and
+    // can be replaced, so the bindings follow whichever editor sits inside the cell right now.
+    useEffect(() => {
+        if (!isJupyterCell || !jupyter || mode !== 'edit') {
+            return
+        }
+        const { completeCode, inspectCode } = jupyter.config
+        let boundEditor: unknown = null
+        let unbind: (() => void) | null = null
+        const bind = (): void => {
+            const mounted = findMountedCodeEditorWithin(shellRef.current)
+            if ((mounted?.editor ?? null) === boundEditor) {
+                return
+            }
+            unbind?.()
+            unbind = null
+            boundEditor = mounted?.editor ?? null
+            if (mounted) {
+                unbind = installNotebookJupyterEditorKeys(mounted, {
+                    onSplit: (offset) => jupyter.splitCell(node.id, offset),
+                    onLeaveCell: (direction) => jupyter.moveEditFocus(node.id, direction),
+                    onDeleteEmptyCell: () => jupyter.deleteEmptyCell(node.id),
+                    complete: completeCode
+                        ? (code, cursorPos) => completeCode(nodeRef.current, code, cursorPos)
+                        : undefined,
+                    inspect: inspectCode
+                        ? (code, cursorPos) => inspectCode(nodeRef.current, code, cursorPos)
+                        : undefined,
+                })
+            }
+        }
+        bind()
+        // Each cell hears about every editor in the page, so it checks only the one that changed.
+        const unsubscribe = subscribeToMountedCodeEditors((entry, change) => {
+            const isOwnEditor =
+                change === 'unmounted'
+                    ? entry.editor === boundEditor
+                    : !boundEditor && !!shellRef.current?.contains(entry.editor.getContainerDomNode())
+            if (isOwnEditor) {
+                bind()
+            }
+        })
+        return () => {
+            unsubscribe()
+            unbind?.()
+        }
+    }, [isJupyterCell, jupyter, mode, node.id])
+
+    const handleJupyterKeyDown = (event: KeyboardEvent<HTMLDivElement>): boolean => {
+        if (!jupyter || mode !== 'edit' || event.defaultPrevented) {
+            return false
+        }
+        if (event.target instanceof Node && !event.currentTarget.contains(event.target)) {
+            return false
+        }
+        const inEditor = event.target !== event.currentTarget
+        // Only a code cell has an edit mode the cell drives; inside any other block, keys belong to it.
+        if (inEditor && (!isJupyterCell || isPlainInputTarget(event.target))) {
+            return false
+        }
+        const { command, pending } = resolveNotebookJupyterKey(
+            {
+                key: event.key,
+                shiftKey: event.shiftKey,
+                altKey: event.altKey,
+                metaKey: event.metaKey,
+                ctrlKey: event.ctrlKey,
+                inEditor,
+            },
+            jupyter.store.pendingKey,
+            Date.now()
+        )
+        jupyter.store.pendingKey = pending
+        // A split from inside the editor carries a cursor offset, so the editor binding handles it.
+        // A block other than a code cell has no edit mode, so Enter keeps its usual meaning there.
+        if ((!command && !pending) || command === 'split' || (command === 'enter-edit-mode' && !isJupyterCell)) {
+            return false
+        }
+        event.preventDefault()
+        event.stopPropagation()
+        if (command) {
+            jupyter.executeCommand(command, node.id)
+        }
+        return true
+    }
+
+    const selectJupyterCell = (): void => {
+        // Focus that a Shift+Up/Down selection itself moved here must not collapse the selection.
+        if (jupyter && jupyter.store.getState().activeCellId !== node.id) {
+            jupyter.store.setActiveCell(node.id)
+        }
+    }
+
+    const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+        if (handleJupyterKeyDown(event)) {
+            return
+        }
+
+        // A handler closer to the key already claimed it, such as Monaco's own Cmd+Enter.
+        if (mode !== 'edit' || event.defaultPrevented) {
+            return
+        }
+
+        // A modal or menu a block renders portals its DOM out of the shell, yet React still bubbles
+        // its events here through the component tree. Without this the source editor inside a
+        // widget's modal would run the cell on Shift+Enter instead of taking the newline.
+        if (event.target instanceof Node && !event.currentTarget.contains(event.target)) {
+            return
+        }
+
+        // Deliberately overrides Monaco's Shift+Enter, which inserts a plain newline that Enter
+        // already gives you.
+        if (event.key === 'Enter' && !event.altKey && (event.metaKey || event.ctrlKey || event.shiftKey)) {
+            const movesOn = event.shiftKey && !event.metaKey && !event.ctrlKey
+            if (runFromKeyboard()) {
+                event.preventDefault()
+                event.stopPropagation()
+                if (movesOn) {
+                    moveFocusToAdjacentNode(node.id, 'next', 0)
+                }
+            }
+            return
+        }
+
+        // Monaco keeps Escape while it has something to dismiss (the suggestion list, the find
+        // box) and releases it once it has not, so this only fires when the editor is done with it.
+        if (
+            isRunnableCell &&
+            event.key === 'Escape' &&
+            event.target !== event.currentTarget &&
+            !event.metaKey &&
+            !event.ctrlKey &&
+            !event.altKey &&
+            !event.shiftKey
+        ) {
+            event.preventDefault()
+            event.stopPropagation()
+            event.currentTarget.focus()
+            return
+        }
+
+        if (event.target !== event.currentTarget) {
+            return
+        }
+
+        if (event.key === 'Backspace' || event.key === 'Delete') {
+            event.preventDefault()
+            if (deleteSelectedNotebookBlocks()) {
+                return
+            }
+        }
+
+        if (event.key === 'Backspace' || (event.key === 'Delete' && isDiscussionCommentNode(node))) {
+            deleteNode()
+            return
+        }
+
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            if (moveFocusToAdjacentNode(node.id, event.key === 'ArrowDown' ? 'next' : 'previous', 0)) {
+                event.preventDefault()
+                return
+            }
+        }
+
+        if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault()
+            if (isRunnableCell && focusCellEditor(event.currentTarget)) {
+                return
+            }
+            insertParagraphAfterNode()
+        }
+    }
+    const handleToolbarPointerDownCapture = (event: ReactPointerEvent<HTMLDivElement>): void => {
+        if (event.button !== 0 || isTitleInputTarget(event.target)) {
+            return
+        }
+
+        event.stopPropagation()
+    }
+    const handleToolbarMouseDownCapture = (event: ReactMouseEvent<HTMLDivElement>): void => {
+        if (event.button !== 0 || isTitleInputTarget(event.target)) {
+            return
+        }
+
+        event.preventDefault()
+        event.stopPropagation()
+    }
+
+    const setShellRef = useCallback(
+        (element: HTMLDivElement | null): void => {
+            shellRef.current = element
+            setBlockRef(element)
+        },
+        [setBlockRef]
+    )
+
+    if (isJupyterCell && jupyter) {
+        const isRunning = !!runHandler?.isRunning
+        const executionCount = runHandler?.executionCount ?? null
+        const canEditCells = mode === 'edit'
+        const showOutput = componentPanels.results || !canToggleComponentPanels
+        const showInput = node.props.hideInput !== true || !showOutput
+        const inputLabel = formatJupyterInputPrompt(isRunning, executionCount)
+        const inputPrompt = canEditCells ? (
+            <LemonButton
+                size="xxsmall"
+                noPadding
+                className={clsx('MarkdownNotebook__jupyter-prompt-button--input', !showInput && 'line-through')}
+                aria-label={showInput ? 'Hide input' : 'Show input'}
+                aria-expanded={showInput}
+                data-attr={showInput ? 'notebook-jupyter-toggle-input' : 'notebook-jupyter-show-input'}
+                tooltip={showInput ? 'click to hide' : 'click to show'}
+                disabledReason={showInput && !showOutput ? 'Show output before hiding input' : undefined}
+                onClick={() => {
+                    if (!showInput || showOutput) {
+                        shellRef.current?.focus({ preventScroll: true })
+                        updateProps({ hideInput: showInput ? true : undefined })
+                    }
+                }}
+            >
+                {inputLabel}
+            </LemonButton>
+        ) : (
+            <span>{inputLabel}</span>
+        )
+        const outputPrompt = (isError = runHandler?.hasError ?? false): JSX.Element => {
+            const label = `${isError ? 'Err' : 'Out'}[${executionCount ?? ' '}]:`
+            return canEditCells ? (
+                <LemonButton
+                    size="xxsmall"
+                    noPadding
+                    className={clsx('MarkdownNotebook__jupyter-prompt-button--output', !showOutput && 'line-through')}
+                    aria-label={showOutput ? 'Hide output' : 'Show output'}
+                    aria-expanded={showOutput}
+                    data-attr={showOutput ? 'notebook-jupyter-hide-output' : 'notebook-jupyter-show-output'}
+                    tooltip={showOutput ? 'click to hide' : 'click to show'}
+                    disabledReason={showOutput && !showInput ? 'Show input before hiding output' : undefined}
+                    onClick={() => {
+                        shellRef.current?.focus({ preventScroll: true })
+                        jupyter.executeCommand('toggle-output', node.id)
+                    }}
+                >
+                    {label}
+                </LemonButton>
+            ) : (
+                <span>{label}</span>
+            )
+        }
+        const outputPrompts = (isError: boolean): JSX.Element => (
+            <div className="MarkdownNotebook__jupyter-prompt-actions" onKeyDown={(event) => event.stopPropagation()}>
+                {!showInput ? inputPrompt : null}
+                {outputPrompt(isError)}
+            </div>
+        )
+        return (
+            <div
+                className={clsx(
+                    'MarkdownNotebook__component-shell',
+                    'MarkdownNotebook__jupyter-cell',
+                    isJupyterActive && 'MarkdownNotebook__jupyter-cell--active',
+                    isJupyterSelected && 'MarkdownNotebook__jupyter-cell--selected',
+                    isRunning && 'MarkdownNotebook__jupyter-cell--running',
+                    isSelected && 'MarkdownNotebook__component-shell--selected',
+                    errors.length && 'MarkdownNotebook__component-shell--error'
+                )}
+                ref={setShellRef}
+                contentEditable={false}
+                tabIndex={canEditCells ? 0 : undefined}
+                onKeyDown={handleKeyDown}
+                onFocus={selectJupyterCell}
+                onMouseDown={() => jupyter.store.setActiveCell(node.id)}
+                data-attr="notebook-jupyter-cell"
+            >
+                {ToolbarComponent ? (
+                    // Kept mounted but out of sight: the control publishes the run handler that the
+                    // prompt and the cell keys read.
+                    <div hidden>
+                        <NotebookComponentToolbarErrorBoundary node={node}>
+                            <NotebookComponentRunHandlerContext.Provider value={setRunHandler}>
+                                <ToolbarComponent node={node} notebookMode={mode} updateProps={updateProps} />
+                            </NotebookComponentRunHandlerContext.Provider>
+                        </NotebookComponentToolbarErrorBoundary>
+                    </div>
+                ) : null}
+                <div className="MarkdownNotebook__jupyter-collapser" aria-hidden />
+                {canEditCells ? (
+                    // Covers the prompts and the bar beside them, so the cell drags from anywhere
+                    // left of its source and output, the way JupyterLab cells move.
+                    <div
+                        className="MarkdownNotebook__jupyter-drag-area"
+                        draggable
+                        role="button"
+                        aria-label="Drag to move cell"
+                        data-attr="notebook-jupyter-cell-drag"
+                        onDragStart={(event) => jupyter.startCellDrag(event, node.id)}
+                        onDragEnd={() => jupyter.endCellDrag()}
+                    />
+                ) : null}
+                <NotebookComponentToolbarExtrasContext.Provider value={setToolbarExtras}>
+                    <ComponentPanelContext.Provider
+                        value={{ ...componentPanelState, jupyterOutputPrompt: outputPrompts }}
+                    >
+                        {showInput ? (
+                            <div className="MarkdownNotebook__jupyter-input">
+                                <div
+                                    className="MarkdownNotebook__jupyter-prompt MarkdownNotebook__jupyter-prompt--input"
+                                    title={isRunning ? 'Running' : undefined}
+                                >
+                                    <div
+                                        className="MarkdownNotebook__jupyter-prompt-actions"
+                                        onKeyDown={(event) => event.stopPropagation()}
+                                    >
+                                        {inputPrompt}
+                                        {!showOutput ? outputPrompt() : null}
+                                    </div>
+                                </div>
+                                <div className="MarkdownNotebook__jupyter-input-area">
+                                    {errors.length ? (
+                                        <div className="MarkdownNotebook__component-errors">
+                                            {errors.map((error) => (
+                                                <div key={error}>{error}</div>
+                                            ))}
+                                        </div>
+                                    ) : null}
+                                    {EditComponent ? (
+                                        <NotebookComponentPanelErrorBoundary node={node} panel="filters">
+                                            <EditComponent
+                                                node={node}
+                                                mode={canEditCells ? 'edit' : 'view'}
+                                                notebookMode={mode}
+                                                updateProps={updateProps}
+                                                deleteNode={deleteNode}
+                                            />
+                                        </NotebookComponentPanelErrorBoundary>
+                                    ) : null}
+                                </div>
+                            </div>
+                        ) : null}
+                        {showOutput ? (
+                            <div className="MarkdownNotebook__jupyter-output">
+                                {ViewComponent ? (
+                                    <NotebookComponentPanelErrorBoundary node={node} panel="results">
+                                        <ViewComponent
+                                            node={node}
+                                            mode="view"
+                                            notebookMode={mode}
+                                            updateProps={updateProps}
+                                            deleteNode={deleteNode}
+                                        />
+                                    </NotebookComponentPanelErrorBoundary>
+                                ) : (
+                                    <UnknownComponentView node={node} />
+                                )}
+                            </div>
+                        ) : null}
+                    </ComponentPanelContext.Provider>
+                </NotebookComponentToolbarExtrasContext.Provider>
+                {canEditCells ? (
+                    <div
+                        className="MarkdownNotebook__jupyter-cell-actions"
+                        onMouseDown={(event) => event.preventDefault()}
+                    >
+                        <LemonButton
+                            size="xsmall"
+                            icon={<IconArrowUp />}
+                            tooltip="Move this cell up"
+                            aria-label="Move this cell up"
+                            onClick={() => jupyter.executeCommand('move-up', node.id)}
+                        />
+                        <LemonButton
+                            size="xsmall"
+                            icon={<IconArrowDown />}
+                            tooltip="Move this cell down"
+                            aria-label="Move this cell down"
+                            onClick={() => jupyter.executeCommand('move-down', node.id)}
+                        />
+                        <LemonButton
+                            size="xsmall"
+                            icon={<IconPlus />}
+                            tooltip="Insert a cell below (B)"
+                            aria-label="Insert a cell below"
+                            onClick={() => jupyter.insertCell(node.id, 'below', { edit: true })}
+                        />
+                        <LemonButton
+                            size="xsmall"
+                            icon={<IconTrash />}
+                            tooltip="Delete this cell (D, D)"
+                            aria-label="Delete this cell"
+                            onClick={() => jupyter.executeCommand('delete', node.id)}
+                        />
+                    </div>
+                ) : null}
+            </div>
+        )
+    }
+
+    return (
+        <div
+            className={clsx(
+                'MarkdownNotebook__component-shell',
+                `MarkdownNotebook__component-shell--status-${runStatus}`,
+                isSelected && 'MarkdownNotebook__component-shell--selected',
+                isJupyterActive && 'MarkdownNotebook__component-shell--jupyter-active',
+                isJupyterSelected && 'MarkdownNotebook__component-shell--jupyter-selected',
+                errors.length && 'MarkdownNotebook__component-shell--error'
+            )}
+            ref={setShellRef}
+            contentEditable={false}
+            tabIndex={mode === 'edit' ? 0 : undefined}
+            onKeyDown={handleKeyDown}
+            onFocus={jupyter ? selectJupyterCell : undefined}
+        >
+            <div
+                className="MarkdownNotebook__component-toolbar"
+                onPointerDownCapture={handleToolbarPointerDownCapture}
+                onMouseDownCapture={handleToolbarMouseDownCapture}
+            >
+                <div className="MarkdownNotebook__component-toolbar-left">
+                    {canToggleComponentPanels ? (
+                        <button
+                            type="button"
+                            className={titleClassName}
+                            aria-expanded={hasOpenComponentPanel}
+                            onClick={toggleAllComponentPanels}
+                        >
+                            {titleContent}
+                        </button>
+                    ) : (
+                        <div className={titleClassName}>{titleContent}</div>
+                    )}
+                    {showModeActions || showViewModeFilters ? (
+                        <div className="MarkdownNotebook__component-mode-actions">
+                            <LemonButton
+                                aria-label={filtersLabel}
+                                size="xsmall"
+                                icon={<IconPencil />}
+                                active={componentPanels.filters}
+                                tooltip={filtersLabel}
+                                disabledReason={toolbarExtras?.filtersDisabledReason ?? undefined}
+                                onClick={() => toggleComponentPanel('filters')}
+                            />
+                            {showModeActions ? (
+                                <LemonButton
+                                    aria-label={resultsLabel}
+                                    size="xsmall"
+                                    icon={componentPanels.results ? <IconEye /> : <IconHide />}
+                                    active={componentPanels.results}
+                                    tooltip={resultsLabel}
+                                    onClick={() => toggleComponentPanel('results')}
+                                />
+                            ) : null}
+                        </div>
+                    ) : null}
+                    {ToolbarComponent ? (
+                        <div className="MarkdownNotebook__component-toolbar-controls">
+                            <NotebookComponentToolbarErrorBoundary node={node}>
+                                {/* The run control publishes the cell's run action from here: the
+                                    toolbar is the one part of a cell that stays mounted while the
+                                    cell is collapsed, so the run shortcuts keep working when it is. */}
+                                <NotebookComponentRunHandlerContext.Provider value={setRunHandler}>
+                                    <ToolbarComponent node={node} notebookMode={mode} updateProps={updateProps} />
+                                </NotebookComponentRunHandlerContext.Provider>
+                            </NotebookComponentToolbarErrorBoundary>
+                        </div>
+                    ) : null}
+                </div>
+                {mode === 'edit' ? (
+                    isTitleEditable && isEditingTitle ? (
+                        <input
+                            className="MarkdownNotebook__component-toolbar-title MarkdownNotebook__component-toolbar-title--input"
+                            value={titleInputValue}
+                            placeholder={titlePlaceholder}
+                            aria-label="Component title"
+                            spellCheck={false}
+                            autoFocus
+                            onChange={(event) => setTitleDraft(event.target.value)}
+                            onBlur={() => {
+                                commitTitle()
+                                setIsEditingTitle(false)
+                            }}
+                            onKeyDown={handleTitleKeyDown}
+                        />
+                    ) : isTitleEditable ? (
+                        <button
+                            type="button"
+                            className="MarkdownNotebook__component-toolbar-title MarkdownNotebook__component-toolbar-title--button"
+                            title={resolvedTitle ?? titlePlaceholder}
+                            onClick={() => setIsEditingTitle(true)}
+                        >
+                            {resolvedTitle ?? (
+                                <span className="MarkdownNotebook__component-toolbar-title-placeholder">
+                                    {titlePlaceholder}
+                                </span>
+                            )}
+                        </button>
+                    ) : (
+                        <div className="MarkdownNotebook__component-toolbar-title-group">
+                            <button
+                                type="button"
+                                className="MarkdownNotebook__component-toolbar-title MarkdownNotebook__component-toolbar-title--button"
+                                title={resolvedTitle ?? titlePlaceholder}
+                                aria-expanded={hasOpenComponentPanel}
+                                onClick={toggleAllComponentPanels}
+                            >
+                                {resolvedTitle ?? titlePlaceholder}
+                            </button>
+                            {titleStatusTag}
+                        </div>
+                    )
+                ) : resolvedTitle ? (
+                    <div className="MarkdownNotebook__component-toolbar-title-group">
+                        <div className="MarkdownNotebook__component-toolbar-title" title={resolvedTitle}>
+                            {resolvedTitle}
+                        </div>
+                        {titleStatusTag}
+                    </div>
+                ) : null}
+                {hasToolbarMenu || mode === 'edit' || showCollapseToggle ? (
+                    <div className="MarkdownNotebook__component-actions">
+                        {showCollapseToggle ? (
+                            <LemonButton
+                                aria-label={hasOpenComponentPanel ? 'Collapse' : 'Expand'}
+                                size="xsmall"
+                                icon={hasOpenComponentPanel ? <IconCollapse /> : <IconExpand />}
+                                tooltip={hasOpenComponentPanel ? 'Collapse' : 'Expand'}
+                                onClick={toggleAllComponentPanels}
+                            />
+                        ) : null}
+                        {hasToolbarMenu ? (
+                            <LemonMenu items={toolbarMenuItems} placement="bottom-end">
+                                <LemonButton
+                                    aria-label="More actions"
+                                    size="xsmall"
+                                    icon={<IconEllipsis />}
+                                    tooltip="More actions"
+                                />
+                            </LemonMenu>
+                        ) : null}
+                        {mode === 'edit' ? (
+                            <LemonButton
+                                aria-label="Delete component"
+                                size="xsmall"
+                                icon={<IconTrash />}
+                                tooltip="Delete"
+                                status="danger"
+                                onClick={deleteNode}
+                            />
+                        ) : null}
+                    </div>
+                ) : null}
+            </div>
+            <NotebookComponentToolbarExtrasContext.Provider value={setToolbarExtras}>
+                <ComponentPanelContext.Provider value={componentPanelState}>
+                    {errors.length ? (
+                        <div className="MarkdownNotebook__component-errors">
+                            {errors.map((error) => (
+                                <div key={error}>{error}</div>
+                            ))}
+                        </div>
+                    ) : null}
+                    {showEditPanel && EditComponent ? (
+                        <div className="MarkdownNotebook__component-panel MarkdownNotebook__component-panel--filters">
+                            <NotebookComponentPanelErrorBoundary node={node} panel="filters">
+                                <EditComponent
+                                    node={node}
+                                    mode="edit"
+                                    notebookMode={mode}
+                                    updateProps={updateProps}
+                                    deleteNode={deleteNode}
+                                />
+                            </NotebookComponentPanelErrorBoundary>
+                        </div>
+                    ) : null}
+                    {showViewPanel ? (
+                        <div className="MarkdownNotebook__component-panel MarkdownNotebook__component-panel--results">
+                            {ViewComponent ? (
+                                <NotebookComponentPanelErrorBoundary node={node} panel="results">
+                                    <ViewComponent
+                                        node={node}
+                                        mode="view"
+                                        notebookMode={mode}
+                                        updateProps={updateProps}
+                                        deleteNode={deleteNode}
+                                    />
+                                </NotebookComponentPanelErrorBoundary>
+                            ) : (
+                                <UnknownComponentView node={node} />
+                            )}
+                        </div>
+                    ) : null}
+                </ComponentPanelContext.Provider>
+            </NotebookComponentToolbarExtrasContext.Provider>
+        </div>
+    )
+}
+
+export function formatJupyterInputPrompt(isRunning: boolean, executionCount: number | null): string {
+    return `In [${isRunning ? '*' : (executionCount ?? ' ')}]:`
+}
+
+function isPlainInputTarget(target: EventTarget | null): boolean {
+    return (
+        target instanceof HTMLElement &&
+        !target.closest('.monaco-editor') &&
+        (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target.isContentEditable)
+    )
+}
+
+function isTitleInputTarget(target: EventTarget | null): boolean {
+    return target instanceof HTMLElement && !!target.closest('.MarkdownNotebook__component-toolbar-title--input')
+}
+
+function NotebookComponentToolbarErrorBoundary({
+    children,
+    node,
+}: {
+    children: ReactNode
+    node: NotebookComponentBlockNode
+}): JSX.Element {
+    return (
+        <PostHogErrorBoundary
+            key={`${node.id}-toolbar`}
+            additionalProperties={{
+                feature: 'markdown_notebook_component',
+                markdown_notebook_node_id: node.id,
+                markdown_notebook_tag_name: node.tagName,
+                markdown_notebook_panel: 'toolbar',
+            }}
+            // A crashed control drops out of the toolbar instead of reporting there: an error block
+            // in the top row would push the title and the block's actions off it.
+            fallback={() => <></>}
+        >
+            {children}
+        </PostHogErrorBoundary>
+    )
+}
+
+export function NotebookComponentPanelErrorBoundary({
+    children,
+    node,
+    panel,
+}: {
+    children: ReactNode
+    node: NotebookComponentBlockNode
+    panel: ComponentPanel
+}): JSX.Element {
+    return (
+        <PostHogErrorBoundary
+            key={`${node.id}-${panel}`}
+            additionalProperties={{
+                feature: 'markdown_notebook_component',
+                markdown_notebook_node_id: node.id,
+                markdown_notebook_tag_name: node.tagName,
+                markdown_notebook_panel: panel,
+            }}
+            fallback={({ error }) => <NotebookComponentRenderError error={error} node={node} panel={panel} />}
+        >
+            {children}
+        </PostHogErrorBoundary>
+    )
+}
+
+export function NotebookComponentRenderError({
+    error,
+    node,
+    panel,
+}: {
+    error: unknown
+    node: NotebookComponentBlockNode
+    panel: ComponentPanel
+}): JSX.Element {
+    const message =
+        error instanceof Error && error.message
+            ? error.message
+            : typeof error === 'string' && error
+              ? error
+              : 'Unknown error'
+
+    return (
+        <div className="MarkdownNotebook__component-preview MarkdownNotebook__component-render-error">
+            <strong>This block couldn't render.</strong>
+            <span className="text-secondary text-sm">
+                The <code>{`<${node.tagName} />`}</code> {panel === 'filters' ? 'filters' : 'results'} panel crashed.
+            </span>
+            <code>{message}</code>
+        </div>
+    )
+}
+
+export function UnknownComponentView({ node }: { node: NotebookComponentBlockNode }): JSX.Element {
+    const [arePropsVisible, setArePropsVisible] = useState(false)
+
+    return (
+        <div className="MarkdownNotebook__unknown-component">
+            <div className="MarkdownNotebook__unknown-component-header">
+                <div className="MarkdownNotebook__unknown-component-message">
+                    <strong>This tag is unknown.</strong>
+                    <span>
+                        The <code>{`<${node.tagName} />`}</code> tag is not registered as a markdown notebook component.
+                    </span>
+                </div>
+                <LemonButton
+                    size="xsmall"
+                    icon={arePropsVisible ? <IconHide /> : <IconEye />}
+                    onClick={() => setArePropsVisible(!arePropsVisible)}
+                >
+                    {arePropsVisible ? 'Hide props' : 'Show props'}
+                </LemonButton>
+            </div>
+            {arePropsVisible ? <pre>{JSON.stringify(node.props, null, 2)}</pre> : null}
+        </div>
+    )
+}
+
+export const MemoizedNotebookComponentShell = memo(NotebookComponentShell, areNotebookComponentShellPropsEqual)
+
+export function areNotebookComponentShellPropsEqual(
+    previousProps: NotebookComponentShellProps,
+    nextProps: NotebookComponentShellProps
+): boolean {
+    const previousDefinition = getMarkdownNotebookComponentDefinition(
+        previousProps.registry,
+        previousProps.node.tagName
+    )
+    const nextDefinition = getMarkdownNotebookComponentDefinition(nextProps.registry, nextProps.node.tagName)
+
+    return (
+        previousProps.mode === nextProps.mode &&
+        previousProps.allowViewModeFilters === nextProps.allowViewModeFilters &&
+        previousProps.updateNode === nextProps.updateNode &&
+        previousProps.deleteSelectedNotebookBlocks === nextProps.deleteSelectedNotebookBlocks &&
+        previousProps.moveFocusToAdjacentNode === nextProps.moveFocusToAdjacentNode &&
+        previousDefinition === nextDefinition &&
+        previousProps.node.id === nextProps.node.id &&
+        previousProps.isSelected === nextProps.isSelected &&
+        previousProps.persistComponentPanelVisibility === nextProps.persistComponentPanelVisibility &&
+        previousProps.componentPanels.filters === nextProps.componentPanels.filters &&
+        previousProps.componentPanels.results === nextProps.componentPanels.results &&
+        previousProps.rememberedComponentPanels?.filters === nextProps.rememberedComponentPanels?.filters &&
+        previousProps.rememberedComponentPanels?.results === nextProps.rememberedComponentPanels?.results &&
+        (previousProps.node === nextProps.node ||
+            getNodeFingerprint(previousProps.node) === getNodeFingerprint(nextProps.node))
+    )
+}
+
+export function getComponentTitleDisplay(
+    node: NotebookComponentBlockNode,
+    definition: NotebookComponentDefinition | null
+): ComponentTitleDisplay {
+    if (node.tagName === 'Query') {
+        return getQueryComponentTitleDisplay(node, definition)
+    }
+
+    const label = definition?.label ?? node.tagName
+    const tone = getComponentTitleTone(node.tagName, definition?.category)
+
+    return {
+        label,
+        tone,
+        icon: definition?.icon ?? getComponentTitleFallbackIcon(tone),
+    }
+}
+
+export function getComponentToolbarTitle(
+    node: NotebookComponentBlockNode,
+    definition: NotebookComponentDefinition | null,
+    label: string
+): string | null {
+    if (
+        node.tagName === 'Query' &&
+        getNotebookStringProp(getNotebookObjectProp(node.props.query)?.kind) === 'SavedInsightNode'
+    ) {
+        return null
+    }
+    const title = definition?.getTitle?.(node) ?? getNotebookStringProp(node.props.title)
+    const trimmedTitle = title?.trim()
+    return trimmedTitle && trimmedTitle !== label ? trimmedTitle : null
+}
+
+export function getQueryComponentTitleDisplay(
+    node: NotebookComponentBlockNode,
+    definition: NotebookComponentDefinition | null
+): ComponentTitleDisplay {
+    const query = getNotebookObjectProp(node.props.query)
+    const source = getNotebookObjectProp(query?.source)
+    const queryKind = getNotebookStringProp(query?.kind)
+    const sourceKind = getNotebookStringProp(source?.kind)
+
+    if (sourceKind === 'HogQLQuery') {
+        return { label: 'SQL', tone: 'sql', icon: <IconDatabase /> }
+    }
+    if (sourceKind === 'FunnelsQuery') {
+        return { label: 'Funnel', tone: 'insight', icon: <IconGraph /> }
+    }
+    if (sourceKind === 'TrendsQuery') {
+        return { label: 'Trend', tone: 'insight', icon: <IconGraph /> }
+    }
+    if (queryKind === 'SavedInsightNode') {
+        return { label: 'Saved insight', tone: 'insight', icon: <IconGraph /> }
+    }
+    if (sourceKind === 'EventsQuery') {
+        return { label: 'Events', tone: 'data', icon: <IconList /> }
+    }
+    if (sourceKind === 'ActorsQuery') {
+        return { label: 'People', tone: 'data', icon: <IconPeople /> }
+    }
+
+    return {
+        label: definition?.label ?? node.tagName,
+        tone: 'insight',
+        icon: definition?.icon ?? <IconGraph />,
+    }
+}
+
+export function getComponentTitleTone(tagName: string, category: string | undefined): ComponentTitleTone {
+    if (tagName === 'Experiment') {
+        return 'experiment'
+    }
+
+    if (tagName === 'DuckSQL' || tagName === 'HogQLSQL') {
+        return 'sql'
+    }
+
+    if (category === 'Insight') {
+        return 'insight'
+    }
+    if (category === 'Code') {
+        return 'code'
+    }
+    if (category === 'Data') {
+        return 'data'
+    }
+    if (category === 'Media') {
+        return 'media'
+    }
+    if (category === 'PostHog') {
+        return 'posthog'
+    }
+    return 'default'
+}
+
+export function getComponentTitleFallbackIcon(tone: ComponentTitleTone): ReactNode {
+    if (tone === 'sql') {
+        return <IconDatabase />
+    }
+    if (tone === 'insight' || tone === 'experiment') {
+        return <IconGraph />
+    }
+    if (tone === 'data' || tone === 'media') {
+        return <IconList />
+    }
+    return null
+}

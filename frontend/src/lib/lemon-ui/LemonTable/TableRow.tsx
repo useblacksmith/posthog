@@ -1,0 +1,240 @@
+import clsx from 'clsx'
+import React, { HTMLProps, useState } from 'react'
+
+import { IconCollapse, IconExpand } from '@posthog/icons'
+
+import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { More } from 'lib/lemon-ui/LemonButton/More'
+
+import { getColumnWidthCap, getStickyColumnInfo, virtualColumnIndex, VirtualColumnWindow } from './columnLayoutUtils'
+import { ExpandableConfig, LemonTableColumn, LemonTableColumnGroup, TableCellRepresentation } from './types'
+
+export interface TableRowProps<T extends Record<string, any>> {
+    record: T
+    recordIndex: number
+    rowKeyDetermined: string | number
+    rowClassNameDetermined: string | null | undefined
+    rowRibbonColorDetermined: string | null | undefined
+    rowStatusDetermined: 'highlighted' | 'highlight-new' | null | undefined
+    columnGroups: LemonTableColumnGroup<T>[]
+    columnWindow?: VirtualColumnWindow
+    onRow: ((record: T, index: number) => Omit<HTMLProps<HTMLTableRowElement>, 'key'>) | undefined
+    expandable: ExpandableConfig<T> | undefined
+    firstColumnSticky: boolean | undefined
+    rowCount: number
+    pinnedColumns?: string[]
+    pinnedColumnWidths?: number[]
+    columns?: LemonTableColumn<T, any>[]
+    rowActions?: (record: T, recordIndex: number) => React.ReactNode | null
+    /** Right-click handler attached to every data cell, used to offer "Copy cell contents". */
+    onCellContextMenu?: (event: React.MouseEvent<HTMLTableCellElement>) => void
+}
+
+function stringifyRawCellValue(value: unknown): string {
+    try {
+        return JSON.stringify(value) ?? '[Unserializable value]'
+    } catch {
+        return '[Unserializable value]'
+    }
+}
+
+function TableRowRaw<T extends Record<string, any>>({
+    record,
+    recordIndex,
+    rowKeyDetermined,
+    rowClassNameDetermined,
+    rowRibbonColorDetermined,
+    rowStatusDetermined,
+    columnGroups,
+    columnWindow,
+    onRow,
+    expandable,
+    firstColumnSticky,
+    rowCount,
+    pinnedColumns,
+    pinnedColumnWidths,
+    columns,
+    rowActions,
+    onCellContextMenu,
+}: TableRowProps<T>): JSX.Element {
+    const [isRowExpandedLocal, setIsRowExpanded] = useState(false)
+    const rowExpandable: number = Number(
+        !!expandable && (!expandable.rowExpandable || expandable.rowExpandable(record, recordIndex))
+    )
+    const isRowExpanded =
+        !expandable?.isRowExpanded || expandable?.isRowExpanded?.(record, recordIndex) === -1
+            ? isRowExpandedLocal
+            : !!expandable?.isRowExpanded?.(record, recordIndex)
+
+    const isRowExpansionToggleShownLocal = !!expandable && rowExpandable >= 0
+    const isRowExpansionToggleShown = expandable?.showRowExpansionToggle ?? isRowExpansionToggleShownLocal
+    const visibleDataColumnCount = columnGroups.reduce(
+        (count, columnGroup) => count + columnGroup.children.filter((column) => !column.isHidden).length,
+        0
+    )
+    const expansionColSpan =
+        visibleDataColumnCount + Number(isRowExpansionToggleShown && !!expandable?.noIndent) + Number(!!rowActions)
+
+    const expandedRowClassNameDetermined =
+        expandable &&
+        isRowExpanded &&
+        expandable.expandedRowClassName &&
+        (typeof expandable.expandedRowClassName === 'function'
+            ? expandable.expandedRowClassName(record, recordIndex)
+            : expandable.expandedRowClassName)
+
+    const { className, style, ...extraProps } = onRow?.(record, recordIndex) || {}
+
+    return (
+        <>
+            <tr
+                data-row-key={rowKeyDetermined}
+                className={clsx(
+                    rowClassNameDetermined,
+                    rowStatusDetermined && `LemonTable__row--status-${rowStatusDetermined}`,
+                    extraProps?.onClick ? 'cursor-pointer hover:bg-accent-highlight-secondary' : undefined,
+                    className
+                )}
+                // eslint-disable-next-line react/forbid-dom-props
+                style={{ '--row-ribbon-color': rowRibbonColorDetermined || undefined, ...style } as React.CSSProperties}
+                {...extraProps}
+            >
+                {isRowExpansionToggleShown && (
+                    <td className="LemonTable__toggle">
+                        {!!rowExpandable && (
+                            <LemonButton
+                                noPadding
+                                active={isRowExpanded}
+                                onClick={() => {
+                                    setIsRowExpanded(!isRowExpanded)
+                                    if (isRowExpanded) {
+                                        expandable?.onRowCollapse?.(record, recordIndex)
+                                    } else {
+                                        expandable?.onRowExpand?.(record, recordIndex)
+                                    }
+                                }}
+                                icon={isRowExpanded ? <IconCollapse /> : <IconExpand />}
+                                title={isRowExpanded ? 'Show less' : 'Show more'}
+                            />
+                        )}
+                    </td>
+                )}
+                {!!columnWindow?.paddingLeft && !firstColumnSticky && (
+                    <td aria-hidden style={{ padding: 0, border: 0 }} />
+                )}
+                {columnGroups.flatMap((columnGroup, columnGroupIndex) =>
+                    columnGroup.children
+                        .filter((column) => !column.isHidden)
+                        .map((column, columnIndex) => {
+                            const columnKeyRaw = column.key || column.dataIndex
+                            const columnKeyOrIndex = columnKeyRaw ? String(columnKeyRaw) : columnIndex
+                            // != is intentional to catch undefined too
+                            const value = column.dataIndex != null ? record[column.dataIndex] : undefined
+                            const rawContents = column.render
+                                ? column.render(value as T[keyof T], record, recordIndex, rowCount)
+                                : isTableCellRepresentation(value)
+                                  ? stringifyRawCellValue(value)
+                                  : value
+
+                            // Wrap with cell actions if defined
+                            const cellActionsOverlay = column.cellActions
+                                ? column.cellActions(value as T[keyof T], record, recordIndex)
+                                : null
+                            const contents =
+                                cellActionsOverlay && !isTableCellRepresentation(rawContents) ? (
+                                    <div className="flex items-center gap-1">
+                                        <div className="flex-1 min-w-0">{rawContents}</div>
+                                        <div className="flex-shrink-0">
+                                            <More overlay={cellActionsOverlay} size="xsmall" />
+                                        </div>
+                                    </div>
+                                ) : (
+                                    rawContents
+                                )
+
+                            const isSticky = firstColumnSticky && columnGroupIndex === 0 && columnIndex === 0
+
+                            // Check if this column is pinned
+                            const { isSticky: isColumnSticky, leftPosition } = getStickyColumnInfo(
+                                columnKeyOrIndex.toString(),
+                                pinnedColumns,
+                                pinnedColumnWidths,
+                                columns
+                            )
+
+                            const extraCellProps =
+                                isTableCellRepresentation(contents) && contents.props ? contents.props : {}
+                            // A column may supply its own onContextMenu via TableCellRepresentation; chain it
+                            // with the copy handler so the spread below can't silently clobber either one.
+                            const { onContextMenu: columnOnContextMenu, ...restCellProps } = extraCellProps
+                            const onCellContextMenuChained =
+                                columnOnContextMenu || onCellContextMenu
+                                    ? (event: React.MouseEvent<HTMLTableCellElement>) => {
+                                          columnOnContextMenu?.(event)
+                                          onCellContextMenu?.(event)
+                                      }
+                                    : undefined
+                            // A cell that spans several columns is not bound by the width of the one it starts in
+                            const spansColumns = extraCellProps.colSpan !== undefined && extraCellProps.colSpan !== 1
+                            const widthCap = spansColumns ? undefined : getColumnWidthCap(column)
+                            return (
+                                <React.Fragment key={`col-${columnGroupIndex}-${columnKeyOrIndex}`}>
+                                    <td
+                                        aria-colindex={
+                                            columnWindow ? virtualColumnIndex(columnIndex, columnWindow) + 1 : undefined
+                                        }
+                                        className={clsx(
+                                            columnIndex === 0 && 'LemonTable__boundary',
+                                            // Hold the value on one line, because a capped cell that wraps grows the row
+                                            // taller instead of cropping
+                                            widthCap && 'whitespace-nowrap',
+                                            isSticky && 'LemonTable__cell--sticky',
+                                            isColumnSticky && 'LemonTable__cell--pinned',
+                                            column.align && `text-${column.align}`,
+                                            typeof column.className === 'function'
+                                                ? column.className(value as T[keyof T], record, recordIndex)
+                                                : column.className
+                                        )}
+                                        // eslint-disable-next-line react/forbid-dom-props
+                                        style={{
+                                            ...(typeof column.style === 'function'
+                                                ? column.style(value as T[keyof T], record, recordIndex)
+                                                : column.style),
+                                            ...(widthCap ? { maxWidth: widthCap } : {}),
+                                            ...(isColumnSticky ? { left: `${leftPosition}px` } : {}),
+                                        }}
+                                        onContextMenu={onCellContextMenuChained}
+                                        {...restCellProps}
+                                    >
+                                        {isTableCellRepresentation(contents) ? contents.children : contents}
+                                    </td>
+                                    {columnIndex === 0 && firstColumnSticky && !!columnWindow?.paddingLeft && (
+                                        <td aria-hidden style={{ padding: 0, border: 0 }} />
+                                    )}
+                                </React.Fragment>
+                            )
+                        })
+                )}
+                {!!columnWindow?.paddingRight && <td aria-hidden style={{ padding: 0, border: 0 }} />}
+                {rowActions && <td className="w-0">{rowActions(record, recordIndex)}</td>}
+            </tr>
+
+            {expandable && !!rowExpandable && isRowExpanded && (
+                <tr className={clsx('LemonTable__expansion', expandedRowClassNameDetermined)}>
+                    {isRowExpansionToggleShown && !expandable.noIndent && <td />}
+                    <td colSpan={expansionColSpan}>{expandable.expandedRowRender(record, recordIndex)}</td>
+                </tr>
+            )}
+        </>
+    )
+}
+// Without `memo` all rows get rendered when anything in the parent component (LemonTable) changes.
+// This was most jarring when scrolling thet table from the very left or the very right – the simple addition
+// of a class indicating that scrollability to `table` caused the component to lag due to unneded rerendering of rows.
+export const TableRow = React.memo(TableRowRaw) as typeof TableRowRaw
+
+function isTableCellRepresentation(
+    contents: React.ReactNode | TableCellRepresentation
+): contents is TableCellRepresentation {
+    return !!contents && typeof contents === 'object' && !React.isValidElement(contents)
+}

@@ -1,0 +1,144 @@
+from typing import Any
+
+from unittest.mock import patch
+
+from django.utils import timezone
+
+import numpy as np
+
+from posthog.dataclasses import frozen
+from posthog.models import Team, User
+from posthog.models.utils import uuid7
+
+from products.experiments.backend.facade import testing as experiments_testing
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+from products.replay_vision.backend import quota
+from products.replay_vision.backend.models.replay_observation import (
+    ObservationStatus,
+    ObservationTrigger,
+    ReplayObservation,
+)
+from products.replay_vision.backend.models.replay_observation_rank import ReplayObservationRank
+from products.replay_vision.backend.models.replay_observation_usage import ReplayObservationUsage
+from products.replay_vision.backend.models.replay_scanner import ReplayScanner
+from products.replay_vision.backend.observation_ranks import NewRank, record_ranks
+from products.replay_vision.backend.temporal.activities.create_observation import _build_scanner_snapshot
+from products.replay_vision.backend.watch_rank import ANCHOR_VERSION, ANCHORS, WatchCategory
+
+# The free plan's allocation, which tests give an org billing never synced unless they say otherwise.
+TEST_FREE_CREDITS = 2500
+
+
+def unsynced_allowance(*, credit_limit: int | None = TEST_FREE_CREDITS, free_credits: int = TEST_FREE_CREDITS):
+    """What an org billing never synced gets, as an instance with no billing service configures it."""
+    return patch.object(
+        quota, "UNSYNCED_ALLOWANCE", quota.BillingAllowance(credit_limit=credit_limit, free_credits=free_credits)
+    )
+
+
+def snapshot_for(scanner: ReplayScanner) -> dict[str, Any]:
+    """Build the same `scanner_snapshot` payload that `create_observation_activity` would persist."""
+    return _build_scanner_snapshot(scanner)
+
+
+def seed_scanner_spend(scanner: ReplayScanner, credits: int, *, observations: int = 1) -> None:
+    """Settle spend for a scanner: `observations` succeeded rows, each with a `credits` receipt.
+    The budget reads the receipt ledger, so receipt-less observations count nothing."""
+    if credits <= 0 or observations <= 0:
+        return
+    snapshot = snapshot_for(scanner)
+    rows = ReplayObservation.objects.bulk_create(
+        ReplayObservation(
+            scanner=scanner,
+            team=scanner.team,
+            session_id=f"seed-spend-{uuid7()}",
+            status=ObservationStatus.SUCCEEDED,
+            completed_at=timezone.now(),
+            scanner_snapshot=snapshot,
+            triggered_by=ObservationTrigger.SCHEDULE,
+        )
+        for _ in range(observations)
+    )
+    ReplayObservationUsage.objects.bulk_create(
+        ReplayObservationUsage(
+            observation_id=row.id,
+            organization_id=scanner.team.organization_id,
+            team_id=scanner.team_id,
+            scanner_id=scanner.id,
+            observation_created_at=row.created_at,
+            model=scanner.model,
+            credits=credits,
+        )
+        for row in rows
+    )
+
+
+@frozen
+class SeededExperiment:
+    """The ids of an experiment planted through the experiments test facade. It is not a model row,
+    so tests change the experiment with `update_experiment`."""
+
+    id: int
+    team_id: int
+    feature_flag_id: int
+
+
+def create_experiment(
+    team: Team,
+    flag_key: str,
+    created_by: User | None = None,
+    *,
+    launched: bool = False,
+    variants: list[str] | None = None,
+) -> SeededExperiment:
+    """An experiment for targeting tests. `launched` plus `variants` makes it resolvable by
+    `resolve_exposure_linkage`, which the experiment scanner type's write path requires."""
+    filters: dict[str, Any] = {"groups": [{"properties": [], "rollout_percentage": 100}]}
+    if variants:
+        filters["multivariate"] = {
+            "variants": [{"key": key, "rollout_percentage": 100 // len(variants)} for key in variants]
+        }
+    flag = FeatureFlag.objects.create(team=team, key=flag_key, filters=filters)
+    experiment_id = experiments_testing.create_experiment(
+        team_id=team.id,
+        feature_flag_id=flag.id,
+        name=f"exp-{flag_key}",
+        created_by_id=created_by.id if created_by else None,
+        start_date=timezone.now() if launched else None,
+        exposure_criteria={},
+    )
+    return SeededExperiment(id=experiment_id, team_id=team.id, feature_flag_id=flag.id)
+
+
+def update_experiment(experiment: SeededExperiment, **fields: Any) -> None:
+    experiments_testing.update_experiment(team_id=experiment.team_id, experiment_id=experiment.id, **fields)
+
+
+def axis_anchors() -> dict[WatchCategory, np.ndarray]:
+    """Unit anchors in three dimensions: failure on x, struggle on y, revenue on -y, routine on z, one row per anchor
+    sentence so similarities come out keyed like real ones."""
+    axes = {
+        "failure": [1.0, 0.0, 0.0],
+        "struggle": [0.0, 1.0, 0.0],
+        "revenue": [0.0, -1.0, 0.0],
+        "routine": [0.0, 0.0, 1.0],
+    }
+    return {category: np.array([axes[category]] * len(ANCHORS[category])) for category in ANCHORS}
+
+
+def set_rank(
+    observation: ReplayObservation,
+    *,
+    category: str = "failure",
+    contrast: float = 0.5,
+    group: Any = None,
+    theme: Any = None,
+    anchor_version: int = ANCHOR_VERSION,
+) -> None:
+    """Give an observation the rank row the rank consumer would write, replacing any it has."""
+    ranks = ReplayObservationRank.objects.for_team(observation.team_id)
+    ranks.filter(observation_id=observation.id).delete()
+    record_ranks(
+        observation.team_id, anchor_version, {str(observation.id): NewRank(contrast=contrast, category=category)}
+    )
+    ranks.filter(observation_id=observation.id).update(feed_group_id=group, search_theme_id=theme)

@@ -1,0 +1,162 @@
+import {
+  deriveUpdateUiStatus,
+  type MenuCheckToast,
+  resolveMenuCheckFromStatus,
+  resolveMenuCheckResult,
+  updateStore,
+} from "@posthog/core/updates/updateStore";
+import { resolveService } from "@posthog/di/container";
+import { useSettingsStore } from "@posthog/ui/features/settings/settingsStore";
+import { useUpdateModalStore } from "@posthog/ui/features/updates/updateModalStore";
+import {
+  UPDATES_CLIENT,
+  type UpdatesClient,
+} from "@posthog/ui/features/updates/updatesClient";
+import { toast } from "@posthog/ui/primitives/toast";
+import { logger } from "@posthog/ui/shell/logger";
+import { useRendererWindowFocusStore } from "@posthog/ui/shell/rendererWindowFocusStore";
+import { hostTrpcClient } from "@renderer/trpc/client";
+
+const log = logger.scope("updates-host");
+
+const client = resolveService<UpdatesClient>(UPDATES_CLIENT);
+const store = updateStore.getState;
+
+function showToast(menuToast: MenuCheckToast): void {
+  if (menuToast.kind === "success") {
+    toast.success(menuToast.message, { alwaysShow: true });
+    return;
+  }
+  toast.error(
+    menuToast.message,
+    menuToast.description
+      ? {
+          description: menuToast.description,
+        }
+      : undefined,
+  );
+}
+
+void client
+  .isEnabled()
+  .then((result) => store().setEnabled(result.enabled))
+  .catch((error: unknown) => {
+    log.error("Failed to get update enabled status", { error });
+  });
+
+function syncStatus(): void {
+  void client
+    .getStatus()
+    .then((status) => {
+      const update = deriveUpdateUiStatus(status, store().status);
+      if (update) {
+        store().applyStatusUpdate(update);
+      }
+    })
+    .catch((error: unknown) => {
+      log.error("Failed to get update status", { error });
+    });
+}
+
+syncStatus();
+
+// The subscription below only carries transitions, so a status emitted before
+// it was registered (or lost with it) never reaches the store. Re-read the
+// snapshot on every return to the window so the banner cannot stay stale.
+let wasFocused = useRendererWindowFocusStore.getState().focused;
+useRendererWindowFocusStore.subscribe(({ focused }) => {
+  if (focused && !wasFocused) {
+    syncStatus();
+  }
+  wasFocused = focused;
+});
+
+client.onStatus({
+  onData: (status) => {
+    const update = deriveUpdateUiStatus(status, store().status);
+    if (update) {
+      store().applyStatusUpdate(update);
+    }
+
+    const outcome = resolveMenuCheckFromStatus(
+      status,
+      store().menuCheckPending,
+    );
+    if (outcome) {
+      if (outcome.clearPending) {
+        store().setMenuCheckPending(false);
+      }
+      if (outcome.toast) {
+        showToast(outcome.toast);
+      }
+      if (outcome.openUpdateModal) {
+        useUpdateModalStore.getState().open();
+      }
+    }
+  },
+  onError: (error) => {
+    log.error("Update status subscription error", { error });
+    store().setMenuCheckPending(false);
+  },
+});
+
+client.onReady({
+  onData: (data) => {
+    store().setReady(data.version);
+  },
+  onError: (error) => {
+    log.error("Update ready subscription error", { error });
+  },
+});
+
+client.onCheckFromMenu({
+  onData: () => {
+    store().setMenuCheckPending(true);
+    void client
+      .check()
+      .then((result) => {
+        const outcome = resolveMenuCheckResult(result);
+        if (outcome) {
+          if (outcome.clearPending) {
+            store().setMenuCheckPending(false);
+          }
+          if (outcome.toast) {
+            showToast(outcome.toast);
+          }
+        }
+      })
+      .catch((error: unknown) => {
+        store().setMenuCheckPending(false);
+        log.error("Failed to check for updates", { error });
+        toast.error("Failed to check for updates");
+      });
+  },
+  onError: (error) => {
+    log.error("Update menu check subscription error", { error });
+  },
+});
+
+// Bridge the "download updates automatically" preference to the core updater.
+let lastSyncedAutoDownload: boolean | null = null;
+function syncAutoDownload(enabled: boolean): void {
+  if (enabled === lastSyncedAutoDownload) return;
+  lastSyncedAutoDownload = enabled;
+  void hostTrpcClient.updates.setAutoDownload
+    .mutate({ enabled })
+    .catch((error: unknown) =>
+      log.error("Failed to sync auto-download preference", { error }),
+    );
+}
+
+function onSettingsReady(): void {
+  syncAutoDownload(useSettingsStore.getState().downloadUpdatesAutomatically);
+  useSettingsStore.subscribe((state) =>
+    syncAutoDownload(state.downloadUpdatesAutomatically),
+  );
+}
+
+if (useSettingsStore.persist.hasHydrated()) {
+  onSettingsReady();
+} else {
+  useSettingsStore.persist.onFinishHydration(onSettingsReady);
+}

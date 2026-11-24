@@ -1,0 +1,228 @@
+# Batch Trace Summarization
+
+Hourly Temporal workflow that generates summaries and embeddings of LLM traces for clustering and semantic search.
+
+## How It Works
+
+1. Coordinator workflow runs hourly, discovering opted-in projects with AI data processing consent and AI events in its window
+2. Per-team workflow queries recent traces (default: last 60 min, max 15 items)
+3. For each item (trace or generation), a two-step activity pipeline runs:
+   - **fetch_and_format**: fetch data from ClickHouse → format text repr → store in Redis (gzip-compressed)
+   - **summarize_and_save**: read text repr from Redis → call LLM → emit summary event → queue embedding → clean up Redis key
+4. Embeddings processed asynchronously by Rust worker, stored in `document_embeddings` table
+
+The two-step split means the expensive LLM call is never re-executed if save/embed fails, and heartbeats work on the I/O-bound summarize step (the CPU-bound formatting is isolated in its own shorter activity).
+
+The workflow is **idempotent** - rerunning on the same window regenerates the same results. Uses `temporalio.workflow.now()` for deterministic timestamps.
+
+## File Structure
+
+```text
+workflow.py             # Per-team workflow (llma-trace-summarization)
+coordinator.py          # Multi-team coordinator (llma-trace-summarization-coordinator)
+schedule.py             # Hourly schedule configuration
+models.py               # Data models (inputs, results, metrics, inter-activity contracts)
+constants.py            # Timeouts, defaults, retry policies
+sampling.py             # Query traces from time window
+fetch_and_format.py     # Activity 1: fetch + format + store text_repr in Redis
+summarize_and_save.py   # Activity 2: read Redis + LLM call + save event + embed
+state.py                # Redis intermediate storage helpers (gzip compress/decompress)
+queries.py              # ClickHouse queries for trace fetching
+utils.py                # Datetime formatting utilities
+tests/
+  test_workflow.py      # Workflow, sampling, and parse_inputs tests
+  test_fetch_and_format.py  # Fetch and format activity tests
+  test_summarize_and_save.py # Summarize and save activity tests
+  test_state.py         # Redis storage helper tests
+  test_coordinator.py   # Coordinator workflow tests
+```
+
+## Activity Pipeline
+
+```text
+Per item (trace or generation):
+
+  fetch_and_format_activity (2 min timeout, 60s heartbeat)
+    └─ fetch from ClickHouse → format text_repr → gzip + store in Redis
+    └─ returns: redis_key, event_count, text_repr_length
+
+  summarize_and_save_activity (15 min timeout, 60s heartbeat)
+    └─ read text_repr from Redis → LLM call → save event → embed → delete Redis key
+    └─ returns: SummarizationActivityResult
+```
+
+Both activities are unified — they handle trace-level and generation-level summarization by branching on `generation_id` presence.
+
+## Workflows
+
+### Coordinator: `llma-trace-summarization-coordinator`
+
+Discovers opted-in projects with AI data processing consent and AI events in the processing window via `get_team_ids_for_ai_observability`, excluding the operational skip list.
+
+The coordinator keeps up to `max_concurrent_teams` per-team workflows running at once.
+It starts the next team when any running team finishes, so one slow team holds one slot and does not delay the others.
+The coordinator fixes one window from the time Temporal started the run, and passes it to every per-team workflow as `window_start` and `window_end`.
+So each team covers the same hour however late in the run it starts, and consecutive runs cover consecutive hours.
+Continue-as-new carries the remaining teams and the window into the next run, so it loses nothing.
+Before it continues as new, the coordinator waits for the running teams to finish, and the free slots stay idle during that wait.
+So it continues as new only at its own history limits (the `continue_as_new_history_length` and `continue_as_new_history_size_bytes` inputs), not at the lower Temporal suggestion.
+A run that is skipped, or that reaches its timeout before it reaches a team, still loses that hour for the teams it did not reach.
+
+**Inputs** (`BatchTraceSummarizationCoordinatorInputs`): `max_traces`, `batch_size`, `mode`, `window_minutes`, `model` - all optional with sensible defaults.
+
+**Returns** `CoordinatorResult`: `teams_processed`, `teams_failed`, `failed_team_ids`, `total_items`, `total_summaries`
+
+### Per-Team: `llma-trace-summarization`
+
+**Inputs** (`BatchSummarizationInputs`):
+
+- `team_id` (required)
+- `max_traces` (default: 100), `batch_size` (default: 5), `mode` (default: "detailed"), `window_minutes` (default: 60)
+- `window_start`, `window_end` - optional explicit window (RFC3339)
+- `model` - optional LLM model override
+
+**Returns** `BatchSummarizationResult`: `batch_run_id`, `metrics` (items_queried, summaries_generated/skipped/failed, embedding_requests_succeeded/failed, duration_seconds)
+
+## Output Events
+
+Each trace gets a `$ai_trace_summary` event:
+
+```python
+{
+    "$ai_trace_id": "original_trace_id",
+    "$ai_batch_run_id": "team_123_2025-01-15T12:00:00Z",
+    "$ai_summary_mode": "detailed",
+    "$ai_summary_title": "User authentication flow",
+    "$ai_summary_flow_diagram": "graph TD; A-->B;",
+    "$ai_summary_bullets": [{"text": "...", "line_refs": "L1-5"}],
+    "$ai_summary_interesting_notes": [{"text": "...", "line_refs": "L10"}],
+    "$ai_text_repr_length": 1234,
+    "$ai_event_count": 5,
+    "trace_timestamp": "2025-01-15T12:00:00Z"
+}
+```
+
+Each generation gets a `$ai_generation_summary` event with `$ai_generation_id` and `$ai_trace_id`.
+
+## Usage
+
+### Manual Trigger (Temporal CLI)
+
+```bash
+# Per-team workflow
+temporal workflow start \
+  --type llma-trace-summarization \
+  --task-queue development-task-queue \
+  --workflow-id "batch-summarization-team-1-$(date +%Y%m%d%H%M%S)" \
+  --input '{"team_id": 1}'
+
+# With custom parameters
+temporal workflow start \
+  --type llma-trace-summarization \
+  --task-queue development-task-queue \
+  --workflow-id "batch-summarization-team-1-$(date +%Y%m%d%H%M%S)" \
+  --input '{"team_id": 1, "max_traces": 50, "window_minutes": 30}'
+
+# Coordinator (all teams in allowlist)
+temporal workflow start \
+  --type llma-trace-summarization-coordinator \
+  --task-queue development-task-queue \
+  --workflow-id "batch-summarization-coordinator-$(date +%Y%m%d%H%M%S)" \
+  --input '{}'
+```
+
+> Local dev uses `development-task-queue`, production uses `general-purpose-task-queue`.
+
+A per-team run returns an empty result if the team's organization did not approve third-party AI data processing.
+See [AI data processing consent](#ai-data-processing-consent).
+
+### Scheduled Execution
+
+The coordinator runs hourly via Temporal schedule (configured in `schedule.py`). Verify at http://localhost:8233 → schedule: `llma-trace-summarization-coordinator-schedule`.
+
+### Opt-in and scheduled processing
+
+Clustering is opt-in. Enabling it saves the project setting and adds missing default jobs within the project's 10-job limit. Preparation and clustering use the existing schedules; enabling or editing a job does not start an immediate run or backfill historical traces.
+
+Scheduled preparation samples recent windows. Clustering requires at least 10 prepared items within its lookback: 7 days for traces and generations, or 3 days for evaluations. Generation sampling takes the last generation from each trace. Evaluation sampling excludes numeric and categorical results. Ten items permit clustering but do not guarantee groups; HDBSCAN can classify all items as outliers.
+
+Workers check project opt-in, AI data processing consent, and the job's current enabled state and scope before paid work and result emission. Disabling a job or changing its scope prevents subsequent processing; an already-issued provider request cannot be undone. Embedding metadata and document IDs include a hash of the job's analysis level and filters so jobs do not consume data prepared for an obsolete scope. Existing unversioned embeddings are excluded from scoped runs.
+
+### Team Discovery
+
+Teams are discovered via `team_discovery.py`: projects with clustering enabled, organization AI data processing consent, and AI events in the discovery window.
+The coordinator passes its summarization window to discovery, so only projects with AI events in that window are included.
+A team with no AI events in the window has nothing to summarize, and it would still cost a child workflow and a sampling query.
+The clustering coordinators pass no window, so their discovery uses `discovery_lookback_days` from the flag payload.
+The feature flag's `skip_team_ids` excludes projects from discovery and worker execution. Legacy guaranteed-team and sampling fields no longer opt projects in.
+
+### AI data processing consent
+
+A team is summarized only if its organization approved third-party AI data processing (`Organization.is_ai_data_processing_approved`).
+An unset flag counts as not approved.
+
+The rule is applied in two places:
+
+- Team discovery drops every project without consent.
+- Worker checks also apply to manual triggers and work queued before consent or opt-in changed.
+
+Discovery retries transient consent database connection errors up to three attempts, with a 100 ms wait between attempts.
+These retries reuse the candidate teams without repeating the ClickHouse discovery query.
+Discovery fails closed if consent remains unreadable: it returns no teams and increments `llma_coordinator_consent_query_failed` once.
+Look for this counter and the `AI data processing consent filter failed` log line when discovery returns no teams unexpectedly.
+If discovery exhausts its activity retries or times out, new summarization and clustering coordinator runs fail before they dispatch any team workflows.
+The old hardcoded fallback is retained only for replaying existing workflow histories.
+
+Each consent query reads all candidate teams at once and returns only team IDs.
+Each per-team summarization run checks consent once more before sampling, including manual runs and queued work.
+These queries run in the database thread pool with connection cleanup; they do not block the workflow event loop or run once per trace.
+Once a team run passes its entry check, it finishes without further consent checks between processing steps.
+
+## Configuration
+
+Key constants in `constants.py`:
+
+| Constant                                    | Default      | Description                                     |
+| ------------------------------------------- | ------------ | ----------------------------------------------- |
+| `DEFAULT_MAX_ITEMS_PER_WINDOW`              | 15           | Max items per window                            |
+| `DEFAULT_BATCH_SIZE`                        | 5            | Concurrent item processing                      |
+| `DEFAULT_MAX_CONCURRENT_TEAMS`              | 20           | Max teams to process in parallel                |
+| `DEFAULT_MODE`                              | "detailed"   | Summary detail level                            |
+| `DEFAULT_MODEL`                             | "gpt-5-nano" | LLM model for summarization (flex service tier) |
+| `DEFAULT_WINDOW_MINUTES`                    | 60           | Time window to query                            |
+| `WORKFLOW_EXECUTION_TIMEOUT_MINUTES`        | 30           | Max per-team workflow duration                  |
+| `COORDINATOR_EXECUTION_TIMEOUT_MINUTES`     | 55           | Max coordinator workflow duration               |
+| `SAMPLE_TIMEOUT_SECONDS`                    | 900          | Sampling activity timeout (per attempt)         |
+| `FETCH_AND_FORMAT_START_TO_CLOSE_TIMEOUT`   | 120s         | Fetch + format activity timeout (per attempt)   |
+| `FETCH_AND_FORMAT_HEARTBEAT_TIMEOUT`        | 60s          | Heartbeat window for fetch activity             |
+| `SUMMARIZE_AND_SAVE_START_TO_CLOSE_TIMEOUT` | 900s         | Summarize + save activity timeout (per attempt) |
+| `SUMMARIZE_AND_SAVE_HEARTBEAT_TIMEOUT`      | 60s          | Heartbeat window for summarize activity         |
+
+Retry policies: `SAMPLE_RETRY_POLICY` (5 attempts with backoff), `FETCH_AND_FORMAT_RETRY_POLICY` (2 attempts), `SUMMARIZE_AND_SAVE_RETRY_POLICY` (2 attempts with backoff, `TextReprExpiredError` non-retryable), `COORDINATOR_CHILD_WORKFLOW_RETRY_POLICY` (1 attempt). All retry policies exclude `ValueError` and `TypeError` from retries.
+
+The text representation handed to the model is capped by `batch_text_repr_budget` (see `products/ai_observability/backend/summarization/budget.py`).
+The batch job runs unattended over every team's traces, so its context size drives a recurring bill.
+The cap holds the input near a cost-conscious ceiling instead of the model's full context window, which never bounds a typical trace.
+Oversized trace text is reduced by uniform line sampling before the LLM call.
+Oversized generation text splits the budget between the input and output sections, so a large input never drops the output section.
+
+Sampling keeps ClickHouse capacity errors retryable deliberately: each run covers a disjoint wall-clock window with no persisted cursor, so a run that gives up loses that hour of traces for that team permanently.
+Concurrency is bounded centrally by `CLICKHOUSE_LLM_ANALYTICS_MAX_CONCURRENT_QUERIES`, not by this workflow's fan-out, because trace clustering and eval reports draw on the same budget.
+
+## Redis Intermediate Storage
+
+Text representations (up to 2 MB) are stored in Redis between the two activities to keep Temporal workflow history small (~100 bytes per reference). Key pattern: `llma:summarization:{trace|generation}:{team_id}:{item_id}:text_repr`. Keys have a 200-minute TTL (exceeds the 30-minute workflow timeout) and are cleaned up after use. See `state.py`.
+
+## Error Handling
+
+- Individual item failures are logged but don't fail the workflow
+- `TextReprExpiredError` is non-retryable (Redis key missing means fetch must re-run, but this is handled by workflow-level retry)
+- Embedding failures tracked separately, don't fail summary generation
+- Activity retries use exponential backoff via centralized retry policies
+- A failed LLM call is captured as an exception only on the last attempt of `summarize_and_save_activity`. An earlier attempt logs `OpenAI API call failed, retry pending` at warning level, because the retry can still save the summary.
+
+## Testing
+
+```bash
+pytest posthog/temporal/ai_observability/trace_summarization/tests/ -v
+```

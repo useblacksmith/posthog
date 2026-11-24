@@ -1,0 +1,87 @@
+from drf_spectacular.utils import extend_schema
+from rest_framework import serializers, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+from posthog.api.routing import TeamAndOrgViewSetMixin
+
+from products.error_tracking.backend.facade import api as error_tracking_api
+
+
+class ErrorTrackingSettingsSerializer(serializers.Serializer):
+    adaptive_ingestion_enabled = serializers.BooleanField(
+        required=False,
+        help_text="Project preference for adaptive ingestion. Turning this on does not currently change ingestion.",
+    )
+    project_rate_limit_value = serializers.IntegerField(
+        min_value=1,
+        allow_null=True,
+        required=False,
+        help_text="Maximum number of exception events ingested per bucket for the entire project. Null removes the limit.",
+    )
+    project_rate_limit_bucket_size_minutes = serializers.IntegerField(
+        min_value=1,
+        allow_null=True,
+        required=False,
+        help_text="Bucket window over which the project-wide rate limit applies, in minutes.",
+    )
+    per_issue_rate_limit_value = serializers.IntegerField(
+        min_value=1,
+        allow_null=True,
+        required=False,
+        help_text="Maximum number of exception events ingested per bucket for each individual issue. Null removes the limit.",
+    )
+    per_issue_rate_limit_bucket_size_minutes = serializers.IntegerField(
+        min_value=1,
+        allow_null=True,
+        required=False,
+        help_text="Bucket window over which the per-issue rate limit applies, in minutes.",
+    )
+    ingestion_enabled = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "Whether the project ingests exception events. When false, ingestion drops every $exception event "
+            "for this project before it is stored or billed, and the events cannot be recovered."
+        ),
+    )
+    ai_issue_summaries_enabled = serializers.BooleanField(
+        required=False,
+        help_text=(
+            "Whether PostHog writes an AI summary of each new issue in this project. Each summary uses the "
+            "organization's AI credits. Setting it to true fails until the organization approves AI data "
+            "processing. Setting it to false always succeeds."
+        ),
+    )
+
+    def validate_ai_issue_summaries_enabled(self, value: bool) -> bool:
+        if value and not self.context["get_organization"]().is_ai_data_processing_approved:
+            raise serializers.ValidationError(
+                "Your organization must approve AI data processing before you turn on issue summaries.",
+                code="ai_data_processing_not_approved",
+            )
+        return value
+
+
+class ErrorTrackingSettingsViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
+    scope_object = "error_tracking"
+    scope_object_read_actions = ["retrieve_settings"]
+    scope_object_write_actions = ["update_settings"]
+
+    @extend_schema(responses={200: ErrorTrackingSettingsSerializer})
+    @action(detail=False, methods=["get"])
+    def retrieve_settings(self, request, *args, **kwargs):
+        settings = error_tracking_api.get_settings(self.team.id)
+        return Response(ErrorTrackingSettingsSerializer(settings).data)
+
+    @extend_schema(
+        request=ErrorTrackingSettingsSerializer,
+        responses={200: ErrorTrackingSettingsSerializer},
+    )
+    @action(detail=False, methods=["patch"])
+    def update_settings(self, request, *args, **kwargs):
+        serializer = ErrorTrackingSettingsSerializer(
+            data=request.data, partial=True, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        settings = error_tracking_api.update_settings(self.team.id, dict(serializer.validated_data))
+        return Response(ErrorTrackingSettingsSerializer(settings).data, status=status.HTTP_200_OK)

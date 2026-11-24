@@ -1,0 +1,175 @@
+"""Analytics capture for data catalog lifecycle events.
+
+Single owner of the server-side ``data catalog *`` events, so every write path (REST, MCP,
+future system callers) emits one uniform, attributed event. Passing the DRF ``request`` attaches
+transport attribution (``source``, ``access_method``, ``mcp_*`` client properties). Callers with
+no user still emit, keyed to the team, with ``is_system: true`` so dashboards can exclude them
+from people-facing counts.
+"""
+
+from typing import TYPE_CHECKING, Any, Optional
+
+from posthog.hogql.database.database import get_data_warehouse_table_name
+
+from posthog.event_usage import (
+    AnalyticsProps,
+    get_request_analytics_properties,
+    report_user_action,
+    report_user_or_team_action,
+)
+from posthog.models import Team, User
+
+if TYPE_CHECKING:
+    from rest_framework.request import Request
+
+    from ..models import Metric, RelationshipProposal, TableCertification
+
+METRIC_CREATED_EVENT = "data catalog metric created"
+METRIC_UPDATED_EVENT = "data catalog metric updated"
+METRIC_NAME_CONFLICT_EVENT = "data catalog metric name conflict"
+METRIC_APPROVED_EVENT = "data catalog metric approved"
+METRIC_APPROVAL_BLOCKED_EVENT = "data catalog metric approval blocked"
+METRIC_DELETED_EVENT = "data catalog metric deleted"
+METRIC_RUN_EVENT = "data catalog metric run"
+METRIC_RUN_FAILED_EVENT = "data catalog metric run failed"
+METRIC_SEARCHED_EVENT = "data catalog metric searched"
+CERTIFICATION_PROPOSED_EVENT = "data catalog certification proposed"
+CERTIFICATION_CERTIFIED_EVENT = "data catalog certification certified"
+CERTIFICATION_DEPRECATED_EVENT = "data catalog certification deprecated"
+CERTIFICATION_REVOKED_EVENT = "data catalog certification revoked"
+RELATIONSHIP_PROPOSED_EVENT = "data catalog relationship proposed"
+RELATIONSHIP_ACCEPTED_EVENT = "data catalog relationship accepted"
+RELATIONSHIP_REJECTED_EVENT = "data catalog relationship rejected"
+
+
+def certification_target_name(cert: "TableCertification") -> str:
+    if cert.table_id:
+        return get_data_warehouse_table_name(cert.table.external_data_source, cert.table.name) if cert.table else ""
+    return cert.saved_query.name if cert.saved_query else ""
+
+
+def capture_metric_event(
+    event: str,
+    metric: "Metric",
+    *,
+    team: Team,
+    user: Optional[User],
+    request: "Request | None" = None,
+    extra: Optional[dict[str, Any]] = None,
+    analytics_props: Optional[AnalyticsProps] = None,
+) -> None:
+    _report(
+        event,
+        {
+            "metric_id": str(metric.id),
+            "metric_name": metric.name,
+            "definition_kind": metric.definition_kind,
+            "status": metric.status,
+            "created_source": metric.created_source,
+            "ai_model": metric.ai_model or None,
+            "has_definition": metric.definition is not None,
+            "is_from_insight": bool(metric.source_insight_short_id),
+            **(extra or {}),
+        },
+        team=team,
+        user=user,
+        request=request,
+        analytics_props=analytics_props,
+    )
+
+
+def capture_metric_search_event(
+    *,
+    team: Team,
+    user: Optional[User],
+    phrasing_count: int,
+    result_count: int,
+    confident_match: bool,
+    search_mode: str,
+    top_metric_name: Optional[str],
+    top_match_reason: Optional[str],
+    analytics_props: Optional[AnalyticsProps] = None,
+) -> None:
+    # The query text stays out: it can hold whatever a person typed.
+    _report(
+        METRIC_SEARCHED_EVENT,
+        {
+            "phrasing_count": phrasing_count,
+            "result_count": result_count,
+            "confident_match": confident_match,
+            "search_mode": search_mode,
+            "top_metric_name": top_metric_name,
+            "top_match_reason": top_match_reason,
+        },
+        team=team,
+        user=user,
+        request=None,
+        analytics_props=analytics_props,
+    )
+
+
+def capture_certification_event(
+    event: str,
+    cert: "TableCertification",
+    *,
+    team: Team,
+    user: Optional[User],
+    request: "Request | None" = None,
+) -> None:
+    _report(
+        event,
+        {
+            "certification_id": str(cert.id),
+            "status": cert.status,
+            "proposed_status": cert.proposed_status,
+            "target": certification_target_name(cert),
+            "target_kind": "table" if cert.table_id else "view",
+        },
+        team=team,
+        user=user,
+        request=request,
+    )
+
+
+def capture_relationship_event(
+    event: str,
+    proposal: "RelationshipProposal",
+    *,
+    team: Team,
+    user: Optional[User],
+    request: "Request | None" = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    _report(
+        event,
+        {
+            "proposal_id": str(proposal.id),
+            "status": proposal.status,
+            "source_table": proposal.source_table_name,
+            "joining_table": proposal.joining_table_name,
+            "confidence": proposal.confidence,
+            "has_evidence": bool(proposal.evidence),
+            **(extra or {}),
+        },
+        team=team,
+        user=user,
+        request=request,
+    )
+
+
+def _report(
+    event: str,
+    properties: dict[str, Any],
+    *,
+    team: Team,
+    user: Optional[User],
+    request: "Request | None",
+    analytics_props: Optional[AnalyticsProps] = None,
+) -> None:
+    properties["is_system"] = user is None
+    if user is not None:
+        report_user_action(user, event, properties, team=team, request=request, analytics_props=analytics_props)
+        return
+    if request is not None:
+        analytics_props = get_request_analytics_properties(request)
+    report_user_or_team_action(event, properties, user=None, team=team, analytics_props=analytics_props)

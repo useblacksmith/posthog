@@ -1,0 +1,291 @@
+import { router } from 'kea-router'
+import { expectLogic } from 'kea-test-utils'
+
+import api from 'lib/api'
+import { sceneLogic } from 'scenes/sceneLogic'
+import { Scene } from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+
+import { cohortsSceneLogic } from './cohortsSceneLogic'
+
+const MOCK_COHORTS = {
+    count: 2,
+    results: [
+        {
+            id: 1,
+            name: 'Cohort one',
+            count: 1,
+            groups: [],
+            filters: {
+                properties: {
+                    type: 'AND',
+                    values: [],
+                },
+            },
+            is_calculating: false,
+            is_static: false,
+            created_at: '2023-08-01T00:00:00Z',
+        },
+        {
+            id: 2,
+            name: 'Cohort two',
+            count: 2,
+            groups: [],
+            filters: {
+                properties: {
+                    type: 'AND',
+                    values: [],
+                },
+            },
+            is_calculating: true,
+            is_static: false,
+            created_at: '2023-08-02T00:00:00Z',
+        },
+    ],
+}
+const blankScene = (): any => ({ scene: { component: () => null, logic: null } })
+const scenes: any = { [Scene.Dashboards]: blankScene }
+
+describe('cohortsSceneLogic', () => {
+    let logic: ReturnType<typeof cohortsSceneLogic.build>
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/projects/:team/cohorts/': MOCK_COHORTS,
+            },
+            delete: {
+                '/api/projects/:team/cohorts/:id/': { success: true },
+            },
+            patch: {
+                '/api/projects/:team/cohorts/:id/': async ({ request }) => {
+                    const data = (await request.json()) as Record<string, any>
+                    return { ...MOCK_COHORTS.results[0], ...data }
+                },
+            },
+        })
+        initKeaTests()
+        sceneLogic({ scenes }).mount()
+        logic = cohortsSceneLogic()
+        logic.mount()
+    })
+
+    describe('cohortsSceneLogic', () => {
+        describe('core assumptions', () => {
+            it('sets polling timeout for calculating cohorts when on cohorts page', async () => {
+                // Set the current location to the cohorts page
+                router.actions.push(urls.cohorts())
+
+                await expectLogic(logic).toDispatchActions(['loadCohorts', 'loadCohortsSuccess'])
+                // Check that the polling timeout disposable was registered
+                expect(logic.cache.disposables.registry.has('pollTimeout')).toBe(true)
+            })
+        })
+
+        describe('cohort filters', () => {
+            it('can set and update filters', async () => {
+                // Navigate to cohorts page first
+                router.actions.push(urls.cohorts())
+
+                // Wait for initial load
+                await expectLogic(logic).toDispatchActions(['loadCohortsSuccess'])
+
+                // Test search filter
+                await expectLogic(logic, () => {
+                    logic.actions.setCohortFilters({ search: 'test' })
+                })
+                    .toDispatchActions(['setCohortFilters', 'loadCohorts', 'loadCohortsSuccess'])
+                    .toMatchValues({
+                        cohortFilters: expect.objectContaining({ search: 'test' }),
+                    })
+
+                // Test pagination
+                await expectLogic(logic, () => {
+                    logic.actions.setCohortFilters({ page: 2 })
+                })
+                    .toDispatchActions(['setCohortFilters', 'loadCohorts', 'loadCohortsSuccess'])
+                    .toMatchValues({
+                        cohortFilters: expect.objectContaining({ page: 2 }),
+                    })
+
+                // Test type filter
+                await expectLogic(logic, () => {
+                    logic.actions.setCohortFilters({ type: 'static' })
+                })
+                    .toDispatchActions(['setCohortFilters', 'loadCohorts', 'loadCohortsSuccess'])
+                    .toMatchValues({
+                        cohortFilters: expect.objectContaining({ type: 'static' }),
+                    })
+
+                // Test created_by_id filter
+                await expectLogic(logic, () => {
+                    logic.actions.setCohortFilters({ created_by_id: 123 })
+                })
+                    .toDispatchActions(['setCohortFilters', 'loadCohorts', 'loadCohortsSuccess'])
+                    .toMatchValues({
+                        cohortFilters: expect.objectContaining({ created_by_id: 123 }),
+                    })
+            })
+        })
+
+        describe('request timing', () => {
+            let listCohorts: jest.SpyInstance
+
+            beforeEach(() => {
+                logic.unmount()
+                jest.useFakeTimers()
+                listCohorts = jest.spyOn(api.cohorts, 'listPaginated').mockResolvedValue({ count: 0, results: [] })
+            })
+
+            afterEach(() => {
+                listCohorts.mockRestore()
+                jest.useRealTimers()
+            })
+
+            it.each<[string, Record<string, string>]>([
+                ['a bare URL', {}],
+                ['a search in the URL', { search: 'paying' }],
+            ])('sends one request at once when the page opens on %s', async (_, searchParams) => {
+                router.actions.push(urls.cohorts(), searchParams)
+                logic = cohortsSceneLogic()
+                logic.mount()
+
+                expect(listCohorts).toHaveBeenCalledTimes(1)
+
+                await jest.advanceTimersByTimeAsync(1000)
+                expect(listCohorts).toHaveBeenCalledTimes(1)
+            })
+
+            it('waits for typing in the search box to pause, then sends one request', async () => {
+                router.actions.push(urls.cohorts())
+                logic = cohortsSceneLogic()
+                logic.mount()
+                await jest.advanceTimersByTimeAsync(1000)
+                listCohorts.mockClear()
+
+                logic.actions.setCohortFilters({ search: 'pay', page: 1 })
+                logic.actions.setCohortFilters({ search: 'paying', page: 1 })
+                await jest.advanceTimersByTimeAsync(299)
+                expect(listCohorts).not.toHaveBeenCalled()
+
+                await jest.advanceTimersByTimeAsync(1)
+                expect(listCohorts).toHaveBeenCalledTimes(1)
+                expect(listCohorts).toHaveBeenCalledWith(expect.objectContaining({ search: 'paying' }))
+            })
+        })
+
+        describe('cohort operations', () => {
+            it('can delete a cohort', async () => {
+                // Wait for initial load
+                await expectLogic(logic).toDispatchActions(['loadCohortsSuccess'])
+
+                jest.spyOn(api.cohorts, 'determineDeleteEndpoint').mockImplementation(() => 'cohorts')
+
+                await expectLogic(logic, () => {
+                    logic.actions.deleteCohort({ id: 1 })
+                })
+                    .toDispatchActions(['deleteCohort'])
+                    .toMatchValues({
+                        cohorts: expect.objectContaining({
+                            results: expect.not.arrayContaining([
+                                expect.objectContaining({
+                                    id: 1,
+                                }),
+                            ]),
+                        }),
+                    })
+            })
+
+            it('puts the cohort back when the server refuses the delete', async () => {
+                await expectLogic(logic).toDispatchActions(['loadCohortsSuccess'])
+                useMocks({
+                    patch: {
+                        '/api/projects/:team/cohorts/:id': () => [
+                            400,
+                            { detail: 'This cohort is used in 1 active feature flag(s).' },
+                        ],
+                    },
+                })
+
+                await expectLogic(logic, () => {
+                    logic.actions.deleteCohort({ id: 1 })
+                })
+                    .toDispatchActions(['deleteCohort', 'loadCohortsSuccess'])
+                    .toMatchValues({
+                        cohorts: expect.objectContaining({
+                            results: expect.arrayContaining([expect.objectContaining({ id: 1 })]),
+                        }),
+                    })
+            })
+        })
+
+        describe('selectors', () => {
+            it('correctly calculates pagination values', async () => {
+                router.actions.push(urls.cohorts())
+                // Wait for the initial load
+                await expectLogic(logic).toDispatchActions(['loadCohortsSuccess'])
+
+                await expectLogic(logic).toMatchValues({
+                    pagination: expect.objectContaining({
+                        currentPage: 1,
+                        pageSize: 100,
+                        entryCount: 2,
+                    }),
+                })
+            })
+
+            it('calculates shouldShowEmptyState correctly', async () => {
+                router.actions.push(urls.cohorts())
+
+                // With cohorts loaded, should not show empty state
+                await expectLogic(logic).toDispatchActions(['loadCohortsSuccess'])
+                expect(logic.values.shouldShowEmptyState).toBe(false)
+
+                // With no cohorts and default filters, should show empty state
+                logic.actions.loadCohortsSuccess({ count: 0, results: [] })
+                expect(logic.values.shouldShowEmptyState).toBe(true)
+
+                // With no cohorts but with search filter, should not show empty state
+                logic.actions.setCohortFilters({ search: 'test' })
+                expect(logic.values.shouldShowEmptyState).toBe(false)
+            })
+        })
+
+        describe('load errors', () => {
+            it.each([
+                ['detail from the error object', { detail: 'Unknown table `person`' }, 'Unknown table `person`'],
+                ['the error string when there is no detail', {}, 'Internal server error'],
+                ['the default message when detail is undefined', { detail: undefined }, 'Error loading cohorts'],
+            ])('tracks %s', async (_, errorObject, expected) => {
+                router.actions.push(urls.cohorts())
+                await expectLogic(logic).toDispatchActions(['loadCohortsSuccess'])
+                expect(logic.values.cohortsLoadError).toBe(null)
+
+                logic.actions.loadCohortsFailure('Internal server error', errorObject)
+                expect(logic.values.cohortsLoadError).toBe(expected)
+            })
+
+            it('suppresses the empty state while there is a load error', async () => {
+                router.actions.push(urls.cohorts())
+                await expectLogic(logic).toDispatchActions(['loadCohortsSuccess'])
+
+                logic.actions.loadCohortsFailure('Internal server error', { detail: 'Unknown table `person`' })
+                expect(logic.values.shouldShowEmptyState).toBe(false)
+            })
+
+            it('clears the error when retrying the load', async () => {
+                router.actions.push(urls.cohorts())
+                await expectLogic(logic).toDispatchActions(['loadCohortsSuccess'])
+
+                logic.actions.loadCohortsFailure('Internal server error', { detail: 'Unknown table `person`' })
+                expect(logic.values.cohortsLoadError).toBe('Unknown table `person`')
+
+                logic.actions.loadCohorts()
+                expect(logic.values.cohortsLoadError).toBe(null)
+            })
+        })
+    })
+})

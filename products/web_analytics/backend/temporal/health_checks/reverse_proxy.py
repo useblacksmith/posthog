@@ -1,0 +1,90 @@
+from posthog.job_owners import JobOwners
+from posthog.models.health_issue import HealthIssue
+from posthog.temporal.health_checks.framework import (
+    _SEVERITY_WEIGHT,
+    AlertContent,
+    Remediation,
+    SignalContent,
+    build_signal_extra,
+)
+from posthog.temporal.health_checks.models import HealthCheckResult
+from posthog.temporal.health_checks.rollups.checks import RollupHealthCheck
+from posthog.temporal.health_checks.rollups.freshness import RollupWindow
+
+from products.web_analytics.backend.models.health_rollups import EventsHealthDaily
+from products.web_analytics.backend.temporal.health_checks.rollup_reads import events_health_totals
+
+# A week-wide window, wider than the daily schedule. A project with intermittent browser
+# traffic keeps at least one browser event in the window across single zero-traffic days,
+# so its verdict stays stable instead of flapping resolved-then-firing day to day.
+REVERSE_PROXY_LOOKBACK_DAYS = 7
+# Judge a team only when the window holds this many browser events. Below it, the query
+# cannot tell "no reverse proxy" apart from "not enough browser traffic to know".
+REVERSE_PROXY_MIN_BROWSER_EVENTS = 50
+
+
+class ReverseProxyCheck(RollupHealthCheck):
+    name = "reverse_proxy"
+    kind = "reverse_proxy"
+    owner = JobOwners.TEAM_WEB_ANALYTICS
+    schedule = "30 6 * * *"
+    active_since_days = 30
+    rollup_model = EventsHealthDaily
+    window_days = REVERSE_PROXY_LOOKBACK_DAYS
+    remediation = Remediation(
+        human="""
+            Set up a reverse proxy that forwards a path on your own domain (e.g. https://ph.example.com or
+            https://example.com/ingest) to PostHog, then point your SDK's `api_host` at that proxy URL and
+            redeploy. PostHog supports several options (managed reverse proxy, Cloudflare, Vercel, AWS
+            CloudFront, nginx, etc.).
+        """,
+        agent="""
+            Confirm traffic isn't proxied with `execute-sql` (check recent events'
+            `properties.$lib_custom_api_host`). Then either stand up a PostHog-managed reverse proxy with
+            `proxy-create` (use `proxy-list` / `proxy-diagnose` to get the CNAME target and check
+            provisioning) and have the user add the DNS record, or implement a proxy in the user's
+            codebase — add the rewrite/route for their stack (e.g. `rewrites` in next.config.js, a
+            `vercel.json` route, an nginx `location` block, or a Cloudflare worker). Either way, set
+            `api_host` (and `ui_host`) in the `posthog.init` call to the proxied URL and redeploy. Use
+            `docs-search` for the reverse proxy guide for their framework. Once proxied events arrive, the
+            issue resolves on the next check run.
+        """,
+    )
+
+    @classmethod
+    def render_alert(cls, issue: HealthIssue) -> AlertContent:
+        return AlertContent(
+            title="No reverse proxy detected",
+            summary=issue.payload.get("reason", "Ad blockers may affect tracking accuracy"),
+            link="/web/health",
+        )
+
+    @classmethod
+    def render_signal(cls, issue: HealthIssue) -> SignalContent | None:
+        title = "No reverse proxy detected"
+        summary = issue.payload.get("reason", "Ad blockers may affect tracking accuracy.")
+        return SignalContent(
+            description=(
+                "PostHog isn't receiving events through a reverse proxy for this project. "
+                "Without one, ad blockers can silently drop a meaningful share of "
+                "`$pageview` / `$screen` events, undercounting traffic and skewing web analytics. "
+                "Recommend serving capture from a first-party domain via a reverse proxy."
+            ),
+            weight=_SEVERITY_WEIGHT[issue.severity],
+            extra=build_signal_extra(issue, title=title, summary=summary, link="/web/health"),
+        )
+
+    def detect_from_rollup(self, team_ids: list[int], window: RollupWindow) -> dict[int, list[HealthCheckResult]]:
+        return {
+            team_id: [_reverse_proxy_result()]
+            for team_id, totals in events_health_totals(team_ids, window).items()
+            if totals.browser_events >= REVERSE_PROXY_MIN_BROWSER_EVENTS and totals.proxied_browser_events == 0
+        }
+
+
+def _reverse_proxy_result() -> HealthCheckResult:
+    return HealthCheckResult(
+        severity=HealthIssue.Severity.WARNING,
+        payload={"reason": "No reverse proxy detected. Ad blockers may affect tracking accuracy."},
+        hash_keys=[],
+    )

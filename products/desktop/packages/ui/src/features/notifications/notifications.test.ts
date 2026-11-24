@@ -1,0 +1,376 @@
+import "reflect-metadata";
+import type { NotificationTarget } from "@posthog/platform/notifications";
+import { describe, expect, it, vi } from "vitest";
+
+// Keep resolveSoundUrl real (the bus uses it to decide the native silent flag);
+// only stub the side-effecting player.
+vi.mock("@posthog/ui/utils/sounds", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@posthog/ui/utils/sounds")>()),
+  playCompletionSound: vi.fn(),
+}));
+
+const toastMock = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+  warning: vi.fn(),
+}));
+vi.mock("@posthog/ui/primitives/toast", () => ({ toast: toastMock }));
+
+import {
+  clearCapturedLogs,
+  formatCapturedLogs,
+} from "@posthog/ui/shell/logCapture";
+import { playCompletionSound } from "@posthog/ui/utils/sounds";
+import type {
+  IActiveView,
+  INotificationSettings,
+  NotificationSettings,
+} from "./identifiers";
+import { NotificationBus } from "./notifications";
+
+const TASK_ID = "task-123";
+const OTHER_TASK_ID = "task-999";
+const taskTarget = (id: string): NotificationTarget => ({
+  kind: "task",
+  taskId: id,
+});
+
+function makeBus(overrides?: {
+  settings?: Partial<NotificationSettings>;
+  hasFocus?: boolean;
+  activeTarget?: NotificationTarget;
+}) {
+  const notify = vi.fn();
+  const showUnreadIndicator = vi.fn();
+  const requestAttention = vi.fn();
+  const play = vi.mocked(playCompletionSound);
+  play.mockClear();
+  toastMock.success.mockClear();
+  toastMock.error.mockClear();
+  toastMock.warning.mockClear();
+
+  const settings: NotificationSettings = {
+    desktopNotifications: true,
+    dockBadgeNotifications: true,
+    dockBounceNotifications: true,
+    completionSound: "meep",
+    completionVolume: 80,
+    scaleSoundWithTaskLength: false,
+    customSounds: [],
+    notificationsPausedUntil: null,
+    ...overrides?.settings,
+  };
+
+  const settingsPort: INotificationSettings = { get: () => settings };
+  const viewPort: IActiveView = {
+    hasFocus: () => overrides?.hasFocus ?? false,
+    getActiveTarget: () => overrides?.activeTarget,
+  };
+
+  const bus = new NotificationBus(
+    { notify, showUnreadIndicator, requestAttention },
+    settingsPort,
+    viewPort,
+  );
+
+  return { bus, notify, showUnreadIndicator, requestAttention, play };
+}
+
+describe("NotificationBus tier routing (via notifyPermissionRequest)", () => {
+  it("app unfocused → native notification", () => {
+    const { bus, notify } = makeBus({
+      hasFocus: false,
+      activeTarget: taskTarget(TASK_ID),
+    });
+    bus.notifyPermissionRequest("My task", TASK_ID);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(toastMock.warning).not.toHaveBeenCalled();
+  });
+
+  it("focused on the same task → suppressed (nothing)", () => {
+    const { bus, notify, play } = makeBus({
+      hasFocus: true,
+      activeTarget: taskTarget(TASK_ID),
+    });
+    bus.notifyPermissionRequest("My task", TASK_ID);
+    expect(notify).not.toHaveBeenCalled();
+    expect(toastMock.warning).not.toHaveBeenCalled();
+    expect(play).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["viewing a different task", taskTarget(OTHER_TASK_ID)],
+    ["viewing nothing relevant", undefined],
+  ])("focused, %s → in-app toast (not native)", (_label, activeTarget) => {
+    const { bus, notify } = makeBus({ hasFocus: true, activeTarget });
+    bus.notifyPermissionRequest("My task", TASK_ID);
+    expect(notify).not.toHaveBeenCalled();
+    expect(toastMock.warning).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("notifyPromptComplete", () => {
+  it.each([
+    { stopReason: "tool_use", delivered: false },
+    { stopReason: "max_tokens", delivered: false },
+    { stopReason: "end_turn", delivered: true },
+  ])(
+    "stop reason '$stopReason' → delivered=$delivered",
+    ({ stopReason, delivered }) => {
+      const { bus, notify } = makeBus({ hasFocus: false });
+      bus.notifyPromptComplete("My task", stopReason, TASK_ID);
+      expect(notify).toHaveBeenCalledTimes(delivered ? 1 : 0);
+    },
+  );
+
+  it("notifies activity subscribers when a task finishes", () => {
+    const { bus } = makeBus({ hasFocus: false });
+    const listener = vi.fn();
+    const unsubscribe = bus.subscribeToTaskActivity(listener);
+
+    bus.notifyPromptComplete("My task", "end_turn", TASK_ID);
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: TASK_ID,
+        taskTitle: "My task",
+        activityKind: "completed",
+      }),
+    );
+
+    unsubscribe();
+    bus.notifyPromptComplete("My task", "end_turn", TASK_ID);
+    expect(listener).toHaveBeenCalledOnce();
+  });
+
+  it("notifies activity subscribers when a task needs input", () => {
+    const { bus } = makeBus({ hasFocus: false });
+    const listener = vi.fn();
+    bus.subscribeToTaskActivity(listener);
+
+    bus.notifyPermissionRequest("My task", TASK_ID);
+
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: TASK_ID,
+        taskTitle: "My task",
+        activityKind: "awaiting_input",
+      }),
+    );
+  });
+
+  it("delivers the notification when an activity subscriber fails", () => {
+    const { bus, notify } = makeBus({ hasFocus: false });
+    bus.subscribeToTaskActivity(() => {
+      throw new Error("activity refresh failed");
+    });
+
+    expect(() =>
+      bus.notifyPromptComplete("My task", "end_turn", TASK_ID),
+    ).not.toThrow();
+    expect(notify).toHaveBeenCalledOnce();
+  });
+});
+
+describe("pause", () => {
+  it.each([
+    { label: "native tier", hasFocus: false, toast: false },
+    { label: "toast tier", hasFocus: true, toast: true },
+  ])("stays silent on the $label while paused", ({ hasFocus, toast }) => {
+    const { bus, notify, showUnreadIndicator, requestAttention, play } =
+      makeBus({
+        hasFocus,
+        settings: { notificationsPausedUntil: Date.now() + 60_000 },
+      });
+    bus.notifyPromptComplete("My task", "end_turn", TASK_ID);
+    expect(play).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+    expect(showUnreadIndicator).not.toHaveBeenCalled();
+    expect(requestAttention).not.toHaveBeenCalled();
+    expect(toastMock.success).toHaveBeenCalledTimes(toast ? 1 : 0);
+  });
+
+  it("alerts again once the pause ends", () => {
+    const { bus, notify, play } = makeBus({
+      hasFocus: false,
+      settings: { notificationsPausedUntil: Date.now() - 1 },
+    });
+    bus.notifyPromptComplete("My task", "end_turn", TASK_ID);
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("native tier settings gating (app unfocused)", () => {
+  it("skips the OS notification when desktopNotifications is off, still dings dock", () => {
+    const { bus, notify, showUnreadIndicator, requestAttention } = makeBus({
+      hasFocus: false,
+      settings: { desktopNotifications: false },
+    });
+    bus.notifyPermissionRequest("My task", TASK_ID);
+    expect(notify).not.toHaveBeenCalled();
+    expect(showUnreadIndicator).toHaveBeenCalledTimes(1);
+    expect(requestAttention).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks the OS notification silent when a custom sound plays", () => {
+    const { bus, notify } = makeBus({
+      hasFocus: false,
+      settings: { completionSound: "meep" },
+    });
+    bus.notifyPermissionRequest("My task", TASK_ID);
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ silent: true }),
+    );
+  });
+
+  it("is not silent when completionSound is none", () => {
+    const { bus, notify } = makeBus({
+      hasFocus: false,
+      settings: { completionSound: "none" },
+    });
+    bus.notifyPromptComplete("My task", "end_turn", TASK_ID);
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ silent: false }),
+    );
+  });
+
+  it("is not silent when the selected custom sound no longer exists", () => {
+    // A deleted custom sound resolves to nothing, so the native chime must
+    // still ring rather than the notification being silent-and-soundless.
+    const { bus, notify } = makeBus({
+      hasFocus: false,
+      settings: { completionSound: "custom:gone", customSounds: [] },
+    });
+    bus.notifyPermissionRequest("My task", TASK_ID);
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ silent: false }),
+    );
+  });
+
+  it("truncates long titles in the body", () => {
+    const { bus, notify } = makeBus({ hasFocus: false });
+    bus.notifyPromptComplete("x".repeat(80), "end_turn", TASK_ID);
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ body: `"${"x".repeat(50)}..." finished` }),
+    );
+  });
+});
+
+describe("notifyError", () => {
+  const payload = { status: 500, message: "upstream exploded", body: { x: 1 } };
+
+  it("toasts a one-line summary, never the raw payload", () => {
+    const { bus } = makeBus({ hasFocus: true });
+    bus.notifyError("Sync failed", payload);
+    expect(toastMock.error).toHaveBeenCalledWith(
+      "Sync failed",
+      expect.objectContaining({ description: "upstream exploded" }),
+    );
+  });
+
+  it("forwards the complete payload for the toast wrapper's View larger action", () => {
+    const { bus } = makeBus({ hasFocus: true });
+    bus.notifyError("Sync failed", payload);
+    expect(toastMock.error).toHaveBeenCalledWith(
+      "Sync failed",
+      expect.objectContaining({ error: payload }),
+    );
+  });
+
+  it("app unfocused → native notification with the summary as body", () => {
+    const { bus, notify } = makeBus({ hasFocus: false });
+    bus.notifyError("Sync failed", payload);
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Sync failed",
+        body: "upstream exploded",
+      }),
+    );
+  });
+});
+
+describe("sound", () => {
+  it("plays on the toast tier too (not just native)", () => {
+    const { bus, play } = makeBus({
+      hasFocus: true,
+      activeTarget: taskTarget(OTHER_TASK_ID),
+    });
+    bus.notifyPromptComplete("My task", "end_turn", TASK_ID);
+    expect(play).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [
+      "scaling off, with duration",
+      false,
+      (10 * 60 * 1000) as number | undefined,
+      1,
+    ],
+    ["scaling on, quick task (<30s) → 3×", true, 10 * 1000, 3],
+    ["scaling on, no duration → 1×", true, undefined, 1],
+  ])("%s", (_label, scaleSoundWithTaskLength, durationMs, expectedRate) => {
+    const { bus, play } = makeBus({
+      hasFocus: false,
+      settings: { scaleSoundWithTaskLength },
+    });
+    bus.notifyPromptComplete("My task", "end_turn", TASK_ID, durationMs);
+    expect(play).toHaveBeenCalledWith(
+      "meep",
+      80,
+      [],
+      expectedRate,
+      "task_completed",
+    );
+  });
+});
+
+describe("notification log", () => {
+  // The only record of why the app made a noise. A user reporting a sound they
+  // did not expect has nothing else to send us.
+  it.each([
+    {
+      label: "delivered notification names its reason, trigger and sound",
+      hasFocus: false,
+      activeTarget: undefined,
+      settings: undefined,
+      expected: [
+        '"reason":"task_needs_input"',
+        '"trigger":"local_permission_request"',
+        '"channel":"native"',
+        '"soundPlayed":true',
+        '"sound":"meep"',
+      ],
+      // The line reaches central logs, so the task title must not ride along.
+      absent: ["needs your input", "My task"],
+    },
+    {
+      label: "suppressed notification records that nothing played",
+      hasFocus: true,
+      activeTarget: taskTarget(TASK_ID),
+      settings: undefined,
+      expected: ['"channel":"suppress"', '"soundPlayed":false'],
+      absent: [],
+    },
+    {
+      // A sound of "none" leaves the OS chime audible, so a noise still came
+      // out and the line has to name it.
+      label: "native notification with no completion sound names the OS chime",
+      hasFocus: false,
+      activeTarget: undefined,
+      settings: { completionSound: "none" as const },
+      expected: ['"soundPlayed":false', '"osChimePlayed":true'],
+      absent: [],
+    },
+  ])("$label", ({ hasFocus, activeTarget, settings, expected, absent }) => {
+    clearCapturedLogs();
+    const { bus } = makeBus({ hasFocus, activeTarget, settings });
+
+    bus.notifyPermissionRequest("My task", TASK_ID, {
+      trigger: "local_permission_request",
+    });
+
+    const logs = formatCapturedLogs();
+    for (const fragment of expected) expect(logs).toContain(fragment);
+    for (const fragment of absent) expect(logs).not.toContain(fragment);
+  });
+});

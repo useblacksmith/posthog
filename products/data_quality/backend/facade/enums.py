@@ -1,0 +1,122 @@
+"""
+Exported enums for data_quality.
+
+The pure, Django-free types other layers (presentation, information_schema loaders, MCP tooling)
+share. Internal-only constants stay in the implementation.
+"""
+
+from enum import StrEnum
+
+from posthog.enums import LabeledStrEnum
+
+
+class CreatedSource(StrEnum):
+    """Who authored a check, for review context."""
+
+    USER = "user"
+    AI_GENERATED = "ai_generated"
+
+
+class CheckType(StrEnum):
+    """Assertion a data quality check makes about its subject.
+
+    Each value has a matching ``CheckTypeSpec`` in the check registry, which owns the config
+    schema and the HogQL compilation. Adding a type means adding a spec, not a migration.
+    """
+
+    NOT_NULL = "not_null"
+    UNIQUE = "unique"
+    ACCEPTED_VALUES = "accepted_values"
+    RELATIONSHIPS = "relationships"
+    ROW_COUNT = "row_count"
+    FRESHNESS = "freshness"
+    CUSTOM_SQL = "custom_sql"
+
+
+class CheckSeverity(StrEnum):
+    """How loudly a failing check speaks. Only ``error`` failures notify and mark a subject failing."""
+
+    ERROR = "error"
+    WARN = "warn"
+
+
+class CheckRunStatus(StrEnum):
+    """Outcome of one check execution.
+
+    ``failed`` means the assertion found failing rows; ``errored`` means the query could not be
+    compiled or executed, which is a different problem and never notifies as a data failure.
+    """
+
+    PASSED = "passed"
+    FAILED = "failed"
+    ERRORED = "errored"
+    SKIPPED = "skipped"
+
+
+class SuiteRunStatus(StrEnum):
+    """Lifecycle of a batch of check executions."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    EMPTY = "empty"
+
+
+class SuiteRunTrigger(StrEnum):
+    """What started a suite run.
+
+    Automatic runs follow materializations, source syncs, or a subject's schedule.
+    """
+
+    MANUAL = "manual"
+    MATERIALIZATION = "materialization"
+    SOURCE_SYNC = "source_sync"
+    SCHEDULED = "scheduled"
+
+
+class SubjectType(LabeledStrEnum):
+    """Kind of catalog object a check targets.
+
+    On the check itself the subject is a foreign key (``saved_query``, ``table``, or ``metric``), or
+    the name of a PostHog table; run history denormalizes it as loose
+    ``(subject_type, subject_uuid, name)`` tuples so it outlives hard deletes.
+    """
+
+    TABLE = "table", "table"
+    VIEW = "view", "view"
+    METRIC = "metric", "metric"
+    POSTHOG_TABLE = "posthog_table", "posthog_table"
+
+
+# The labels repeat the values because the published OpenAPI enum lists these exact pairs.
+class DataQualityScheduleInterval(LabeledStrEnum):
+    ONE_HOUR = "1hour", "1hour"
+    SIX_HOURS = "6hour", "6hour"
+    TWELVE_HOURS = "12hour", "12hour"
+    DAILY = "24hour", "24hour"
+    WEEKLY = "7day", "7day"
+
+
+def subject_type_choices() -> dict[str, str]:
+    return {kind.value: kind.value for kind in SubjectType}
+
+
+def suite_run_trigger_choices() -> dict[str, str]:
+    return {trigger.value: trigger.value for trigger in SuiteRunTrigger}
+
+
+class SubjectStatus(StrEnum):
+    """Whether the subject a check points at still resolves."""
+
+    ACTIVE = "active"
+    ORPHANED = "orphaned"
+
+
+class SubjectHealth(StrEnum):
+    """Rollup of a subject's latest check results, shared by the REST endpoint and system table."""
+
+    HEALTHY = "healthy"
+    WARN = "warn"
+    FAILING = "failing"
+    ERRORING = "erroring"
+    UNKNOWN = "unknown"

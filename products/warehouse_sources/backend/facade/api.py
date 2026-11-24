@@ -1,0 +1,1046 @@
+"""
+Facade for warehouse_sources.
+
+Capability-oriented read functions that map ORM instances to framework-free
+contracts (``facade/contracts.py``) — the facade never returns ORM across the
+boundary. Mappers are explicit so the consumed shape is visible in one place.
+
+Heavy HogQL-adjacent wiring (model classes, table resolution, ClickHouse→HogQL
+type mappings) lives in ``facade/hogql.py``; temporal/source wiring in
+``facade/temporal.py``. This module re-exports only the framework-free helper
+transforms (prefix/URL validation, column converters) so config-only consumers
+don't drag heavy imports onto the ``django.setup()`` path.
+
+Write paths (create/update of sources, schemas, tables, jobs) remain inside
+``products/data_warehouse`` for now — a legacy-leak swept in Phase 2 — so this
+first facade serves the read consumers and the framework-free helpers. The one
+exception is ``soft_delete_tables``: consumers may not iterate the model to call
+``soft_delete()`` themselves, so the facade does it for them.
+"""
+
+from collections import defaultdict
+from collections.abc import Collection
+from datetime import datetime
+from typing import TYPE_CHECKING
+from uuid import UUID
+
+from django.db.models import OuterRef, Prefetch, Q, QuerySet, Subquery
+from django.utils import timezone
+
+from posthog.uuidt import UUIDT
+
+# Source-agnostic storage contract for user-uploaded files — shared with the upload endpoint.
+from products.warehouse_sources.backend.file_uploads import (
+    FILE_FORMAT_READ_HINTS,
+    FILE_FORMAT_TO_TABLE_FORMAT,
+    FORMAT_CSV,
+    MAX_UPLOAD_SIZE_BYTES as MAX_FILE_UPLOAD_SIZE_BYTES,
+    SUPPORTED_FILE_FORMATS,
+    build_file_upload_s3_key,
+    build_file_upload_s3_path,
+    build_file_upload_url_pattern,
+    hosted_upload_s3_path,
+)
+from products.warehouse_sources.backend.logic.column_sensitivity import classify_column_sensitivity
+from products.warehouse_sources.backend.models.column_annotation import (
+    WarehouseColumnAnnotation as _WarehouseColumnAnnotation,
+)
+from products.warehouse_sources.backend.models.column_statistics import (
+    WarehouseColumnStatistics as _WarehouseColumnStatistics,
+)
+from products.warehouse_sources.backend.models.external_data_job import (
+    ExternalDataJob as _ExternalDataJob,
+    latest_completed_job_subquery,
+)
+from products.warehouse_sources.backend.models.external_data_schema import (
+    SCHEMA_SELF_MANAGED_TABLE_METADATA_KEY,
+    ExternalDataSchema as _ExternalDataSchema,
+    self_managed_table_ref,
+)
+from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource as _ExternalDataSource
+from products.warehouse_sources.backend.models.table import DataWarehouseTable as _DataWarehouseTable
+
+# Framework-free helper transforms — re-exported as the public helper surface.
+from products.warehouse_sources.backend.models.util import (
+    clickhouse_columns_to_dwh_columns,
+    get_view_or_table_by_name as _get_view_or_table_by_name,
+    motherduck_columns_to_dwh_columns,
+    mysql_column_to_dwh_column,
+    mysql_columns_to_dwh_columns,
+    postgres_column_to_dwh_column,
+    postgres_columns_to_dwh_columns,
+    snowflake_columns_to_dwh_columns,
+    trino_columns_to_dwh_columns,
+    validate_source_prefix,
+    validate_warehouse_table_url_pattern,
+)
+from products.warehouse_sources.backend.source_status import effective_source_status
+from products.warehouse_sources.backend.types import ExternalDataSourceType, WarehouseColumnAnnotationDescriptionSource
+from products.warehouse_sources.backend.view_consumers import saved_queries_feeding_consumers
+from products.warehouse_sources.backend.webhook_registration import schema_needs_webhook, sources_missing_webhook
+
+from . import contracts
+
+if TYPE_CHECKING:
+    from products.access_control.backend.facade.user_access_control import AccessControlLevel, UserAccessControl
+
+__all__ = [
+    # capability functions
+    "get_source",
+    "list_sources",
+    "list_source_health",
+    "list_revenue_sources",
+    "list_revenue_source_settings",
+    "get_schema",
+    "list_schemas_for_source",
+    "github_repositories_syncing",
+    "list_imported_schema_snapshots",
+    "source_locations_for_tables",
+    "get_table",
+    "get_queryable_table",
+    "earliest_import_table_named",
+    "resolve_object_by_name",
+    "direct_access_table_ids",
+    "team_has_had_direct_query_source",
+    "discard_backing_table",
+    "record_table_row_count",
+    "allowed_table_ids",
+    "live_table_exists",
+    "table_level_descriptions",
+    "write_table_level_description",
+    "denied_table_ids",
+    "pending_source_ids_for_tables",
+    "registered_history_table_for",
+    "copy_access_rules_to_history_table",
+    "tables_awaiting_first_sync",
+    "all_queryable_tables",
+    "all_queryable_table_columns",
+    "list_tables_for_source",
+    "list_jobs_for_source",
+    "import_started_before",
+    "list_column_statistics",
+    "column_sensitivity",
+    "column_sensitivity_enabled",
+    "saved_queries_feeding_consumers",
+    "schema_needs_webhook",
+    "sources_missing_webhook",
+    # framework-free helper transforms
+    "effective_source_status",
+    "clickhouse_columns_to_dwh_columns",
+    "motherduck_columns_to_dwh_columns",
+    "trino_columns_to_dwh_columns",
+    "mysql_column_to_dwh_column",
+    "mysql_columns_to_dwh_columns",
+    "postgres_column_to_dwh_column",
+    "postgres_columns_to_dwh_columns",
+    "snowflake_columns_to_dwh_columns",
+    "validate_source_prefix",
+    "validate_warehouse_table_url_pattern",
+    # file-upload storage contract
+    "FILE_FORMAT_READ_HINTS",
+    "FILE_FORMAT_TO_TABLE_FORMAT",
+    "FORMAT_CSV",
+    "MAX_FILE_UPLOAD_SIZE_BYTES",
+    "SUPPORTED_FILE_FORMATS",
+    "build_file_upload_s3_key",
+    "build_file_upload_s3_path",
+    "build_file_upload_url_pattern",
+    "hosted_upload_s3_path",
+]
+
+# GitHub multi-repo source helpers live in ``github_warehouse_repos`` and pull the source
+# registry (dlt drivers) in via ``facade.source_management``, so resolve them lazily to keep that
+# weight off the ``django.setup()`` import path — only the namespaced-resource registry loads them.
+_LAZY = {
+    "github_repositories_for_job_inputs": "github_warehouse_repos",
+    "github_source_credential": "github_warehouse_repos",
+    "reconcile_github_repositories": "github_warehouse_repos",
+}
+
+
+def __getattr__(name: str):
+    module = _LAZY.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    return getattr(importlib.import_module(f"products.warehouse_sources.backend.{module}"), name)
+
+
+# --- Mappers (ORM -> contract) ---
+
+
+def _to_source(source: _ExternalDataSource) -> contracts.ExternalDataSource:
+    return contracts.ExternalDataSource(
+        id=source.id,
+        team_id=source.team_id,
+        source_type=source.source_type,
+        status=source.status,
+        prefix=source.prefix,
+        access_method=source.access_method,
+        direct_query_enabled=source.direct_query_enabled,
+        created_via=source.created_via,
+        created_at=source.created_at,
+        updated_at=source.updated_at,
+        is_direct_query=source.is_direct_query,
+        is_direct_postgres=source.is_direct_postgres,
+        is_direct_mysql=source.is_direct_mysql,
+        direct_engine=source.direct_engine,
+    )
+
+
+def _to_revenue_source(source: _ExternalDataSource) -> contracts.RevenueSource:
+    settings = getattr(source, "revenue_analytics_config", None)
+    return contracts.RevenueSource(
+        id=source.id,
+        source_type=source.source_type,
+        prefix=source.prefix,
+        enabled=settings.enabled if settings is not None else source.source_type == ExternalDataSourceType.STRIPE,
+        include_invoiceless_charges=settings.include_invoiceless_charges if settings is not None else True,
+        schemas=tuple(
+            contracts.RevenueSourceSchema(
+                name=schema.name,
+                table=(
+                    contracts.RevenueSourceTable(id=schema.table.id, name=schema.table.name)
+                    if schema.table is not None and schema.table.team_id == schema.team_id
+                    else None
+                ),
+            )
+            for schema in source.schemas.all()
+        ),
+    )
+
+
+def _to_revenue_source_settings(source: _ExternalDataSource) -> contracts.RevenueSourceSettings:
+    settings = getattr(source, "revenue_analytics_config", None)
+    return contracts.RevenueSourceSettings(
+        id=source.id,
+        source_type=source.source_type,
+        prefix=source.prefix,
+        deleted=bool(source.deleted),
+        enabled=settings.enabled if settings is not None else source.source_type == ExternalDataSourceType.STRIPE,
+    )
+
+
+def _to_schema(schema: _ExternalDataSchema) -> contracts.ExternalDataSchema:
+    return contracts.ExternalDataSchema(
+        id=schema.id,
+        team_id=schema.team_id,
+        source_id=schema.source_id,
+        table_id=schema.table_id,
+        name=schema.name,
+        label=schema.label,
+        status=schema.status,
+        should_sync=schema.should_sync,
+        latest_error=schema.latest_error,
+        last_synced_at=schema.last_synced_at,
+        sync_type=schema.sync_type,
+        sync_frequency_interval=schema.sync_frequency_interval,
+        sync_time_of_day=schema.sync_time_of_day,
+        initial_sync_complete=schema.initial_sync_complete,
+        description=schema.description,
+        created_at=schema.created_at,
+        updated_at=schema.updated_at,
+        normalized_name=schema.normalized_name,
+        is_incremental=schema.is_incremental,
+        is_cdc=schema.is_cdc,
+        source_type=schema.source.source_type if schema.source_id else None,
+    )
+
+
+def _to_table(table: _DataWarehouseTable) -> contracts.DataWarehouseTable:
+    return contracts.DataWarehouseTable(
+        id=table.id,
+        team_id=table.team_id,
+        name=table.name,
+        format=table.format,
+        url_pattern=table.url_pattern,
+        queryable_folder=table.queryable_folder,
+        columns=table.columns or {},
+        row_count=table.row_count,
+        size_in_s3_mib=table.size_in_s3_mib,
+        external_data_source_id=table.external_data_source_id,
+        credential_id=table.credential_id,
+        created_at=table.created_at,
+    )
+
+
+def _to_job(job: _ExternalDataJob) -> contracts.ExternalDataJob:
+    pipeline = job.pipeline if job.pipeline_id else None
+    return contracts.ExternalDataJob(
+        id=job.id,
+        team_id=job.team_id,
+        status=job.status,
+        latest_error=job.latest_error,
+        finished_at=job.finished_at,
+        rows_synced=job.rows_synced or 0,
+        billable=job.billable,
+        schema_id=job.schema_id,
+        pipeline_id=job.pipeline_id,
+        workflow_id=job.workflow_id,
+        workflow_run_id=job.workflow_run_id,
+        created_at=job.created_at,
+        source_type=pipeline.source_type if pipeline else None,
+        source_prefix=pipeline.prefix if pipeline else None,
+    )
+
+
+# --- Capability functions (read) ---
+
+
+def get_source(source_id: UUID, team_id: int) -> contracts.ExternalDataSource:
+    return _to_source(_ExternalDataSource.objects.get(id=source_id, team_id=team_id))
+
+
+def list_sources(
+    team_id: int,
+    *,
+    include_deleted: bool = False,
+) -> list[contracts.ExternalDataSource]:
+    qs = _ExternalDataSource.objects.filter(team_id=team_id)
+    if not include_deleted:
+        qs = qs.exclude(deleted=True)
+    return [_to_source(s) for s in qs]
+
+
+def list_source_health(team_id: int) -> list[contracts.ExternalDataSourceHealth]:
+    """Live sources with their effective status, newest completed run and newest schema error.
+
+    The status rolls up the source's active schemas the same way the source list does.
+
+    One correlated probe per source for each of the two lookups, so the cost tracks the number
+    of sources rather than the length of the team's job history.
+    """
+    # Newest schema-level error across the source's non-deleted schemas. Ordered by most
+    # recently updated so a consumer sees the freshest failure.
+    latest_error = Subquery(
+        _ExternalDataSchema.objects.filter(source_id=OuterRef("pk"), deleted=False, latest_error__isnull=False)
+        .order_by("-updated_at")
+        .values("latest_error")[:1]
+    )
+    rows = (
+        _ExternalDataSource.objects.filter(team_id=team_id, deleted=False)
+        .annotate(
+            last_run_at=latest_completed_job_subquery(team_id, "created_at"),
+            latest_error=latest_error,
+        )
+        .order_by("source_type", "id")
+        .values("id", "source_type", "status", "prefix", "created_at", "last_run_at", "latest_error")
+    )
+    active_schemas_by_source: defaultdict[UUID, list[_ExternalDataSchema]] = defaultdict(list)
+    for schema in (
+        _ExternalDataSchema.objects.filter(team_id=team_id, deleted=False, source__deleted=False)
+        .filter(Q(should_sync=True) | Q(latest_error__isnull=False))
+        .only("source_id", "status", "should_sync")
+    ):
+        active_schemas_by_source[schema.source_id].append(schema)
+    return [
+        contracts.ExternalDataSourceHealth(
+            source_type=row["source_type"],
+            status=effective_source_status(active_schemas_by_source[row["id"]], fallback=row["status"]),
+            prefix=row["prefix"],
+            created_at=row["created_at"],
+            last_run_at=row["last_run_at"],
+            latest_error=row["latest_error"],
+        )
+        for row in rows
+    ]
+
+
+def _revenue_source_queryset(
+    team_id: int,
+    *,
+    include_deleted: bool,
+    source_types: Collection[str] | None,
+    source_ids: Collection[UUID] | None,
+) -> QuerySet[_ExternalDataSource]:
+    sources = _ExternalDataSource.objects.select_related("revenue_analytics_config").filter(team_id=team_id)
+    if not include_deleted:
+        sources = sources.exclude(deleted=True)
+    if source_types is not None:
+        sources = sources.filter(source_type__in=source_types)
+    if source_ids is not None:
+        sources = sources.filter(id__in=source_ids)
+    return sources
+
+
+def list_revenue_sources(
+    team_id: int,
+    *,
+    source_types: Collection[str] | None = None,
+) -> list[contracts.RevenueSource]:
+    schemas = _ExternalDataSchema.objects.select_related("table").filter(team_id=team_id)
+    sources = _revenue_source_queryset(
+        team_id,
+        include_deleted=False,
+        source_types=source_types,
+        source_ids=None,
+    ).prefetch_related(Prefetch("schemas", queryset=schemas))
+    return [_to_revenue_source(source) for source in sources]
+
+
+def list_revenue_source_settings(
+    team_id: int,
+    *,
+    include_deleted: bool = False,
+    source_types: Collection[str] | None = None,
+    source_ids: Collection[UUID] | None = None,
+) -> list[contracts.RevenueSourceSettings]:
+    sources = _revenue_source_queryset(
+        team_id,
+        include_deleted=include_deleted,
+        source_types=source_types,
+        source_ids=source_ids,
+    )
+    return [_to_revenue_source_settings(source) for source in sources]
+
+
+def get_schema(schema_id: UUID, team_id: int) -> contracts.ExternalDataSchema:
+    return _to_schema(_ExternalDataSchema.objects.select_related("source").get(id=schema_id, team_id=team_id))
+
+
+def list_schemas_for_source(source_id: UUID, team_id: int) -> list[contracts.ExternalDataSchema]:
+    qs = _ExternalDataSchema.objects.select_related("source").filter(team_id=team_id, source_id=source_id)
+    return [_to_schema(s) for s in qs]
+
+
+def github_repositories_syncing(team_id: int, endpoint: str) -> frozenset[str]:
+    """The repositories, lowercased `owner/repo`, whose `endpoint` a live GitHub source of this team syncs."""
+    # Imported here to keep the source registry and the credential stores off the `django.setup()` path.
+    from products.warehouse_sources.backend.logic.source_inputs import SourceInputsStore  # noqa: PLC0415
+    from products.warehouse_sources.backend.temporal.data_imports.sources.github.naming import (  # noqa: PLC0415
+        normalize_repository,
+        schema_repo_endpoint,
+    )
+
+    schemas = (
+        _ExternalDataSchema.objects.filter(
+            team_id=team_id, should_sync=True, source__source_type=ExternalDataSourceType.GITHUB
+        )
+        .exclude(deleted=True)
+        .exclude(source__deleted=True)
+        .select_related("source")
+    )
+    repositories: set[str] = set()
+    for schema in schemas:
+        repository, schema_endpoint = schema_repo_endpoint(schema.schema_metadata, schema.name, None)
+        if schema_endpoint != endpoint:
+            continue
+        # Only a bare single-repository row keeps its repository in encrypted inputs, so decrypt just those.
+        if repository is None:
+            try:
+                legacy = str(SourceInputsStore.load(schema.source).get("repository") or "")
+            except contracts.UnreadableSourceInputsError:
+                continue
+            repository = normalize_repository(legacy).lower() or None
+        if repository:
+            repositories.add(repository)
+    return frozenset(repositories)
+
+
+def list_imported_schema_snapshots(team_id: int) -> list[contracts.ImportedSchemaSnapshot]:
+    rows = _ExternalDataSchema.objects.filter(
+        team_id=team_id,
+        deleted=False,
+        source__deleted=False,
+        source__team_id=team_id,
+        source__access_method="warehouse",
+        table__deleted=False,
+        table__team_id=team_id,
+    ).values_list("id", "table__queryable_folder")
+    return [
+        contracts.ImportedSchemaSnapshot(schema_id=schema_id, queryable_folder=folder) for schema_id, folder in rows
+    ]
+
+
+def source_locations_for_tables(team_id: int, table_ids: Collection[UUID]) -> dict[UUID, contracts.TableSourceLocation]:
+    """Where each of these tables is administered. One query, and tables with no schema are absent."""
+    if not table_ids:
+        return {}
+    rows = _ExternalDataSchema.objects.filter(
+        team_id=team_id, table_id__in=list(table_ids), source_id__isnull=False
+    ).values_list("table_id", "source_id", "id")
+    return {
+        table_id: contracts.TableSourceLocation(source_id=source_id, schema_id=schema_id)
+        for table_id, source_id, schema_id in rows
+    }
+
+
+def get_table(table_id: UUID, team_id: int) -> contracts.DataWarehouseTable:
+    return _to_table(_DataWarehouseTable.objects.get(id=table_id, team_id=team_id))
+
+
+def earliest_import_table_named(team_id: int, name: str) -> UUID | None:
+    """The id of the team's earliest created live import table whose name matches `name` case-insensitively."""
+    return (
+        _DataWarehouseTable.objects.filter(team_id=team_id, name__iexact=name, external_data_source__isnull=False)
+        .exclude(deleted=True)
+        .exclude(external_data_source__deleted=True)
+        .order_by("created_at", "id")
+        .values_list("id", flat=True)
+        .first()
+    )
+
+
+def get_queryable_table(table_id: UUID, team_id: int) -> contracts.DataWarehouseTable | None:
+    """The table only if it is still queryable, else None.
+
+    Unlike ``get_table``, this applies the soft-delete and orphaned-source filters and returns
+    None instead of raising, so a caller holding a stored table reference can tell "gone" from
+    "something went wrong".
+    """
+    # raw_objects skips the eager schema prefetch/joins objects does -- the mapper only reads scalars.
+    table = _DataWarehouseTable.raw_objects.queryable().filter(id=table_id, team_id=team_id).first()
+    return _to_table(table) if table is not None else None
+
+
+def resolve_object_by_name(team_id: int, name: str) -> contracts.WarehouseObjectRef | None:
+    """The warehouse table or saved query a query reaches under this name, else None.
+
+    Resolves the dotted source forms (``stripe.charges``) the same way a query does, and skips
+    soft-deleted rows, orphans of a deleted source, and direct-connection tables the default HogQL
+    scope hides. None means the name reaches neither, so it carries no object-level access control
+    -- a PostHog table such as ``events``, or nothing at all.
+
+    For a caller recording what a query read: the identity survives the name being freed and taken
+    by something else, which is what makes it usable as evidence later.
+    """
+    resolved = _get_view_or_table_by_name(team_id, name, exclude_direct_access=True)
+    if resolved is None:
+        return None
+    kind = (
+        contracts.WAREHOUSE_OBJECT_TABLE
+        if isinstance(resolved, _DataWarehouseTable)
+        else contracts.WAREHOUSE_OBJECT_VIEW
+    )
+    return contracts.WarehouseObjectRef(kind=kind, id=resolved.id)
+
+
+def all_queryable_table_names(team_id: int) -> dict[UUID, str]:
+    """The current name of every table in this team that is still queryable. One query."""
+    rows = _DataWarehouseTable.raw_objects.queryable().filter(team_id=team_id)
+    return dict(rows.values_list("id", "name"))
+
+
+def all_queryable_table_keys(team_id: int) -> dict[UUID, contracts.TableNames]:
+    """Every queryable table of this team, by id, under both the names it answers to. One query.
+
+    A caller matching what a query read against what a person may reach has to know both spellings.
+    """
+    from posthog.hogql.database.database import (  # noqa: PLC0415 -- keeps HogQL off this module's import path
+        get_data_warehouse_table_name,
+    )
+
+    rows = (
+        _DataWarehouseTable.raw_objects.queryable()
+        .filter(team_id=team_id)
+        .select_related("external_data_source")
+        .only(
+            "id",
+            "name",
+            "external_data_source_id",
+            "external_data_source__id",
+            "external_data_source__access_method",
+            "external_data_source__source_type",
+            "external_data_source__prefix",
+        )
+    )
+    return {
+        table.id: contracts.TableNames(
+            row_name=table.name,
+            queryable_key=get_data_warehouse_table_name(table.external_data_source, table.name),
+        )
+        for table in rows
+    }
+
+
+def direct_access_table_ids(team_id: int) -> set[UUID]:
+    """The queryable tables belonging to direct-access sources in this team. One query."""
+    rows = (
+        _DataWarehouseTable.raw_objects.queryable()
+        .filter(team_id=team_id, external_data_source__access_method=_ExternalDataSource.AccessMethod.DIRECT)
+        .values_list("id", flat=True)
+    )
+    return set(rows)
+
+
+def team_has_had_direct_query_source(team_id: int) -> bool:
+    """Whether any source in this team, deleted ones included, was set up for queries over a direct connection.
+
+    A view saved on a source keeps its connection id after the source is deleted, so deleted rows count too.
+    It can return True for a source that `is_direct_capable` refuses, such as one whose type maps to no engine.
+    """
+    return (
+        _ExternalDataSource.objects.filter(team_id=team_id)
+        .filter(Q(access_method=_ExternalDataSource.AccessMethod.DIRECT) | Q(direct_query_enabled=True))
+        .exists()
+    )
+
+
+def allowed_table_ids(
+    team_id: int,
+    user_access_control: "UserAccessControl",
+    *,
+    required_level: "AccessControlLevel" = "viewer",
+    ids: Collection[UUID] | None = None,
+) -> frozenset[UUID]:
+    """The queryable tables this caller may reach at ``required_level``.
+
+    ``ids`` narrows the objects loaded before their access controls are read, so a caller asking
+    about one table does not pay for the whole warehouse. ``None`` asks about every table; an empty
+    collection asks about none.
+    """
+    if ids is not None and not ids:
+        return frozenset()
+    if ids is None:
+        return user_access_control.allowed_object_ids(
+            "warehouse_table",
+            team_id,
+            required_level,
+            lambda: _resolve_allowed_table_ids(team_id, user_access_control, required_level, None),
+        )
+    return _resolve_allowed_table_ids(team_id, user_access_control, required_level, ids)
+
+
+def _resolve_allowed_table_ids(
+    team_id: int,
+    user_access_control: "UserAccessControl",
+    required_level: "AccessControlLevel",
+    ids: Collection[UUID] | None,
+) -> frozenset[UUID]:
+    candidates = _DataWarehouseTable.raw_objects.queryable().filter(team_id=team_id)
+    if ids is not None:
+        candidates = candidates.filter(id__in=ids)
+    return _allowed_tables(_tables_for_access_check(candidates), user_access_control, required_level)
+
+
+def table_level_descriptions(team_id: int, table_ids: Collection[UUID]) -> dict[UUID, contracts.TableLevelDescription]:
+    """The text that `TableDescriptions` resolves for each table: the annotation, then the source schema."""
+    descriptions: dict[UUID, contracts.TableLevelDescription] = {}
+    for table_id, text in (
+        _ExternalDataSchema.objects.filter(team_id=team_id, table_id__in=table_ids, deleted=False)
+        .exclude(description__isnull=True)
+        .exclude(description="")
+        .order_by("updated_at")
+        .values_list("table_id", "description")
+    ):
+        descriptions[table_id] = contracts.TableLevelDescription(text=text or "", source=None)
+    for table_id, text, source in (
+        _WarehouseColumnAnnotation.objects.for_team(team_id)
+        .filter(table_id__in=table_ids, column_name="")
+        .values_list("table_id", "description", "description_source")
+    ):
+        descriptions[table_id] = contracts.TableLevelDescription(
+            text=text, source=WarehouseColumnAnnotationDescriptionSource(source)
+        )
+    return descriptions
+
+
+def live_table_exists(team_id: int, table_id: UUID) -> bool:
+    return _DataWarehouseTable.raw_objects.queryable().filter(team_id=team_id, id=table_id).exists()
+
+
+def write_table_level_description(team_id: int, table_id: UUID, description: str) -> None:
+    """Store a user edit, protected from enrichment. An empty description deletes the row."""
+    annotations = _WarehouseColumnAnnotation.objects.for_team(team_id)
+    if not description:
+        annotations.filter(table_id=table_id, column_name="").delete()
+        return
+    table = _DataWarehouseTable.raw_objects.queryable().get(team_id=team_id, id=table_id)
+    user_edited = _WarehouseColumnAnnotation.DescriptionSource.USER_EDITED
+    annotation, created = annotations.get_or_create(
+        table=table,
+        column_name="",
+        defaults={
+            "team_id": team_id,
+            "description": description,
+            "description_source": user_edited,
+            "is_user_edited": True,
+        },
+    )
+    if not created:
+        annotation.description = description
+        annotation.description_source = user_edited
+        annotation.is_user_edited = True
+        annotation.save(update_fields=["description", "description_source", "is_user_edited", "updated_at"])
+
+
+def pending_source_ids_for_tables(team_id: int, table_ids: Collection[UUID] | None = None) -> dict[UUID, UUID]:
+    """Map each self-managed table to the managed source that will import it on its first sync.
+
+    A table is pending when a live, still unlinked schema of a live source in the same team pins it,
+    and the table has no source yet and still reads the files the schema was pinned to. That matches
+    the conditions under which the first sync adopts the table rather than creating a new one.
+    `table_ids` of None checks every table in the team.
+    """
+    if table_ids is not None and not table_ids:
+        return {}
+    pinned = (
+        _ExternalDataSchema.objects.filter(team_id=team_id, source__team_id=team_id)
+        .exclude(deleted=True)
+        .exclude(source__deleted=True)
+        .filter(table__isnull=True)
+        .filter(sync_type_config__schema_metadata__has_key=SCHEMA_SELF_MANAGED_TABLE_METADATA_KEY)
+        .order_by("created_at", "id")
+    )
+    if table_ids is not None:
+        pinned = pinned.filter(
+            sync_type_config__schema_metadata__self_managed_table__table_id__in=[str(i) for i in table_ids]
+        )
+    by_table: dict[UUID, list[tuple[UUID, str, str]]] = {}
+    for schema in pinned:
+        ref = self_managed_table_ref(schema)
+        if ref is None or ref.abandon_reason is not None or not UUIDT.is_valid_uuid(ref.table_id):
+            continue
+        by_table.setdefault(UUID(ref.table_id), []).append((schema.source_id, ref.url_pattern, ref.format))
+    if not by_table:
+        return {}
+    unsourced = _DataWarehouseTable.raw_objects.filter(
+        team_id=team_id, id__in=list(by_table), external_data_source__isnull=True
+    ).values_list("id", "url_pattern", "format")
+    found: dict[UUID, UUID] = {}
+    for table_id, url_pattern, table_format in unsourced:
+        # A table edited since the migration reads other files, so its sync creates a new table instead.
+        source_id = next(
+            (
+                sid
+                for sid, ref_url, ref_format in by_table[table_id]
+                if (ref_url, ref_format) == (url_pattern, table_format)
+            ),
+            None,
+        )
+        if source_id is not None:
+            found[table_id] = source_id
+    return found
+
+
+def tables_awaiting_first_sync(team_id: int) -> list[contracts.TableAwaitingFirstSync]:
+    """Every table a live, syncing schema of this team will create, but has not created yet. One query.
+
+    The names are built the way the first sync builds them, so they match what a query writes for
+    the table once it exists. Direct-access sources are skipped, because they never create tables.
+    """
+    from posthog.hogql.database.database import (  # noqa: PLC0415 -- keeps HogQL off this module's import path
+        get_data_warehouse_table_name,
+    )
+
+    from products.warehouse_sources.backend.temporal.data_imports.pipelines.helpers import (  # noqa: PLC0415 -- keeps the import pipeline off this module's import path
+        build_table_name,
+        resolve_table_and_folder_names,
+    )
+
+    schemas = (
+        _ExternalDataSchema.objects.filter(
+            team_id=team_id,
+            source__team_id=team_id,
+            source__access_method=_ExternalDataSource.AccessMethod.WAREHOUSE,
+            table__isnull=True,
+            should_sync=True,
+            initial_sync_complete=False,
+        )
+        .exclude(deleted=True)
+        .exclude(source__deleted=True)
+        .select_related("source")
+        .only(
+            "name",
+            "status",
+            "s3_folder_name",
+            "sync_type_config",
+            "source__id",
+            "source__source_type",
+            "source__prefix",
+            "source__access_method",
+        )
+    )
+    pending: list[contracts.TableAwaitingFirstSync] = []
+    for schema in schemas:
+        storage_name = resolve_table_and_folder_names(schema.name, schema.resolved_s3_folder_name).table_storage_name
+        row_name = build_table_name(schema.source, storage_name)
+        pending.append(
+            contracts.TableAwaitingFirstSync(
+                names=contracts.TableNames(
+                    row_name=row_name,
+                    queryable_key=get_data_warehouse_table_name(schema.source, row_name),
+                ),
+                first_sync_failed=schema.status == _ExternalDataSchema.Status.FAILED,
+            )
+        )
+    return pending
+
+
+def denied_table_ids(team_id: int, user_access_control: "UserAccessControl") -> frozenset[UUID]:
+    """Every table this caller may not view.
+
+    Unlike :func:`allowed_table_ids`, this covers soft-deleted tables and tables of a soft-deleted
+    source, for surfaces that list those rows.
+    """
+    if user_access_control.is_organization_admin:
+        return frozenset()
+    candidates = _DataWarehouseTable.raw_objects.filter(team_id=team_id)
+    if user_access_control.has_resource_access("warehouse_table") and user_access_control.has_resource_access(
+        "external_data_source"
+    ):
+        # With access to both resources, only a rule on a table or on its source can deny the table,
+        # so the tables those rules name are the only candidates.
+        blocked = user_access_control.blocked_resource_ids_by_scope
+        # A rule's resource_id is free text, and one malformed id must not break the id__in lookup.
+        table_ids = [UUID(i) for i in blocked.get("warehouse_table", ()) if UUIDT.is_valid_uuid(i)]
+        source_ids = [UUID(i) for i in blocked.get("external_data_source", ()) if UUIDT.is_valid_uuid(i)]
+        if not table_ids and not source_ids:
+            return frozenset()
+        candidates = candidates.filter(Q(id__in=table_ids) | Q(external_data_source_id__in=source_ids))
+    tables = _tables_for_access_check(candidates)
+    allowed = _allowed_tables(tables, user_access_control, "viewer")
+    return frozenset(table.id for table in tables if table.id not in allowed)
+
+
+def _tables_for_access_check(candidates: QuerySet[_DataWarehouseTable]) -> list[_DataWarehouseTable]:
+    return list(
+        candidates.select_related("external_data_source").only(
+            "id", "created_by_id", "external_data_source_id", "external_data_source__id"
+        )
+    )
+
+
+def _allowed_tables(
+    tables: list[_DataWarehouseTable],
+    user_access_control: "UserAccessControl",
+    required_level: "AccessControlLevel",
+) -> frozenset[UUID]:
+    """The ids among ``tables`` this caller may reach. A table resolves through its source."""
+    sources = {
+        table.external_data_source_id: table.external_data_source
+        for table in tables
+        if table.external_data_source is not None
+    }
+    user_access_control.preload_object_access_controls([*tables, *sources.values()])
+    return frozenset(
+        table.id for table in tables if user_access_control.check_access_level_for_object(table, required_level)
+    )
+
+
+def all_queryable_tables(team_id: int) -> list[contracts.DataWarehouseTable]:
+    """Every table in this team that is still queryable, with its recorded columns. One query."""
+    rows = _DataWarehouseTable.raw_objects.queryable().filter(team_id=team_id)
+    return [_to_table(table) for table in rows]
+
+
+def all_queryable_table_columns(team_id: int, table_ids: Collection[UUID] | None = None) -> dict[UUID, dict[str, str]]:
+    """Each queryable table's columns, by id, under the names HogQL exposes and with their ClickHouse types.
+
+    Not the raw column store: a curated source exposes some raw columns under another name
+    (Stripe's ``customer`` answers to ``customer_id``) and the internal sync columns under none at
+    all, so a caller reading the store directly hands out names a query cannot resolve.
+
+    ``table_ids`` narrows the tables loaded; ``None`` asks about every one, an empty collection
+    about none. One query.
+    """
+    if table_ids is not None and not table_ids:
+        return {}
+    rows = (
+        _DataWarehouseTable.raw_objects.queryable()
+        .filter(team_id=team_id)
+        .select_related("external_data_source")
+        .only(
+            "id",
+            "name",
+            "columns",
+            "options",
+            "external_data_source_id",
+            "external_data_source__id",
+            "external_data_source__prefix",
+        )
+    )
+    if table_ids is not None:
+        rows = rows.filter(id__in=list(table_ids))
+    return {table.id: _hogql_visible_columns(table) for table in rows}
+
+
+def _hogql_visible_columns(table: _DataWarehouseTable) -> dict[str, str]:
+    from products.warehouse_sources.backend.models.external_table_definitions import (  # noqa: PLC0415 -- keeps the HogQL ast import off this module's import path
+        get_hogql_column_name_mapping,
+    )
+
+    # The same raw -> visible mapping DataWarehouseTable.get_user_facing_columns applies, keeping
+    # the stored type rather than the cleaned one so a consumer still reads any Nullable() wrapper.
+    hogql_by_raw = get_hogql_column_name_mapping(table.table_name_without_prefix())
+    hidden = table.hidden_columns()
+    return {
+        hogql_by_raw.get(name, name): type_
+        for name, entry in (table.columns or {}).items()
+        if name not in hidden and (type_ := _clickhouse_column_type(entry)) is not None
+    }
+
+
+def _clickhouse_column_type(entry: object) -> str | None:
+    # A table records either a bare type string (older rows) or a dict keyed "clickhouse".
+    if isinstance(entry, dict):
+        entry = entry.get("clickhouse")
+    return entry if isinstance(entry, str) else None
+
+
+def list_tables_for_source(source_id: UUID, team_id: int) -> list[contracts.DataWarehouseTable]:
+    qs = _DataWarehouseTable.objects.filter(team_id=team_id, external_data_source_id=source_id).exclude(deleted=True)
+    return [_to_table(t) for t in qs]
+
+
+def soft_delete_tables(team_id: int, names: Collection[str]) -> int:
+    """Soft-delete the team's tables with these names and return how many were deleted.
+
+    Goes through ``DataWarehouseTable.soft_delete`` so the joins that reference a table
+    are retired with it, instead of leaving a dangling join behind a hidden table.
+    Already-deleted tables are skipped, so calling this twice is safe.
+    """
+    tables = _DataWarehouseTable.objects.filter(team_id=team_id, name__in=names).exclude(deleted=True)
+    deleted = 0
+    for table in tables:
+        table.soft_delete()
+        deleted += 1
+    return deleted
+
+
+def record_table_row_count(team_id: int, table_id: UUID, row_count: int) -> None:
+    """Set a table's row count, unless the table was deleted in the meantime."""
+    _DataWarehouseTable.objects.filter(team_id=team_id, id=table_id).exclude(deleted=True).update(
+        row_count=row_count, updated_at=timezone.now()
+    )
+
+
+def discard_backing_table(team_id: int, table_id: UUID) -> None:
+    """Soft-delete a view's backing table but keep the view's joins, which match the table's name."""
+    table = _DataWarehouseTable.objects.filter(team_id=team_id, id=table_id).exclude(deleted=True).first()
+    if table is not None:
+        table.soft_delete(delete_joins=False)
+
+
+MAX_JOBS_PER_SOURCE = 100
+
+
+def list_jobs_for_source(
+    source_id: UUID, team_id: int, limit: int = MAX_JOBS_PER_SOURCE
+) -> list[contracts.ExternalDataJob]:
+    """The source's newest jobs, most recent first, at most `MAX_JOBS_PER_SOURCE` of them.
+
+    The cap is not optional in effect: a busy source runs millions of jobs, so an unbounded
+    read here would scan and sort that whole history to serve one caller.
+    """
+    qs = (
+        _ExternalDataJob.objects.select_related("schema", "pipeline")
+        .filter(team_id=team_id, pipeline_id=source_id)
+        .order_by("-created_at")[: min(max(limit, 1), MAX_JOBS_PER_SOURCE)]
+    )
+    return [_to_job(j) for j in qs]
+
+
+def column_sensitivity(column_name: str, data_type: str | None) -> str | None:
+    """The kind of personal or secret data a column's name and type suggest, such as `email`, or None."""
+    sensitivity = classify_column_sensitivity(column_name, data_type)
+    return sensitivity.value if sensitivity else None
+
+
+def column_sensitivity_enabled(team_id: int) -> bool:
+    """Whether the team sees sensitivity tags. The same flag gates the column picker's suggestions."""
+    # Inline: keeps the Temporal helpers off this module's import path.
+    from products.warehouse_sources.backend.temporal.data_imports.schema_flags import (  # noqa: PLC0415
+        is_team_flag_enabled,
+    )
+
+    return is_team_flag_enabled(team_id, "warehouse-column-sensitivity")
+
+
+def import_started_before(
+    team_id: int, table_names: Collection[str], finished_by: datetime
+) -> dict[str, datetime | None]:
+    """Start time of the newest import that finished by `finished_by`, per synced table name. None when there is none.
+
+    Ordered on `created_at` so each probe walks `idx_extdatajob_latest_run` and stops at the first match.
+    """
+    consumed = (
+        _ExternalDataJob.objects.filter(
+            team_id=team_id,
+            pipeline_id=OuterRef("source_id"),
+            schema_id=OuterRef("pk"),
+            status=_ExternalDataJob.Status.COMPLETED,
+            finished_at__lte=finished_by,
+        )
+        .order_by("-created_at")
+        .values("created_at")[:1]
+    )
+    schemas = _ExternalDataSchema.objects.filter(
+        team_id=team_id, table__name__in=table_names, deleted=False, should_sync=True
+    ).annotate(consumed_started_at=Subquery(consumed))
+    return dict(schemas.values_list("table__name", "consumed_started_at"))
+
+
+def list_column_statistics(team_id: int) -> list[contracts.ColumnStatistics]:
+    """Every column profile for a team, for describing warehouse tables in a query schema."""
+    qs = _WarehouseColumnStatistics.objects.for_team(team_id).values_list(
+        "table_id", "column_name", "null_fraction", "min_value", "max_value"
+    )
+    return [
+        contracts.ColumnStatistics(
+            table_id=table_id,
+            column_name=column_name,
+            null_fraction=null_fraction,
+            min_value=min_value,
+            max_value=max_value,
+        )
+        for table_id, column_name, null_fraction, min_value, max_value in qs
+    ]
+
+
+def _history_table_ref(
+    history_table: _DataWarehouseTable, user_access_control: "UserAccessControl"
+) -> contracts.HistoryTableRef:
+    # Imported here to keep HogQL off the `django.setup()` import path.
+    from posthog.hogql.database.database import get_data_warehouse_table_name
+
+    return contracts.HistoryTableRef(
+        id=history_table.id,
+        name=get_data_warehouse_table_name(history_table.external_data_source, history_table.name),
+        user_can_manage_access=user_access_control.check_can_modify_access_levels_for_object(history_table),
+    )
+
+
+def _live_table(team_id: int, table_id: UUID) -> _DataWarehouseTable | None:
+    return _DataWarehouseTable.objects.filter(team_id=team_id, id=table_id, deleted=False).first()
+
+
+def _registered_history_table(table: _DataWarehouseTable | None) -> _DataWarehouseTable | None:
+    # Imported here to keep the history-table modules off the `django.setup()` import path.
+    from products.warehouse_sources.backend.temporal.data_imports.history_access_rules import registered_history_table
+
+    return registered_history_table(table) if table is not None else None
+
+
+def registered_history_table_for(
+    *, team_id: int, table_id: UUID, user_access_control: "UserAccessControl"
+) -> contracts.HistoryTableRef | None:
+    """The table's registered history table, or None when it has none or the caller can't view it."""
+    history_table = _registered_history_table(_live_table(team_id, table_id))
+    if history_table is None or not user_access_control.check_access_level_for_object(
+        history_table, required_level="viewer"
+    ):
+        return None
+    return _history_table_ref(history_table, user_access_control)
+
+
+def copy_access_rules_to_history_table(
+    *, team_id: int, table_id: UUID, user_id: int, user_access_control: "UserAccessControl"
+) -> contracts.HistoryTableRef:
+    """Replace the access rules of the table's history table with the table's own rules.
+
+    Raises `NoHistoryTableError` when the table has none, `HistoryAccessRulesNotAllowedError` when the user
+    can't manage access to both tables, and the access control facade's `InvalidObjectAccessControlError`
+    at the cap on objects with rules.
+    """
+    from posthog.models import User
+
+    from products.warehouse_sources.backend.temporal.data_imports.history_access_rules import copy_access_rules_now
+
+    table = _live_table(team_id, table_id)
+    history_table = _registered_history_table(table)
+    if table is None or history_table is None:
+        raise contracts.NoHistoryTableError("This table has no history table.")
+    copy_access_rules_now(User.objects.get(id=user_id), table, history_table)
+    return _history_table_ref(history_table, user_access_control)

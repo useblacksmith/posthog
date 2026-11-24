@@ -1,0 +1,482 @@
+import React, { useLayoutEffect, useMemo, useState } from 'react'
+
+import {
+    AxisLabels,
+    computeVisibleValueTicks,
+    computeVisibleXLabels,
+    computeVisibleYTicks,
+} from '../overlays/AxisLabels'
+import { AxisTitles } from '../overlays/AxisTitles'
+import { DefaultTooltip } from '../overlays/DefaultTooltip'
+import { Tooltip } from '../overlays/Tooltip'
+import { normalizeAxisLabel } from '../utils/axis-labels'
+import {
+    composeDrawHoverWithCrosshair,
+    composeDrawHoverWithSelection,
+    drawTickMarks,
+    resolveAxisLineColor,
+    type TickMarkCoords,
+} from './canvas-renderer'
+import { ChartHoverContext, ChartLayoutContext } from './chart-context'
+import type { ChartHoverContextValue, ChartLayoutContextValue } from './chart-context'
+import { ChartShell, countVisibleSeries, useCanvasBounds, useColoredSeries } from './chart-shell'
+import { useChartCanvas } from './hooks/useChartCanvas'
+import { useChartDraw } from './hooks/useChartDraw'
+import { useChartInteraction } from './hooks/useChartInteraction'
+import { useChartMargins } from './hooks/useChartMargins'
+import { useChartScales } from './hooks/useChartScales'
+import { useStableResolveValue } from './hooks/useStableResolveValue'
+import { useYAxisMaps } from './hooks/useYAxisMaps'
+import { useHoverSync } from './hover-sync'
+import { useResolvedChartTheme } from './theme'
+import type {
+    AreaSelectData,
+    ChartConfig,
+    ChartDrawArgs,
+    ChartScales,
+    ChartTheme,
+    CreateScalesFn,
+    DateRangeZoomData,
+    DrawHoverResult,
+    PointClickData,
+    ResolveValueFn,
+    Series,
+    TooltipContext,
+} from './types'
+
+const DEFAULT_AXIS_COLOR = 'rgba(0, 0, 0, 0.5)'
+const DEFAULT_HOVER_ANIMATION_MS = 150
+// A synced chart draws only the crosshair, with no point highlights.
+const DRAW_NOTHING = (): boolean => true
+// Horizontal charts let category labels use this share of the chart width when it beats the fixed cap.
+const HORIZONTAL_CATEGORY_LABEL_WIDTH_RATIO = 0.3
+
+function resolveHoverAnimationMs(animateHover: boolean | number | undefined): number {
+    if (animateHover === true) {
+        return DEFAULT_HOVER_ANIMATION_MS
+    }
+    if (typeof animateHover === 'number') {
+        return animateHover
+    }
+    return 0
+}
+
+export interface ChartProps<Meta = unknown> {
+    series: Series<Meta>[]
+    labels: string[]
+    config?: ChartConfig
+    /** Defaults to the nearest `ChartThemeProvider`, then the quill CSS vars. */
+    theme?: ChartTheme
+    createScales: CreateScalesFn
+    /** Static layer — grid, lines, areas, points. Redrawn only when chart inputs change. */
+    drawStatic: (args: ChartDrawArgs) => void
+    /** Hover overlay — highlight rings only. Return `false` if nothing was drawn (the
+     *  hover-fade timer pauses while invisible). */
+    drawHover: (args: ChartDrawArgs) => DrawHoverResult
+    tooltip?: (ctx: TooltipContext<Meta>) => React.ReactNode
+    onPointClick?: (data: PointClickData<Meta>) => void
+    /** Fires on a right click with the series nearest the cursor. It never pins or unpins the
+     *  tooltip. The browser menu still opens unless the host calls `preventDefault()` on the
+     *  `contextmenu` event. `isPointClickable` limits it like `onPointClick`. */
+    onPointContextMenu?: (data: PointClickData<Meta>) => void
+    /** Limits `onPointClick` and the pointer cursor to the points it returns true for. */
+    isPointClickable?: (dataIndex: number) => boolean
+    /** Enables x-axis drag-to-zoom. Fired with the label range the user dragged across.
+     *  x-axis only — has no effect on charts with a vertical (`interactionAxis: 'y'`) interaction. */
+    onDateRangeZoom?: (data: DateRangeZoomData) => void
+    /** Enables a 2D brush: the drag tracks both axes, the selection rect clamps to the dragged
+     *  vertical range, and the completed gesture reports the x label range plus the y pixel
+     *  span, with the committed `scales` so chart-type adapters can map pixels onto their own
+     *  bands. Takes precedence over `onDateRangeZoom`. Chart-type adapters provide this and
+     *  expose a domain-shaped callback (e.g. Heatmap's `onBrush`); consumers do not. */
+    onAreaSelect?: (data: AreaSelectData, scales: ChartScales) => void
+    className?: string
+    dataAttr?: string
+    children?: React.ReactNode
+    /** Resolves the y-value to *display* for a series at a given index. Defaults to
+     *  series.data[index]. Identity is read live for tooltip values, but the pinned-tooltip
+     *  rebuild only refires when `series`, `labels`, or `scales` change. Callers that
+     *  derive values from data not reflected in those (e.g. an external "%" toggle)
+     *  should ensure that toggle also updates `series` or the chart's scales — otherwise
+     *  a held pin will keep showing values from the previous resolver. */
+    resolveValue?: ResolveValueFn
+    /** Value used to *anchor* the tooltip and value-label overlays per series. Defaults to
+     *  `resolveValue`. Stacked charts pass the stacked-top resolver here so overlays land at the
+     *  visual top of each segment, while each tooltip row still shows that series's own value
+     *  via `resolveValue`. */
+    resolvePositionValue?: ResolveValueFn
+    /** Resolves the stacked bottom value per series — used to compute segment midpoints for
+     *  tooltip closest-series detection. Only bar charts provide this. */
+    resolveBottomValue?: ResolveValueFn
+    /** Required for horizontal orientation — maps labels to the coordinate on the categorical
+     *  axis (y in horizontal mode). Should be referentially stable; non-stable identities
+     *  invalidate the interaction memo on every render. */
+    labelToCoord?: (label: string) => number | undefined
+    /** Override the series fed into value-axis tick sizing (`useChartMargins`). Use when the
+     *  visible series's `data[i]` doesn't span the y-domain — e.g. BoxPlot passes synthetic
+     *  whisker min/max samples so the y-tick column fits the real value range, not just the
+     *  medians it draws on `series.data`. */
+    valueRangeSeries?: Series[]
+    /** Chart-type seam: rewrite the click payload (e.g. resolve the stacked segment under the
+     *  cursor) before it reaches `onPointClick`, using the committed `scales` from this render.
+     *  Chart-type adapters provide this; consumers do not. */
+    wrapClickData?: (data: PointClickData<Meta>, scales: ChartScales) => PointClickData<Meta>
+    /** Chart-type seam: given the nearest band index and cursor, return the effective hover index — or
+     *  -1 to make the position a dead zone (no tooltip, pointer cursor, highlight, or click). Chart-type
+     *  adapters provide this; BarChart uses it for a capped track's blank volume gap. */
+    resolveHoverIndex?: (index: number, cursor: { x: number; y: number }, scales: ChartScales) => number
+}
+
+export function Chart<Meta = unknown>({
+    series,
+    labels,
+    config,
+    theme: themeProp,
+    createScales: createScalesFn,
+    drawStatic,
+    drawHover,
+    tooltip: renderTooltipProp,
+    onPointClick,
+    onPointContextMenu,
+    isPointClickable,
+    onDateRangeZoom,
+    onAreaSelect,
+    className,
+    dataAttr,
+    children,
+    resolveValue,
+    resolvePositionValue,
+    resolveBottomValue,
+    labelToCoord,
+    valueRangeSeries,
+    wrapClickData,
+    resolveHoverIndex,
+}: ChartProps<Meta>): React.ReactElement {
+    const theme = useResolvedChartTheme(themeProp)
+    const {
+        xTickFormatter,
+        xTickLabelRotation = 0,
+        yTickFormatter,
+        hideXAxis = false,
+        hideYAxis = false,
+        xAxisLabel,
+        yAxisLabel,
+        tooltip: tooltipConfig,
+        showCrosshair = false,
+        syncHover = false,
+        showTickMarks = false,
+        axisOrientation = 'vertical',
+        isPercent = false,
+        animateHover,
+        margins: marginsOverride,
+        maxCategoryLabelWidth: baseMaxCategoryLabelWidth,
+        yAxes,
+    } = config ?? {}
+
+    // Width from the last layout. Margins feed the canvas size, so the cap can only react to it one render later.
+    const [chartWidth, setChartWidth] = useState(0)
+    const maxCategoryLabelWidth =
+        baseMaxCategoryLabelWidth && axisOrientation === 'horizontal'
+            ? Math.max(baseMaxCategoryLabelWidth, Math.floor(chartWidth * HORIZONTAL_CATEGORY_LABEL_WIDTH_RATIO))
+            : baseMaxCategoryLabelWidth
+
+    const {
+        formatters: yAxisFormatters,
+        positions: yAxisPositions,
+        titles: yAxisTitles,
+        hidden: yAxisHidden,
+    } = useYAxisMaps(yAxes, yAxisLabel)
+    const hoverAnimationMs = resolveHoverAnimationMs(animateHover)
+    const interactionAxis: 'x' | 'y' = axisOrientation === 'horizontal' ? 'y' : 'x'
+    const {
+        enabled: showTooltip = true,
+        pinnable: pinnableTooltip = false,
+        resolveClickToNearestSeries = false,
+        placement: tooltipPlacement = 'follow-data',
+        ...defaultTooltipOptions
+    } = tooltipConfig ?? {}
+
+    // No render prop: render DefaultTooltip with config.tooltip's content options.
+    const renderTooltip =
+        renderTooltipProp ?? ((ctx: TooltipContext<Meta>) => <DefaultTooltip {...ctx} {...defaultTooltipOptions} />)
+
+    const margins = useChartMargins({
+        series,
+        labels,
+        hideXAxis,
+        hideYAxis,
+        xAxisLabel,
+        xTickFormatter,
+        xTickLabelRotation,
+        yTickFormatter,
+        axisOrientation,
+        isPercent,
+        override: marginsOverride,
+        valueRangeSeries,
+        maxCategoryLabelWidth,
+        yAxisFormatters,
+        yAxisPositions,
+        yAxisTitles,
+        yAxisHidden,
+    })
+
+    const {
+        canvasRef,
+        overlayCanvasRef,
+        wrapperRef,
+        dimensions: canvasDimensions,
+        ctx,
+        overlayCtx,
+    } = useChartCanvas({ margins })
+    const containerWidth = canvasDimensions?.width ?? 0
+    useLayoutEffect(() => setChartWidth(containerWidth), [containerWidth])
+
+    const coloredSeries = useColoredSeries<Meta>(series, theme)
+
+    // Computed once and shared with AxisLabels and AxisTitles via context so they can't drift.
+    const { dimensions, scales, yGutters, resolvedYFormatter } = useChartScales({
+        canvasDimensions,
+        series: coloredSeries,
+        labels,
+        createScales: createScalesFn,
+        showYGutters: !hideYAxis && axisOrientation !== 'horizontal',
+        yTickFormatter,
+        yAxisFormatters,
+        yAxisTitles,
+        yAxisHidden,
+        marginsOverride,
+    })
+
+    // Mirrors AxisLabels' visible-label computation (same pure helpers, same inputs) so every tick
+    // mark sits next to a rendered label. Drawn on canvas rather than as DOM overlays so ticks share
+    // the axis/grid stroke snapping and can't drift a pixel against those lines.
+    const tickMarkCoords = useMemo<TickMarkCoords | null>(() => {
+        if (!showTickMarks || !scales || !dimensions) {
+            return null
+        }
+        if (axisOrientation === 'horizontal') {
+            const labelToY = labelToCoord ?? scales.x
+            const ys = hideYAxis
+                ? []
+                : labels
+                      .filter((label, i) => !xTickFormatter || xTickFormatter(label, i) !== null)
+                      .map((label) => labelToY(label))
+                      .filter((y): y is number => y != null && isFinite(y))
+                      .map((y) => ({ y, side: 'left' as const, offset: 0 }))
+            const xs = hideXAxis
+                ? []
+                : computeVisibleValueTicks(scales.yTicks(), scales.y, resolvedYFormatter).map((t) => t.x)
+            return { xs, ys }
+        }
+        const xs = hideXAxis
+            ? []
+            : computeVisibleXLabels(labels, scales.x, xTickFormatter, maxCategoryLabelWidth, xTickLabelRotation).map(
+                  (l) => l.x
+              )
+        const ys = yGutters.flatMap((gutter) =>
+            computeVisibleYTicks(gutter.ticks, gutter.scale)
+                .map((tick) => gutter.scale(tick))
+                .filter((y) => isFinite(y))
+                .map((y) => ({ y, side: gutter.side, offset: gutter.offset }))
+        )
+        return { xs, ys }
+    }, [
+        showTickMarks,
+        scales,
+        dimensions,
+        axisOrientation,
+        labels,
+        xTickFormatter,
+        xTickLabelRotation,
+        maxCategoryLabelWidth,
+        yGutters,
+        hideXAxis,
+        hideYAxis,
+        resolvedYFormatter,
+        labelToCoord,
+    ])
+
+    const drawStaticWithTicks = useMemo(() => {
+        if (!tickMarkCoords) {
+            return drawStatic
+        }
+        // Shared with the chart types' drawAxes calls, so ticks match their axis line.
+        const tickColor = resolveAxisLineColor(theme)
+        return (args: ChartDrawArgs): void => {
+            drawStatic(args)
+            drawTickMarks(args.ctx, args.dimensions, tickMarkCoords, tickColor)
+        }
+    }, [drawStatic, tickMarkCoords, theme])
+
+    const { hoverIndex, hoverPosition, tooltipCtx, dragRect, handlers } = useChartInteraction<Meta>({
+        scales,
+        dimensions,
+        labels,
+        series: coloredSeries,
+        canvasRef,
+        wrapperRef,
+        showTooltip,
+        pinnable: pinnableTooltip,
+        resolveClickToNearestSeries,
+        onPointClick,
+        onPointContextMenu,
+        isPointClickable,
+        onDateRangeZoom,
+        onAreaSelect,
+        resolveValue,
+        resolvePositionValue,
+        resolveBottomValue,
+        interactionAxis,
+        labelToCoord,
+        wrapClickData,
+        resolveHoverIndex,
+    })
+
+    const composedDrawHover = useMemo(() => {
+        const withCrosshair = composeDrawHoverWithCrosshair(drawHover, {
+            crosshairColor: theme.crosshairColor,
+            crosshairDash: theme.crosshairDashPattern,
+            showCrosshair,
+            axisOrientation,
+            labelToCoord,
+        })
+        return composeDrawHoverWithSelection(withCrosshair)
+    }, [showCrosshair, theme.crosshairColor, theme.crosshairDashPattern, axisOrientation, labelToCoord, drawHover])
+
+    // Inside a <ChartHoverSync>, another chart's hover draws a bare crosshair here while this chart
+    // isn't hovered itself. Its tooltip and point highlights stay on the hovered chart.
+    const syncedIndex = useHoverSync(labels, hoverIndex >= 0 ? (labels[hoverIndex] ?? null) : null, syncHover)
+    const showSyncedCrosshair = hoverIndex < 0 && syncedIndex >= 0
+    const syncedCrosshairColor = theme.crosshairColor ?? resolveAxisLineColor(theme) ?? DEFAULT_AXIS_COLOR
+    const drawSyncedCrosshair = useMemo(
+        () =>
+            composeDrawHoverWithCrosshair(DRAW_NOTHING, {
+                crosshairColor: syncedCrosshairColor,
+                crosshairDash: theme.crosshairDashPattern,
+                showCrosshair: true,
+                axisOrientation,
+                labelToCoord,
+            }),
+        [syncedCrosshairColor, theme.crosshairDashPattern, axisOrientation, labelToCoord]
+    )
+
+    useChartDraw({
+        ctx,
+        overlayCtx,
+        dimensions,
+        scales,
+        series: coloredSeries,
+        labels,
+        hoverIndex: showSyncedCrosshair ? syncedIndex : hoverIndex,
+        hoverPosition,
+        theme,
+        dragRect,
+        drawStatic: drawStaticWithTicks,
+        drawHover: showSyncedCrosshair ? drawSyncedCrosshair : composedDrawHover,
+        hoverAnimationMs,
+    })
+
+    const visibleSeriesCount = useMemo(() => countVisibleSeries(coloredSeries), [coloredSeries])
+    const ariaParts = [`Chart with ${visibleSeriesCount} data series`]
+    const cleanXAxisLabel = normalizeAxisLabel(xAxisLabel)
+    const cleanYAxisLabel = normalizeAxisLabel(yAxisLabel)
+    if (!hideXAxis && cleanXAxisLabel) {
+        ariaParts.push(`X-axis: ${cleanXAxisLabel}`)
+    }
+    if (!hideYAxis && cleanYAxisLabel) {
+        ariaParts.push(`Y-axis: ${cleanYAxisLabel}`)
+    }
+    const ariaLabel = ariaParts.join('. ')
+
+    const canvasBounds = useCanvasBounds(canvasRef)
+
+    // Overlays (value labels) anchor at the stacked top, so expose the position resolver —
+    // falling back to the value resolver when the chart doesn't stack.
+    const stablePositionValue = useStableResolveValue(resolvePositionValue ?? resolveValue)
+
+    const axisColor = theme.axisColor ?? DEFAULT_AXIS_COLOR
+
+    const layoutValue = useMemo<ChartLayoutContextValue | null>(() => {
+        if (!scales || !dimensions) {
+            return null
+        }
+        return {
+            scales,
+            dimensions,
+            labels,
+            series: coloredSeries,
+            theme,
+            resolvePositionValue: stablePositionValue,
+            canvasBounds,
+            axis: { orientation: axisOrientation, xTickFormatter, isPercent },
+            yGutters,
+        }
+    }, [
+        scales,
+        dimensions,
+        labels,
+        coloredSeries,
+        theme,
+        stablePositionValue,
+        canvasBounds,
+        axisOrientation,
+        xTickFormatter,
+        isPercent,
+        yGutters,
+    ])
+
+    const hoverValue = useMemo<ChartHoverContextValue>(() => ({ hoverIndex }), [hoverIndex])
+
+    return (
+        <ChartLayoutContext.Provider value={layoutValue}>
+            <ChartHoverContext.Provider value={hoverValue}>
+                <ChartShell
+                    wrapperRef={wrapperRef}
+                    canvasRef={canvasRef}
+                    overlayCanvasRef={overlayCanvasRef}
+                    className={className}
+                    dataAttr={dataAttr}
+                    pointer={
+                        hoverIndex >= 0 &&
+                        hoverIndex < labels.length &&
+                        !!onPointClick &&
+                        (isPointClickable?.(hoverIndex) ?? true)
+                    }
+                    crosshair={!!onDateRangeZoom || !!onAreaSelect}
+                    contextMenu={!!onPointContextMenu}
+                    ariaLabel={ariaLabel}
+                    labelCount={labels.length}
+                    syncedIndex={showSyncedCrosshair ? syncedIndex : undefined}
+                    handlers={handlers}
+                    showOverlay={!!(dimensions && scales)}
+                >
+                    <AxisLabels
+                        xTickFormatter={xTickFormatter}
+                        xTickLabelRotation={xTickLabelRotation}
+                        yTickFormatter={resolvedYFormatter}
+                        hideXAxis={hideXAxis}
+                        hideYAxis={hideYAxis}
+                        axisColor={axisColor}
+                        orientation={axisOrientation}
+                        labelToCoord={labelToCoord}
+                        maxCategoryLabelWidth={maxCategoryLabelWidth}
+                    />
+                    <AxisTitles
+                        xAxisLabel={xAxisLabel}
+                        yAxisLabel={yAxisLabel}
+                        hideXAxis={hideXAxis}
+                        hideYAxis={hideYAxis}
+                        orientation={axisOrientation}
+                        axisColor={axisColor}
+                    />
+
+                    {children}
+
+                    {tooltipCtx && showTooltip && (
+                        <Tooltip context={tooltipCtx} renderTooltip={renderTooltip} placement={tooltipPlacement} />
+                    )}
+                </ChartShell>
+            </ChartHoverContext.Provider>
+        </ChartLayoutContext.Provider>
+    )
+}

@@ -1,0 +1,65 @@
+import dagster
+
+from products.signals.backend.facade.dags import (
+    inbox_ranking_dataset,
+    inbox_ranking_feature_backfill,
+    inbox_ranking_mirror,
+    inbox_ranking_promote,
+    inbox_ranking_served,
+    inbox_ranking_training,
+    is_inbox_ranking_mirror_registered,
+    is_inbox_ranking_registered,
+)
+
+from . import loggers, resources
+
+# The inbox-ranking dataset reads US Postgres/ClickHouse plus the US dogfood project's label
+# events; EU has neither, so the definitions register on US (and non-cloud) only.
+if is_inbox_ranking_registered():
+    defs = dagster.Definitions(
+        assets=[
+            inbox_ranking_dataset.inbox_report_state,
+            inbox_ranking_dataset.inbox_report_embeddings,
+            inbox_ranking_dataset.inbox_signal_embeddings,
+            inbox_ranking_dataset.inbox_report_labels,
+            inbox_ranking_dataset.inbox_report_model_data,
+            inbox_ranking_dataset.inbox_report_title_embeddings,
+            inbox_ranking_dataset.inbox_report_reviewers,
+            inbox_ranking_dataset.inbox_user_report_interactions,
+            inbox_ranking_dataset.inbox_project_vectors,
+            inbox_ranking_dataset.inbox_user_vectors,
+            inbox_ranking_dataset.inbox_engagement_export,
+            inbox_ranking_dataset.inbox_activity_summary_vectors,
+            inbox_ranking_dataset.inbox_activity_summary_profile_vectors,
+            inbox_ranking_dataset.inbox_report_scored_facts,
+            inbox_ranking_feature_backfill.inbox_report_feature_backfill,
+            inbox_ranking_training.inbox_ranking_serving_manifest,
+            inbox_ranking_served.inbox_ranking_served_scores,
+            inbox_ranking_training.inbox_ranking_unseen_graded,
+        ],
+        jobs=[
+            inbox_ranking_dataset.inbox_ranking_dataset_job,
+            inbox_ranking_dataset.inbox_ranking_labels_refresh_job,
+            inbox_ranking_feature_backfill.inbox_ranking_feature_backfill_job,
+            inbox_ranking_training.inbox_ranking_training_job,
+            inbox_ranking_promote.inbox_ranking_promote_job,
+        ],
+        schedules=[
+            inbox_ranking_dataset.inbox_ranking_dataset_schedule,
+            inbox_ranking_training.inbox_ranking_training_schedule,
+        ],
+        sensors=[inbox_ranking_dataset.inbox_ranking_labels_refresh_sensor],
+        loggers=loggers,
+        resources=resources,
+    )
+# EU trains nothing, but it builds its own project vectors from its own report embeddings.
+elif is_inbox_ranking_mirror_registered():
+    defs = dagster.Definitions(
+        assets=[inbox_ranking_mirror.inbox_mirror_project_vectors],
+        jobs=[inbox_ranking_mirror.inbox_ranking_mirror_job],
+        schedules=[inbox_ranking_mirror.inbox_ranking_mirror_schedule],
+        loggers=loggers,
+        resources=resources,
+    )
+else:
+    defs = dagster.Definitions(loggers=loggers, resources=resources)

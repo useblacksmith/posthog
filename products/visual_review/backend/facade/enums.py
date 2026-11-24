@@ -1,0 +1,237 @@
+"""Exported enums and constants for visual_review."""
+
+from enum import StrEnum
+
+from posthog.enums import LabeledStrEnum
+
+
+class RunStatus(StrEnum):
+    """Status of a visual review run."""
+
+    PENDING = "pending"  # Waiting for artifacts to be uploaded
+    PROCESSING = "processing"  # Diff computation in progress
+    COMPLETED = "completed"  # All diffs computed, results ready
+    FAILED = "failed"  # Processing failed
+
+
+class RunType(StrEnum):
+    """Well-known run type constants. Not exhaustive — users can use any string."""
+
+    STORYBOOK = "storybook"
+    PLAYWRIGHT = "playwright"
+    CYPRESS = "cypress"
+    OTHER = "other"
+
+
+class SnapshotResult(StrEnum):
+    """Result of comparing a snapshot against baseline."""
+
+    UNCHANGED = "unchanged"  # Matches baseline
+    CHANGED = "changed"  # Differs from baseline
+    NEW = "new"  # No baseline exists
+    REMOVED = "removed"  # Baseline exists but snapshot missing
+
+
+class RunPurpose(StrEnum):
+    """Why this run was submitted."""
+
+    REVIEW = "review"  # Expects approval (human or auto) before merge
+    OBSERVE = "observe"  # Tracking only — not approvable
+
+
+class RunReviewFilter(StrEnum):
+    """Where a run stands in review, as the run lists filter it."""
+
+    NEEDS_REVIEW = "needs_review"  # Completed PR run with changes nobody approved yet
+    CLEAN = "clean"  # No changes, or approved
+    PROCESSING = "processing"  # Diffs still computing
+    STALE = "stale"  # Superseded by a newer run while its changes were unapproved
+
+
+class ReviewDecision(StrEnum):
+    """Run-level review outcome."""
+
+    PENDING = "pending"
+    HUMAN_APPROVED = "human_approved"
+    AUTO_APPROVED = "auto_approved"
+    AGENT_APPROVED = "agent_approved"
+    REJECTED = "rejected"  # Passive annotation — no system effect in MVP
+
+
+class ReviewState(StrEnum):
+    """
+    Human review state for a snapshot.
+
+    Separate from SnapshotResult which is the computed diff status.
+    ReviewState tracks the human decision and can change between runs.
+    """
+
+    PENDING = "pending"  # Not yet reviewed
+    APPROVED = "approved"  # Accepted the change — updates baseline
+    TOLERATED = "tolerated"  # Acknowledged as rendering noise — does not update baseline
+    REJECTED = "rejected"  # Explicitly rejected
+
+
+class ClassificationReason(StrEnum):
+    """Why a snapshot was classified as UNCHANGED."""
+
+    EXACT = "exact"  # Hash matches baseline
+    TOLERATED_HASH = "tolerated_hash"  # Matched a known tolerated alternate
+    BELOW_THRESHOLD = "below_threshold"  # Diffed this run, below pixel/SSIM threshold
+
+
+class ChangeKind(StrEnum):
+    """What kind of change a CHANGED snapshot represents.
+
+    Set when a snapshot's `result` is CHANGED. The classifier distinguishes a
+    pixel-level diff (lots of pixels differ) from a structural/perceptual
+    change caught by SSIM (few pixels but a measurable perceptual difference),
+    and from a layout change where rows moved. Empty for snapshots that
+    haven't been diffed yet (legacy data).
+
+    Size mismatch is *not* a kind here — a snapshot can have a different
+    viewport AND a content change. The flag lives in `diff_metadata`
+    instead so it composes with whichever kind the classifier picks.
+    """
+
+    PIXEL = "pixel"  # Pixel diff above threshold — a chunk of pixels visibly changed
+    STRUCTURAL = "structural"  # SSIM caught a perceptual change; pixel diff was below threshold
+    # Rows were inserted or deleted past the absorb cap, so the page moved
+    # vertically. The content in the rows that exist in both images is within
+    # both thresholds; what changed is where things sit.
+    LAYOUT = "layout"
+
+
+class ShiftBandKind(LabeledStrEnum):
+    """Whether a shift band marks rows the current image gained or lost.
+
+    The OpenAPI component name (ShiftBandKindEnum) derives from this class, so it
+    does not collide with the other `kind` fields across products. Each label
+    repeats its value, because the API documents these choices as plain values.
+    """
+
+    INSERTED = "inserted", "inserted"
+    DELETED = "deleted", "deleted"
+
+
+class FlakinessState(StrEnum):
+    """How unstable a snapshot's rendering is, and what to do about it.
+
+    Derived, not stored. Scored on how often default-branch runs in the window
+    rendered the snapshot differently from its baseline, and on how much of the
+    diff threshold the absorbed ones leave free. The ladder is ordered by
+    urgency, and each rung asks for a different fix.
+    """
+
+    BROKEN = "broken"  # Fails nearly every run: the baseline is wrong, not the story
+    UNSTABLE = "unstable"  # Fails some runs and not others: the classic flake
+    AT_RISK = "at_risk"  # Never fails, but its diff is already touching the threshold
+    CLEAN = "clean"  # No gate failure in the window, and any absorbed diff is far below the threshold
+
+
+class ActorType(StrEnum):
+    """Who performed an action — human user, AI agent, or automated system."""
+
+    HUMAN = "human"
+    AGENT = "agent"
+    AUTO = "auto"
+
+
+class QuarantineLiftState(LabeledStrEnum):
+    """Where a request to lift a quarantine once its pull request merges stands.
+
+    The OpenAPI component name (QuarantineLiftStateEnum) derives from this class, so the
+    `state` field does not collide with other products' enums. Each label repeats its value,
+    because the API documents these choices as plain values.
+    """
+
+    # Waits for the merge and for a default-branch run that renders the expected picture
+    PENDING = "pending", "pending"
+    APPLIED = "applied", "applied"
+    # Withdrawn by a reviewer, or the pull request closed without merging into the run's branch
+    CANCELLED = "cancelled", "cancelled"
+    # The quarantine ended some other way, or another request lifted it
+    SUPERSEDED = "superseded", "superseded"
+
+
+class AutoQuarantineMode(LabeledStrEnum):
+    """Whether a repo quarantines a proven flaky snapshot, and lifts a quarantine that went clean, without a person.
+
+    The OpenAPI component name (AutoQuarantineModeEnum) derives from this class, so the field does
+    not collide with other products' `mode` enums. Each label repeats its value, because the API
+    documents these choices as plain values.
+    """
+
+    OFF = "off", "off"
+    # Finds proofs and clean streaks and records them in logs and analytics, and changes nothing
+    PREVIEW = "preview", "preview"
+    ON = "on", "on"
+
+
+class BaselineMode(LabeledStrEnum):
+    """Which record of approved baselines decides a repo's runs.
+
+    Each label repeats its value, as the other labeled enums here do.
+    """
+
+    YAML = "yaml", "yaml"
+    SHADOW = "shadow", "shadow"
+    LEDGER = "ledger", "ledger"
+
+
+class RunGate(LabeledStrEnum):
+    """What turns a run's verdict into a merge gate. Set when the run is created and never changed."""
+
+    CI_JOB = "ci_job", "ci_job"
+    COMMIT_STATUS = "commit_status", "commit_status"
+
+
+class NoRunNeededOutcome(LabeledStrEnum):
+    """What a "no visual run needed" report did."""
+
+    POSTED = "posted", "posted"
+    RUN_EXISTS = "run_exists", "run_exists"
+    STATUS_GATE_OFF = "status_gate_off", "status_gate_off"
+
+
+class BaselineEntrySource(LabeledStrEnum):
+    """How an entry got into the baseline ledger."""
+
+    SEED = "seed", "seed"
+    MERGE = "merge", "merge"
+
+
+class BaselineApprovalState(LabeledStrEnum):
+    """Where an approved baseline change of one pull request stands."""
+
+    OPEN = "open", "open"
+    PROMOTED = "promoted", "promoted"
+    # The merge-queue run did not reproduce the approved hash
+    VOIDED = "voided", "voided"
+    # The ledger baseline moved under the approval before it landed
+    CONFLICTED = "conflicted", "conflicted"
+    SUPERSEDED = "superseded", "superseded"
+    ABANDONED = "abandoned", "abandoned"
+
+
+class BaselineEvidence(LabeledStrEnum):
+    """Whether a full observe run off the default branch rendered an approved hash."""
+
+    REPRODUCED = "reproduced", "reproduced"
+    NOT_REPRODUCED = "not_reproduced", "not_reproduced"
+
+
+class ToleratedReason(StrEnum):
+    """Why a hash was tolerated."""
+
+    AUTO_THRESHOLD = "auto_threshold"  # Below pixel/SSIM diff threshold
+    HUMAN = "human"  # Manually marked by a reviewer
+    AGENT = "agent"  # Tolerated by an AI agent
+
+
+# A toleration somebody decided on, as opposed to one the diff pipeline minted
+# for sub-threshold pixel jitter. Counting AUTO_THRESHOLD rows as decisions
+# inflates every "tolerated drift" number with rendering noise. Use this
+# wherever the question is "did a reviewer accept this drift", so a reviewer and
+# an agent are never counted differently.
+INTENTIONAL_TOLERATE_REASONS = (ToleratedReason.HUMAN, ToleratedReason.AGENT)

@@ -1,0 +1,357 @@
+import { closeHub, createHub } from '~/common/utils/db/hub'
+import { PostgresUse } from '~/common/utils/db/postgres'
+import { UUIDT } from '~/common/utils/utils'
+import { createTeam, createTestTeamFixture, getTeam } from '~/tests/helpers/sql'
+import { INVALID_TEAM_ID_KEYS } from '~/tests/helpers/team'
+import { Hub, Team } from '~/types'
+
+import { RecipientGetArgs, RecipientsManagerService } from './recipients-manager.service'
+
+describe('RecipientsManager', () => {
+    let hub: Hub
+    let manager: RecipientsManagerService
+    let team: Team
+    let team2: Team
+
+    beforeEach(async () => {
+        hub = await createHub()
+        manager = new RecipientsManagerService(hub.postgres)
+        const { organizationId, team: fixtureTeam } = await createTestTeamFixture(hub.postgres)
+        team = fixtureTeam
+        const team2Id = await createTeam(hub.postgres, organizationId)
+        team2 = (await getTeam(hub.postgres, team2Id))!
+    })
+
+    afterEach(async () => {
+        await closeHub(hub)
+    })
+
+    const createRecipient = async (teamId: number, identifier: string, preferences: Record<string, string> = {}) => {
+        const id = new UUIDT().toString()
+        await hub.postgres.query(
+            PostgresUse.COMMON_WRITE,
+            `INSERT INTO posthog_messagerecipientpreference (id, team_id, identifier, preferences, created_at, updated_at, deleted)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), false)`,
+            [id, teamId, identifier, JSON.stringify(preferences)],
+            'testInsertRecipient'
+        )
+        return id
+    }
+
+    describe('get', () => {
+        it('should return null when recipient does not exist', async () => {
+            const args: RecipientGetArgs = { teamId: team.id, identifier: 'nonexistent@example.com' }
+            const result = await manager.get(args)
+            expect(result).toBeNull()
+        })
+
+        it('should return recipient when it exists', async () => {
+            const preferences = { 'category-1': 'OPTED_IN', 'category-2': 'OPTED_OUT' }
+            const id = await createRecipient(team.id, 'user@example.com', preferences)
+
+            const args: RecipientGetArgs = { teamId: team.id, identifier: 'user@example.com' }
+            const result = await manager.get(args)
+
+            expect(result).toEqual({
+                id: id,
+                team_id: team.id,
+                identifier: 'user@example.com',
+                preferences: preferences,
+                created_at: expect.any(String),
+                updated_at: expect.any(String),
+            })
+        })
+
+        it('should handle invalid preference statuses by defaulting to NO_PREFERENCE', async () => {
+            const preferences = { 'category-1': 'INVALID_STATUS', 'category-2': 'OPTED_IN' }
+            await createRecipient(team.id, 'user@example.com', preferences)
+
+            const args: RecipientGetArgs = { teamId: team.id, identifier: 'user@example.com' }
+            const result = await manager.get(args)
+
+            expect(result?.preferences).toEqual({
+                'category-1': 'NO_PREFERENCE',
+                'category-2': 'OPTED_IN',
+            })
+        })
+
+        it('finds an email address stored in another case', async () => {
+            await createRecipient(team.id, 'User@Example.com', { $all: 'OPTED_OUT' })
+
+            const results = await manager.getMany([
+                { teamId: team.id, identifier: 'user@example.com', anyCase: true },
+                { teamId: team.id, identifier: 'USER@EXAMPLE.COM', anyCase: true },
+            ])
+
+            expect(results[`${team.id}:user@example.com`]?.preferences).toEqual({ $all: 'OPTED_OUT' })
+            expect(results[`${team.id}:USER@EXAMPLE.COM`]?.preferences).toEqual({ $all: 'OPTED_OUT' })
+        })
+
+        it('lets the spelling the send names win over another spelling of the address', async () => {
+            await createRecipient(team.id, 'user@example.com', { $all: 'OPTED_IN', 'category-1': 'OPTED_OUT' })
+            await createRecipient(team.id, 'User@Example.com', { $all: 'OPTED_OUT' })
+
+            const result = await manager.get({ teamId: team.id, identifier: 'user@example.com', anyCase: true })
+
+            expect(result?.identifier).toBe('user@example.com')
+            expect(result?.preferences).toEqual({ $all: 'OPTED_IN', 'category-1': 'OPTED_OUT' })
+        })
+
+        it('matches an identifier exactly unless the caller says it is an email address', async () => {
+            await createRecipient(team.id, 'User@Example.com', { $all: 'OPTED_OUT' })
+
+            expect(await manager.get({ teamId: team.id, identifier: 'user@example.com' })).toBeNull()
+            expect(await manager.get({ teamId: team.id, identifier: 'user@example.com', anyCase: true })).not.toBeNull()
+        })
+
+        it('reads many spellings of one address without slowing down', async () => {
+            // Every upper and lower case mix of 16 letters, 50,000 spellings of one address in all.
+            await hub.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `INSERT INTO posthog_messagerecipientpreference (id, team_id, identifier, preferences, created_at, updated_at, deleted)
+                 SELECT gen_random_uuid(), $1,
+                    (SELECT string_agg(CASE WHEN (g >> i) & 1 = 1 THEN 'A' ELSE 'a' END, '' ORDER BY i) FROM generate_series(0, 15) i)
+                        || '@example.com',
+                    '{"$all": "OPTED_OUT"}', NOW(), NOW(), false
+                 FROM generate_series(0, 49999) g`,
+                [team.id],
+                'testInsertSpellings'
+            )
+
+            const started = Date.now()
+            const result = await manager.get({
+                teamId: team.id,
+                identifier: 'aaaaaaaaaaaaaaaa@example.com',
+                anyCase: true,
+            })
+
+            expect(result?.preferences).toEqual({ $all: 'OPTED_OUT' })
+            expect(Date.now() - started).toBeLessThan(2000)
+        })
+
+        it('should filter out deleted recipients', async () => {
+            const id = await createRecipient(team.id, 'user@example.com', {})
+
+            await hub.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `UPDATE posthog_messagerecipientpreference SET deleted = true WHERE id = $1`,
+                [id],
+                'testMarkDeleted'
+            )
+
+            const args: RecipientGetArgs = { teamId: team.id, identifier: 'user@example.com' }
+            const result = await manager.get(args)
+            expect(result).toBeNull()
+        })
+    })
+
+    describe('getMany', () => {
+        it('should return multiple recipients', async () => {
+            const id1 = await createRecipient(team.id, 'user1@example.com', { 'cat-1': 'OPTED_IN' })
+            const id2 = await createRecipient(team.id, 'user2@example.com', { 'cat-1': 'OPTED_OUT' })
+            const id3 = await createRecipient(team2.id, 'user3@example.com', { 'cat-1': 'NO_PREFERENCE' })
+
+            const args: RecipientGetArgs[] = [
+                { teamId: team.id, identifier: 'user1@example.com' },
+                { teamId: team.id, identifier: 'user2@example.com' },
+                { teamId: team2.id, identifier: 'user3@example.com' },
+                { teamId: team.id, identifier: 'nonexistent@example.com' }, // This should return null
+            ]
+
+            const results = await manager.getMany(args)
+
+            expect(results[`${team.id}:user1@example.com`]).toEqual({
+                id: id1,
+                team_id: team.id,
+                identifier: 'user1@example.com',
+                preferences: { 'cat-1': 'OPTED_IN' },
+                created_at: expect.any(String),
+                updated_at: expect.any(String),
+            })
+
+            expect(results[`${team.id}:user2@example.com`]).toEqual({
+                id: id2,
+                team_id: team.id,
+                identifier: 'user2@example.com',
+                preferences: { 'cat-1': 'OPTED_OUT' },
+                created_at: expect.any(String),
+                updated_at: expect.any(String),
+            })
+
+            expect(results[`${team2.id}:user3@example.com`]).toEqual({
+                id: id3,
+                team_id: team2.id,
+                identifier: 'user3@example.com',
+                preferences: { 'cat-1': 'NO_PREFERENCE' },
+                created_at: expect.any(String),
+                updated_at: expect.any(String),
+            })
+
+            expect(results[`${team.id}:nonexistent@example.com`]).toBeNull()
+        })
+
+        it('should handle empty input', async () => {
+            const results = await manager.getMany([])
+            expect(results).toEqual({})
+        })
+
+        it.each(INVALID_TEAM_ID_KEYS)(
+            'returns null for invalid team id %p without failing the valid team in the same load',
+            async (key) => {
+                await createRecipient(team.id, 'user1@example.com', { 'cat-1': 'OPTED_IN' })
+                const invalidTeamId = key as unknown as number
+
+                const results = await manager.getMany([
+                    { teamId: team.id, identifier: 'user1@example.com' },
+                    { teamId: invalidTeamId, identifier: 'user1@example.com' },
+                ])
+
+                expect(results[`${team.id}:user1@example.com`]?.preferences).toEqual({ 'cat-1': 'OPTED_IN' })
+                expect(results[`${key}:user1@example.com`]).toBeNull()
+                // A load that holds only invalid ids has no query to run.
+                expect(await manager.get({ teamId: invalidTeamId, identifier: 'user2@example.com' })).toBeNull()
+            }
+        )
+    })
+
+    describe('getPreference', () => {
+        it('should return the correct preference status', () => {
+            const recipient = {
+                id: 'test-id',
+                team_id: team.id,
+                identifier: 'user@example.com',
+                preferences: {
+                    'category-1': 'OPTED_IN' as const,
+                    'category-2': 'OPTED_OUT' as const,
+                },
+                created_at: '2023-01-01T00:00:00Z',
+                updated_at: '2023-01-01T00:00:00Z',
+            }
+
+            expect(manager.getPreference(recipient, 'category-1')).toBe('OPTED_IN')
+            expect(manager.getPreference(recipient, 'category-2')).toBe('OPTED_OUT')
+            expect(manager.getPreference(recipient, 'category-3')).toBe('NO_PREFERENCE')
+        })
+    })
+
+    describe('optOut', () => {
+        it('should create a new recipient with $all OPTED_OUT when none exists', async () => {
+            await manager.optOut(team.id, ['new@example.com'])
+
+            const result = await manager.get({ teamId: team.id, identifier: 'new@example.com' })
+            expect(result).toMatchObject({
+                team_id: team.id,
+                identifier: 'new@example.com',
+                preferences: { $all: 'OPTED_OUT' },
+            })
+        })
+
+        it('should merge $all OPTED_OUT into existing preferences', async () => {
+            await createRecipient(team.id, 'user@example.com', { 'category-1': 'OPTED_IN' })
+
+            await manager.optOut(team.id, ['user@example.com'])
+
+            const result = await manager.get({ teamId: team.id, identifier: 'user@example.com' })
+            expect(result?.preferences).toEqual({
+                'category-1': 'OPTED_IN',
+                $all: 'OPTED_OUT',
+            })
+        })
+
+        it('should overwrite existing $all preference with OPTED_OUT', async () => {
+            await createRecipient(team.id, 'user@example.com', { $all: 'OPTED_IN', 'category-1': 'OPTED_IN' })
+
+            await manager.optOut(team.id, ['user@example.com'])
+
+            const result = await manager.get({ teamId: team.id, identifier: 'user@example.com' })
+            expect(result?.preferences).toEqual({
+                'category-1': 'OPTED_IN',
+                $all: 'OPTED_OUT',
+            })
+        })
+
+        it('should opt out multiple recipients in a single call', async () => {
+            await createRecipient(team.id, 'user1@example.com', { 'category-1': 'OPTED_IN' })
+            // user2 does not exist yet
+            await createRecipient(team.id, 'user3@example.com', { 'category-1': 'OPTED_IN', 'category-2': 'OPTED_IN' })
+
+            await manager.optOut(team.id, ['user1@example.com', 'user2@example.com', 'user3@example.com'])
+
+            const result1 = await manager.get({ teamId: team.id, identifier: 'user1@example.com' })
+            expect(result1?.preferences).toEqual({ 'category-1': 'OPTED_IN', $all: 'OPTED_OUT' })
+
+            const result2 = await manager.get({ teamId: team.id, identifier: 'user2@example.com' })
+            expect(result2?.preferences).toEqual({ $all: 'OPTED_OUT' })
+
+            const result3 = await manager.get({ teamId: team.id, identifier: 'user3@example.com' })
+            expect(result3?.preferences).toEqual({
+                'category-1': 'OPTED_IN',
+                'category-2': 'OPTED_IN',
+                $all: 'OPTED_OUT',
+            })
+        })
+
+        it('should be a no-op for an empty array', async () => {
+            await createRecipient(team.id, 'user@example.com', { 'category-1': 'OPTED_IN' })
+
+            await manager.optOut(team.id, [])
+
+            const result = await manager.get({ teamId: team.id, identifier: 'user@example.com' })
+            expect(result?.preferences).toEqual({ 'category-1': 'OPTED_IN' })
+        })
+
+        it('should clear the cache after opt-out', async () => {
+            await createRecipient(team.id, 'user@example.com', { $all: 'OPTED_IN' })
+
+            // Load into cache
+            const before = await manager.get({ teamId: team.id, identifier: 'user@example.com' })
+            expect(before?.preferences.$all).toBe('OPTED_IN')
+
+            // Opt out (should clear cache)
+            await manager.optOut(team.id, ['user@example.com'])
+
+            // Should reflect the new value, not the cached one
+            const after = await manager.get({ teamId: team.id, identifier: 'user@example.com' })
+            expect(after?.preferences.$all).toBe('OPTED_OUT')
+        })
+    })
+
+    describe('caching', () => {
+        it('should cache results and not hit database on second call', async () => {
+            const id = await createRecipient(team.id, 'user@example.com', { 'cat-1': 'OPTED_IN' })
+            const args: RecipientGetArgs = { teamId: team.id, identifier: 'user@example.com' }
+
+            const result1 = await manager.get(args)
+            expect(result1?.id).toBe(id)
+
+            await hub.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `DELETE FROM posthog_messagerecipientpreference WHERE id = $1`,
+                [id],
+                'testDeleteRecipient'
+            )
+
+            const result2 = await manager.get(args)
+            expect(result2?.id).toBe(id)
+        })
+
+        it('should clear cache', async () => {
+            const id = await createRecipient(team.id, 'user@example.com', { 'cat-1': 'OPTED_IN' })
+            const args: RecipientGetArgs = { teamId: team.id, identifier: 'user@example.com' }
+
+            await manager.get(args)
+
+            manager.clear()
+
+            await hub.postgres.query(
+                PostgresUse.COMMON_WRITE,
+                `DELETE FROM posthog_messagerecipientpreference WHERE id = $1`,
+                [id],
+                'testDeleteRecipient'
+            )
+
+            const result = await manager.get(args)
+            expect(result).toBeNull()
+        })
+    })
+})

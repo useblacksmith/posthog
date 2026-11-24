@@ -1,0 +1,867 @@
+import decimal
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Literal
+
+import pytest
+
+import pyarrow as pa
+from parameterized import parameterized
+
+from products.warehouse_sources.backend.temporal.data_imports.cdc.batcher import (
+    CDC_OP_COLUMN,
+    CDC_SEQ_COLUMN,
+    CDC_SEQ_PROVENANCE,
+    CDC_TIMESTAMP_COLUMN,
+    DELETED_AT_COLUMN,
+    DELETED_COLUMN,
+    HISTORY_NAMING,
+    LEGACY_HISTORY_NAMING,
+    TOAST_OMITTED_COLUMN,
+    ChangeEventBatcher,
+    HistoryNaming,
+    build_scd2_table,
+    enrich_delete_rows,
+    enrich_toast_omitted_rows,
+    is_history_table_mode,
+    reserved_column_collisions,
+    reserved_column_names,
+)
+from products.warehouse_sources.backend.temporal.data_imports.cdc.errors import CDCReservedColumnError
+from products.warehouse_sources.backend.temporal.data_imports.cdc.types import ChangeEvent
+
+
+def _make_event(
+    op: Literal["I", "U", "D"] = "I",
+    table: str = "users",
+    position: str = "0/100",
+    columns: dict | None = None,
+    timestamp: datetime | None = None,
+    column_types: Mapping[str, pa.DataType] | None = None,
+    omitted_columns: frozenset[str] = frozenset(),
+) -> ChangeEvent:
+    return ChangeEvent(
+        operation=op,
+        table_name=table,
+        position_serialized=position,
+        timestamp=timestamp or datetime(2025, 6, 15, 12, 0, 0, tzinfo=UTC),
+        columns=columns or {"id": 1, "name": "Alice"},
+        column_types=column_types,
+        omitted_columns=omitted_columns,
+    )
+
+
+class TestChangeEventBatcher:
+    def test_discarding_a_table_releases_its_share_of_the_flush_budget(self):
+        batcher = ChangeEventBatcher(max_bytes=1)
+        batcher.add(_make_event(table="users"))
+        batcher.add(_make_event(table="orders"))
+
+        batcher.discard("users")
+        batcher.discard("orders")
+
+        assert batcher.event_count == 0
+        assert batcher.should_flush is False
+
+    def test_empty_flush(self):
+        batcher = ChangeEventBatcher()
+        result = batcher.flush()
+        assert result == {}
+
+    def test_insert_event_metadata(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(op="I"))
+        tables = batcher.flush()
+
+        assert "users" in tables
+        table = tables["users"]
+        assert table.num_rows == 1
+        assert table.column(CDC_OP_COLUMN)[0].as_py() == "I"
+        assert table.column(DELETED_COLUMN)[0].as_py() is False
+        assert table.column(DELETED_AT_COLUMN)[0].as_py() is None
+
+    def test_delete_event_metadata(self):
+        ts = datetime(2025, 6, 15, 14, 30, 0, tzinfo=UTC)
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(op="D", timestamp=ts))
+        tables = batcher.flush()
+
+        table = tables["users"]
+        assert table.column(CDC_OP_COLUMN)[0].as_py() == "D"
+        assert table.column(DELETED_COLUMN)[0].as_py() is True
+        deleted_at = table.column(DELETED_AT_COLUMN)[0].as_py()
+        assert deleted_at == ts
+
+    def test_source_columns_preserved(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(columns={"id": 42, "email": "test@example.com", "score": 99.5}))
+        tables = batcher.flush()
+
+        table = tables["users"]
+        assert table.column("id")[0].as_py() == 42
+        assert table.column("email")[0].as_py() == "test@example.com"
+        assert table.column("score")[0].as_py() == 99.5
+
+    def test_grouping_by_table_name(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(table="users", columns={"id": 1}))
+        batcher.add(_make_event(table="orders", columns={"id": 100}))
+        batcher.add(_make_event(table="users", columns={"id": 2}))
+        tables = batcher.flush()
+
+        assert set(tables.keys()) == {"users", "orders"}
+        assert tables["users"].num_rows == 2
+        assert tables["orders"].num_rows == 1
+
+    def test_mixed_operations_single_table(self):
+        ts = datetime(2025, 6, 15, 12, 0, 0, tzinfo=UTC)
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(op="I", columns={"id": 1, "name": "Alice"}, position="0/100", timestamp=ts))
+        batcher.add(_make_event(op="U", columns={"id": 1, "name": "Bob"}, position="0/200", timestamp=ts))
+        batcher.add(_make_event(op="D", columns={"id": 2}, position="0/300", timestamp=ts))
+        tables = batcher.flush()
+
+        table = tables["users"]
+        assert table.num_rows == 3
+
+        ops = table.column(CDC_OP_COLUMN).to_pylist()
+        assert ops == ["I", "U", "D"]
+
+        deleted = table.column(DELETED_COLUMN).to_pylist()
+        assert deleted == [False, False, True]
+
+    def test_null_source_column_values(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(columns={"id": 1, "name": None}))
+        tables = batcher.flush()
+
+        table = tables["users"]
+        assert table.column("id")[0].as_py() == 1
+        assert table.column("name")[0].as_py() is None
+
+    def test_sparse_columns_across_events(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(columns={"id": 1, "name": "Alice"}))
+        batcher.add(_make_event(columns={"id": 2, "email": "bob@test.com"}))
+        tables = batcher.flush()
+
+        table = tables["users"]
+        assert table.num_rows == 2
+        # First event has name but no email
+        assert table.column("name")[0].as_py() == "Alice"
+        assert table.column("email")[0].as_py() is None
+        # Second event has email but no name
+        assert table.column("name")[1].as_py() is None
+        assert table.column("email")[1].as_py() == "bob@test.com"
+
+    def test_flush_clears_buffer(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event())
+        assert batcher.event_count == 1
+
+        batcher.flush()
+        assert batcher.event_count == 0
+
+        result = batcher.flush()
+        assert result == {}
+
+    def test_event_count_and_table_names(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(table="users"))
+        batcher.add(_make_event(table="orders"))
+        batcher.add(_make_event(table="users"))
+
+        assert batcher.event_count == 3
+        assert sorted(batcher.table_names) == ["orders", "users"]
+
+    def test_cdc_timestamp_column(self):
+        ts = datetime(2025, 6, 15, 14, 30, 45, 123456, tzinfo=UTC)
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(timestamp=ts))
+        tables = batcher.flush()
+
+        table = tables["users"]
+        cdc_ts = table.column(CDC_TIMESTAMP_COLUMN)[0].as_py()
+        assert cdc_ts == ts
+
+    def test_delete_event_with_sparse_columns(self):
+        # PG CDC DELETE events often carry only identity (PK) columns, not all columns.
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(op="I", columns={"id": 1, "name": "Alice", "email": "a@test.com"}))
+        batcher.add(_make_event(op="D", columns={"id": 1}))
+        tables = batcher.flush()
+
+        table = tables["users"]
+        assert table.num_rows == 2
+        assert table.column(DELETED_COLUMN)[1].as_py() is True
+        # Columns absent from the D event should be null, not missing
+        assert table.column("name")[1].as_py() is None
+        assert table.column("email")[1].as_py() is None
+
+    def test_should_flush_event_count_threshold(self):
+        batcher = ChangeEventBatcher(max_events=3)
+        batcher.add(_make_event(columns={"id": 1}))
+        batcher.add(_make_event(columns={"id": 2}))
+        assert not batcher.should_flush
+
+        batcher.add(_make_event(columns={"id": 3}))
+        assert batcher.should_flush is True  # noqa: E712
+
+        batcher.flush()  # type: ignore[unreachable]
+        assert batcher.should_flush is False  # noqa: E712
+
+    def test_toast_omitted_columns_materialized_with_marker(self):
+        # An UPDATE whose TOASTed column was unchanged carries no value for it. The
+        # batch must still materialize the column (null) plus a per-row marker —
+        # without the column, the load path aligns the batch to the target schema
+        # with a plain null column and merges NULL over the real value.
+        batcher = ChangeEventBatcher()
+        batcher.add(
+            _make_event(
+                op="U",
+                columns={"id": 1, "name": "renamed"},
+                column_types={"id": pa.int64(), "name": pa.string(), "big": pa.string()},
+                omitted_columns=frozenset({"big"}),
+            )
+        )
+        table = batcher.flush()["users"]
+
+        assert table.column("big").to_pylist() == [None]
+        assert table.column("big").type == pa.string()
+        assert table.column(TOAST_OMITTED_COLUMN).to_pylist() == [["big"]]
+
+        # A flush without omissions must not carry the marker column.
+        batcher.add(_make_event(op="U", columns={"id": 1, "name": "again"}))
+        table = batcher.flush()["users"]
+        assert TOAST_OMITTED_COLUMN not in table.column_names
+
+    def test_should_flush_toast_omitted_event_threshold(self):
+        batcher = ChangeEventBatcher(max_toast_omitted_events=2)
+        batcher.add(_make_event(op="U", columns={"id": 1}, omitted_columns=frozenset({"big"})))
+        batcher.add(_make_event(op="U", columns={"id": 2}))
+        assert batcher.should_flush is False
+
+        batcher.add(_make_event(op="U", table="orders", columns={"id": 3}, omitted_columns=frozenset({"big"})))
+        assert batcher.should_flush is True
+
+        batcher.discard("orders")  # type: ignore[unreachable]
+        assert batcher.should_flush is False
+
+        batcher.add(_make_event(op="U", columns={"id": 4}, omitted_columns=frozenset({"big"})))
+        assert batcher.should_flush is True
+        batcher.flush()
+        assert batcher.should_flush is False
+
+    def test_should_flush_byte_threshold(self):
+        batcher = ChangeEventBatcher(max_bytes=500)
+        batcher.add(_make_event(columns={"id": 1, "data": "x"}))
+        assert batcher.should_flush is False
+
+        batcher.add(_make_event(columns={"id": 2, "data": "y" * 500}))
+        assert batcher.should_flush is True
+
+
+class TestEventsToTableEdgeCases:
+    def test_all_null_column_becomes_string_not_null_type(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(op="D", columns={"id": 1, "email": None}))
+        batcher.add(_make_event(op="D", columns={"id": 2, "email": None}))
+        tables = batcher.flush()
+
+        table = tables["users"]
+        assert table.column("email").type == pa.string()
+
+    def test_mixed_types_in_column_falls_back_to_string(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(op="I", columns={"id": 1, "val": 42}))
+        batcher.add(_make_event(op="I", columns={"id": 2, "val": "hello"}))
+        tables = batcher.flush()
+
+        table = tables["users"]
+        assert table.column("val").type == pa.string()
+
+    def test_source_type_overrides_all_null_inference(self):
+        # A column that is all-null in a micro-batch must keep its declared source type
+        # rather than being inferred as null/string.
+        types = {"id": pa.int64(), "seats": pa.int64()}
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(op="D", columns={"id": 1, "seats": None}, column_types=types))
+        batcher.add(_make_event(op="D", columns={"id": 2, "seats": None}, column_types=types))
+
+        table = batcher.flush()["users"]
+        assert table.column("seats").type == pa.int64()
+
+    def test_all_null_and_concrete_flushes_merge(self):
+        # Reproduces the prod crash: one flush sees `seats` all-null, a later flush sees
+        # concrete ints. Without a declared source type the first is string and the
+        # second int64, and S3BatchWriter's unify_schemas raises int64-vs-string.
+        types = {"id": pa.int64(), "seats": pa.int64()}
+
+        b1 = ChangeEventBatcher()
+        b1.add(_make_event(op="D", columns={"id": 1, "seats": None}, column_types=types))
+        flush1 = b1.flush()["users"]
+
+        b2 = ChangeEventBatcher()
+        b2.add(_make_event(op="I", columns={"id": 2, "seats": 5}, column_types=types))
+        flush2 = b2.flush()["users"]
+
+        # Both Parquet schemas agree, so the cross-flush merge succeeds.
+        merged = pa.unify_schemas([flush1.schema, flush2.schema])
+        assert merged.field("seats").type == pa.int64()
+
+    def test_source_type_falls_back_when_value_does_not_fit(self):
+        # If a value can't be cast to the declared type (e.g. a mid-WAL type change),
+        # the batch must still build rather than raise.
+        types = {"id": pa.int64(), "seats": pa.int64()}
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(op="I", columns={"id": 1, "seats": "not-a-number"}, column_types=types))
+
+        table = batcher.flush()["users"]
+        assert table.column("seats").type == pa.string()
+
+    def test_source_columns_differing_only_by_case_are_deduped(self):
+        # Postgres quoted identifiers let two columns differ only by case (e.g. "clickid" and
+        # "CLICKID"), which pyarrow keeps distinct but Delta's case-insensitive field-name check
+        # rejects as a duplicate. The table must carry no two column names that fold to the same
+        # value. Resolution is by sorted order ("CLICKID" < "clickid"), not event order.
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(columns={"id": 1, "clickid": "a", "CLICKID": "b"}))
+        table = batcher.flush()["users"]
+
+        folded = [name.lower() for name in table.column_names]
+        assert len(folded) == len(set(folded))
+        assert table.column("CLICKID")[0].as_py() == "b"
+        assert table.column("clickid_dup1")[0].as_py() == "a"
+
+    def test_non_colliding_mixed_case_column_keeps_its_source_name(self):
+        # Only a genuine case collision may rename a column. A column with no colliding
+        # sibling, however it is cased, must reach the table under its exact source name —
+        # TOAST markers and primary-key enrichment elsewhere in the CDC pipeline match columns
+        # by that exact name, and renaming it too would silently break syncs that work today.
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(columns={"id": 1, "createdAt": "2025-06-15"}))
+        table = batcher.flush()["users"]
+
+        assert table.column("createdAt")[0].as_py() == "2025-06-15"
+
+
+class TestBuildScd2Table:
+    def _make_raw_table(self, events):
+        batcher = ChangeEventBatcher()
+        for ev in events:
+            batcher.add(ev)
+        return batcher.flush()["users"]
+
+    _TS1 = datetime(2026, 1, 1, tzinfo=UTC)
+    _TS2 = datetime(2026, 1, 2, tzinfo=UTC)
+    _TS3 = datetime(2026, 1, 3, tzinfo=UTC)
+
+    @parameterized.expand(
+        [
+            (
+                "single_event_valid_to_null",
+                [("I", {"id": 1}, _TS1)],
+                ["id"],
+                [None],
+                [_TS1],
+            ),
+            (
+                "two_events_same_pk_chain",
+                [("I", {"id": 1}, _TS1), ("U", {"id": 1}, _TS2)],
+                ["id"],
+                [_TS2, None],
+                [_TS1, _TS2],
+            ),
+            (
+                "three_events_same_pk",
+                [("I", {"id": 1}, _TS1), ("U", {"id": 1}, _TS2), ("U", {"id": 1}, _TS3)],
+                ["id"],
+                [_TS2, _TS3, None],
+                [_TS1, _TS2, _TS3],
+            ),
+            (
+                "delete_is_last_valid_state",
+                [("I", {"id": 1}, _TS1), ("D", {"id": 1}, _TS2)],
+                ["id"],
+                [_TS2, None],
+                [_TS1, _TS2],
+            ),
+            (
+                "different_pks_independent",
+                [("I", {"id": 1}, _TS1), ("I", {"id": 2}, _TS2)],
+                ["id"],
+                [None, None],
+                [_TS1, _TS2],
+            ),
+            (
+                "empty_pk_all_null_valid_to",
+                [("I", {"id": 1}, _TS1), ("U", {"id": 1}, _TS1)],
+                [],
+                [None, None],
+                [_TS1, _TS1],
+            ),
+        ],
+    )
+    def test_scd2(self, _name, ops_cols_ts, pk_columns, expected_valid_to, expected_valid_from):
+        events = [
+            _make_event(op=op, columns=cols, position=f"0/{i}00", timestamp=ts)
+            for i, (op, cols, ts) in enumerate(ops_cols_ts, start=1)
+        ]
+        table = self._make_raw_table(events)
+        result = build_scd2_table(table, pk_columns, HISTORY_NAMING)
+        assert result.column(HISTORY_NAMING.valid_to).to_pylist() == expected_valid_to
+        assert result.column(HISTORY_NAMING.valid_from).to_pylist() == expected_valid_from
+
+    def test_valid_from_equals_cdc_timestamp(self):
+        ts = datetime(2026, 3, 15, 10, 30, 0, tzinfo=UTC)
+        table = self._make_raw_table([_make_event(timestamp=ts)])
+        result = build_scd2_table(table, ["id"], HISTORY_NAMING)
+        assert result.column(HISTORY_NAMING.valid_from)[0].as_py() == ts
+        assert result.column(CDC_TIMESTAMP_COLUMN)[0].as_py() == ts
+
+
+class TestEnrichDeleteRows:
+    def _make_raw_table(self, events):
+        batcher = ChangeEventBatcher()
+        for ev in events:
+            batcher.add(ev)
+        return batcher.flush()["users"]
+
+    def test_no_deletes_returns_unchanged(self):
+        table = self._make_raw_table([_make_event(op="I", columns={"id": 1, "name": "Alice"})])
+        result = enrich_delete_rows(table, ["id"])
+        assert result.num_rows == 1
+        assert result.column("name")[0].as_py() == "Alice"
+
+    def test_delete_after_insert_same_batch_fills_data(self):
+        events = [
+            _make_event(op="I", columns={"id": 1, "name": "Alice"}),
+            _make_event(op="D", columns={"id": 1}),
+        ]
+        table = self._make_raw_table(events)
+        result = enrich_delete_rows(table, ["id"])
+        assert result.column("name")[1].as_py() == "Alice"
+        assert result.column(CDC_OP_COLUMN)[1].as_py() == "D"
+        assert result.column(DELETED_COLUMN)[1].as_py() is True
+
+    def test_delete_uses_the_last_change_before_it(self):
+        events = [
+            _make_event(op="I", columns={"id": 1, "name": "Alice"}),
+            _make_event(op="U", columns={"id": 1, "name": "Bob"}),
+            _make_event(op="D", columns={"id": 1}),
+            _make_event(op="I", columns={"id": 1, "name": "Carol"}),
+        ]
+        table = self._make_raw_table(events)
+        result = enrich_delete_rows(table, ["id"])
+        assert result.column("name")[2].as_py() == "Bob"
+
+    def test_delete_without_prior_event_uses_existing_rows(self):
+        table = self._make_raw_table([_make_event(op="D", columns={"id": 1})])
+        existing = self._make_raw_table([_make_event(op="I", columns={"id": 1, "name": "Alice"})])
+        result = enrich_delete_rows(table, ["id"], existing_rows=existing)
+        assert result.column("name")[0].as_py() == "Alice"
+        assert result.column(CDC_OP_COLUMN)[0].as_py() == "D"
+
+    def test_existing_rows_do_not_overwrite_batch_data(self):
+        events = [
+            _make_event(op="U", columns={"id": 1, "name": "Bob"}),
+            _make_event(op="D", columns={"id": 1}),
+        ]
+        table = self._make_raw_table(events)
+        existing = self._make_raw_table([_make_event(op="I", columns={"id": 1, "name": "OldAlice"})])
+        result = enrich_delete_rows(table, ["id"], existing_rows=existing)
+        # Batch-internal UPDATE "Bob" takes priority over existing row "OldAlice"
+        assert result.column("name")[1].as_py() == "Bob"
+
+    def test_metadata_columns_preserved_from_delete_event(self):
+        ts_insert = datetime(2025, 1, 1, tzinfo=UTC)
+        ts_delete = datetime(2025, 6, 1, tzinfo=UTC)
+        events = [
+            _make_event(op="I", columns={"id": 1, "name": "Alice"}, timestamp=ts_insert),
+            _make_event(op="D", columns={"id": 1}, timestamp=ts_delete),
+        ]
+        table = self._make_raw_table(events)
+        result = enrich_delete_rows(table, ["id"])
+        # Timestamp should come from the DELETE event, not the INSERT
+        assert result.column(CDC_TIMESTAMP_COLUMN)[1].as_py() == ts_delete
+        assert result.column(DELETED_AT_COLUMN)[1].as_py() == ts_delete
+        assert result.column(DELETED_COLUMN)[1].as_py() is True
+
+    def test_only_the_stamped_validity_columns_are_metadata(self):
+        # A new history table frees `valid_from` for the source, so a delete must carry the source's
+        # last value for it while keeping its own stamp.
+        ts_insert = datetime(2025, 1, 1, tzinfo=UTC)
+        ts_delete = datetime(2025, 6, 1, tzinfo=UTC)
+        events = [
+            _make_event(op="I", columns={"id": 1, "valid_from": "2020-01-01"}, timestamp=ts_insert),
+            _make_event(op="D", columns={"id": 1}, timestamp=ts_delete),
+        ]
+        table = build_scd2_table(self._make_raw_table(events), ["id"], HISTORY_NAMING)
+        result = enrich_delete_rows(table, ["id"], history=HISTORY_NAMING)
+        assert result.column("valid_from")[1].as_py() == "2020-01-01"
+        assert result.column(HISTORY_NAMING.valid_from)[1].as_py() == ts_delete
+
+    def test_empty_pk_columns_returns_unchanged(self):
+        table = self._make_raw_table([_make_event(op="D", columns={"id": 1})])
+        result = enrich_delete_rows(table, [])
+        assert result.num_rows == 1
+
+    def test_different_pks_enriched_independently(self):
+        events = [
+            _make_event(op="I", columns={"id": 1, "name": "Alice"}),
+            _make_event(op="I", columns={"id": 2, "name": "Bob"}),
+            _make_event(op="D", columns={"id": 1}),
+        ]
+        table = self._make_raw_table(events)
+        result = enrich_delete_rows(table, ["id"])
+        # id=1 DELETE should be enriched with Alice; id=2 INSERT untouched
+        assert result.column("name")[2].as_py() == "Alice"
+        assert result.column("name")[1].as_py() == "Bob"
+
+    def test_enrichment_with_decimal_values_from_existing(self):
+        table = self._make_raw_table([_make_event(op="D", columns={"id": 1, "amount": None})])
+        existing = pa.table(
+            {
+                "id": pa.array([1], type=pa.int64()),
+                "amount": pa.array([decimal.Decimal("99.99")]),
+            }
+        )
+        result = enrich_delete_rows(table, ["id"], existing_rows=existing)
+        assert result.column("amount")[0].as_py() == decimal.Decimal("99.99")
+
+    def test_enrichment_type_mismatch_existing_vs_batch(self):
+        table = self._make_raw_table([_make_event(op="D", columns={"id": 1, "code": None})])
+        existing = pa.table(
+            {
+                "id": pa.array([1], type=pa.int64()),
+                "code": pa.array(["ABC"], type=pa.string()),
+            }
+        )
+        result = enrich_delete_rows(table, ["id"], existing_rows=existing)
+        assert result.column("code")[0].as_py() == "ABC"
+
+    def test_enrichment_decimal_in_existing_binary_in_batch(self):
+        """Reproduces the 'Expected bytes, got Decimal' failure.
+
+        DeltaLake stores decimals as fixed-size binary. When the batch column
+        is binary and existing_rows yield Decimal via .as_py(), _safe_pa_array
+        must handle the mixed types without raising.
+        """
+        # Batch has a binary-typed amount column (simulates reading from DeltaLake parquet)
+        events = [
+            _make_event(op="U", columns={"id": 1, "amount": b"\x00" * 16}),
+            _make_event(op="D", columns={"id": 2, "amount": None}),
+        ]
+        table = self._make_raw_table(events)
+
+        # Existing rows return Decimal (as DeltaLake .as_py() does)
+        existing = pa.table(
+            {
+                "id": pa.array([2], type=pa.int64()),
+                "amount": pa.array([decimal.Decimal("150.75")]),
+            }
+        )
+        result = enrich_delete_rows(table, ["id"], existing_rows=existing)
+        # The DELETE row should be enriched — exact type may be coerced to string
+        assert result.column("amount")[1].as_py() is not None
+
+
+class TestEnrichToastOmittedRows:
+    def _make_raw_table(self, events):
+        batcher = ChangeEventBatcher()
+        for ev in events:
+            batcher.add(ev)
+        return batcher.flush()["users"]
+
+    def _omitted_update(self, columns: dict, omitted: set[str]) -> ChangeEvent:
+        return _make_event(op="U", columns=columns, omitted_columns=frozenset(omitted))
+
+    @parameterized.expand(
+        [
+            # (name, first event (op, columns), expected fill for the omitted row)
+            ("from_insert", ("I", {"id": 1, "big": "v1"}), "v1"),
+            ("from_update", ("U", {"id": 1, "big": "v2"}), "v2"),
+            # An explicit NULL set by a prior event is a real value: it must
+            # propagate, not be resurrected from any older state.
+            ("real_null_propagates", ("I", {"id": 1, "big": None}), None),
+        ]
+    )
+    def test_fills_from_last_batch_row_and_clears_marker(self, _name, first_event, expected):
+        op, columns = first_event
+        events = [
+            _make_event(op=op, columns=columns),
+            self._omitted_update({"id": 1, "name": "renamed"}, {"big"}),
+        ]
+        table = self._make_raw_table(events)
+        result = enrich_toast_omitted_rows(table, ["id"])
+
+        assert result.column("big")[1].as_py() == expected
+        assert result.column(TOAST_OMITTED_COLUMN)[1].as_py() is None
+
+    def test_filled_value_chains_to_later_omitted_rows(self):
+        events = [
+            _make_event(op="I", columns={"id": 1, "big": "v1"}),
+            self._omitted_update({"id": 1, "name": "a"}, {"big"}),
+            self._omitted_update({"id": 1, "name": "b"}, {"big"}),
+        ]
+        table = self._make_raw_table(events)
+        result = enrich_toast_omitted_rows(table, ["id"])
+
+        assert result.column("big").to_pylist() == ["v1", "v1", "v1"]
+        assert result.column(TOAST_OMITTED_COLUMN).to_pylist() == [None, None, None]
+
+    def test_fills_from_existing_rows_when_not_in_batch(self):
+        table = self._make_raw_table([self._omitted_update({"id": 1, "name": "renamed"}, {"big"})])
+        existing = pa.table(
+            {
+                "id": pa.array([1], type=pa.int64()),
+                "big": pa.array(["persisted"], type=pa.string()),
+            }
+        )
+        result = enrich_toast_omitted_rows(table, ["id"], existing_rows=existing)
+
+        assert result.column("big")[0].as_py() == "persisted"
+        assert result.column(TOAST_OMITTED_COLUMN)[0].as_py() is None
+
+    def test_batch_value_beats_existing_rows(self):
+        events = [
+            _make_event(op="U", columns={"id": 1, "big": "fresh"}),
+            self._omitted_update({"id": 1, "name": "renamed"}, {"big"}),
+        ]
+        table = self._make_raw_table(events)
+        existing = pa.table(
+            {
+                "id": pa.array([1], type=pa.int64()),
+                "big": pa.array(["stale"], type=pa.string()),
+            }
+        )
+        result = enrich_toast_omitted_rows(table, ["id"], existing_rows=existing)
+
+        assert result.column("big")[1].as_py() == "fresh"
+
+    def test_unresolvable_row_keeps_marker(self):
+        # PK absent from both batch and existing state: value unknowable at this
+        # stage — the marker must survive so a later stage (or the final drop in
+        # the load processor) makes the call, not a silent NULL.
+        table = self._make_raw_table([self._omitted_update({"id": 1, "name": "renamed"}, {"big"})])
+        result = enrich_toast_omitted_rows(table, ["id"])
+
+        assert result.column("big")[0].as_py() is None
+        assert result.column(TOAST_OMITTED_COLUMN)[0].as_py() == ["big"]
+
+
+def _pg_position_to_seq(position: str) -> int:
+    from products.warehouse_sources.backend.temporal.data_imports.sources.postgres.cdc.position import PgLSN
+
+    return PgLSN.deserialize(position).value
+
+
+class TestSeqColumn:
+    def test_seq_column_emitted_with_converter(self):
+        batcher = ChangeEventBatcher(position_to_seq=_pg_position_to_seq)
+        batcher.add(_make_event(op="I", position="0/100"))
+        batcher.add(_make_event(op="U", position="0/200"))
+        table = batcher.flush()["users"]
+
+        assert table.schema.field(CDC_SEQ_COLUMN).type == pa.int64()
+        assert table.column(CDC_SEQ_COLUMN).to_pylist() == [0x100, 0x200]
+
+    def test_seq_column_absent_without_converter(self):
+        batcher = ChangeEventBatcher()
+        batcher.add(_make_event(op="I", position="0/100"))
+        table = batcher.flush()["users"]
+
+        assert CDC_SEQ_COLUMN not in table.column_names
+
+    @parameterized.expand([(CDC_SEQ_COLUMN,), ("_PH_CDC_SEQ",), ("_phDeletedAt",)])
+    def test_a_source_column_that_loads_like_a_capture_column_is_refused(self, column: str) -> None:
+        # The load renames `_PH_CDC_SEQ` to `_ph_cdc_seq`, so the snapshot would put customer values
+        # in the column every position decision reads.
+        batcher = ChangeEventBatcher(position_to_seq=_pg_position_to_seq)
+        batcher.add(_make_event(op="I", position="0/100", columns={"id": 1, column: 42}))
+
+        tables = batcher.flush()
+
+        assert "users" not in tables
+        assert column in str(batcher.reserved_collisions["users"])
+
+    def test_engine_seq_stamp_survives_the_whole_transform_chain(self):
+        # The load side gates every position decision on this stamp, and each transform below
+        # rebuilds the table. If one of them ever reconstructs the seq field instead of carrying
+        # it through, resolution silently turns itself off and every other test still passes.
+        from products.warehouse_sources.backend.temporal.data_imports.cdc.load_resolution import has_engine_seq
+
+        batcher = ChangeEventBatcher(position_to_seq=_pg_position_to_seq)
+        batcher.add(_make_event(op="I", position="0/100", columns={"id": 1, "name": "a", "big": "x"}))
+        batcher.add(
+            _make_event(op="U", position="0/150", columns={"id": 1, "name": "b"}, omitted_columns=frozenset({"big"}))
+        )
+        batcher.add(_make_event(op="D", position="0/200", columns={"id": 1}))
+        table = batcher.flush()["users"]
+
+        toasted = enrich_toast_omitted_rows(table, ["id"])
+        enriched = enrich_delete_rows(toasted, ["id"])
+
+        assert has_engine_seq(table)
+        assert has_engine_seq(toasted)
+        assert has_engine_seq(enriched)
+        assert has_engine_seq(build_scd2_table(enriched, ["id"], HISTORY_NAMING))
+
+    def test_engine_seq_is_stamped_and_survives_a_parquet_round_trip(self):
+        # The load side tells our column from a same-named source column by this stamp, and it
+        # reads batches back from parquet — so the metadata has to survive the file, not just
+        # the in-memory table.
+        import io
+
+        import pyarrow.parquet as pq
+
+        batcher = ChangeEventBatcher(position_to_seq=_pg_position_to_seq)
+        batcher.add(_make_event(op="I", position="0/100"))
+        table = batcher.flush()["users"]
+
+        assert table.schema.field(CDC_SEQ_COLUMN).metadata == CDC_SEQ_PROVENANCE
+
+        buf = io.BytesIO()
+        pq.write_table(table, buf)
+        restored = pq.read_table(io.BytesIO(buf.getvalue()))
+
+        assert restored.schema.field(CDC_SEQ_COLUMN).metadata == CDC_SEQ_PROVENANCE
+
+    def test_seq_survives_enrichment_untouched(self):
+        # Seq is CDC metadata: DELETE/TOAST enrichment must never fill or copy it.
+        batcher = ChangeEventBatcher(position_to_seq=_pg_position_to_seq)
+        batcher.add(
+            _make_event(
+                op="U",
+                position="0/100",
+                columns={"id": 1, "name": "Alice"},
+                omitted_columns=frozenset({"big"}),
+            )
+        )
+        batcher.add(_make_event(op="D", position="0/200", columns={"id": 1}))
+        table = batcher.flush()["users"]
+
+        enriched = enrich_toast_omitted_rows(table, ["id"])
+        enriched = enrich_delete_rows(enriched, ["id"])
+
+        assert enriched.column(CDC_SEQ_COLUMN).to_pylist() == [0x100, 0x200]
+        # The DELETE row copied `name` from the preceding update, proving
+        # enrichment ran while seq stayed per-event.
+        assert enriched.column("name")[1].as_py() == "Alice"
+
+
+class TestScd2TimestampType:
+    def test_scd2_columns_match_the_timestamp_column(self):
+        # `valid_from` carries the timestamp column's own values, so it must carry its type too:
+        # declaring a fixed UTC type made pyarrow reject every naive batch.
+        ts = pa.timestamp("us")
+        table = pa.table(
+            {
+                "id": pa.array([1, 1], pa.int64()),
+                CDC_TIMESTAMP_COLUMN: pa.array([0, 1], ts),
+            }
+        )
+
+        result = build_scd2_table(table, ["id"], HISTORY_NAMING)
+
+        assert result.schema.field(HISTORY_NAMING.valid_from).type == ts
+        assert result.schema.field(HISTORY_NAMING.valid_to).type == ts
+        assert result.column(HISTORY_NAMING.valid_to).to_pylist()[0] is not None
+
+
+class TestReservedColumnCollisions:
+    @parameterized.expand(
+        [
+            ("legacy_validity_name", ["id", "valid_to"], LEGACY_HISTORY_NAMING, None, None, ["valid_to"]),
+            (
+                "legacy_name_the_load_renames",
+                ["id", "validFrom", "VALID_TO"],
+                LEGACY_HISTORY_NAMING,
+                None,
+                None,
+                ["VALID_TO", "validFrom"],
+            ),
+            ("legacy_validity_name_on_a_new_table", ["id", "valid_from"], HISTORY_NAMING, None, None, []),
+            (
+                "new_validity_name_on_a_legacy_table",
+                ["id", "_PH_VALID_FROM"],
+                LEGACY_HISTORY_NAMING,
+                None,
+                None,
+                ["_PH_VALID_FROM"],
+            ),
+            ("capture_name_the_load_renames", ["id", "_PH_CDC_SEQ"], None, None, None, ["_PH_CDC_SEQ"]),
+            ("validity_name_without_history", ["id", "valid_from"], None, None, None, []),
+            ("left_out_of_enabled_columns", ["id", "validFrom"], LEGACY_HISTORY_NAMING, ["id"], None, []),
+            (
+                "kept_as_the_incremental_field",
+                ["id", "valid_from"],
+                LEGACY_HISTORY_NAMING,
+                [],
+                "valid_from",
+                ["valid_from"],
+            ),
+        ]
+    )
+    def test_names_the_source_columns_that_collide(
+        self,
+        _name: str,
+        column_names: list[str],
+        history: HistoryNaming | None,
+        enabled_columns: list[str] | None,
+        incremental_field: str | None,
+        expected: list[str],
+    ) -> None:
+        assert (
+            reserved_column_collisions(
+                column_names,
+                reserved_column_names(history),
+                enabled_columns=enabled_columns,
+                primary_keys=["id"],
+                incremental_field=incremental_field,
+            )
+            == expected
+        )
+
+
+class TestIsHistoryTableMode:
+    @parameterized.expand(
+        [
+            ("cdc_only", "cdc_only", True),
+            ("both", "both", True),
+            ("consolidated", "consolidated", False),
+            ("missing", None, False),
+            ("list", [], False),
+            ("dict", {}, False),
+        ]
+    )
+    def test_reads_only_a_history_mode_string(self, _name: str, cdc_table_mode: object, expected: bool) -> None:
+        assert is_history_table_mode(cdc_table_mode) is expected
+
+
+class TestScd2ReservedColumns:
+    @parameterized.expand(
+        [
+            ("legacy_valid_from", LEGACY_HISTORY_NAMING, LEGACY_HISTORY_NAMING.valid_from),
+            ("legacy_valid_to", LEGACY_HISTORY_NAMING, LEGACY_HISTORY_NAMING.valid_to),
+            ("new_valid_from", HISTORY_NAMING, HISTORY_NAMING.valid_from),
+        ]
+    )
+    def test_a_source_column_named_like_the_stamp_fails_before_the_writer(
+        self, _name: str, history: HistoryNaming, taken: str
+    ) -> None:
+        # Delta refuses the duplicate name at write time, but by then a batch is half built and
+        # the error names a qualified field, not the customer's column. A silent skip here is
+        # worse still: the writer would close rows against the customer's own values.
+        table = pa.table(
+            {
+                "id": pa.array([1], pa.int64()),
+                taken: pa.array([datetime(2020, 1, 1)], pa.timestamp("us")),
+                CDC_SEQ_COLUMN: pa.array([5], pa.int64()),
+                CDC_OP_COLUMN: pa.array(["U"], pa.string()),
+                CDC_TIMESTAMP_COLUMN: pa.array([datetime(2026, 1, 1)], pa.timestamp("us")),
+            }
+        )
+
+        with pytest.raises(CDCReservedColumnError, match=taken):
+            build_scd2_table(table, ["id"], history)

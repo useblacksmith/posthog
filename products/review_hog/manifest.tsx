@@ -1,0 +1,39 @@
+import { FEATURE_FLAGS } from 'lib/constants'
+import { urls } from 'scenes/urls'
+
+import { FileSystemIconType, ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
+import { ProductManifest } from '~/types'
+
+export const manifest: ProductManifest = {
+    name: 'PostHog Review',
+    scenes: {
+        CodeReview: {
+            name: 'Code review',
+            import: () => import('./frontend/CodeReviewScene'),
+            projectBased: true,
+            description: 'Automated code reviews of your pull requests, and your review agent settings.',
+            iconType: 'code_review',
+        },
+    },
+    routes: {
+        '/code-review': ['CodeReview', 'codeReview'],
+    },
+    urls: {
+        codeReview: (tab?: 'approval_history' | 'code_you_own' | 'settings' | 'approval_settings'): string =>
+            tab ? `/code-review?tab=${tab}` : '/code-review',
+    },
+    treeItemsProducts: [
+        {
+            path: 'Code review',
+            intents: [ProductKey.REVIEW_HOG],
+            category: ProductItemCategory.UNRELEASED,
+            iconType: 'code_review' as FileSystemIconType,
+            iconColor: ['var(--color-product-code-review-light)', 'var(--color-product-code-review-dark)'],
+            href: urls.codeReview(),
+            searchKeywords: ['pr review', 'review agent', 'reviewhog'],
+            flag: FEATURE_FLAGS.REVIEW_HOG,
+            tags: ['alpha'],
+            sceneKey: 'CodeReview',
+        },
+    ],
+}

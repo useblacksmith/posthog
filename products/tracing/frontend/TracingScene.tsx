@@ -1,0 +1,458 @@
+import { BindLogic, useActions, useValues } from 'kea'
+import { router } from 'kea-router'
+import posthog from 'posthog-js'
+import { useCallback, useMemo, useState } from 'react'
+
+import { LemonButton, LemonModal, LemonTabs, Link } from '@posthog/lemon-ui'
+import { Button } from '@posthog/quill'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
+import { IconFeedback } from 'lib/lemon-ui/icons'
+import { LinkPrimitive } from 'lib/lemon-ui/Link'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { useAttachedLogic } from 'lib/logic/scenes/useAttachedLogic'
+import { cn } from 'lib/utils/css-classes'
+import { SceneExport } from 'scenes/sceneTypes'
+import { teamLogic } from 'scenes/teamLogic'
+import { urls } from 'scenes/urls'
+
+import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { SceneDivider } from '~/layout/scenes/components/SceneDivider'
+import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
+import { AggregatedSpanRow, ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
+
+import { QueryFailedOverlay } from 'products/logs/frontend/components/QueryFailedOverlay'
+
+import { TracesAlertFromRowModals } from './alerting/TracesAlertFromRowModals'
+import { TracesAlertPreset, buildPresetForm } from './alerting/tracesAlertPresets'
+import { TracesAlertsTab } from './alerting/TracesAlertsTab'
+import { TracesAlertFormType } from './alerting/tracesAlertUtils'
+import { ComparisonBar } from './components/Comparison/ComparisonBar'
+import { TracingFacetRail } from './components/FacetRail/TracingFacetRail'
+import { TraceDrawer } from './components/TraceDrawer/TraceDrawer'
+import { TracingSqlEditor } from './components/TracingSqlEditor/TracingSqlEditor'
+import { VirtualizedSpanList } from './components/VirtualizedSpanList/VirtualizedSpanList'
+import { TRACING_DISPLAY_TIMEZONE } from './dateFormats'
+import { tracingEmptyState } from './emptyState/tracingEmptyState'
+import type { ErrorScope } from './errorCorrelation'
+import { OperationsTable } from './OperationsTable'
+import { TraceCompareFlame } from './TraceCompareFlame'
+import { TraceCompareTable } from './TraceCompareTable'
+import { TRACING_DOCS_URL } from './traceLinks'
+import { TracingAgentIntegration } from './TracingAgentIntegration'
+import { tracingConfigLogic } from './tracingConfigLogic'
+import { tracingDataLogic } from './tracingDataLogic'
+import { TracingDisplayBar } from './TracingDisplayBar'
+import { TracingFilterBar } from './TracingFilterBar'
+import { TRACING_SCENE_VIEWER_ID, tracingFiltersLogic } from './tracingFiltersLogic'
+import { type TracingSceneTab, tracingSceneLogic } from './tracingSceneLogic'
+import { TracingSparkline } from './TracingSparkline'
+import { traceViewId, tracingViewerLogic } from './tracingViewerLogic'
+import type { Span, SpanInspectorTab } from './types'
+
+const TRACING_FEEDBACK_SURVEY_ID = '019e6a26-4943-0000-24a0-dc46310f6b7c'
+
+const SCENE_TAB_LABELS: Record<TracingSceneTab, string> = {
+    viewer: 'Viewer',
+    sql: 'SQL',
+    alerts: 'Alerts',
+}
+
+export const scene: SceneExport = {
+    component: TracingScene,
+    logic: tracingSceneLogic,
+    productKey: ProductKey.TRACING,
+    emptyState: tracingEmptyState,
+}
+
+export default function TracingScene(): JSX.Element {
+    const { featureFlags } = useValues(featureFlagLogic)
+    const sceneLogic = tracingSceneLogic()
+    const { activeSceneTab } = useValues(sceneLogic)
+    // Keep filters + data + viewer logic alive across React unmounts by attaching them to the scene root.
+    useAttachedLogic(tracingFiltersLogic({ id: TRACING_SCENE_VIEWER_ID }), sceneLogic)
+    useAttachedLogic(tracingDataLogic({ id: TRACING_SCENE_VIEWER_ID }), sceneLogic)
+    useAttachedLogic(tracingViewerLogic({ id: TRACING_SCENE_VIEWER_ID }), sceneLogic)
+
+    if (featureFlags[FEATURE_FLAGS.TRACING_UI_V2]) {
+        return <p>Tracing UI v2</p>
+    }
+
+    // Bind the scene's keyed instances so nested components (filter bar, sparkline, ...)
+    // resolve them from context — the same components work inside an embedded viewer
+    // bound to a different id.
+    return (
+        <BindLogic logic={tracingFiltersLogic} props={{ id: TRACING_SCENE_VIEWER_ID }}>
+            <BindLogic logic={tracingDataLogic} props={{ id: TRACING_SCENE_VIEWER_ID }}>
+                <BindLogic logic={tracingViewerLogic} props={{ id: TRACING_SCENE_VIEWER_ID }}>
+                    <TracingAgentIntegration sceneTabIsViewer={activeSceneTab === 'viewer'} />
+                    <TracingSceneContents />
+                </BindLogic>
+            </BindLogic>
+        </BindLogic>
+    )
+}
+
+function TracingSceneContents(): JSX.Element {
+    const {
+        listRows,
+        spansLoading,
+        spansError,
+        isTraceOpen,
+        selectedTraceId,
+        selectedTraceTs,
+        sparklineData,
+        sparklineLoading,
+        sparklineError,
+        openTraceSpans,
+        traceIdentity,
+        traceSessionId,
+        sessionErrorBadgesEnabled,
+        errorBadgeByRow,
+        inspectorOpen,
+        isFullscreen,
+        errorsScope,
+        isLoadingFullTrace,
+        canLoadMoreTraceSpans,
+        traceSpansLoadingMore,
+        selectedTraceLoadFailed,
+        aggregation,
+        aggregationLoading,
+        filters,
+        currentWindowMs,
+        previousWindowMs,
+        spanTree,
+        spanTreeLoading,
+        compareFlameSpanName,
+        hasMoreToLoad,
+        visibleRowDateRange,
+        durationHistogramData,
+        durationHistogramLoading,
+        visibleRowDurationRange,
+        isDurationMode,
+        latencyHeatmapData,
+        latencyHeatmapLoading,
+        showHeatmap,
+        displayMode,
+        compareActive,
+        sceneTabsEnabled,
+        availableSceneTabs,
+        activeSceneTab,
+    } = useValues(tracingSceneLogic())
+    const { traceLoadFiltersActive } = useValues(tracingDataLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const todayRailNav = useFeatureFlag('TODAY_RAIL_NAV')
+    const {
+        openTrace,
+        closeTrace,
+        setDateRange,
+        updateComparisonWindows,
+        openCompareFlame,
+        closeCompareFlame,
+        fetchNextPage,
+        fetchSpans,
+        fetchSparkline,
+        loadTraceSpans,
+        loadMoreTraceSpans,
+        setVisibleRowRange,
+        toggleInspector,
+        toggleFullscreen,
+        setSort,
+        setChartType,
+        applyHeatmapBrush,
+        selectSceneTab,
+    } = useActions(tracingSceneLogic())
+    const { addProductIntent } = useActions(teamLogic)
+    const { facetRailCollapsed, spanColumns } = useValues(tracingConfigLogic)
+    const facetRailEnabled = !!featureFlags[FEATURE_FLAGS.TRACING_FACET_RAIL]
+    const impactStripEnabled = !!featureFlags[FEATURE_FLAGS.TRACING_IMPACT_STRIP]
+
+    // Resolved aggregation window (ms) — turns span counts into a request rate.
+    // Use sparklineWindowMs which correctly resolves relative date strings (e.g. '-1h').
+    const { sparklineWindowMs, utcDateRange } = useValues(tracingFiltersLogic)
+    const operationsWindowMs = sparklineWindowMs.endMs - sparklineWindowMs.startMs
+
+    // react-window rebuilds its row memo from the shallow values of rowProps, so one unstable
+    // value there re-renders every visible row. This handler and `spanErrors` below are both
+    // passed that way, so both hold their identity.
+    const onRowClick = useCallback(
+        (span: Span, tab?: SpanInspectorTab, errorsScope?: ErrorScope): void => {
+            // Clicking a row leaves the scrollable <main tabIndex="0"> as the active element;
+            // react-modal then scrolls it back into view when restoring focus on close. Blur so
+            // the restore target is <body>, which doesn't scroll.
+            ;(document.activeElement as HTMLElement | null)?.blur?.()
+            // Anchor the waterfall on the clicked span. In Spans mode this is often a child span,
+            // so without spanId the drawer would open unfocused at the root.
+            openTrace(span.trace_id, { spanId: span.span_id, ts: span.timestamp, tab, errorsScope })
+        },
+        [openTrace]
+    )
+
+    const [alertDraft, setAlertDraft] = useState<TracesAlertFormType | null>(null)
+    const createAlertFromRow = useCallback((row: AggregatedSpanRow, preset: TracesAlertPreset): void => {
+        posthog.capture('tracing operation alert preset opened', { preset })
+        setAlertDraft(buildPresetForm(row, preset))
+    }, [])
+    const closeAlertDraft = useCallback((): void => setAlertDraft(null), [])
+    // The platform API serves traces alerts only when the Alerts tab is available.
+    const alertsAvailable = availableSceneTabs.includes('alerts')
+
+    // Absent while the flag is off, which is how the list decides whether to keep a badge column.
+    const spanErrors = useMemo(
+        () =>
+            sessionErrorBadgesEnabled
+                ? {
+                      badges: errorBadgeByRow,
+                      onShow: (span: Span, scope: ErrorScope) => onRowClick(span, 'errors', scope),
+                  }
+                : undefined,
+        [sessionErrorBadgesEnabled, errorBadgeByRow, onRowClick]
+    )
+
+    const onDocsLinkClick = (): void => {
+        addProductIntent({
+            product_type: ProductKey.TRACING,
+            intent_context: ProductIntentContext.TRACING_DOCS_VIEWED,
+        })
+    }
+
+    const onFeedbackClick = (): void => {
+        posthog.displaySurvey(TRACING_FEEDBACK_SURVEY_ID)
+    }
+
+    // Anchor the overlay's coordinate space to the *fetched* sparkline data so overlay
+    // drags never shift the canvas underfoot. The sparkline only refetches when dateRange
+    // changes (via the DateFilter), never via overlay interaction. Only the 'custom' preset
+    // shows draggable windows — named presets compare the full range, whose baseline window
+    // sits outside the visible sparkline anyway.
+    const sparklineFirstMs = sparklineData.dates.length > 0 ? new Date(sparklineData.dates[0]).valueOf() : null
+    const sparklineLastMs =
+        sparklineData.dates.length > 0 ? new Date(sparklineData.dates[sparklineData.dates.length - 1]).valueOf() : null
+    const compareConfig =
+        filters.comparison?.mode === 'time' &&
+        filters.comparison.preset === 'custom' &&
+        sparklineFirstMs !== null &&
+        sparklineLastMs !== null
+            ? {
+                  fullStartMs: sparklineFirstMs,
+                  fullEndMs: sparklineLastMs,
+                  currentWindow: currentWindowMs,
+                  previousWindow: previousWindowMs,
+                  onChange: updateComparisonWindows,
+              }
+            : undefined
+
+    return (
+        <SceneContent className="@container/facet-rail-host h-[calc(var(--scene-layout-rect-height,_100vh)_-_1rem)]">
+            <SceneTitleSection
+                name="Tracing"
+                description="Monitor and analyze distributed traces to understand service performance and debug issues."
+                resourceType={{
+                    type: 'tracing',
+                }}
+                actions={
+                    todayRailNav ? (
+                        <div className="flex flex-wrap items-center gap-2">
+                            <Button variant="outline" onClick={onFeedbackClick}>
+                                <IconFeedback />
+                                Feedback
+                            </Button>
+                            <Button
+                                variant="outline"
+                                render={<LinkPrimitive to={TRACING_DOCS_URL} target="_blank" />}
+                                onClick={onDocsLinkClick}
+                            >
+                                Documentation
+                            </Button>
+                        </div>
+                    ) : (
+                        <>
+                            <LemonButton
+                                size="small"
+                                type="secondary"
+                                icon={<IconFeedback />}
+                                onClick={onFeedbackClick}
+                            >
+                                Feedback
+                            </LemonButton>
+                            <LemonButton
+                                to={TRACING_DOCS_URL}
+                                onClick={onDocsLinkClick}
+                                type="secondary"
+                                size="small"
+                                targetBlank
+                            >
+                                Documentation
+                            </LemonButton>
+                        </>
+                    )
+                }
+            />
+            {sceneTabsEnabled && (
+                <LemonTabs<TracingSceneTab>
+                    activeKey={activeSceneTab}
+                    onChange={selectSceneTab}
+                    tabs={availableSceneTabs.map((key) => ({ key, label: SCENE_TAB_LABELS[key] }))}
+                    sceneInset
+                />
+            )}
+            <div className={cn('flex flex-col gap-y-4 flex-1 min-h-0', activeSceneTab !== 'viewer' && 'hidden')}>
+                <TracingFilterBar />
+                <SceneDivider />
+                <TracingSparkline
+                    sparklineData={sparklineData}
+                    sparklineLoading={sparklineLoading || (isDurationMode && !showHeatmap && durationHistogramLoading)}
+                    // The duration histogram replaces the sparkline in this mode.
+                    sparklineError={isDurationMode && !showHeatmap ? null : sparklineError}
+                    onRetry={() => fetchSparkline()}
+                    onDateRangeChange={setDateRange}
+                    displayTimezone={TRACING_DISPLAY_TIMEZONE}
+                    currentDateTo={utcDateRange.date_to}
+                    compare={compareConfig}
+                    compareActive={compareActive}
+                    visibleRowDateRange={visibleRowDateRange}
+                    durationHistogram={isDurationMode && !showHeatmap ? durationHistogramData : null}
+                    visibleRowDurationRange={visibleRowDurationRange}
+                    chartType={filters.chartType}
+                    onChartTypeChange={setChartType}
+                    latencyHeatmap={showHeatmap ? latencyHeatmapData : null}
+                    latencyHeatmapLoading={latencyHeatmapLoading}
+                    onHeatmapBrush={applyHeatmapBrush}
+                    heatmapDisabledReason={
+                        compareActive ? 'The heatmap is unavailable while comparing time windows' : null
+                    }
+                />
+                <div className="flex flex-row gap-2 flex-1 min-h-0 @max-[48rem]/facet-rail-host:flex-col">
+                    {facetRailEnabled && !facetRailCollapsed && <TracingFacetRail />}
+                    <div className="flex flex-col gap-2 flex-1 min-w-0 min-h-0">
+                        <TracingDisplayBar />
+                        {compareActive && displayMode !== 'operations' && displayMode !== 'endpoints' && (
+                            <ComparisonBar />
+                        )}
+                        {displayMode === 'operations' || displayMode === 'endpoints' ? (
+                            <OperationsTable
+                                rows={aggregation.current}
+                                loading={aggregationLoading}
+                                windowMs={operationsWindowMs}
+                                showImpact={impactStripEnabled}
+                                groupedByEndpoint={displayMode === 'endpoints'}
+                                // Operations only: an endpoint row can merge span names, and an alert
+                                // filters on one span name.
+                                onCreateAlert={
+                                    displayMode === 'operations' && alertsAvailable ? createAlertFromRow : undefined
+                                }
+                                // Rows can still be the endpoints tab's until the operations load.
+                                createAlertDisabledReason={
+                                    aggregationLoading ? 'Wait for the operations to load' : undefined
+                                }
+                                // No row click on endpoints yet: an endpoint row can merge span
+                                // names, and the operation page opens one span name. Rows stay
+                                // unclickable while loading, because they can still be the other tab's.
+                                onRowClick={
+                                    displayMode === 'operations' && !aggregationLoading
+                                        ? (row) =>
+                                              router.actions.push(
+                                                  urls.tracingOperation(row.service_name, row.name, filters.dateRange)
+                                              )
+                                        : undefined
+                                }
+                            />
+                        ) : compareActive ? (
+                            <TraceCompareTable
+                                current={aggregation.current}
+                                previous={aggregation.previous}
+                                loading={aggregationLoading}
+                                onRowClick={(row) => openCompareFlame(row.name, row.service_name)}
+                            />
+                        ) : (
+                            <div className="relative flex flex-col flex-1 min-h-0">
+                                <VirtualizedSpanList
+                                    dataSource={listRows}
+                                    spanColumns={spanColumns}
+                                    showRootTag={filters.viewMode === 'spans'}
+                                    showTraceDuration={filters.viewMode === 'traces'}
+                                    loading={spansLoading}
+                                    hasMoreToLoad={hasMoreToLoad}
+                                    onLoadMore={fetchNextPage}
+                                    onVisibleRowRangeChange={setVisibleRowRange}
+                                    spanErrors={spanErrors}
+                                    orderBy={filters.orderBy}
+                                    orderDirection={filters.orderDirection}
+                                    onSort={(column) =>
+                                        // Click an active column to flip direction; a new column starts at DESC.
+                                        setSort(
+                                            column,
+                                            column === filters.orderBy && filters.orderDirection === 'DESC'
+                                                ? 'ASC'
+                                                : 'DESC'
+                                        )
+                                    }
+                                    emptyState={
+                                        <div className="flex flex-col items-center gap-1">
+                                            <span>No spans found</span>
+                                            <Link to={TRACING_DOCS_URL} onClick={onDocsLinkClick} target="_blank">
+                                                Learn how to send traces
+                                            </Link>
+                                        </div>
+                                    }
+                                    onRowClick={onRowClick}
+                                />
+                                <QueryFailedOverlay
+                                    error={spansError}
+                                    title="Couldn't load traces"
+                                    onRetry={() => fetchSpans()}
+                                    className="rounded border bg-bg-light"
+                                />
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+            {activeSceneTab === 'sql' && <TracingSqlEditor id={TRACING_SCENE_VIEWER_ID} />}
+            {activeSceneTab === 'alerts' && <TracesAlertsTab />}
+            {alertDraft !== null && <TracesAlertFromRowModals initialForm={alertDraft} onDone={closeAlertDraft} />}
+            <TraceDrawer
+                viewId={traceViewId(TRACING_SCENE_VIEWER_ID)}
+                isOpen={isTraceOpen}
+                traceId={selectedTraceId}
+                ts={selectedTraceTs}
+                spans={openTraceSpans}
+                identity={traceIdentity}
+                sessionId={traceSessionId}
+                showErrorsTab={sessionErrorBadgesEnabled}
+                errorsScope={errorsScope}
+                inspectorOpen={inspectorOpen}
+                onToggleInspector={toggleInspector}
+                isFullscreen={isFullscreen}
+                onToggleFullscreen={toggleFullscreen}
+                loading={isLoadingFullTrace}
+                loadFailed={selectedTraceLoadFailed}
+                filtersActive={traceLoadFiltersActive}
+                onRetry={
+                    selectedTraceId
+                        ? () => loadTraceSpans({ traceId: selectedTraceId, ts: selectedTraceTs })
+                        : undefined
+                }
+                hasMoreSpans={canLoadMoreTraceSpans}
+                loadingMoreSpans={traceSpansLoadingMore}
+                onLoadMoreSpans={loadMoreTraceSpans}
+                onClose={closeTrace}
+            />
+            <LemonModal
+                title={`Call tree diff: ${compareFlameSpanName ?? ''}`}
+                isOpen={compareFlameSpanName !== null}
+                onClose={closeCompareFlame}
+                width="90vw"
+            >
+                <TraceCompareFlame
+                    current={spanTree.current}
+                    previous={spanTree.previous}
+                    loading={spanTreeLoading}
+                    initialSpanName={compareFlameSpanName}
+                    surface="compare_modal"
+                />
+            </LemonModal>
+        </SceneContent>
+    )
+}

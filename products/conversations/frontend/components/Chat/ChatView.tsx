@@ -1,0 +1,235 @@
+import { JSONContent } from '@tiptap/core'
+
+import { LemonCard } from '@posthog/lemon-ui'
+
+import { cn } from 'lib/utils/css-classes'
+
+import type { TicketMacroApi } from 'products/conversations/frontend/generated/api.schemas'
+
+import type {
+    AITriageSource,
+    AiReplyFeedbackRating,
+    ChatMessage,
+    MessageDeliveryStatus,
+    Ticket,
+    TicketChannel,
+    TicketStatus,
+} from '../../types'
+import type { SimplifiedRepliesProps } from '../ComposerHeader/ComposerHeader'
+import type { SupportEditorProps } from '../Editor'
+import { MessageInput } from './MessageInput'
+import { MessageList, type TimelineExtra } from './MessageList'
+
+export interface ChatViewProps {
+    messages: ChatMessage[]
+    messagesLoading: boolean
+    messageSending: boolean
+    hasMoreMessages?: boolean
+    olderMessagesLoading?: boolean
+    ticket?: Ticket
+    onSendMessage: (
+        content: string,
+        richContent: JSONContent | null,
+        isPrivate: boolean,
+        onSuccess: () => void,
+        statusAfterSend?: TicketStatus
+    ) => void
+    onLoadOlderMessages?: () => void
+    header?: React.ReactNode
+    minHeight?: string
+    maxHeight?: string
+    /** Fill a bounded parent (the ticket scene pane). Do not opt in when the parent height is auto:
+     *  overflow-hidden plus a 0 min-height list would collapse the thread. */
+    fillParent?: boolean
+    /** Show a one-line field until the user focuses it, then the full composer. */
+    collapseUntilActive?: boolean
+    /** When this changes, the collapsed composer closes. Ticket navigation reuses the same mount. */
+    threadId?: string
+    /** Channel the ticket came from; drives the reply placeholder and send-button logo */
+    channel?: TicketChannel
+    /** Whether to show the "Send as private" option in the message input */
+    showPrivateOption?: boolean
+    deliveryStatusByMessageId?: Map<string, MessageDeliveryStatus>
+    /** Draft content to restore (for tab persistence) */
+    draftContent?: JSONContent | string | null
+    /** Called when draft content changes */
+    onDraftChange?: (content: JSONContent | null) => void
+    /** Whether the private note checkbox is checked */
+    isPrivate?: boolean
+    /** Called when private checkbox changes */
+    onPrivateChange?: (isPrivate: boolean) => void
+    /** Extra actions rendered next to the send button in MessageInput */
+    extraActions?: React.ReactNode
+    /** Non-message thread entries, placed by their own timestamp (e.g. team-only agent findings) */
+    threadExtras?: TimelineExtra[]
+    /** Blocks sending customer-facing messages (private notes stay available) */
+    replyDisabledReason?: string | JSX.Element
+    /** Blocks sending entirely, including private notes (e.g. the user lacks edit access) */
+    sendDisabledReason?: string | JSX.Element
+    /** Whether draft mode is on: tints the composer green and confirms the recipient before sending */
+    draftMode?: boolean
+    /** Called when the draft-mode toggle changes */
+    onDraftModeChange?: (enabled: boolean) => void
+    /** Recipient description shown in the draft-mode send confirmation */
+    sendConfirmationMessage?: string
+    /** When provided, renders a dropdown next to the send button to send and set the ticket status in one go */
+    sendAndSetStatusOptions?: { value: TicketStatus; statusLabel: string }[]
+    /** Composer header and send menu in place of draft mode; see MessageInput */
+    simplifiedReplies?: SimplifiedRepliesProps
+    /** Other unsaved ticket edits that sending with a status would also persist */
+    unsavedTicketChanges?: string[]
+    latestAiMessageId?: string | null
+    latestAiDraftId?: string | null
+    feedbackByMessageId?: Record<string, AiReplyFeedbackRating>
+    showAiReplyFeedback?: boolean
+    aiReplyFeedbackDisabledReason?: string
+    onSubmitAiReplyFeedback?: (messageId: string, rating: AiReplyFeedbackRating, feedbackText?: string) => void
+    currentUserId?: number | null
+    /** False when the caller lacks ticket editor access (e.g. viewer-only). */
+    canEditTicket?: boolean
+    editingMessageId?: string | null
+    onEditMessage?: (message: ChatMessage) => void
+    onDeleteMessage?: (messageId: string) => void
+    onCancelEdit?: () => void
+    fullEmailLoadingMessageId?: string | null
+    onViewFullEmail?: (messageId: string) => void
+    composerPrefillAt?: number
+    composerInsertAt?: number
+    composerInsertContent?: string | null
+    macroPicker?: React.ReactNode
+    enableMacros?: boolean
+    onInsertMacro?: (macro: TicketMacroApi) => void
+    /** Stores a file of any type for the reply. Leave unset to hide the attach button. */
+    onAttachFile?: SupportEditorProps['onAttachFile']
+    aiSources?: AITriageSource[]
+    aiDraftApplying?: boolean
+    onApplyAiDraft?: (message: ChatMessage) => void
+}
+
+export function ChatView({
+    messages,
+    messagesLoading,
+    messageSending,
+    hasMoreMessages = false,
+    olderMessagesLoading = false,
+    onSendMessage,
+    onLoadOlderMessages,
+    header,
+    minHeight,
+    maxHeight,
+    fillParent = false,
+    collapseUntilActive = false,
+    threadId,
+    channel,
+    showPrivateOption = false,
+    deliveryStatusByMessageId,
+    draftContent,
+    onDraftChange,
+    isPrivate,
+    threadExtras,
+    onPrivateChange,
+    extraActions,
+    replyDisabledReason,
+    sendDisabledReason,
+    draftMode,
+    onDraftModeChange,
+    sendConfirmationMessage,
+    sendAndSetStatusOptions,
+    simplifiedReplies,
+    unsavedTicketChanges,
+    latestAiMessageId,
+    latestAiDraftId,
+    feedbackByMessageId,
+    showAiReplyFeedback,
+    aiReplyFeedbackDisabledReason,
+    onSubmitAiReplyFeedback,
+    currentUserId,
+    canEditTicket = false,
+    editingMessageId,
+    onEditMessage,
+    onDeleteMessage,
+    onCancelEdit,
+    fullEmailLoadingMessageId,
+    onViewFullEmail,
+    composerPrefillAt,
+    composerInsertAt,
+    composerInsertContent,
+    macroPicker,
+    enableMacros,
+    onAttachFile,
+    onInsertMacro,
+    aiSources,
+    aiDraftApplying,
+    onApplyAiDraft,
+}: ChatViewProps): JSX.Element {
+    const listMinHeight = minHeight ?? (fillParent ? '0' : '400px')
+    const listMaxHeight = maxHeight ?? (fillParent ? 'none' : '600px')
+
+    return (
+        <LemonCard
+            hoverEffect={false}
+            className={cn('flex flex-col overflow-hidden p-3', fillParent && 'h-full min-h-0 flex-1')}
+        >
+            {header}
+            <MessageList
+                messages={messages}
+                messagesLoading={messagesLoading}
+                hasMoreMessages={hasMoreMessages}
+                olderMessagesLoading={olderMessagesLoading}
+                onLoadOlderMessages={onLoadOlderMessages}
+                emptyMessage="No messages yet. Start the conversation!"
+                minHeight={listMinHeight}
+                maxHeight={listMaxHeight}
+                deliveryStatusByMessageId={deliveryStatusByMessageId}
+                latestAiMessageId={latestAiMessageId}
+                latestAiDraftId={latestAiDraftId}
+                feedbackByMessageId={feedbackByMessageId}
+                showAiReplyFeedback={showAiReplyFeedback}
+                aiReplyFeedbackDisabledReason={aiReplyFeedbackDisabledReason}
+                onSubmitAiReplyFeedback={onSubmitAiReplyFeedback}
+                extras={threadExtras}
+                currentUserId={currentUserId}
+                canEditTicket={canEditTicket}
+                onEditMessage={onEditMessage}
+                onDeleteMessage={onDeleteMessage}
+                fullEmailLoadingMessageId={fullEmailLoadingMessageId}
+                onViewFullEmail={onViewFullEmail}
+                aiSources={aiSources}
+                aiDraftApplying={aiDraftApplying}
+                onApplyAiDraft={onApplyAiDraft}
+            />
+            <div className="border-t pt-3 shrink-0">
+                <MessageInput
+                    onSendMessage={onSendMessage}
+                    messageSending={messageSending}
+                    channel={channel}
+                    showPrivateOption={showPrivateOption}
+                    draftContent={draftContent}
+                    onDraftChange={onDraftChange}
+                    isPrivate={isPrivate}
+                    onPrivateChange={onPrivateChange}
+                    extraActions={extraActions}
+                    replyDisabledReason={replyDisabledReason}
+                    sendDisabledReason={sendDisabledReason}
+                    draftMode={draftMode}
+                    onDraftModeChange={onDraftModeChange}
+                    sendConfirmationMessage={sendConfirmationMessage}
+                    sendAndSetStatusOptions={sendAndSetStatusOptions}
+                    simplifiedReplies={simplifiedReplies}
+                    unsavedTicketChanges={unsavedTicketChanges}
+                    editingMessageId={editingMessageId}
+                    onCancelEdit={onCancelEdit}
+                    collapseUntilActive={collapseUntilActive}
+                    threadId={threadId}
+                    composerPrefillAt={composerPrefillAt}
+                    composerInsertAt={composerInsertAt}
+                    composerInsertContent={composerInsertContent}
+                    macroPicker={macroPicker}
+                    enableMacros={enableMacros}
+                    onAttachFile={onAttachFile}
+                    onInsertMacro={onInsertMacro}
+                />
+            </div>
+        </LemonCard>
+    )
+}

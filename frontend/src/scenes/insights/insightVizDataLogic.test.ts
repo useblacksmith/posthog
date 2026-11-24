@@ -1,0 +1,1700 @@
+import { expectLogic } from 'kea-test-utils'
+
+import { FEATURE_FLAGS, FunnelLayout } from 'lib/constants'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { getDefaultEventLabel, getDefaultEventName } from 'lib/utils/getAppContext'
+import { entityFilterLogic } from 'scenes/insights/filters/ActionFilter/entityFilterLogic'
+import { QuerySourceUpdate, insightVizDataLogic } from 'scenes/insights/insightVizDataLogic'
+
+import { useMocks } from '~/mocks/jest'
+import { actionsModel } from '~/models/actionsModel'
+import { funnelsQueryDefault, trendsQueryDefault } from '~/queries/nodes/InsightQuery/defaults'
+import { LATEST_VERSIONS } from '~/queries/schema/latest-versions'
+import { setLatestVersionsOnQuery } from '~/queries/schema/query-versions'
+import {
+    FunnelsQuery,
+    LifecycleQuery,
+    Node,
+    NodeKind,
+    RetentionQuery,
+    TrendsQuery,
+} from '~/queries/schema/schema-general'
+import { initKeaTests } from '~/test/init'
+import {
+    BaseMathType,
+    ChartDisplayType,
+    FunnelVizType,
+    InsightModel,
+    InsightShortId,
+    PropertyFilterType,
+    PropertyOperator,
+} from '~/types'
+
+import {
+    funnelInvalidExclusionError,
+    funnelResult,
+} from 'products/product_analytics/frontend/insights/funnels/__mocks__/funnelDataLogicMocks'
+
+import { insightDataLogic } from './insightDataLogic'
+
+const Insight123 = '123' as InsightShortId
+
+type PickerLogic = ReturnType<typeof entityFilterLogic.build>
+
+describe('insightVizDataLogic', () => {
+    let builtInsightVizDataLogic: ReturnType<typeof insightVizDataLogic.build>
+    let builtInsightDataLogic: ReturnType<typeof insightDataLogic.build>
+    let builtFeatureFlagLogic: ReturnType<typeof featureFlagLogic.build>
+
+    beforeEach(() => {
+        useMocks({
+            get: {
+                '/api/environments/:team_id/insights/trend': [],
+                '/api/environments/:team_id/insights/': { results: [{}] },
+                '/api/projects/:team_id/actions/': {
+                    results: [{ id: 7, name: 'Sign up', steps: [{ event: '$pageview' }, { event: 'sign_up' }] }],
+                },
+            },
+        })
+        initKeaTests()
+
+        builtFeatureFlagLogic = featureFlagLogic()
+        builtFeatureFlagLogic.mount()
+
+        const props = { dashboardItemId: Insight123 }
+
+        builtInsightVizDataLogic = insightVizDataLogic(props)
+        builtInsightDataLogic = insightDataLogic(props)
+
+        builtInsightDataLogic.mount()
+        builtInsightVizDataLogic.mount()
+    })
+
+    describe('updateQuerySource', () => {
+        it('updates the query source', () => {
+            // with default query
+            expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({ filterTestAccounts: true })
+            }).toMatchValues({
+                query: setLatestVersionsOnQuery({
+                    kind: NodeKind.InsightVizNode,
+                    source: {
+                        ...trendsQueryDefault,
+                        filterTestAccounts: true,
+                    },
+                }),
+            })
+
+            expect(builtInsightVizDataLogic.values.querySource).toMatchObject({ filterTestAccounts: true })
+
+            // merges with existing changes
+            expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({ samplingFactor: 0.1 })
+            }).toMatchValues({
+                query: setLatestVersionsOnQuery({
+                    kind: NodeKind.InsightVizNode,
+                    source: {
+                        ...trendsQueryDefault,
+                        filterTestAccounts: true,
+                        samplingFactor: 0.1,
+                    },
+                }),
+            })
+
+            expect(builtInsightVizDataLogic.values.querySource).toEqual(
+                setLatestVersionsOnQuery({
+                    ...trendsQueryDefault,
+                    filterTestAccounts: true,
+                    samplingFactor: 0.1,
+                })
+            )
+        })
+
+        it('handles funnel step range side effects', () => {
+            const querySource = {
+                ...funnelsQueryDefault,
+                series: [funnelsQueryDefault.series[0], funnelsQueryDefault.series[0], funnelsQueryDefault.series[0]],
+                funnelsFilter: {
+                    funnelVizType: 'trends',
+                    funnelFromStep: 0,
+                    funnelToStep: 2,
+                },
+            } as FunnelsQuery
+            builtInsightVizDataLogic.actions.updateQuerySource(querySource)
+
+            expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    ...querySource,
+                    series: querySource.series.slice(0, 2),
+                } as FunnelsQuery)
+            }).toMatchValues({
+                query: {
+                    kind: NodeKind.InsightVizNode,
+                    source: {
+                        ...querySource,
+                        series: querySource.series.slice(0, 2),
+                        funnelsFilter: {
+                            funnelVizType: 'trends',
+                            funnelFromStep: 0,
+                            funnelToStep: 1,
+                        },
+                        trendsFilter: {}, // we currently don't remove insight filters of previous query kinds
+                        version: LATEST_VERSIONS[NodeKind.TrendsQuery], // carried over from the initial trends source, like the stale trendsFilter
+                    },
+                },
+            })
+        })
+
+        it('clamps exclusion step ranges when a funnel step is removed', () => {
+            const querySource = {
+                ...funnelsQueryDefault,
+                series: [funnelsQueryDefault.series[0], funnelsQueryDefault.series[0], funnelsQueryDefault.series[0]],
+                funnelsFilter: {
+                    funnelVizType: 'steps',
+                    exclusions: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$autocapture',
+                            event: '$autocapture',
+                            funnelFromStep: 0,
+                            funnelToStep: 2,
+                        },
+                    ],
+                },
+            } as FunnelsQuery
+            builtInsightVizDataLogic.actions.updateQuerySource(querySource)
+
+            expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    ...querySource,
+                    series: querySource.series.slice(0, 2),
+                } as FunnelsQuery)
+            }).toMatchValues({
+                query: {
+                    kind: NodeKind.InsightVizNode,
+                    source: {
+                        ...querySource,
+                        series: querySource.series.slice(0, 2),
+                        funnelsFilter: {
+                            funnelVizType: 'steps',
+                            exclusions: [
+                                {
+                                    kind: NodeKind.EventsNode,
+                                    name: '$autocapture',
+                                    event: '$autocapture',
+                                    funnelFromStep: 0,
+                                    funnelToStep: 1,
+                                },
+                            ],
+                        },
+                        trendsFilter: {},
+                        version: LATEST_VERSIONS[NodeKind.TrendsQuery], // carried over from the initial trends source, like the stale trendsFilter
+                    },
+                },
+            })
+        })
+
+        it('clears a custom lifecycle aggregation target when switching away from a data warehouse series', () => {
+            const lifecycleQuery: LifecycleQuery = {
+                kind: NodeKind.LifecycleQuery,
+                customAggregationTarget: true,
+                series: [
+                    {
+                        kind: NodeKind.LifecycleDataWarehouseNode,
+                        id: 'warehouse_orders',
+                        table_name: 'warehouse_orders',
+                        name: 'Orders',
+                        timestamp_field: 'created_at',
+                        aggregation_target_field: 'order_id',
+                        created_at_field: 'created_at',
+                    },
+                ],
+            }
+
+            builtInsightVizDataLogic.actions.updateQuerySource(lifecycleQuery)
+
+            expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    kind: NodeKind.LifecycleQuery,
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                } as LifecycleQuery)
+            }).toMatchValues({
+                query: {
+                    kind: NodeKind.InsightVizNode,
+                    source: {
+                        kind: NodeKind.LifecycleQuery,
+                        customAggregationTarget: undefined,
+                        series: [
+                            {
+                                kind: NodeKind.EventsNode,
+                                name: '$pageview',
+                                event: '$pageview',
+                            },
+                        ],
+                        trendsFilter: {},
+                        version: LATEST_VERSIONS[NodeKind.TrendsQuery], // carried over from the initial trends source, like the stale trendsFilter
+                    },
+                },
+            })
+        })
+
+        it('clears a custom retention aggregation target when an entity switches away from the data warehouse', () => {
+            const dataWarehouseEntity = {
+                id: 'warehouse_orders',
+                type: 'data_warehouse' as const,
+                table_name: 'warehouse_orders',
+                timestamp_field: 'created_at',
+                aggregation_target_field: 'order_id',
+            }
+
+            builtInsightVizDataLogic.actions.updateQuerySource({
+                kind: NodeKind.RetentionQuery,
+                retentionFilter: {
+                    customAggregationTarget: true,
+                    targetEntity: dataWarehouseEntity,
+                    returningEntity: dataWarehouseEntity,
+                },
+            } as RetentionQuery)
+            expect(builtInsightVizDataLogic.values.retentionFilter).toMatchObject({ customAggregationTarget: true })
+
+            // updateInsightFilter merges entity changes into the full filter, so the stale flag rides along
+            builtInsightVizDataLogic.actions.updateQuerySource({
+                kind: NodeKind.RetentionQuery,
+                retentionFilter: {
+                    customAggregationTarget: true,
+                    targetEntity: { id: '$pageview', type: 'events' },
+                    returningEntity: dataWarehouseEntity,
+                },
+            } as RetentionQuery)
+
+            expect(builtInsightVizDataLogic.values.retentionFilter).toEqual({
+                customAggregationTarget: undefined,
+                targetEntity: { id: '$pageview', type: 'events' },
+                returningEntity: dataWarehouseEntity,
+            })
+        })
+
+        it('clears unsupported lifecycle globals when switching to a data warehouse series', () => {
+            const lifecycleQuery: LifecycleQuery = {
+                kind: NodeKind.LifecycleQuery,
+                filterTestAccounts: true,
+                samplingFactor: 0.1,
+                properties: [
+                    {
+                        key: '$browser',
+                        value: 'Chrome',
+                        type: PropertyFilterType.Event,
+                        operator: PropertyOperator.Exact,
+                    },
+                ],
+                series: [
+                    {
+                        kind: NodeKind.EventsNode,
+                        name: '$pageview',
+                        event: '$pageview',
+                    },
+                ],
+            }
+
+            builtInsightVizDataLogic.actions.updateQuerySource(lifecycleQuery)
+
+            expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    kind: NodeKind.LifecycleQuery,
+                    series: [
+                        {
+                            kind: NodeKind.LifecycleDataWarehouseNode,
+                            id: 'warehouse_orders',
+                            table_name: 'warehouse_orders',
+                            name: 'Orders',
+                            timestamp_field: 'created_at',
+                            aggregation_target_field: 'order_id',
+                            created_at_field: 'created_at',
+                        },
+                    ],
+                } as LifecycleQuery)
+            }).toMatchValues({
+                query: {
+                    kind: NodeKind.InsightVizNode,
+                    source: {
+                        kind: NodeKind.LifecycleQuery,
+                        properties: undefined,
+                        filterTestAccounts: false,
+                        samplingFactor: undefined,
+                        series: [
+                            {
+                                kind: NodeKind.LifecycleDataWarehouseNode,
+                                id: 'warehouse_orders',
+                                table_name: 'warehouse_orders',
+                                name: 'Orders',
+                                timestamp_field: 'created_at',
+                                aggregation_target_field: 'order_id',
+                                created_at_field: 'created_at',
+                            },
+                        ],
+                        trendsFilter: {},
+                        version: LATEST_VERSIONS[NodeKind.TrendsQuery], // carried over from the initial trends source, like the stale trendsFilter
+                    },
+                },
+            })
+        })
+
+        const warehouseSeries = {
+            id: 'warehouse_orders',
+            table_name: 'warehouse_orders',
+            name: 'Orders',
+            timestamp_field: 'created_at',
+            id_field: 'order_id',
+        }
+        const warehouseEntity = {
+            id: 'warehouse_orders',
+            type: 'data_warehouse' as const,
+            table_name: 'warehouse_orders',
+            timestamp_field: 'created_at',
+            aggregation_target_field: 'customer_id',
+        }
+        const addsWarehouseSeries = (kind: NodeKind, warehouseKind: NodeKind): Record<string, any> => ({
+            kind,
+            added: 'series',
+            initial: { series: [{ kind: NodeKind.EventsNode, name: '$pageview', event: '$pageview' }] },
+            update: { series: [{ ...warehouseSeries, kind: warehouseKind }] },
+        })
+        const warehouseTrendsSeries = { ...warehouseSeries, kind: NodeKind.DataWarehouseNode }
+        const pageviewSeries = { kind: NodeKind.EventsNode, name: '$pageview', event: '$pageview' }
+        const flagCallsNode = {
+            id: 'posthog.flag_evaluations',
+            table_name: 'posthog.flag_evaluations',
+            name: 'Feature flag called',
+            timestamp_field: 'timestamp',
+            aggregation_target_field: 'person_id',
+        }
+        const flagCallsEntity = { ...flagCallsNode, type: 'data_warehouse' as const }
+        const flagCallsTrendsSeries = { ...flagCallsNode, kind: NodeKind.DataWarehouseNode }
+
+        it.each([
+            addsWarehouseSeries(NodeKind.TrendsQuery, NodeKind.DataWarehouseNode),
+            addsWarehouseSeries(NodeKind.FunnelsQuery, NodeKind.FunnelsDataWarehouseNode),
+            addsWarehouseSeries(NodeKind.StickinessQuery, NodeKind.DataWarehouseNode),
+            {
+                kind: NodeKind.TrendsQuery,
+                added: 'series beside a flag calls series',
+                initial: { series: [pageviewSeries] },
+                update: { series: [flagCallsTrendsSeries, warehouseTrendsSeries] },
+            },
+            {
+                kind: NodeKind.RetentionQuery,
+                added: 'target entity',
+                initial: { retentionFilter: { targetEntity: { id: '$pageview', type: 'events' } } },
+                update: { retentionFilter: { targetEntity: warehouseEntity } },
+            },
+            {
+                kind: NodeKind.RetentionQuery,
+                added: 'returning entity',
+                initial: { retentionFilter: { targetEntity: { id: '$pageview', type: 'events' } } },
+                update: {
+                    retentionFilter: {
+                        targetEntity: { id: '$pageview', type: 'events' },
+                        returningEntity: warehouseEntity,
+                    },
+                },
+            },
+        ])(
+            'disables filterTestAccounts and properties when adding a data warehouse $added to $kind',
+            ({ kind, initial, update }) => {
+                const initialSource: Record<string, unknown> = {
+                    kind,
+                    filterTestAccounts: true,
+                    properties: [{ type: 'event', key: 'browser', value: 'Chrome', operator: 'exact' }],
+                    ...initial,
+                }
+                builtInsightVizDataLogic.actions.updateQuerySource(initialSource as QuerySourceUpdate)
+
+                expect(builtInsightVizDataLogic.values.querySource).toMatchObject({
+                    kind,
+                    filterTestAccounts: true,
+                    properties: [expect.objectContaining({ key: 'browser' })],
+                })
+
+                const updateSource: Record<string, unknown> = { kind, ...update }
+                builtInsightVizDataLogic.actions.updateQuerySource(updateSource as QuerySourceUpdate)
+
+                expect(builtInsightVizDataLogic.values.querySource).toMatchObject({
+                    kind,
+                    filterTestAccounts: false,
+                    properties: undefined,
+                })
+                expect(builtInsightVizDataLogic.values.globalFiltersUnsupported).toBe(true)
+            }
+        )
+
+        it.each([
+            {
+                kind: NodeKind.TrendsQuery,
+                added: 'series',
+                initial: { series: [pageviewSeries] },
+                update: { series: [flagCallsTrendsSeries] },
+            },
+            {
+                kind: NodeKind.TrendsQuery,
+                added: 'series beside an event series',
+                initial: { series: [pageviewSeries] },
+                update: { series: [pageviewSeries, flagCallsTrendsSeries] },
+            },
+            {
+                kind: NodeKind.RetentionQuery,
+                added: 'target entity',
+                initial: { retentionFilter: { targetEntity: { id: '$pageview', type: 'events' } } },
+                update: { retentionFilter: { targetEntity: flagCallsEntity } },
+            },
+        ])(
+            'keeps filterTestAccounts and properties but clears sampling when adding a flag calls $added to $kind',
+            ({ kind, initial, update }) => {
+                const initialSource: Record<string, unknown> = {
+                    kind,
+                    filterTestAccounts: true,
+                    properties: [{ type: 'event', key: 'browser', value: 'Chrome', operator: 'exact' }],
+                    samplingFactor: 0.1,
+                    ...initial,
+                }
+                builtInsightVizDataLogic.actions.updateQuerySource(initialSource as QuerySourceUpdate)
+
+                const updateSource: Record<string, unknown> = { kind, ...update }
+                builtInsightVizDataLogic.actions.updateQuerySource(updateSource as QuerySourceUpdate)
+
+                expect(builtInsightVizDataLogic.values.querySource).toMatchObject({
+                    kind,
+                    filterTestAccounts: true,
+                    properties: [expect.objectContaining({ key: 'browser' })],
+                    samplingFactor: undefined,
+                })
+                expect(builtInsightVizDataLogic.values.globalFiltersUnsupported).toBe(false)
+            }
+        )
+
+        it('clears sampling when adding a data warehouse series to an insight with no other unsupported settings', () => {
+            builtInsightVizDataLogic.actions.updateQuerySource({ samplingFactor: 0.1 } as TrendsQuery)
+            expect(builtInsightVizDataLogic.values.querySource).toMatchObject({ samplingFactor: 0.1 })
+
+            builtInsightVizDataLogic.actions.updateQuerySource({ series: [warehouseTrendsSeries] } as TrendsQuery)
+
+            expect(builtInsightVizDataLogic.values.querySource).toMatchObject({ samplingFactor: undefined })
+        })
+
+        it.each([
+            {
+                name: 'an event breakdown',
+                breakdownFilter: { breakdown_type: 'event', breakdown: '$browser' },
+                series: [warehouseTrendsSeries],
+                expected: undefined,
+                toasts: [expect.stringMatching(/^A data warehouse series doesn't support this breakdown/)],
+            },
+            {
+                name: 'multiple breakdowns with an event one',
+                breakdownFilter: {
+                    breakdowns: [
+                        { type: 'data_warehouse', property: 'status' },
+                        { type: 'event', property: '$browser' },
+                    ],
+                },
+                series: [warehouseTrendsSeries],
+                expected: undefined,
+                toasts: [expect.stringMatching(/^A data warehouse series doesn't support this breakdown/)],
+            },
+            {
+                name: 'a data warehouse breakdown',
+                breakdownFilter: { breakdown_type: 'data_warehouse', breakdown: 'status' },
+                series: [warehouseTrendsSeries],
+                expected: { breakdown_type: 'data_warehouse', breakdown: 'status' },
+                toasts: [],
+            },
+            {
+                name: 'an event breakdown when a flag calls series joins an event series',
+                breakdownFilter: { breakdown_type: 'event', breakdown: '$browser' },
+                series: [pageviewSeries, flagCallsTrendsSeries],
+                expected: undefined,
+                toasts: [expect.stringMatching(/^Feature flag called doesn't support this breakdown/)],
+            },
+            {
+                name: 'a flag response breakdown when a trends series changes to flag calls',
+                breakdownFilter: { breakdown_type: 'event', breakdown: '$feature_flag_response' },
+                series: [flagCallsTrendsSeries],
+                expected: { breakdown_type: 'data_warehouse', breakdown: 'response' },
+                toasts: [],
+            },
+            {
+                name: 'multiple breakdowns with a flag key one when a trends series changes to flag calls',
+                breakdownFilter: { breakdowns: [{ type: 'event', property: '$feature_flag' }] },
+                series: [flagCallsTrendsSeries],
+                expected: { breakdowns: [{ type: 'data_warehouse', property: 'flag_key' }] },
+                toasts: [],
+            },
+            {
+                name: 'a flag calls breakdown when an event series joins a flag calls series',
+                breakdownFilter: { breakdown_type: 'data_warehouse', breakdown: 'flag_key' },
+                series: [pageviewSeries, flagCallsTrendsSeries],
+                expected: undefined,
+                toasts: [
+                    expect.stringMatching(/^Feature flag called can't share a breakdown with event or action series/),
+                ],
+            },
+        ])(
+            'handles $name when a trends series changes to a data warehouse series',
+            ({ breakdownFilter, series, expected, toasts }) => {
+                builtInsightVizDataLogic.actions.updateQuerySource({ breakdownFilter } as TrendsQuery)
+                const infoToast = jest.spyOn(lemonToast, 'info')
+
+                builtInsightVizDataLogic.actions.updateQuerySource({ series } as TrendsQuery)
+
+                expect((builtInsightVizDataLogic.values.querySource as TrendsQuery).breakdownFilter).toEqual(expected)
+                expect(infoToast.mock.calls.map(([message]) => message)).toEqual(toasts)
+                infoToast.mockRestore()
+            }
+        )
+
+        it.each([
+            {
+                kind: NodeKind.FunnelsQuery,
+                flagCalls: { series: [{ ...flagCallsNode, kind: NodeKind.FunnelsDataWarehouseNode }] },
+                targets: (source: any) => [
+                    source.series[0].aggregation_target_field,
+                    source.series[0].created_at_field,
+                ],
+                byGroup: ['$group_1', undefined],
+                byPerson: ['person_id', undefined],
+            },
+            {
+                kind: NodeKind.LifecycleQuery,
+                flagCalls: {
+                    series: [
+                        {
+                            ...flagCallsNode,
+                            kind: NodeKind.LifecycleDataWarehouseNode,
+                            created_at_field: 'person.created_at',
+                        },
+                    ],
+                },
+                targets: (source: any) => [
+                    source.series[0].aggregation_target_field,
+                    source.series[0].created_at_field,
+                ],
+                byGroup: ['$group_1', 'group_1.created_at'],
+                byPerson: ['person_id', 'person.created_at'],
+            },
+            {
+                kind: NodeKind.RetentionQuery,
+                flagCalls: { retentionFilter: { targetEntity: flagCallsEntity, returningEntity: flagCallsEntity } },
+                targets: (source: any) => [
+                    source.retentionFilter.targetEntity.aggregation_target_field,
+                    source.retentionFilter.returningEntity.aggregation_target_field,
+                    source.retentionFilter.targetEntity.created_at_field,
+                    source.retentionFilter.returningEntity.created_at_field,
+                ],
+                byGroup: ['$group_1', '$group_1', undefined, undefined],
+                byPerson: ['person_id', 'person_id', undefined, undefined],
+            },
+        ])('counts $kind flag calls by the aggregation group', ({ kind, flagCalls, targets, byGroup, byPerson }) => {
+            const update = (source: Record<string, unknown>): void =>
+                builtInsightVizDataLogic.actions.updateQuerySource({ kind, ...source } as QuerySourceUpdate)
+
+            update({ aggregation_group_type_index: 1 })
+            update(flagCalls)
+            expect(targets(builtInsightVizDataLogic.values.querySource)).toEqual(byGroup)
+
+            update({ aggregation_group_type_index: undefined })
+            expect(targets(builtInsightVizDataLogic.values.querySource)).toEqual(byPerson)
+        })
+
+        it('counts funnel flag calls by the funnel aggregation expression', () => {
+            const update = (source: Record<string, unknown>): void =>
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    kind: NodeKind.FunnelsQuery,
+                    ...source,
+                } as QuerySourceUpdate)
+            const target = (): string | undefined =>
+                (builtInsightVizDataLogic.values.querySource as any).series[0].aggregation_target_field
+
+            update({ series: [{ ...flagCallsNode, kind: NodeKind.FunnelsDataWarehouseNode }] })
+            update({ funnelsFilter: { funnelAggregateByHogQL: 'properties.$session_id' } })
+            expect(target()).toEqual('properties.$session_id')
+
+            update({ funnelsFilter: { funnelAggregateByHogQL: undefined } })
+            expect(target()).toEqual('person_id')
+        })
+
+        it('does not toast on an edit of a saved trends insight whose mixed series left empty properties', () => {
+            builtInsightDataLogic.actions.setQuery({
+                kind: NodeKind.InsightVizNode,
+                source: { kind: NodeKind.TrendsQuery, series: [pageviewSeries, warehouseTrendsSeries], properties: [] },
+            } as Node)
+            const infoToast = jest.spyOn(lemonToast, 'info')
+
+            builtInsightVizDataLogic.actions.updateQuerySource({ dateRange: { date_from: '-30d' } } as TrendsQuery)
+
+            expect(infoToast).not.toHaveBeenCalled()
+            infoToast.mockRestore()
+        })
+
+        it.each([
+            {
+                saved: 'another warehouse table',
+                series: warehouseTrendsSeries,
+                kept: { filterTestAccounts: false, properties: undefined },
+            },
+            {
+                saved: 'flag calls',
+                series: flagCallsTrendsSeries,
+                kept: { filterTestAccounts: true, properties: [expect.objectContaining({ key: 'browser' })] },
+            },
+        ])('resets sampling and the filters a saved $saved series cannot take', ({ series, kept }) => {
+            builtInsightDataLogic.actions.setQuery({
+                kind: NodeKind.InsightVizNode,
+                source: {
+                    kind: NodeKind.TrendsQuery,
+                    series: [series],
+                    filterTestAccounts: true,
+                    properties: [{ type: 'event', key: 'browser', value: 'Chrome', operator: 'exact' }],
+                    samplingFactor: 0.1,
+                },
+            } as Node)
+
+            builtInsightVizDataLogic.actions.updateQuerySource({ samplingFactor: undefined } as TrendsQuery)
+
+            expect(builtInsightVizDataLogic.values.querySource).toMatchObject({ ...kept, samplingFactor: undefined })
+        })
+
+        it('keeps test accounts off when a later edit turns them on for a retention insight with a data warehouse entity', () => {
+            builtInsightVizDataLogic.actions.updateQuerySource({
+                kind: NodeKind.RetentionQuery,
+                retentionFilter: { targetEntity: warehouseEntity, returningEntity: warehouseEntity },
+            } as QuerySourceUpdate)
+
+            builtInsightVizDataLogic.actions.updateQuerySource({
+                ...builtInsightVizDataLogic.values.querySource,
+                filterTestAccounts: true,
+            } as QuerySourceUpdate)
+
+            expect(builtInsightVizDataLogic.values.querySource).toMatchObject({
+                kind: NodeKind.RetentionQuery,
+                filterTestAccounts: false,
+            })
+            expect(builtInsightVizDataLogic.values.globalFiltersUnsupported).toBe(true)
+        })
+    })
+
+    describe('updateSeries', () => {
+        const pageview = { kind: NodeKind.EventsNode, event: '$pageview', name: '$pageview' }
+        const signUp = { kind: NodeKind.ActionsNode, id: 7, name: 'Sign up' }
+        const added = { kind: NodeKind.EventsNode, event: getDefaultEventName(), name: getDefaultEventLabel() }
+
+        it.each([
+            {
+                edit: 'adds a series with the default math',
+                source: { kind: NodeKind.TrendsQuery, series: [{ ...pageview, math: BaseMathType.UniqueUsers }] },
+                apply: (picker: PickerLogic) => picker.actions.addSeries(),
+                expected: [
+                    { ...pageview, math: BaseMathType.UniqueUsers },
+                    { ...added, math: BaseMathType.TotalCount },
+                ],
+            },
+            {
+                edit: 'changes a math',
+                source: { kind: NodeKind.TrendsQuery, series: [{ ...pageview, math: BaseMathType.TotalCount }] },
+                apply: (picker: PickerLogic) =>
+                    picker.actions.updateSeriesMath(0, { math: BaseMathType.WeeklyActiveUsers, math_hogql: undefined }),
+                expected: [{ ...pageview, math: BaseMathType.WeeklyActiveUsers }],
+            },
+            {
+                edit: 'removes a series',
+                source: {
+                    kind: NodeKind.TrendsQuery,
+                    series: [
+                        { ...pageview, math: BaseMathType.TotalCount },
+                        { ...signUp, math: BaseMathType.TotalCount },
+                    ],
+                },
+                apply: (picker: PickerLogic) => picker.actions.removeSeries(0),
+                expected: [{ ...signUp, math: BaseMathType.TotalCount }],
+            },
+            {
+                edit: 'reorders series',
+                source: {
+                    kind: NodeKind.TrendsQuery,
+                    series: [
+                        { ...pageview, math: BaseMathType.TotalCount },
+                        { ...signUp, math: BaseMathType.TotalCount },
+                    ],
+                },
+                apply: (picker: PickerLogic) => picker.actions.setLocalSeries([...picker.values.localSeries].reverse()),
+                expected: [
+                    { ...signUp, math: BaseMathType.TotalCount },
+                    { ...pageview, math: BaseMathType.TotalCount },
+                ],
+            },
+            {
+                edit: 'adds a stickiness series with an actors math',
+                source: { kind: NodeKind.StickinessQuery, series: [{ ...pageview, math: BaseMathType.UniqueUsers }] },
+                apply: (picker: PickerLogic) => picker.actions.addSeries(),
+                expected: [
+                    { ...pageview, math: BaseMathType.UniqueUsers },
+                    { ...added, math: BaseMathType.UniqueUsers },
+                ],
+            },
+            {
+                edit: 'moves an optional funnel step to the start',
+                source: { kind: NodeKind.FunnelsQuery, series: [pageview, { ...signUp, optionalInFunnel: true }] },
+                apply: (picker: PickerLogic) => picker.actions.setLocalSeries([...picker.values.localSeries].reverse()),
+                expected: [signUp, pageview],
+            },
+        ])('$edit', ({ source, apply, expected }) => {
+            builtInsightDataLogic.actions.setQuery({ kind: NodeKind.InsightVizNode, source } as Node)
+            const picker = entityFilterLogic({
+                typeKey: 'insight-series',
+                series: builtInsightVizDataLogic.values.series ?? [],
+                onChange: builtInsightVizDataLogic.actions.updateSeries,
+            })
+            picker.mount()
+
+            apply(picker)
+
+            expect(builtInsightVizDataLogic.values.series).toEqual(expected)
+        })
+    })
+
+    describe('updateDateRange', () => {
+        it('does not inject the interval side effect into a paths v2 query, which has no interval field', async () => {
+            builtInsightDataLogic.actions.setQuery({
+                kind: NodeKind.InsightVizNode,
+                source: { kind: NodeKind.PathsV2Query },
+            } as Node)
+
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateDateRange({ date_from: '-7d', date_to: null })
+            }).toFinishAllListeners()
+
+            expect(builtInsightVizDataLogic.values.querySource).not.toHaveProperty('interval')
+            expect(builtInsightVizDataLogic.values.dateRange).toMatchObject({ date_from: '-7d' })
+        })
+
+        it('updates the date range', async () => {
+            // when dateRange is empty
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateDateRange({
+                    date_from: '-7d',
+                    date_to: null,
+                    explicitDate: false,
+                })
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: setLatestVersionsOnQuery({
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            ...trendsQueryDefault,
+                            interval: 'day', // side effect
+                            dateRange: {
+                                date_from: '-7d',
+                                date_to: null,
+                                explicitDate: false,
+                            },
+                        },
+                    }),
+                })
+
+            expect(builtInsightVizDataLogic.values.dateRange).toEqual({
+                date_from: '-7d',
+                date_to: null,
+                explicitDate: false,
+            })
+
+            // merges with existing dateRange
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateDateRange({
+                    date_to: '-3d',
+                })
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: setLatestVersionsOnQuery({
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            ...trendsQueryDefault,
+                            interval: 'day', // side effect
+                            dateRange: {
+                                date_from: '-7d',
+                                date_to: '-3d',
+                                explicitDate: false,
+                            },
+                        },
+                    }),
+                })
+
+            expect(builtInsightVizDataLogic.values.dateRange).toEqual({
+                date_from: '-7d',
+                date_to: '-3d',
+                explicitDate: false,
+            })
+        })
+
+        it('auto-selects quarter interval for >36-month range when flag is on', async () => {
+            featureFlagLogic.actions.setFeatureFlags([], {
+                [FEATURE_FLAGS.PRODUCT_ANALYTICS_QUARTER_YEAR_INTERVALS]: true,
+            })
+
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateDateRange({
+                    date_from: '2020-01-01',
+                    date_to: '2024-01-01',
+                    explicitDate: true,
+                })
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: {
+                        kind: NodeKind.InsightVizNode,
+                        source: expect.objectContaining({
+                            interval: 'quarter',
+                        }),
+                    },
+                })
+
+            featureFlagLogic.actions.setFeatureFlags([], {
+                [FEATURE_FLAGS.PRODUCT_ANALYTICS_QUARTER_YEAR_INTERVALS]: false,
+            })
+        })
+
+        it('auto-selects month interval for >36-month range when flag is off', async () => {
+            featureFlagLogic.actions.setFeatureFlags([], {
+                [FEATURE_FLAGS.PRODUCT_ANALYTICS_QUARTER_YEAR_INTERVALS]: false,
+            })
+
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateDateRange({
+                    date_from: '2020-01-01',
+                    date_to: '2024-01-01',
+                    explicitDate: true,
+                })
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: {
+                        kind: NodeKind.InsightVizNode,
+                        source: expect.objectContaining({
+                            interval: 'month',
+                        }),
+                    },
+                })
+        })
+
+        it.each([
+            ['2024-06-10 08:00:00', '2024-06-10 14:00:00', 'minute'],
+            // A bare same-day pair means "that whole day" and must stay hourly, not 1440 minute buckets
+            ['2024-06-10', '2024-06-10', 'hour'],
+            // A time-carrying range over 12 hours must not go sub-hour
+            ['2024-06-10 08:00:00', '2024-06-11 20:00:00', 'hour'],
+            ['2024-06-01', '2024-07-15', 'day'],
+        ])('auto-adjusts interval for absolute range %s..%s to %s', async (dateFrom, dateTo, expectedInterval) => {
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateDateRange({ date_from: dateFrom, date_to: dateTo }, true)
+            }).toFinishAllListeners()
+
+            expect((builtInsightVizDataLogic.values.querySource as TrendsQuery).interval).toBe(expectedInterval)
+        })
+    })
+
+    describe('zoomDateRange', () => {
+        it.each([
+            // [interval, dateFrom, dateTo (bucket start), expected date_to, explicitDate]
+            ['day', '2024-06-10', '2024-06-12', '2024-06-12', false],
+            // Coarser-than-day buckets: the end widens to the bucket's last day, so a
+            // single-bucket drag (e.g. over one monthly bar) zooms into the whole bucket.
+            ['week', '2024-06-09', '2024-06-09', '2024-06-15', false],
+            ['month', '2024-04-01', '2024-04-01', '2024-04-30', false],
+            // Sub-day buckets widen to the bucket's last second and pin explicitDate.
+            ['hour', '2024-06-10 08:00:00', '2024-06-10 14:00:00', '2024-06-10 14:59:59', true],
+        ])('zooms %s buckets %s..%s', async (interval, dateFrom, dateTo, expectedDateTo, explicitDate) => {
+            builtInsightVizDataLogic.actions.updateQuerySource({ interval } as Partial<TrendsQuery>)
+
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.zoomDateRange(dateFrom, dateTo)
+            }).toFinishAllListeners()
+
+            expect(builtInsightVizDataLogic.values.dateRange).toEqual({
+                date_from: dateFrom,
+                date_to: expectedDateTo,
+                explicitDate,
+            })
+        })
+    })
+
+    describe('updateBreakdownFilter', () => {
+        it('updates the breakdown', async () => {
+            // when breakdown is empty
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateBreakdownFilter({
+                    breakdown_type: 'event',
+                    breakdown: '$current_url',
+                })
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: setLatestVersionsOnQuery({
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            ...trendsQueryDefault,
+                            breakdownFilter: {
+                                breakdown_type: 'event',
+                                breakdown: '$current_url',
+                            },
+                        },
+                    }),
+                })
+
+            expect(builtInsightVizDataLogic.values.breakdownFilter).toEqual({
+                breakdown_type: 'event',
+                breakdown: '$current_url',
+            })
+
+            // merges with existing breakdown
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateBreakdownFilter({
+                    breakdown: '$browser',
+                })
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: setLatestVersionsOnQuery({
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            ...trendsQueryDefault,
+                            breakdownFilter: {
+                                breakdown_type: 'event',
+                                breakdown: '$browser',
+                            },
+                        },
+                    }),
+                })
+
+            expect(builtInsightVizDataLogic.values.breakdownFilter).toEqual({
+                breakdown_type: 'event',
+                breakdown: '$browser',
+            })
+        })
+    })
+
+    describe('updateInsightFilter', () => {
+        it('updates the insight filter', async () => {
+            // when insight filter is empty
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateInsightFilter({ display: ChartDisplayType.ActionsAreaGraph })
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: setLatestVersionsOnQuery({
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            ...trendsQueryDefault,
+                            trendsFilter: {
+                                display: 'ActionsAreaGraph',
+                            },
+                        },
+                    }),
+                })
+
+            expect(builtInsightVizDataLogic.values.insightFilter).toEqual({ display: 'ActionsAreaGraph' })
+
+            // merges with existing insight filter
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateInsightFilter({
+                    showValuesOnSeries: true,
+                })
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: setLatestVersionsOnQuery({
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            ...trendsQueryDefault,
+                            trendsFilter: {
+                                display: 'ActionsAreaGraph',
+                                showValuesOnSeries: true,
+                            },
+                        },
+                    }),
+                })
+
+            expect(builtInsightVizDataLogic.values.insightFilter).toEqual({
+                display: 'ActionsAreaGraph',
+                showValuesOnSeries: true,
+            })
+        })
+
+        it('updates the insight filter for other insight query kinds', async () => {
+            builtInsightVizDataLogic.actions.updateQuerySource(funnelsQueryDefault)
+
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateInsightFilter({
+                    layout: FunnelLayout.horizontal,
+                })
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: {
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            ...funnelsQueryDefault,
+                            funnelsFilter: {
+                                ...funnelsQueryDefault.funnelsFilter,
+                                layout: FunnelLayout.horizontal,
+                            },
+                            trendsFilter: {}, // we currently don't remove insight filters of previous query kinds
+                            version: LATEST_VERSIONS[NodeKind.TrendsQuery], // carried over from the initial trends source, like the stale trendsFilter
+                        },
+                    },
+                })
+
+            expect(builtInsightVizDataLogic.values.insightFilter).toMatchObject({
+                ...funnelsQueryDefault.funnelsFilter,
+                layout: FunnelLayout.horizontal,
+            })
+        })
+
+        it('drops a debounced update when the insight type changes before it applies', async () => {
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateInsightFilter({
+                    formula: undefined,
+                    formulas: undefined,
+                    formulaNodes: [{ formula: '(A/B)*100' }],
+                })
+                builtInsightDataLogic.actions.setQuery({
+                    kind: NodeKind.InsightVizNode,
+                    source: funnelsQueryDefault,
+                } as Node)
+            }).toFinishAllListeners()
+
+            expect(builtInsightVizDataLogic.values.querySource).toEqual(funnelsQueryDefault)
+        })
+
+        it('clears the breakdown when switching to the Metric display', async () => {
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateBreakdownFilter({
+                    breakdown_type: 'event',
+                    breakdown: '$browser',
+                })
+            }).toFinishAllListeners()
+            expect((builtInsightVizDataLogic.values.querySource as TrendsQuery).breakdownFilter).toEqual({
+                breakdown_type: 'event',
+                breakdown: '$browser',
+            })
+
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateInsightFilter({ display: ChartDisplayType.Metric })
+            }).toFinishAllListeners()
+
+            expect(builtInsightVizDataLogic.values.querySource).toMatchObject({
+                trendsFilter: { display: ChartDisplayType.Metric },
+            })
+            expect((builtInsightVizDataLogic.values.querySource as TrendsQuery).breakdownFilter).toBeUndefined()
+        })
+    })
+
+    describe('activeUsersMath', () => {
+        it('returns null without active users math', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                            math: BaseMathType.TotalCount,
+                        },
+                    ],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ activeUsersMath: null })
+        })
+
+        it('returns weekly active users math type', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                            math: BaseMathType.WeeklyActiveUsers,
+                        },
+                    ],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ activeUsersMath: BaseMathType.WeeklyActiveUsers })
+        })
+
+        it('returns monthly active users math type', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                            math: BaseMathType.TotalCount,
+                        },
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                            math: BaseMathType.MonthlyActiveUsers,
+                        },
+                    ],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ activeUsersMath: BaseMathType.MonthlyActiveUsers })
+        })
+    })
+
+    describe('enabledIntervals', () => {
+        it('returns all intervals', () => {
+            expectLogic(builtInsightVizDataLogic).toMatchValues({
+                enabledIntervals: {
+                    day: { label: 'day', newDateFrom: undefined },
+                    minute: { label: 'minute', newDateFrom: 'hStart' },
+                    hour: { label: 'hour', newDateFrom: 'dStart' },
+                    month: { label: 'month', newDateFrom: '-90d' },
+                    week: { label: 'week', newDateFrom: '-30d' },
+                    quarter: { label: 'quarter', newDateFrom: '-3y', hidden: true },
+                    year: { label: 'year', newDateFrom: '-5y', hidden: true },
+                },
+            })
+        })
+
+        it('unhides quarter and year when the flag is enabled', () => {
+            featureFlagLogic.actions.setFeatureFlags([], {
+                [FEATURE_FLAGS.PRODUCT_ANALYTICS_QUARTER_YEAR_INTERVALS]: true,
+            })
+
+            expect(builtInsightVizDataLogic.values.enabledIntervals.quarter).toEqual({
+                label: 'quarter',
+                newDateFrom: '-3y',
+                hidden: false,
+            })
+            expect(builtInsightVizDataLogic.values.enabledIntervals.year).toEqual({
+                label: 'year',
+                newDateFrom: '-5y',
+                hidden: false,
+            })
+
+            featureFlagLogic.actions.setFeatureFlags([], {
+                [FEATURE_FLAGS.PRODUCT_ANALYTICS_QUARTER_YEAR_INTERVALS]: false,
+            })
+        })
+
+        it('adds a disabled reason with active users math', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: 'EventsNode',
+                            name: '$pageview',
+                            event: '$pageview',
+                            math: BaseMathType.WeeklyActiveUsers,
+                        },
+                    ],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({
+                enabledIntervals: {
+                    day: { label: 'day', newDateFrom: undefined },
+                    minute: {
+                        label: 'minute',
+                        newDateFrom: 'hStart',
+                    },
+                    hour: {
+                        label: 'hour',
+                        newDateFrom: 'dStart',
+                        disabledReason:
+                            'Grouping by hour is not supported on insights with weekly or monthly active users series.',
+                    },
+                    month: {
+                        label: 'month',
+                        newDateFrom: '-90d',
+                        disabledReason:
+                            'Grouping by month is not supported on insights with weekly active users series.',
+                    },
+                    week: { label: 'week', newDateFrom: '-30d' },
+                    quarter: {
+                        label: 'quarter',
+                        newDateFrom: '-3y',
+                        hidden: true,
+                        disabledReason:
+                            'Grouping by quarter is not supported on insights with weekly active users series.',
+                    },
+                    year: {
+                        label: 'year',
+                        newDateFrom: '-5y',
+                        hidden: true,
+                        disabledReason:
+                            'Grouping by year is not supported on insights with weekly active users series.',
+                    },
+                },
+            })
+        })
+
+        it('snaps interval to week when switching series to WAU on a quarter-grouped query', () => {
+            builtInsightVizDataLogic.actions.updateQuerySource({
+                interval: 'quarter',
+            } as Partial<TrendsQuery>)
+
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                            math: BaseMathType.WeeklyActiveUsers,
+                        },
+                    ],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({
+                querySource: expect.objectContaining({ interval: 'week' }),
+            })
+        })
+
+        it('clears smoothing when switching between intervals', async () => {
+            const trendsQuery = { ...trendsQueryDefault, interval: 'minute' as const }
+            trendsQuery.trendsFilter = { ...trendsQuery.trendsFilter, smoothingIntervals: 2 }
+            builtInsightVizDataLogic.actions.updateQuerySource(trendsQuery)
+
+            await expectLogic(builtInsightDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    kind: NodeKind.TrendsQuery,
+                    interval: 'hour',
+                } as TrendsQuery)
+            })
+                .toFinishAllListeners()
+                .toMatchValues({
+                    query: setLatestVersionsOnQuery({
+                        kind: NodeKind.InsightVizNode,
+                        source: {
+                            ...trendsQuery,
+                            interval: 'hour',
+                            dateRange: {
+                                date_from: '-1h',
+                                date_to: undefined,
+                            },
+                            trendsFilter: { smoothingIntervals: undefined },
+                        },
+                    }),
+                })
+        })
+    })
+
+    describe('validationError', () => {
+        it('for standard funnel', async () => {
+            const insight: Partial<InsightModel> = {
+                result: funnelResult.result,
+            }
+
+            await expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightDataLogic.actions.loadDataSuccess(insight)
+            }).toMatchValues({
+                validationError: null,
+            })
+        })
+
+        it('for invalid exclusion', async () => {
+            await expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightDataLogic.actions.loadDataFailure('', { status: 400, ...funnelInvalidExclusionError })
+            }).toMatchValues({
+                validationError: "Exclusion steps cannot contain an event that's part of funnel steps.",
+            })
+        })
+    })
+
+    describe('hasRenderableResults', () => {
+        it('tracks whether the loaded response contains results', async () => {
+            await expectLogic(builtInsightVizDataLogic).toMatchValues({ hasRenderableResults: false })
+
+            await expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightDataLogic.actions.loadDataSuccess({ result: funnelResult.result })
+            }).toMatchValues({ hasRenderableResults: true })
+
+            await expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightDataLogic.actions.loadDataSuccess({
+                    cache_key: 'cache_1_abc',
+                    query_status: { id: 'cache_1_abc', complete: false },
+                } as Record<string, any>)
+            }).toMatchValues({ hasRenderableResults: false })
+        })
+
+        it.each([
+            ['blocks time series rows under a donut chart', ChartDisplayType.ActionsDonut, { data: [1, 2, 3] }, false],
+            [
+                'renders total value rows under a donut chart',
+                ChartDisplayType.ActionsDonut,
+                { aggregated_value: 6 },
+                true,
+            ],
+            ['renders time series rows under a scatter plot', ChartDisplayType.ScatterPlot, { data: [1, 2, 3] }, true],
+            [
+                'renders time series rows under a two dimensional heatmap',
+                ChartDisplayType.TwoDimensionalHeatmap,
+                { data: [1, 2, 3] },
+                true,
+            ],
+        ])('%s', (_, display, row, expected) => {
+            builtInsightVizDataLogic.actions.updateQuerySource({ ...trendsQueryDefault, trendsFilter: { display } })
+            builtInsightDataLogic.actions.loadDataSuccess({ results: [row] })
+            expect(builtInsightVizDataLogic.values.hasRenderableResults).toBe(expected)
+        })
+    })
+
+    describe('isSingleSeriesOutput', () => {
+        it('returns true for single series without breakdown', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesOutput: true })
+        })
+
+        it.each([
+            ['a single breakdown', { breakdown: '$browser', breakdown_type: 'event' }, undefined],
+            ['multiple breakdowns', { breakdowns: [{ property: '$browser', type: 'event' }] }, undefined],
+            ['a breakdown and one formula', { breakdowns: [{ property: '$browser', type: 'event' }] }, 'A * 2'],
+        ])('returns false for a single series with %s', (_, breakdownFilter, formula) => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [{ kind: NodeKind.EventsNode, name: '$pageview', event: '$pageview' }],
+                    breakdownFilter,
+                    trendsFilter: formula ? { formula } : undefined,
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesOutput: false })
+        })
+
+        it('returns false for multiple series without formula', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesOutput: false })
+        })
+
+        it('returns true for multiple series with single formula', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                    trendsFilter: {
+                        formula: 'A + B',
+                    },
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesOutput: true })
+        })
+
+        it('returns true for multiple series with single formula in formulas array', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                    trendsFilter: {
+                        formulas: ['A + B'],
+                    },
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesOutput: true })
+        })
+
+        it('returns false for multiple series with multiple formulas', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                    trendsFilter: {
+                        formulas: ['A + B', 'A - B'],
+                    },
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesOutput: false })
+        })
+
+        it('returns false for single series with breakdown', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                    breakdownFilter: {
+                        breakdown: '$browser',
+                        breakdown_type: 'event',
+                    },
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesOutput: false })
+        })
+    })
+
+    describe('isSingleSeriesDefinition', () => {
+        it('returns true for single series without breakdown', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesDefinition: true })
+        })
+
+        it('returns false for multiple series', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$autocapture',
+                            event: '$autocapture',
+                        },
+                    ],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesDefinition: false })
+        })
+
+        it('returns true for single series WITH breakdown (unlike isSingleSeriesOutput)', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                    breakdownFilter: {
+                        breakdown: '$browser',
+                        breakdown_type: 'event',
+                    },
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesDefinition: true })
+        })
+
+        it('returns true for single series WITH breakdowns array', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                    ],
+                    breakdownFilter: {
+                        breakdowns: [
+                            {
+                                property: '$browser',
+                                type: 'event',
+                            },
+                        ],
+                    },
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesDefinition: true })
+        })
+
+        it('returns true for multiple series with single formula', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$pageview',
+                            event: '$pageview',
+                        },
+                        {
+                            kind: NodeKind.EventsNode,
+                            name: '$autocapture',
+                            event: '$autocapture',
+                        },
+                    ],
+                    trendsFilter: {
+                        formula: 'A + B',
+                    },
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isSingleSeriesDefinition: true })
+        })
+    })
+
+    describe('isBreakdownSeries', () => {
+        it('returns false without breakdown filter', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [{ kind: NodeKind.EventsNode, name: '$pageview', event: '$pageview' }],
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isBreakdownSeries: false })
+        })
+
+        it('returns true with singular breakdown object', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [{ kind: NodeKind.EventsNode, name: '$pageview', event: '$pageview' }],
+                    breakdownFilter: {
+                        breakdown: '$browser',
+                        breakdown_type: 'event',
+                    },
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isBreakdownSeries: true })
+        })
+
+        it('returns true with breakdowns array', () => {
+            expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightVizDataLogic.actions.updateQuerySource({
+                    series: [{ kind: NodeKind.EventsNode, name: '$pageview', event: '$pageview' }],
+                    breakdownFilter: {
+                        breakdowns: [{ property: '$browser', type: 'event' }],
+                    },
+                } as Partial<TrendsQuery>)
+            }).toMatchValues({ isBreakdownSeries: true })
+        })
+    })
+
+    describe('showLegend', () => {
+        const rows = (count: number, compare_label?: string): Record<string, any>[] =>
+            Array.from({ length: count }, (_, i) => ({ breakdown_value: `part ${i}`, compare_label }))
+
+        it.each([
+            ['a proportion bar with few parts', rows(15), true],
+            ['a proportion bar with many parts', rows(25), undefined],
+            [
+                'a proportion bar saved with compare on, counting only the current period',
+                [...rows(15, 'current'), ...rows(15, 'previous')],
+                true,
+            ],
+        ])('%s', async (_name, result, expected) => {
+            builtInsightVizDataLogic.actions.updateQuerySource({
+                ...trendsQueryDefault,
+                trendsFilter: { display: ChartDisplayType.ActionsProportionBar },
+            } as TrendsQuery)
+
+            await expectLogic(builtInsightVizDataLogic, () => {
+                builtInsightDataLogic.actions.loadDataSuccess({ result })
+            }).toMatchValues({ showLegend: expected })
+        })
+    })
+
+    describe('supportsCompare', () => {
+        const setFunnelVizType = (funnelVizType: FunnelVizType): void => {
+            builtInsightVizDataLogic.actions.updateQuerySource({
+                ...funnelsQueryDefault,
+                funnelsFilter: { ...funnelsQueryDefault.funnelsFilter, funnelVizType },
+            } as FunnelsQuery)
+        }
+
+        it.each([
+            [FunnelVizType.Steps, true],
+            [FunnelVizType.Trends, true],
+            [FunnelVizType.TimeToConvert, true],
+            // FLOW is excluded — the backend ignores compare for it.
+            [FunnelVizType.Flow, false],
+        ] as [FunnelVizType, boolean][])('%s viz → %s', (funnelVizType, expected) => {
+            setFunnelVizType(funnelVizType)
+
+            expect(builtInsightVizDataLogic.values.supportsCompare).toBe(expected)
+        })
+
+        it.each([
+            [ChartDisplayType.ActionsPie, true],
+            [ChartDisplayType.ActionsProportionBar, false],
+        ])('trends %s display -> %s', (display, expected) => {
+            builtInsightVizDataLogic.actions.updateQuerySource({
+                ...trendsQueryDefault,
+                trendsFilter: { display },
+            } as TrendsQuery)
+
+            expect(builtInsightVizDataLogic.values.supportsCompare).toBe(expected)
+        })
+    })
+
+    describe('allEventNames', () => {
+        it('resolves action series once actionsModel mounts, without mounting it itself', async () => {
+            initKeaTests()
+            actionsModel.build()
+            const props = { dashboardItemId: Insight123 }
+            builtInsightDataLogic = insightDataLogic(props)
+            builtInsightVizDataLogic = insightVizDataLogic(props)
+            builtInsightDataLogic.mount()
+            builtInsightVizDataLogic.mount()
+
+            builtInsightVizDataLogic.actions.updateQuerySource({
+                ...trendsQueryDefault,
+                series: [{ kind: NodeKind.ActionsNode, id: 7 }],
+            } as TrendsQuery)
+
+            expect(actionsModel.isMounted()).toBe(false)
+            expect(builtInsightVizDataLogic.values.allEventNames).toEqual([])
+
+            actionsModel.mount()
+            await expectLogic(builtInsightVizDataLogic)
+                .toDispatchActions([actionsModel.actionTypes.loadActionsSuccess])
+                .toMatchValues({ allEventNames: ['$pageview', 'sign_up'] })
+        })
+    })
+})

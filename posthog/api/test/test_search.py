@@ -1,0 +1,556 @@
+import pytest
+from posthog.test.base import APIBaseTest
+from unittest.mock import Mock
+
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+
+from parameterized import parameterized
+
+from posthog.api.search import ENTITY_MAP, SEARCHABLE_ENTITIES, class_queryset, search_entities
+from posthog.helpers.full_text_search import build_search_vector, process_query
+from posthog.models import OrganizationMembership, Team, User
+
+from products.access_control.backend.models.access_control import AccessControl
+from products.dashboards.backend.models.dashboard import Dashboard
+from products.data_modeling.backend.facade.models import DAG, DataWarehouseSavedQuery, Node, NodeType
+from products.early_access_features.backend.models import EarlyAccessFeature
+from products.endpoints.backend.facade.models import Endpoint
+from products.event_definitions.backend.models import EventDefinition, PropertyDefinition
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+from products.notebooks.backend.models import Notebook
+from products.product_analytics.backend.facade.models import Insight
+from products.workflows.backend.facade.testing import create_workflow_for_test
+
+
+class TestSearch(APIBaseTest):
+    insight_1: Insight
+    dashboard_1: Dashboard
+
+    def setUp(self):
+        super().setUp()
+
+        Insight.objects.create(team=self.team, derived_name="derived name")
+        self.insight_1 = Insight.objects.create(team=self.team, name="second insight")
+        Insight.objects.create(team=self.team, name="third insight")
+
+        Dashboard.objects.create(team=self.team, created_by=self.user)
+        self.dashboard_1 = Dashboard.objects.create(name="second dashboard", team=self.team, created_by=self.user)
+        Dashboard.objects.create(name="third dashboard", team=self.team, created_by=self.user)
+
+        FeatureFlag.objects.create(key="a", team=self.team, created_by=self.user)
+        FeatureFlag.objects.create(name="second feature flag", key="b", team=self.team, created_by=self.user)
+        FeatureFlag.objects.create(name="third feature flag", key="c", team=self.team, created_by=self.user)
+
+        Notebook.objects.create(team=self.team, created_by=self.user, short_id="01234", title="first notebook")
+        self.notebook_1 = Notebook.objects.create(
+            team=self.team, created_by=self.user, short_id="56789", title="second notebook"
+        )
+
+    def test_search(self):
+        response = self.client.get("/api/projects/@current/search?q=sec")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["results"]), 4)
+        self.assertEqual(response.json()["counts"]["action"], 0)
+        self.assertEqual(response.json()["counts"]["dashboard"], 1)
+        self.assertEqual(response.json()["counts"]["feature_flag"], 1)
+        self.assertEqual(response.json()["counts"]["insight"], 1)
+        self.assertEqual(response.json()["counts"]["notebook"], 1)
+
+    def test_search_without_counts(self):
+        response = self.client.get("/api/projects/@current/search?q=sec&include_counts=false")
+
+        assert response.status_code == 200
+        assert len(response.json()["results"]) == 4
+        assert "counts" not in response.json()
+
+    def test_search_results_identical_with_and_without_counts(self):
+        response_with = self.client.get("/api/projects/@current/search?q=sec&include_counts=true")
+        response_without = self.client.get("/api/projects/@current/search?q=sec&include_counts=false")
+
+        assert response_with.json()["results"] == response_without.json()["results"]
+
+    def test_search_without_query(self):
+        response = self.client.get("/api/projects/@current/search")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["results"]), 11)
+        self.assertEqual(response.json()["counts"]["action"], 0)
+        self.assertEqual(response.json()["counts"]["dashboard"], 3)
+        self.assertEqual(response.json()["counts"]["feature_flag"], 3)
+        self.assertEqual(response.json()["counts"]["insight"], 3)
+        self.assertEqual(response.json()["counts"]["notebook"], 2)
+
+    def test_archived_feature_flags_are_excluded(self):
+        FeatureFlag.objects.create(
+            key="archived-flag", team=self.team, created_by=self.user, archived=True, active=False
+        )
+
+        response = self.client.get("/api/projects/@current/search?entities=feature_flag")
+
+        self.assertEqual(response.status_code, 200)
+        result_ids = [result["extra_fields"]["key"] for result in response.json()["results"]]
+        self.assertNotIn("archived-flag", result_ids)
+        self.assertEqual(response.json()["counts"]["feature_flag"], 3)
+
+    def test_search_filtered_by_entity(self):
+        response = self.client.get(
+            "/api/projects/@current/search?q=sec&entities=insight&entities=dashboard&entities=notebook"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["results"]), 3)
+        self.assertEqual(response.json()["counts"]["dashboard"], 1)
+        self.assertEqual(response.json()["counts"]["insight"], 1)
+        self.assertEqual(response.json()["counts"]["notebook"], 1)
+
+    def test_search_returns_views_and_endpoints_without_internal_views(self):
+        dag = DAG.get_or_create_default(self.team)
+        view = DataWarehouseSavedQuery.objects.create(
+            name="searchable_view",
+            team=self.team,
+            created_by=self.user,
+            origin=DataWarehouseSavedQuery.Origin.DATA_WAREHOUSE,
+            is_materialized=True,
+            deleted=None,
+        )
+        node = Node.objects.create(team=self.team, dag=dag, saved_query=view, type=NodeType.MAT_VIEW)
+
+        for name, origin in (
+            ("searchable_endpoint_backing_view", DataWarehouseSavedQuery.Origin.ENDPOINT),
+            ("searchable_managed_view", DataWarehouseSavedQuery.Origin.MANAGED_VIEWSET),
+        ):
+            internal_view = DataWarehouseSavedQuery.objects.create(name=name, team=self.team, origin=origin)
+            Node.objects.create(team=self.team, dag=dag, saved_query=internal_view, type=NodeType.VIEW)
+
+        endpoint = Endpoint.objects.create(
+            name="searchable_endpoint", team=self.team, created_by=self.user, deleted=None
+        )
+
+        deleted_view = DataWarehouseSavedQuery.objects.create(
+            name="searchable_deleted_view", team=self.team, deleted=True
+        )
+        Node.objects.create(team=self.team, dag=dag, saved_query=deleted_view, type=NodeType.VIEW)
+        Endpoint.objects.create(name="searchable_deleted_endpoint", team=self.team, deleted=True)
+
+        response = self.client.get(
+            "/api/projects/@current/search?q=searchable&entities=data_warehouse_view&entities=endpoint"
+        )
+        sorted_results = sorted(response.json()["results"], key=lambda result: result["type"])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            sorted_results,
+            [
+                {
+                    "rank": sorted_results[0]["rank"],
+                    "type": "data_warehouse_view",
+                    "result_id": str(view.id),
+                    "extra_fields": {"name": "searchable_view", "node_id": str(node.id)},
+                    "user_access_level": "manager",
+                },
+                {
+                    "rank": sorted_results[1]["rank"],
+                    "type": "endpoint",
+                    "result_id": str(endpoint.id),
+                    "extra_fields": {"name": "searchable_endpoint"},
+                    "user_access_level": "manager",
+                },
+            ],
+        )
+
+    def test_response_format_and_ids(self):
+        response = self.client.get(
+            "/api/projects/@current/search?q=sec&entities=insight&entities=dashboard&entities=notebook"
+        )
+
+        sorted_results = sorted(response.json()["results"], key=lambda entity: entity["type"])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            sorted_results,
+            [
+                {
+                    "rank": sorted_results[0]["rank"],
+                    "type": "dashboard",
+                    "result_id": str(self.dashboard_1.id),
+                    "extra_fields": {"description": "", "name": "second dashboard"},
+                    "user_access_level": "manager",
+                },
+                {
+                    "rank": sorted_results[1]["rank"],
+                    "type": "insight",
+                    "result_id": self.insight_1.short_id,
+                    "extra_fields": {"name": "second insight", "description": None, "query": None},
+                    "user_access_level": "editor",
+                },
+                {
+                    "rank": sorted_results[2]["rank"],
+                    "type": "notebook",
+                    "result_id": self.notebook_1.short_id,
+                    "extra_fields": {"title": "second notebook", "content": None},
+                    "user_access_level": "manager",
+                },
+            ],
+        )
+
+    def test_extra_fields(self):
+        response = self.client.get("/api/projects/@current/search?entities=insight")
+
+        self.assertEqual(response.status_code, 200)
+        results = response.json()["results"]
+        for result in results:
+            self.assertEqual(set(result["extra_fields"].keys()), {"name", "description", "query"})
+
+    def test_search_with_fully_invalid_query(self):
+        response = self.client.get("/api/projects/@current/search?q=%3E")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["results"]), 11)
+        self.assertEqual(response.json()["counts"]["action"], 0)
+        self.assertEqual(response.json()["counts"]["dashboard"], 3)
+        self.assertEqual(response.json()["counts"]["feature_flag"], 3)
+
+    def test_entities_from_other_teams(self):
+        other_team = Team.objects.create(organization=self.organization)
+        Dashboard.objects.create(name="permissions", team=self.team, created_by=self.user)
+        Dashboard.objects.create(name="permissions", team=other_team, created_by=self.user)
+
+        response = self.client.get("/api/projects/@current/search?q=permissions")
+
+        self.assertEqual(response.json()["counts"]["dashboard"], 1)
+
+    def test_dangerous_characters(self):
+        response = self.client.get("/api/projects/@current/search?q=%21%3A%28%29%5B%5D%26%7C%3C%3E%20str1%20str2")
+        self.assertEqual(response.status_code, 200)
+
+    @parameterized.expand(
+        [
+            ("prefix", "sec", {"second event"}),
+            ("every word", "first event", {"first event"}),
+            ("some words, as the rank allows", "first event missing", {"first event"}),
+            ("shared word", "event", {"first event", "second event", "third event"}),
+            ("word inside a snake_case name", "view", {"page_view_v2"}),
+            ("dotted capital I folded like the rank", "istanbul", {"İstanbul office"}),
+            ("dotted capital I query", "İstanbul", {"İstanbul office"}),
+            ("mixed case", "SeCoNd", {"second event"}),
+            ("short prefix", "s", {"second event"}),
+            ("no match", "missing", set()),
+        ]
+    )
+    def test_definitions(self, _name: str, query: str, expected: set[str]) -> None:
+        other_team = Team.objects.create(organization=self.organization)
+        for name in ("first event", "second event", "third event", "page_view_v2", "İstanbul office"):
+            project_id = self.team.project_id if name != "second event" else None
+            EventDefinition.objects.create(name=name, team=self.team, project_id=project_id)
+            PropertyDefinition.objects.create(name=name, team=self.team, project_id=project_id)
+            EventDefinition.objects.create(name=name, team=other_team, project_id=other_team.project_id)
+            PropertyDefinition.objects.create(name=name, team=other_team, project_id=other_team.project_id)
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(
+                "/api/projects/@current/search",
+                {"q": query, "entities": ["property_definition", "event_definition"]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({result["extra_fields"]["name"] for result in response.json()["results"]}, expected)
+        for entity_type in ("event_definition", "property_definition"):
+            self.assertEqual(response.json()["counts"][entity_type], len(expected))
+            self.assertEqual(
+                {
+                    result["extra_fields"]["name"]
+                    for result in response.json()["results"]
+                    if result["type"] == entity_type
+                },
+                expected,
+            )
+        definition_sql = next(q["sql"] for q in queries.captured_queries if "UNION" in q["sql"])
+        for table in ("posthog_eventdefinition", "posthog_propertydefinition"):
+            self.assertIn(f'LOWER("{table}"."name")::text LIKE', definition_sql)
+            self.assertNotIn(f'"{table}"."name"::text ILIKE', definition_sql)
+        self.assertLess(
+            definition_sql.index('FROM "posthog_eventdefinition"'),
+            definition_sql.index('FROM "posthog_propertydefinition"'),
+        )
+
+    def test_early_access_features(self):
+        EarlyAccessFeature.objects.create(name="first feature", team=self.team, stage="beta")
+        EarlyAccessFeature.objects.create(name="second feature", team=self.team, stage="beta")
+        EarlyAccessFeature.objects.create(name="third feature", team=self.team, stage="alpha")
+
+        response = self.client.get("/api/projects/@current/search?q=sec&entities=early_access_feature")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["counts"]["early_access_feature"], 1)
+
+        results = response.json()["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["type"], "early_access_feature")
+        self.assertEqual(results[0]["extra_fields"]["name"], "second feature")
+
+    def test_hog_flows(self):
+        create_workflow_for_test(team_id=self.team.id, name="first workflow")
+        create_workflow_for_test(team_id=self.team.id, name="second workflow")
+        create_workflow_for_test(team_id=self.team.id, name="third workflow")
+
+        response = self.client.get("/api/projects/@current/search?q=sec&entities=hog_flow")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["counts"]["hog_flow"], 1)
+
+        results = response.json()["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["type"], "hog_flow")
+        self.assertEqual(results[0]["extra_fields"]["name"], "second workflow")
+
+    def test_build_search_vector_requires_search_fields(self):
+        with pytest.raises(ValueError, match="search_fields cannot be empty"):
+            build_search_vector({})
+
+    def test_filters(self):
+        # Create feature flags with specific tags to identify them
+        FeatureFlag.objects.create(
+            name="filter test active one", key="filter_active1", team=self.team, created_by=self.user, active=True
+        )
+        FeatureFlag.objects.create(
+            name="filter test active two", key="filter_active2", team=self.team, created_by=self.user, active=True
+        )
+        FeatureFlag.objects.create(
+            name="filter test inactive", key="filter_inactive1", team=self.team, created_by=self.user, active=False
+        )
+
+        # Mock view with user_access_control
+        mock_view = Mock()
+        mock_view.user_access_control.filter_queryset_by_access_level = lambda qs: qs
+
+        # Test without filters - should get all flags for this team
+        qs_no_filter, entity_name = class_queryset(
+            view=mock_view,
+            klass=FeatureFlag,
+            project_id=self.team.project_id,
+            query=None,
+            search_fields={"key": "A", "name": "C"},
+            extra_fields=["key", "name", "active"],
+            filters=None,
+        )
+        count_without_filter = qs_no_filter.count()
+
+        # Test with filters - should get fewer results (only active ones)
+        qs_with_filter, entity_name = class_queryset(
+            view=mock_view,
+            klass=FeatureFlag,
+            project_id=self.team.project_id,
+            query=None,
+            search_fields={"key": "A", "name": "C"},
+            extra_fields=["key", "name", "active"],
+            filters={"active": True},
+        )
+        count_with_filter = qs_with_filter.count()
+
+        # The filtered count should be less than unfiltered (we created 1 inactive flag)
+        self.assertLess(count_with_filter, count_without_filter)
+
+        # Verify all returned flags with filter are active
+        results = list(qs_with_filter)
+        for result in results:
+            self.assertTrue(result["extra_fields"]["active"])
+
+        # Test with specific key filter
+        qs_key_filter, entity_name = class_queryset(
+            view=mock_view,
+            klass=FeatureFlag,
+            project_id=self.team.project_id,
+            query=None,
+            search_fields={"key": "A", "name": "C"},
+            extra_fields=["key", "name"],
+            filters={"key": "filter_active1"},
+        )
+        self.assertEqual(qs_key_filter.count(), 1)
+        self.assertEqual(next(iter(qs_key_filter))["extra_fields"]["key"], "filter_active1")
+
+    def test_search_query_count_with_and_without_counts(self):
+        mock_view = Mock()
+        mock_view.user_access_control.filter_queryset_by_access_level = lambda qs: qs
+
+        with CaptureQueriesContext(connection) as ctx_with:
+            search_entities(
+                entities=set(SEARCHABLE_ENTITIES),
+                query="sec",
+                project_id=self.team.project_id,
+                view=mock_view,
+                entity_map=ENTITY_MAP,
+                include_counts=True,
+            )
+
+        with CaptureQueriesContext(connection) as ctx_without:
+            search_entities(
+                entities=set(SEARCHABLE_ENTITIES),
+                query="sec",
+                project_id=self.team.project_id,
+                view=mock_view,
+                entity_map=ENTITY_MAP,
+                include_counts=False,
+            )
+
+        assert len(ctx_with) - len(ctx_without) >= 13
+        # One query for the unioned entities, and one per facade search: actions, dashboards and workflows.
+        assert len(ctx_without) == 4
+
+    def test_search_entities_returns_total_count(self):
+        for i in range(5):
+            Insight.objects.create(team=self.team, name=f"total count insight {i}", saved=True)
+
+        mock_view = Mock()
+        mock_view.user_access_control.filter_queryset_by_access_level = lambda qs: qs
+
+        results, counts, total_count = search_entities(
+            entities={"insight"},
+            query="total count",
+            project_id=self.team.project_id,
+            view=mock_view,
+            entity_map=ENTITY_MAP,
+        )
+
+        self.assertEqual(total_count, 5)
+        self.assertEqual(len(results), 5)
+
+    def test_search_entities_pagination_with_limit(self):
+        for i in range(10):
+            Insight.objects.create(team=self.team, name=f"pagination limit {i}", saved=True)
+
+        mock_view = Mock()
+        mock_view.user_access_control.filter_queryset_by_access_level = lambda qs: qs
+
+        results, counts, total_count = search_entities(
+            entities={"insight"},
+            query="pagination limit",
+            project_id=self.team.project_id,
+            view=mock_view,
+            entity_map=ENTITY_MAP,
+            limit=3,
+        )
+
+        self.assertEqual(total_count, 10)
+        self.assertEqual(len(results), 3)
+
+    def test_search_entities_pagination_with_offset(self):
+        for i in range(10):
+            Insight.objects.create(team=self.team, name=f"pagination offset {i}", saved=True)
+
+        mock_view = Mock()
+        mock_view.user_access_control.filter_queryset_by_access_level = lambda qs: qs
+
+        results_page1, _, total_count1 = search_entities(
+            entities={"insight"},
+            query="pagination offset",
+            project_id=self.team.project_id,
+            view=mock_view,
+            entity_map=ENTITY_MAP,
+            limit=3,
+            offset=0,
+        )
+        results_page2, _, total_count2 = search_entities(
+            entities={"insight"},
+            query="pagination offset",
+            project_id=self.team.project_id,
+            view=mock_view,
+            entity_map=ENTITY_MAP,
+            limit=3,
+            offset=3,
+        )
+
+        self.assertEqual(total_count1, 10)
+        self.assertEqual(total_count2, 10)
+        self.assertEqual(len(results_page1), 3)
+        self.assertEqual(len(results_page2), 3)
+
+        page1_ids = {r["result_id"] for r in results_page1}
+        page2_ids = {r["result_id"] for r in results_page2}
+        self.assertEqual(len(page1_ids & page2_ids), 0)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "query,expected,dbresult",
+    [
+        ("som", "som:*", "'som':*"),
+        ("some te", "some & te:*", "'some' & 'te':*"),
+        ("we", "we:*", "'we':*"),
+        ("a'&|!<>():b", "a & b:*", "'a' & 'b':*"),
+        ("!", None, None),
+    ],
+)
+def test_process_query(query, expected, dbresult):
+    processed_query = process_query(query)
+    assert processed_query == expected
+
+    if dbresult is not None:
+        cursor = connection.cursor()
+        cursor.execute("SELECT tsquery(%s);", (processed_query,))
+        result = cursor.fetchall()
+
+        assert result[0][0] == dbresult
+
+
+@pytest.mark.ee
+class TestSearchAccessLevels(APIBaseTest):
+    def setUp(self):
+        super().setUp()
+        self.organization.available_product_features = [
+            {"key": "access_control", "name": "access_control"},
+            {"key": "role_based_access", "name": "role_based_access"},
+        ]
+        self.organization.save()
+        self.other_user = User.objects.create_and_join(self.organization, "other@posthog.com", "testpass")
+        self.membership = OrganizationMembership.objects.get(organization=self.organization, user=self.user)
+
+    def _levels_by_result_id(self, response, entity_type: str) -> dict[str, str | None]:
+        return {
+            result["result_id"]: result["user_access_level"]
+            for result in response.json()["results"]
+            if result["type"] == entity_type
+        }
+
+    def test_blocked_resource_results_are_hidden_except_own(self):
+        FeatureFlag.objects.create(key="searchable-a", team=self.team, created_by=self.other_user)
+        own = FeatureFlag.objects.create(key="searchable-b", team=self.team, created_by=self.user)
+        EventDefinition.objects.create(team=self.team, name="searchable-event")
+        AccessControl.objects.create(team=self.team, resource="feature_flag", resource_id=None, access_level="none")
+
+        response = self.client.get("/api/projects/@current/search?q=searchable")
+
+        assert response.status_code == 200
+        assert set(self._levels_by_result_id(response, "feature_flag")) == {str(own.id)}
+        assert set(self._levels_by_result_id(response, "event_definition").values()) == {None}
+
+    def test_object_grants_resolve_by_pk_for_short_id_entities(self):
+        flag_granted = FeatureFlag.objects.create(key="searchable-a", team=self.team, created_by=self.other_user)
+        FeatureFlag.objects.create(key="searchable-b", team=self.team, created_by=self.other_user)
+        insight_granted = Insight.objects.create(name="searchable insight", team=self.team, created_by=self.other_user)
+        Insight.objects.create(name="searchable insight two", team=self.team, created_by=self.other_user)
+        for resource in ("feature_flag", "insight"):
+            AccessControl.objects.create(team=self.team, resource=resource, resource_id=None, access_level="none")
+        AccessControl.objects.create(
+            team=self.team,
+            resource="feature_flag",
+            resource_id=str(flag_granted.pk),
+            access_level="viewer",
+            organization_member=self.membership,
+        )
+        # AccessControl rows are keyed by pk even though insight results expose short_id as result_id
+        AccessControl.objects.create(
+            team=self.team,
+            resource="insight",
+            resource_id=str(insight_granted.pk),
+            access_level="viewer",
+            organization_member=self.membership,
+        )
+
+        response = self.client.get("/api/projects/@current/search?q=searchable")
+
+        assert response.status_code == 200
+        # "none" resource access + object grants: only granted objects are returned, with resolved levels
+        assert self._levels_by_result_id(response, "feature_flag") == {str(flag_granted.pk): "viewer"}
+        assert self._levels_by_result_id(response, "insight") == {insight_granted.short_id: "viewer"}

@@ -1,0 +1,1723 @@
+/**
+ * Auto-generated from the Django backend OpenAPI schema.
+ * To modify these types, update the Django serializers or views, then run:
+ *   hogli build:openapi
+ * Questions or issues? #team-devex on Slack
+ *
+ * PostHog API - generated
+ * OpenAPI spec version: 1.0.0
+ */
+export interface AppMetricSeriesApi {
+    name: string
+    values: number[]
+}
+
+export interface AppMetricsResponseApi {
+    labels: string[]
+    series: AppMetricSeriesApi[]
+}
+
+export type AppMetricsTotalsResponseApiTotals = { [key: string]: number }
+
+export interface AppMetricsTotalsResponseApi {
+    totals: AppMetricsTotalsResponseApiTotals
+}
+
+export interface _MetricAttributeValueApi {
+    /** The attribute value (same as name; kept for picker compatibility). */
+    id: string
+    /** The attribute value. */
+    name: string
+    /** Number of data points observed with this value in the window. */
+    count: number
+}
+
+export interface _MetricAttributeValuesResponseApi {
+    /** Observed values for the requested key, most frequent first. */
+    results: _MetricAttributeValueApi[]
+}
+
+/**
+ * * `key` - key
+ * * `value` - value
+ */
+export type MatchedOnEnumApi = (typeof MatchedOnEnumApi)[keyof typeof MatchedOnEnumApi]
+
+export const MatchedOnEnumApi = {
+    Key: 'key',
+    Value: 'value',
+} as const
+
+export interface _MetricAttributeKeyApi {
+    /** Attribute key as it appears on the team's metrics (e.g. 'env', 'k8s.pod.name'). */
+    name: string
+    /** Number of distinct values for this attribute in recent data. */
+    value_count: number
+    /** Set to 'value' when the key matched through one of its values. Absent when its name matched.
+     *
+     * * `key` - key
+     * * `value` - value */
+    matchedOn?: MatchedOnEnumApi
+    /**
+     * One value that matched the search; only set when matchedOn is 'value'.
+     * @nullable
+     */
+    matchedValue?: string | null
+}
+
+export interface _MetricAttributeKeysResponseApi {
+    /** Distinct attribute keys (datapoint and resource attributes merged), ordered by distinct value count descending. */
+    results: _MetricAttributeKeyApi[]
+    /** Number of keys returned. */
+    count: number
+}
+
+/**
+ * * `sum` - sum
+ * * `avg` - avg
+ * * `count` - count
+ * * `min` - min
+ * * `max` - max
+ * * `p95` - p95
+ * * `rate` - rate
+ * * `increase` - increase
+ * * `histogram_quantile` - histogram_quantile
+ * * `count_rate` - count_rate
+ * * `count_increase` - count_increase
+ */
+export type MetricAnomalyAggregationEnumApi =
+    (typeof MetricAnomalyAggregationEnumApi)[keyof typeof MetricAnomalyAggregationEnumApi]
+
+export const MetricAnomalyAggregationEnumApi = {
+    Sum: 'sum',
+    Avg: 'avg',
+    Count: 'count',
+    Min: 'min',
+    Max: 'max',
+    P95: 'p95',
+    Rate: 'rate',
+    Increase: 'increase',
+    HistogramQuantile: 'histogram_quantile',
+    CountRate: 'count_rate',
+    CountIncrease: 'count_increase',
+} as const
+
+/**
+ * * `eq` - eq
+ * * `neq` - neq
+ * * `regex` - regex
+ * * `not_regex` - not_regex
+ */
+export type OpEnumApi = (typeof OpEnumApi)[keyof typeof OpEnumApi]
+
+export const OpEnumApi = {
+    Eq: 'eq',
+    Neq: 'neq',
+    Regex: 'regex',
+    NotRegex: 'not_regex',
+} as const
+
+/**
+ * * `resource` - resource
+ * * `attribute` - attribute
+ * * `auto` - auto
+ */
+export type MetricAttributeScopeEnumApi = (typeof MetricAttributeScopeEnumApi)[keyof typeof MetricAttributeScopeEnumApi]
+
+export const MetricAttributeScopeEnumApi = {
+    Resource: 'resource',
+    Attribute: 'attribute',
+    Auto: 'auto',
+} as const
+
+export interface _MetricFilterApi {
+    /**
+     * Attribute name to filter on, without any type-tag suffix (e.g. 'k8s.pod.name', 'env').
+     * @maxLength 255
+     */
+    key: string
+    /** Comparison operator. 'regex'/'not_regex' use RE2 syntax. Negative operators also match rows that lack the key entirely, mirroring Prometheus negative matchers.
+     *
+     * * `eq` - eq
+     * * `neq` - neq
+     * * `regex` - regex
+     * * `not_regex` - not_regex */
+    op?: OpEnumApi
+    /**
+     * Value to compare against. For regex operators this is the pattern.
+     * @maxLength 1024
+     */
+    value: string
+    /** Where the attribute lives: 'resource' = per-target resource attributes (k8s.pod.name, service.version), 'attribute' = per-datapoint attributes (http.method, path), 'auto' = resource first with per-datapoint fallback. Use 'auto' unless you know the exact scope.
+     *
+     * * `resource` - resource
+     * * `attribute` - attribute
+     * * `auto` - auto */
+    scope?: MetricAttributeScopeEnumApi
+}
+
+export interface _MetricAnomalyBodyApi {
+    /**
+     * Exact metric name to characterize (e.g. 'metrics_rate_limiter_message_lag_seconds').
+     * @maxLength 255
+     */
+    metricName: string
+    /** Start of the suspicious window (inclusive). ISO 8601 — e.g. when the alert fired or the graph started looking wrong. */
+    anomalyFrom: string
+    /** End of the suspicious window (exclusive). Defaults to now. */
+    anomalyTo?: string
+    /** Start of the healthy comparison window. Defaults to one anomaly-window-length before baselineTo. */
+    baselineFrom?: string
+    /** End of the healthy comparison window. Defaults to anomalyFrom. Must not extend past anomalyFrom. */
+    baselineTo?: string
+    /** Aggregation to characterize. Omit to auto-pick from the metric's OTel type (counter -> rate, gauge -> avg, histogram -> histogram_quantile 0.95).
+     *
+     * * `sum` - sum
+     * * `avg` - avg
+     * * `count` - count
+     * * `min` - min
+     * * `max` - max
+     * * `p95` - p95
+     * * `rate` - rate
+     * * `increase` - increase
+     * * `histogram_quantile` - histogram_quantile
+     * * `count_rate` - count_rate
+     * * `count_increase` - count_increase */
+    aggregation?: MetricAnomalyAggregationEnumApi | null
+    /**
+     * Quantile for histogram_quantile. Defaults to 0.95.
+     * @minimum 0
+     * @maximum 1
+     * @nullable
+     */
+    quantile?: number | null
+    /** Label predicates narrowing which series are characterized. */
+    filters?: _MetricFilterApi[]
+    /**
+     * Label keys to drill into when finding which label values moved. Omit to auto-discover the most common keys on this metric (plus service_name). Max 4 are used.
+     * @items.maxLength 255
+     */
+    candidateKeys?: string[]
+}
+
+export interface _MetricAnomalyRequestApi {
+    /** The anomaly characterization to run. */
+    query: _MetricAnomalyBodyApi
+}
+
+/**
+ * * `up` - up
+ * * `down` - down
+ * * `flat` - flat
+ */
+export type MetricAnomalyDirectionEnumApi =
+    (typeof MetricAnomalyDirectionEnumApi)[keyof typeof MetricAnomalyDirectionEnumApi]
+
+export const MetricAnomalyDirectionEnumApi = {
+    Up: 'up',
+    Down: 'down',
+    Flat: 'flat',
+} as const
+
+export interface _MetricAnomalyDimensionApi {
+    /** Label key that was drilled into. */
+    key: string
+    /** Label value this row describes. */
+    label: string
+    /** Mean value over the baseline window for this label value. */
+    baseline_value: number
+    /** Mean value over the anomaly window for this label value. */
+    anomaly_value: number
+    /** anomaly_value / baseline_value. A zero baseline yields the anomaly value itself (new traffic). */
+    change_ratio: number
+}
+
+export interface _MetricQueryPointApi {
+    /** Bucket start as ISO 8601 timestamp. */
+    time: string
+    /**
+     * Aggregated value for the bucket. Null when the aggregate isn't representable (e.g. float overflow) — render as a gap.
+     * @nullable
+     */
+    value: number | null
+}
+
+/**
+ * Label values identifying this series. Empty for an ungrouped query.
+ */
+export type _MetricSeriesApiLabels = { [key: string]: string }
+
+export interface _MetricSeriesApi {
+    /** Label values identifying this series. Empty for an ungrouped query. */
+    labels: _MetricSeriesApiLabels
+    /** Time-bucketed points, ordered by time ascending. Absent for instant queries and the summary output. */
+    points?: _MetricQueryPointApi[]
+    /**
+     * Instant queries only: the series' value at 'time'.
+     * @nullable
+     */
+    value?: number | null
+    /**
+     * Instant queries: the time of 'value' (for the builder, the start of the bucket). Summary output: the time of 'last'.
+     * @nullable
+     */
+    time?: string | null
+    /**
+     * Summary output only: the last non-null value.
+     * @nullable
+     */
+    last?: number | null
+    /**
+     * Summary output only: the smallest non-null value.
+     * @nullable
+     */
+    min?: number | null
+    /**
+     * Summary output only: the largest non-null value.
+     * @nullable
+     */
+    max?: number | null
+    /**
+     * Summary output only: the mean of the non-null values.
+     * @nullable
+     */
+    avg?: number | null
+    /**
+     * Metric the series was computed from. Null for formula results.
+     * @nullable
+     */
+    metric_name?: string | null
+    /**
+     * Name of the query clause that produced this series.
+     * @nullable
+     */
+    clause?: string | null
+    /**
+     * UCUM unit of the returned values, e.g. "By", "ms", "{request}/s". It is the ingested unit, except that a count of series has no unit and a rate is per second ("ms/s", or "1/s" for a counter without a unit). Null when the values have no unit, when merged series disagree on the unit, and for formula results.
+     * @nullable
+     */
+    unit?: string | null
+    /**
+     * Bucket upper edges a histogram_quantile series was estimated from. The true quantile can be anywhere between two edges. Null for other aggregations.
+     * @nullable
+     */
+    histogram_bounds?: number[] | null
+    /**
+     * Most distinct bucket layouts merged into one point of a histogram_quantile series. Above 1, series with different buckets were merged by bucket width. Null for other aggregations.
+     * @nullable
+     */
+    histogram_layout_count?: number | null
+}
+
+export interface _MetricAnomalyReportApi {
+    /** Metric that was characterized. */
+    metric_name: string
+    /** Aggregation used (auto-picked when not specified). */
+    aggregation: string
+    /** Bucket size of the analysis grid. */
+    interval: string
+    /** Baseline window start, ISO 8601. */
+    baseline_from: string
+    /** Baseline window end, ISO 8601. */
+    baseline_to: string
+    /** Anomaly window start, ISO 8601. */
+    anomaly_from: string
+    /** Anomaly window end, ISO 8601. */
+    anomaly_to: string
+    /** Mean over the baseline window. */
+    baseline_mean: number
+    /** Population stddev over the baseline window. */
+    baseline_stddev: number
+    /** Mean over the anomaly window. */
+    anomaly_mean: number
+    /** Maximum bucket value in the anomaly window. */
+    anomaly_peak: number
+    /** anomaly_mean / baseline_mean. A zero baseline yields anomaly_mean itself. */
+    change_ratio: number
+    /** Which way the metric moved versus the baseline.
+     *
+     * * `up` - up
+     * * `down` - down
+     * * `flat` - flat */
+    direction: MetricAnomalyDirectionEnumApi
+    /**
+     * First bucket clearly outside the baseline range (3 stddevs or 50% relative change), or null if no clear onset.
+     * @nullable
+     */
+    onset_time: string | null
+    /**
+     * Start of the last bucket when it ends after anomalyTo or now, so it holds only part of its samples. It stays in series but is left out of every statistic, the onset and the movers. Null when every bucket is complete.
+     * @nullable
+     */
+    partial_bucket_time?: string | null
+    /** Label values whose behavior changed the most between windows, largest change first. Empty when nothing moved or the metric has no labels. */
+    top_movers: _MetricAnomalyDimensionApi[]
+    /** The metric across baseline + anomaly windows on one grid, for plotting or further inspection. */
+    series: _MetricSeriesApi
+}
+
+/**
+ * * `grafana` - Grafana
+ * * `screenshot` - Screenshot
+ */
+export type DashboardImportSourceEnumApi =
+    (typeof DashboardImportSourceEnumApi)[keyof typeof DashboardImportSourceEnumApi]
+
+export const DashboardImportSourceEnumApi = {
+    Grafana: 'grafana',
+    Screenshot: 'screenshot',
+} as const
+
+/**
+ * * `running` - Running
+ * * `completed` - Completed
+ * * `failed` - Failed
+ */
+export type DashboardImportStatusEnumApi =
+    (typeof DashboardImportStatusEnumApi)[keyof typeof DashboardImportStatusEnumApi]
+
+export const DashboardImportStatusEnumApi = {
+    Running: 'running',
+    Completed: 'completed',
+    Failed: 'failed',
+} as const
+
+/**
+ * * `starting` - Starting
+ * * `matching` - Matching
+ * * `building` - Building
+ * * `checking_layout` - Checking Layout
+ */
+export type DashboardImportPhaseEnumApi = (typeof DashboardImportPhaseEnumApi)[keyof typeof DashboardImportPhaseEnumApi]
+
+export const DashboardImportPhaseEnumApi = {
+    Starting: 'starting',
+    Matching: 'matching',
+    Building: 'building',
+    CheckingLayout: 'checking_layout',
+} as const
+
+/**
+ * * `waiting` - Waiting
+ * * `working` - Working
+ * * `done` - Done
+ * * `skipped` - Skipped
+ */
+export type PanelProgressStateEnumApi = (typeof PanelProgressStateEnumApi)[keyof typeof PanelProgressStateEnumApi]
+
+export const PanelProgressStateEnumApi = {
+    Waiting: 'waiting',
+    Working: 'working',
+    Done: 'done',
+    Skipped: 'skipped',
+} as const
+
+export interface DashboardImportPanelProgressApi {
+    /** Panel key in the import. */
+    key: string
+    /** Panel title. */
+    title: string
+    /** 'waiting' before the agent checked the panel, 'working' while its checks fail, 'done' once a check passed, 'skipped' when PostHog has no equivalent.
+     *
+     * * `waiting` - Waiting
+     * * `working` - Working
+     * * `done` - Done
+     * * `skipped` - Skipped */
+    state: PanelProgressStateEnumApi
+}
+
+export interface DashboardImportSummaryApi {
+    /** Number of panels in the input. */
+    total: number
+    /** Panels imported with the same meaning. */
+    imported: number
+    /** Panels imported with a change in what they show. */
+    approximated: number
+    /** Panels that have no working query. */
+    failed: number
+    /** Panels with no PostHog equivalent. */
+    skipped: number
+}
+
+/**
+ * * `imported` - Imported
+ * * `approximated` - Approximated
+ * * `failed` - Failed
+ * * `skipped` - Skipped
+ */
+export type PanelImportOutcomeEnumApi = (typeof PanelImportOutcomeEnumApi)[keyof typeof PanelImportOutcomeEnumApi]
+
+export const PanelImportOutcomeEnumApi = {
+    Imported: 'imported',
+    Approximated: 'approximated',
+    Failed: 'failed',
+    Skipped: 'skipped',
+} as const
+
+export interface DashboardImportPanelApi {
+    /** Panel key in the import, for example 'p12' for Grafana panel 12. */
+    key: string
+    /** Panel title. */
+    title: string
+    /** What happened to the panel.
+     *
+     * * `imported` - Imported
+     * * `approximated` - Approximated
+     * * `failed` - Failed
+     * * `skipped` - Skipped */
+    outcome: PanelImportOutcomeEnumApi
+    /** What changed, or why the panel failed or was skipped. */
+    reason: string
+}
+
+export interface DashboardImportApi {
+    /**
+     * Id to poll for the status. Null when the import finished in the request, with no agent.
+     * @nullable
+     */
+    id: string | null
+    /** What the import reads.
+     *
+     * * `grafana` - Grafana
+     * * `screenshot` - Screenshot */
+    source: DashboardImportSourceEnumApi
+    /** Where the import is.
+     *
+     * * `running` - Running
+     * * `completed` - Completed
+     * * `failed` - Failed */
+    status: DashboardImportStatusEnumApi
+    /** Name of the new dashboard. */
+    dashboard_name: string
+    /** The step of an import that runs: 'starting' the agent, 'matching' panels, 'building' the dashboard, or 'checking_layout' against the screenshot.
+     *
+     * * `starting` - Starting
+     * * `matching` - Matching
+     * * `building` - Building
+     * * `checking_layout` - Checking Layout */
+    phase: DashboardImportPhaseEnumApi | null
+    /** Where each panel is, while the import runs. */
+    panel_progress: DashboardImportPanelProgressApi[]
+    /**
+     * How many pictures of the dashboard the import compares with the screenshot, at most. Null when the import does not check the layout.
+     * @nullable
+     */
+    layout_rounds: number | null
+    /**
+     * The comparison that runs, from 1, while the phase is 'checking_layout'.
+     * @nullable
+     */
+    layout_round: number | null
+    /**
+     * Id of the new dashboard, when it exists.
+     * @nullable
+     */
+    dashboard_id: number | null
+    /**
+     * Why the import failed, when it failed.
+     * @nullable
+     */
+    error: string | null
+    /** Panel counts, when the import ended. */
+    summary: DashboardImportSummaryApi | null
+    /** The outcome for each panel, when the import ended. */
+    panels: DashboardImportPanelApi[]
+}
+
+export interface DashboardImportCreateApi {
+    /** What to import: 'grafana' reads a Grafana dashboard JSON model, 'screenshot' reads an image of a dashboard.
+     *
+     * * `grafana` - Grafana
+     * * `screenshot` - Screenshot */
+    source: DashboardImportSourceEnumApi
+    /**
+     * Name of the new dashboard. Defaults to the Grafana dashboard title, or to 'Imported dashboard'.
+     * @maxLength 400
+     */
+    name?: string
+    /**
+     * The Grafana dashboard JSON model as text, from Dashboard settings > JSON Model or from an export. Required when source is 'grafana'.
+     * @maxLength 5242880
+     */
+    grafana_json?: string
+    /**
+     * The screenshot as base64, without a data URL prefix. PNG, JPEG, WebP or GIF, at most 5 MB. Required when source is 'screenshot'.
+     * @maxLength 7340032
+     */
+    image_base64?: string
+}
+
+/**
+ * * `promql` - Promql
+ * * `builder` - Builder
+ * * `histogram` - Histogram
+ * * `hogql` - Hogql
+ */
+export type PanelQueryLanguageEnumApi = (typeof PanelQueryLanguageEnumApi)[keyof typeof PanelQueryLanguageEnumApi]
+
+export const PanelQueryLanguageEnumApi = {
+    Promql: 'promql',
+    Builder: 'builder',
+    Histogram: 'histogram',
+    Hogql: 'hogql',
+} as const
+
+/**
+ * * `sum` - Sum
+ * * `avg` - Avg
+ * * `count` - Count
+ * * `min` - Min
+ * * `max` - Max
+ * * `p95` - P95
+ * * `rate` - Rate
+ * * `increase` - Increase
+ * * `histogram_quantile` - Histogram Quantile
+ */
+export type PanelBuilderAggregationEnumApi =
+    (typeof PanelBuilderAggregationEnumApi)[keyof typeof PanelBuilderAggregationEnumApi]
+
+export const PanelBuilderAggregationEnumApi = {
+    Sum: 'sum',
+    Avg: 'avg',
+    Count: 'count',
+    Min: 'min',
+    Max: 'max',
+    P95: 'p95',
+    Rate: 'rate',
+    Increase: 'increase',
+    HistogramQuantile: 'histogram_quantile',
+} as const
+
+export interface PanelFilterApi {
+    /**
+     * Attribute name, for example 'service.name'.
+     * @maxLength 255
+     */
+    key: string
+    /** Comparison. Regex operators use RE2.
+     *
+     * * `eq` - eq
+     * * `neq` - neq
+     * * `regex` - regex
+     * * `not_regex` - not_regex */
+    op: OpEnumApi
+    /**
+     * Value or regex to compare against.
+     * @maxLength 1024
+     */
+    value: string
+}
+
+export interface PanelBuilderClauseApi {
+    /**
+     * Alias that a formula uses, for example 'a'.
+     * @maxLength 64
+     */
+    name: string
+    /**
+     * Exact metric name.
+     * @maxLength 255
+     */
+    metric_name: string
+    /** Aggregation for each bucket, with the same meaning as in the metrics query API.
+     *
+     * * `sum` - Sum
+     * * `avg` - Avg
+     * * `count` - Count
+     * * `min` - Min
+     * * `max` - Max
+     * * `p95` - P95
+     * * `rate` - Rate
+     * * `increase` - Increase
+     * * `histogram_quantile` - Histogram Quantile */
+    aggregation: PanelBuilderAggregationEnumApi
+    /**
+     * Quantile between 0 and 1. Required for 'histogram_quantile'. The other aggregations ignore it.
+     * @minimum 0
+     * @maximum 1
+     * @nullable
+     */
+    quantile?: number | null
+    /** Attribute filters, joined with AND. */
+    filters?: PanelFilterApi[]
+    /**
+     * Attribute names that split the result into series.
+     * @items.maxLength 255
+     */
+    group_by?: string[]
+}
+
+export interface PanelBuilderQueryApi {
+    /** One clause for each series. */
+    clauses: PanelBuilderClauseApi[]
+    /**
+     * Arithmetic over clause aliases, for example 'a / b'.
+     * @nullable
+     */
+    formula?: string | null
+}
+
+export interface PanelQueryCheckApi {
+    /**
+     * Panel key. The result for the panel carries the same key.
+     * @maxLength 64
+     */
+    key: string
+    /**
+     * Panel title, shown in the import progress.
+     * @maxLength 200
+     */
+    title?: string
+    /** 'promql' or 'builder' for metrics, 'histogram' for a latency heatmap, 'hogql' for logs and traces.
+     *
+     * * `promql` - Promql
+     * * `builder` - Builder
+     * * `histogram` - Histogram
+     * * `hogql` - Hogql */
+    language: PanelQueryLanguageEnumApi
+    /**
+     * PromQL expression. Used when language is 'promql'.
+     * @nullable
+     */
+    promql?: string | null
+    /** Builder query. Used when language is 'builder'. */
+    builder?: PanelBuilderQueryApi | null
+    /**
+     * Histogram metric name. Used when language is 'histogram'.
+     * @nullable
+     */
+    histogram_metric?: string | null
+    /**
+     * SQL SELECT over logs or posthog.trace_spans with {filters} in the WHERE clause. Used when language is 'hogql'.
+     * @nullable
+     */
+    hogql?: string | null
+}
+
+export interface PanelQueryCheckRequestApi {
+    /**
+     * Up to 20 panel queries to check.
+     * @minItems 1
+     * @maxItems 20
+     */
+    panels: PanelQueryCheckApi[]
+    /**
+     * The import that these panels belong to, from the import instructions. The import progress shows which panels pass.
+     * @nullable
+     */
+    import_id?: string | null
+}
+
+export interface PanelQueryCheckResultApi {
+    /** Panel key from the request. */
+    key: string
+    /** True when the query can go on a dashboard. */
+    valid: boolean
+    /**
+     * Why the query cannot go on a dashboard.
+     * @nullable
+     */
+    error: string | null
+    /** Warnings that do not block the query, such as no recent data. */
+    notes: string[]
+}
+
+export interface PanelQueryCheckResponseApi {
+    /** One result for each checked panel. */
+    results: PanelQueryCheckResultApi[]
+}
+
+/**
+ * * `curated` - Curated
+ * * `generated` - Generated
+ */
+export type MetricsDashboardTemplateSourceEnumApi =
+    (typeof MetricsDashboardTemplateSourceEnumApi)[keyof typeof MetricsDashboardTemplateSourceEnumApi]
+
+export const MetricsDashboardTemplateSourceEnumApi = {
+    Curated: 'curated',
+    Generated: 'generated',
+} as const
+
+/**
+ * * `generating` - Generating
+ * * `pending_review` - Pending Review
+ * * `approved` - Approved
+ * * `rejected` - Rejected
+ * * `failed` - Failed
+ */
+export type DashboardTemplateStatusEnumApi =
+    (typeof DashboardTemplateStatusEnumApi)[keyof typeof DashboardTemplateStatusEnumApi]
+
+export const DashboardTemplateStatusEnumApi = {
+    Generating: 'generating',
+    PendingReview: 'pending_review',
+    Approved: 'approved',
+    Rejected: 'rejected',
+    Failed: 'failed',
+} as const
+
+export interface MetricsDashboardTemplateRoundApi {
+    /** Check round, from 1. */
+    round: number
+    /** True when the round rendered a picture of the dashboard. */
+    has_picture: boolean
+    /**
+     * The verdict of the model on the picture.
+     * @nullable
+     */
+    looks_good: boolean | null
+    /** The problems that the model saw. */
+    problems: string[]
+    /** True when the model corrected the panels after this round. */
+    revised: boolean
+}
+
+export interface MetricsDashboardTemplateApi {
+    /** Template id. */
+    id: string
+    /** Stable key: the bank file name, or a digest of the metric names. */
+    key: string
+    /** Dashboard name. */
+    name: string
+    /** What the dashboard shows. */
+    description: string
+    /** Curated in code, or generated.
+     *
+     * * `curated` - Curated
+     * * `generated` - Generated */
+    source: MetricsDashboardTemplateSourceEnumApi
+    /** Review status.
+     *
+     * * `generating` - Generating
+     * * `pending_review` - Pending Review
+     * * `approved` - Approved
+     * * `rejected` - Rejected
+     * * `failed` - Failed */
+    status: DashboardTemplateStatusEnumApi
+    /** Metric names that the charts read. */
+    metric_names: string[]
+    /** Chart titles, top to bottom. */
+    panel_titles: string[]
+    /** When the template entered the bank. */
+    created_at: string
+    /** Number of projects that have the template suggested. */
+    suggestion_count: number
+    /**
+     * Project whose metrics generated it.
+     * @nullable
+     */
+    source_team_id: number | null
+    /**
+     * Project of the preview dashboard.
+     * @nullable
+     */
+    preview_team_id: number | null
+    /**
+     * Unlisted dashboard that shows the template with live data.
+     * @nullable
+     */
+    preview_dashboard_id: number | null
+    /** The picture check rounds of the generation. */
+    rounds: MetricsDashboardTemplateRoundApi[]
+    /** Drafted charts whose queries failed the checks. */
+    dropped_panels: string[]
+    /**
+     * Why the generation failed.
+     * @nullable
+     */
+    error: string | null
+    /**
+     * Who approved or rejected the template.
+     * @nullable
+     */
+    reviewed_by: string | null
+    /**
+     * When the template was approved or rejected.
+     * @nullable
+     */
+    reviewed_at: string | null
+}
+
+export interface MetricsCreatedDashboardApi {
+    /** The id of the dashboard. */
+    dashboard_id: number
+}
+
+export interface _MetricErrorSpikeApi {
+    /** When the error spike was detected, ISO 8601. */
+    detected_at: string
+    /** Error Tracking issue that spiked. */
+    issue_id: string
+    /**
+     * Issue name, if one is set.
+     * @nullable
+     */
+    issue_name: string | null
+}
+
+export interface _MetricErrorSpikesResponseApi {
+    /** Error Tracking issue spikes detected in the window, newest first. Team-wide: not yet scoped to a specific metric's service. */
+    results: _MetricErrorSpikeApi[]
+}
+
+export interface _HasMetricsResponseApi {
+    /** Whether the team has ingested any metrics. */
+    hasMetrics: boolean
+    /** Whether the team sent spans or logs in the last day, so series could be derived from them. */
+    hasDerivedSources: boolean
+    /** Whether series derived from the team's spans and logs are available to chart. */
+    hasDerivedMetrics: boolean
+}
+
+export interface _MetricPickerNameApi {
+    /** Metric name as it appears in the team's data. */
+    name: string
+    /** OTel metric type (gauge, sum, histogram, summary, exponential_histogram). */
+    metric_type: string
+}
+
+export interface _MetricPickerNamesResponseApi {
+    /** Distinct metric names ordered by recent activity. */
+    results: _MetricPickerNameApi[]
+}
+
+export interface _MetricsOverviewServiceApi {
+    /** Service that reported metrics inside the window. */
+    service_name: string
+    /** Distinct metric names this service reported in the window. */
+    metric_names: number
+    /** Distinct series (metric + label-set combinations) this service reported in the window. */
+    series: number
+    /** When this service's newest datapoint arrived, ISO 8601. */
+    last_seen: string
+}
+
+export interface _MetricsOverviewResponseApi {
+    /**
+     * When the newest datapoint arrived across all series, ISO 8601. Unlike the counts this ignores the window, so it still answers 'when did ingestion stop'. Null when nothing was ever ingested.
+     * @nullable
+     */
+    last_seen: string | null
+    /** Distinct metric names reported inside the window. */
+    metric_names: number
+    /** Distinct series (metric + label-set combinations) reported inside the window. */
+    series: number
+    /** Length of the rollup window in seconds, so consumers can label the counts. */
+    lookback_seconds: number
+    /** Per-service rollup for the window, largest series count first. Capped at the 500 largest. */
+    services: _MetricsOverviewServiceApi[]
+}
+
+/**
+ * * `gauge` - gauge
+ * * `sum` - sum
+ * * `histogram` - histogram
+ * * `exponential_histogram` - exponential_histogram
+ * * `summary` - summary
+ */
+export type OtelMetricTypeEnumApi = (typeof OtelMetricTypeEnumApi)[keyof typeof OtelMetricTypeEnumApi]
+
+export const OtelMetricTypeEnumApi = {
+    Gauge: 'gauge',
+    Sum: 'sum',
+    Histogram: 'histogram',
+    ExponentialHistogram: 'exponential_histogram',
+    Summary: 'summary',
+} as const
+
+/**
+ * * `none` - none
+ * * `sum` - sum
+ * * `avg` - avg
+ * * `count` - count
+ * * `min` - min
+ * * `max` - max
+ * * `p95` - p95
+ * * `rate` - rate
+ * * `increase` - increase
+ * * `histogram_quantile` - histogram_quantile
+ * * `count_rate` - count_rate
+ * * `count_increase` - count_increase
+ */
+export type MetricQueryAggregationEnumApi =
+    (typeof MetricQueryAggregationEnumApi)[keyof typeof MetricQueryAggregationEnumApi]
+
+export const MetricQueryAggregationEnumApi = {
+    None: 'none',
+    Sum: 'sum',
+    Avg: 'avg',
+    Count: 'count',
+    Min: 'min',
+    Max: 'max',
+    P95: 'p95',
+    Rate: 'rate',
+    Increase: 'increase',
+    HistogramQuantile: 'histogram_quantile',
+    CountRate: 'count_rate',
+    CountIncrease: 'count_increase',
+} as const
+
+/**
+ * * `rate` - rate
+ * * `increase` - increase
+ */
+export type MetricRangeFunctionEnumApi = (typeof MetricRangeFunctionEnumApi)[keyof typeof MetricRangeFunctionEnumApi]
+
+export const MetricRangeFunctionEnumApi = {
+    Rate: 'rate',
+    Increase: 'increase',
+} as const
+
+export interface _MetricGroupByApi {
+    /**
+     * Attribute name to split series by (e.g. 'k8s.pod.name', 'env').
+     * @maxLength 255
+     */
+    key: string
+    /** Where the attribute lives; same semantics as filter scope. Use 'auto' unless you know the exact scope.
+     *
+     * * `resource` - resource
+     * * `attribute` - attribute
+     * * `auto` - auto */
+    scope?: MetricAttributeScopeEnumApi
+}
+
+/**
+ * * `second_15` - second_15
+ * * `second_30` - second_30
+ * * `minute` - minute
+ * * `minute_5` - minute_5
+ * * `minute_15` - minute_15
+ * * `minute_30` - minute_30
+ * * `hour` - hour
+ * * `hour_6` - hour_6
+ * * `day` - day
+ * * `week` - week
+ */
+export type MetricQueryIntervalEnumApi = (typeof MetricQueryIntervalEnumApi)[keyof typeof MetricQueryIntervalEnumApi]
+
+export const MetricQueryIntervalEnumApi = {
+    Second15: 'second_15',
+    Second30: 'second_30',
+    Minute: 'minute',
+    Minute5: 'minute_5',
+    Minute15: 'minute_15',
+    Minute30: 'minute_30',
+    Hour: 'hour',
+    Hour6: 'hour_6',
+    Day: 'day',
+    Week: 'week',
+} as const
+
+export interface _MetricClauseApi {
+    /**
+     * Clause name a formula refers to (e.g. 'a').
+     * @maxLength 64
+     */
+    name: string
+    /**
+     * Exact metric name this clause queries.
+     * @maxLength 255
+     */
+    metricName: string
+    /** Constrain the query to one metric type. A name can exist as several types (e.g. a counter and a gauge); without this, rows of every type sharing the name are blended into one aggregate. Get the type from 'metric-names-list'.
+     *
+     * * `gauge` - gauge
+     * * `sum` - sum
+     * * `histogram` - histogram
+     * * `exponential_histogram` - exponential_histogram
+     * * `summary` - summary */
+    metricType?: OtelMetricTypeEnumApi | null
+    /** Aggregation applied per time bucket; same semantics as the top-level aggregation.
+     *
+     * * `none` - none
+     * * `sum` - sum
+     * * `avg` - avg
+     * * `count` - count
+     * * `min` - min
+     * * `max` - max
+     * * `p95` - p95
+     * * `rate` - rate
+     * * `increase` - increase
+     * * `histogram_quantile` - histogram_quantile
+     * * `count_rate` - count_rate
+     * * `count_increase` - count_increase */
+    aggregation?: MetricQueryAggregationEnumApi
+    /** Counter-aware transform applied to each series before the aggregation: 'rate' (per-second) or 'increase'. Combine with 'none' to get one rate line per series. Do not combine with the 'rate' or 'increase' aggregations.
+     *
+     * * `rate` - rate
+     * * `increase` - increase */
+    rangeFunction?: MetricRangeFunctionEnumApi | null
+    /**
+     * Quantile in (0, 1) for 'histogram_quantile'.
+     * @minimum 0
+     * @maximum 1
+     * @nullable
+     */
+    quantile?: number | null
+    /**
+     * Apdex threshold T in milliseconds for 'posthog.derived.spans.apdex': a request is satisfied at or under T and tolerating up to 4T. Defaults to 500. Ignored for other metrics.
+     * @minimum 0.001
+     * @nullable
+     */
+    apdexThresholdMs?: number | null
+    /** Label predicates ANDed together for this clause. */
+    filters?: _MetricFilterApi[]
+    /** Labels to split this clause into separate series by. */
+    groupBy?: _MetricGroupByApi[]
+}
+
+/**
+ * * `points` - points
+ * * `summary` - summary
+ */
+export type MetricQueryOutputEnumApi = (typeof MetricQueryOutputEnumApi)[keyof typeof MetricQueryOutputEnumApi]
+
+export const MetricQueryOutputEnumApi = {
+    Points: 'points',
+    Summary: 'summary',
+} as const
+
+export interface _MetricQueryBodyApi {
+    /**
+     * Exact metric name to query (e.g. 'http.server.duration'). Single-clause shorthand — mutually exclusive with 'clauses'.
+     * @maxLength 255
+     */
+    metricName?: string
+    /** Constrain the query to one metric type. A name can exist as several types (e.g. a counter and a gauge); without this, rows of every type sharing the name are blended into one aggregate. Get the type from 'metric-names-list'.
+     *
+     * * `gauge` - gauge
+     * * `sum` - sum
+     * * `histogram` - histogram
+     * * `exponential_histogram` - exponential_histogram
+     * * `summary` - summary */
+    metricType?: OtelMetricTypeEnumApi | null
+    /** Defaults to 'sum'. Aggregation applied per time bucket, always across series rather than across raw samples. 'sum', 'avg', 'min', 'max' and 'p95' reduce each series to its last sample in the bucket and then combine those, so the result does not scale with the scrape rate; 'count' is the number of series that reported. 'rate' (per-second) and 'increase' are counter-aware: per-series deltas with Prometheus counter-reset handling, temporality-aware (delta-temporality samples count as-is). 'histogram_quantile' interpolates from OTel histogram buckets and requires 'quantile'. 'count_rate' (per-second) and 'count_increase' are 'rate' and 'increase' over a histogram's or summary's observation count instead of its running sum, so they chart requests per second from a latency histogram; they take no 'rangeFunction'. 'none' skips the aggregation and returns one series per label set, at most 100, using each series' last sample per bucket; it cannot be combined with 'groupBy'.
+     *
+     * * `none` - none
+     * * `sum` - sum
+     * * `avg` - avg
+     * * `count` - count
+     * * `min` - min
+     * * `max` - max
+     * * `p95` - p95
+     * * `rate` - rate
+     * * `increase` - increase
+     * * `histogram_quantile` - histogram_quantile
+     * * `count_rate` - count_rate
+     * * `count_increase` - count_increase */
+    aggregation?: MetricQueryAggregationEnumApi
+    /** Counter-aware transform applied to each series before the aggregation: 'rate' (per-second) or 'increase'. Combine with 'none' to get one rate line per series. Do not combine with the 'rate' or 'increase' aggregations.
+     *
+     * * `rate` - rate
+     * * `increase` - increase */
+    rangeFunction?: MetricRangeFunctionEnumApi | null
+    /**
+     * Quantile in (0, 1) for 'histogram_quantile' (e.g. 0.95). Ignored for other aggregations.
+     * @minimum 0
+     * @maximum 1
+     * @nullable
+     */
+    quantile?: number | null
+    /**
+     * Apdex threshold T in milliseconds for 'posthog.derived.spans.apdex': a request is satisfied at or under T and tolerating up to 4T. Defaults to 500. Ignored for other metrics.
+     * @minimum 0.001
+     * @nullable
+     */
+    apdexThresholdMs?: number | null
+    /** Label predicates ANDed together. Rows must satisfy every filter. */
+    filters?: _MetricFilterApi[]
+    /** Labels to split the result into separate series by. Series share one time grid and are capped at the 100 largest. */
+    groupBy?: _MetricGroupByApi[]
+    /** Bucket size for the shared time grid. Omit to auto-pick (~60 buckets across the range).
+     *
+     * * `second_15` - second_15
+     * * `second_30` - second_30
+     * * `minute` - minute
+     * * `minute_5` - minute_5
+     * * `minute_15` - minute_15
+     * * `minute_30` - minute_30
+     * * `hour` - hour
+     * * `hour_6` - hour_6
+     * * `day` - day
+     * * `week` - week */
+    interval?: MetricQueryIntervalEnumApi | null
+    /** Full multi-clause form: each clause is an independent metric selection sharing the request's time grid (maximum 10). Mutually exclusive with 'metricName'. */
+    clauses?: _MetricClauseApi[]
+    /**
+     * Arithmetic over clause names evaluated server-side per grid point, e.g. '(a - b) / a'. Supports + - * / and parentheses; division by zero yields 0. When set, only the formula result series are returned.
+     * @maxLength 512
+     * @nullable
+     */
+    formula?: string | null
+    /**
+     * PromQL expression, run as a range query over the request's time grid, e.g. 'sum by (job) (rate(http_requests_total[5m]))'. Use it to run an alert or runbook expression as written. Mutually exclusive with 'metricName' and 'clauses'; put label selectors and grouping in the expression instead of 'filters' and 'groupBy'. In PromQL, service.name is service_name and other label names with dots need quotes. A bucket that a series did not report is null, not zero.
+     * @maxLength 8192
+     * @nullable
+     */
+    promql?: string | null
+    /** Lower bound (inclusive) for the query range. ISO 8601, or a relative offset back from now such as '-30M' (minutes), '-1h', '-7d', '-2w' or '-1m' (months; lowercase m is months, capital M is minutes). Defaults to 24 hours before dateTo. */
+    dateFrom?: string
+    /** Upper bound (exclusive) for the query range. ISO 8601 or a relative offset like dateFrom. Defaults to now if omitted. */
+    dateTo?: string
+    /**
+     * Leave out series whose every point is zero or null, and count them in 'omitted_empty_series'. Defaults to true for MCP clients and false otherwise.
+     * @nullable
+     */
+    dropEmptySeries?: boolean | null
+    /**
+     * Return at most this many series, the ones with the largest summed absolute value, and count the rest in 'omitted_by_limit'. Applies after dropEmptySeries.
+     * @minimum 1
+     * @maximum 100
+     * @nullable
+     */
+    limit?: number | null
+    /** Return one value per series instead of a time series. PromQL runs as an instant query at 'time'. The builder returns the last complete bucket before 'time', 5 minutes wide unless 'interval' says otherwise. Each series then has 'value' and 'time' instead of 'points'. Cannot be combined with 'dateFrom', 'dateTo' or 'output'. */
+    instant?: boolean
+    /** Evaluation time of an instant query: ISO 8601 or a relative offset like dateFrom. Defaults to now. Setting it makes the query instant. */
+    time?: string
+    /** 'points' (default) returns every point. 'summary' runs the same range query but returns per series only 'last' (the last non-null value), its 'time', and 'min', 'max' and 'avg' over the non-null points.
+     *
+     * * `points` - points
+     * * `summary` - summary */
+    output?: MetricQueryOutputEnumApi
+}
+
+export interface _MetricQueryRequestApi {
+    /** The metric query to execute. */
+    query: _MetricQueryBodyApi
+}
+
+export interface _MetricQueryResponseApi {
+    /** One series per (clause, label-set). A single ungrouped query returns exactly one series with empty labels. */
+    results: _MetricSeriesApi[]
+    /** Set when the query returned no points, with what to check before querying again, or when a histogram_quantile merged different bucket layouts, with how to read the result. */
+    hint?: string
+    /** Number of series left out because every point was zero or null. Set only when dropEmptySeries left some out. */
+    omitted_empty_series?: number
+    /** Number of series left out by 'limit'. Set only when it left some out. */
+    omitted_by_limit?: number
+    /** Search params that open this query in the metrics viewer, e.g. /metrics?<url_params>. For a builder query the viewer cannot show (a 'resource' or 'attribute' scope, an unusual quantile), they open the viewer without it. */
+    url_params?: string
+}
+
+export interface _MetricQueryCountApi {
+    /** Metric name as it appears in the team's data. */
+    metric_name: string
+    /** Number of builder and PromQL queries that read the metric in the window. SQL mode queries do not count. */
+    query_count: number
+    /** When a query last read the metric, ISO 8601. */
+    last_queried_at: string
+}
+
+export interface _MetricQueryCountsResponseApi {
+    /** Metrics that queries read in the window, the most queried first. */
+    results: _MetricQueryCountApi[]
+}
+
+export interface MetricsRecordingRuleApi {
+    /** Recording rule id. */
+    readonly id: string
+    /**
+     * The metric the rule writes, in the level:metric:operations form, for example job:http_errors:rate5m. It must contain a colon and cannot change after create.
+     * @maxLength 200
+     */
+    metric_name: string
+    /**
+     * A PromQL expression over this project's metrics that returns an instant vector or a scalar. Each series it returns is written as one series of `metric_name`, with the same labels.
+     * @maxLength 8192
+     */
+    query: string
+    /** What the recorded metric means. */
+    description?: string
+    /** When false, the rule is kept but not evaluated. */
+    enabled?: boolean
+    /** When the rule was created. */
+    readonly created_at: string
+    /** When the rule was last changed. */
+    readonly updated_at: string
+    /**
+     * The minute the rule last wrote a result. Null until it first writes.
+     * @nullable
+     */
+    readonly last_evaluated_at: string | null
+    /**
+     * How many series the last result had.
+     * @nullable
+     */
+    readonly last_series_count: number | null
+    /**
+     * Why the last evaluation wrote nothing. Null when the last evaluation wrote a result.
+     * @nullable
+     */
+    readonly last_error: string | null
+}
+
+export interface PatchedMetricsRecordingRuleUpdateApi {
+    /**
+     * A new PromQL expression for the rule.
+     * @maxLength 8192
+     */
+    query?: string
+    /** What the recorded metric means. */
+    description?: string
+    /** When false, the rule is kept but not evaluated. */
+    enabled?: boolean
+}
+
+export interface _MetricSamplesBodyApi {
+    /**
+     * Exact metric name to list raw emissions for (e.g. 'http.server.duration'). Omit to list emissions across all metric names — allowed only with traceId (the trace->metrics pivot).
+     * @maxLength 255
+     */
+    metricName?: string
+    /** Lower bound (inclusive) for the sample window. ISO 8601. */
+    dateFrom: string
+    /** Upper bound (exclusive) for the sample window. Defaults to now if omitted. */
+    dateTo?: string
+    /**
+     * Restrict to emissions on this trace (hex trace id, as the tracing product uses) — the reverse metric->trace pivot. Omit for all traces.
+     * @maxLength 255
+     */
+    traceId?: string
+    /**
+     * Restrict to emissions recorded on this span (hex span id). Requires traceId, since a span id is only unique within its trace.
+     * @maxLength 255
+     */
+    spanId?: string
+    /** Constrain the emissions to one metric type. A name can exist as several types (e.g. a counter and a gauge); without this, emissions of every type sharing the name are listed together. Pass the same value used for the chart so both describe the same series.
+     *
+     * * `gauge` - gauge
+     * * `sum` - sum
+     * * `histogram` - histogram
+     * * `exponential_histogram` - exponential_histogram
+     * * `summary` - summary */
+    metricType?: OtelMetricTypeEnumApi | null
+    /** Label predicates ANDed together, matched against each emission's series. Pass the same filters used for the chart so the emissions listed are the ones behind it. */
+    filters?: _MetricFilterApi[]
+    /**
+     * Max emissions to return, newest first. Defaults to 100, capped at 1000.
+     * @minimum 1
+     * @maximum 1000
+     */
+    limit?: number
+}
+
+export interface _MetricSamplesRequestApi {
+    /** The raw-emissions query to execute. */
+    query: _MetricSamplesBodyApi
+}
+
+/**
+ * Per-emission attributes (high-cardinality labels on the data point).
+ */
+export type _MetricEventSampleApiAttributes = { [key: string]: string }
+
+/**
+ * Attributes of the resource (host, pod, service version) that emitted the metric.
+ */
+export type _MetricEventSampleApiResourceAttributes = { [key: string]: string }
+
+export interface _MetricEventSampleApi {
+    /** When the metric was emitted, ISO 8601. */
+    timestamp: string
+    /** Metric this emission belongs to. */
+    metric_name: string
+    /** OTel metric type: gauge, sum, histogram, summary, or exponential_histogram. */
+    metric_type: string
+    /** The emitted value. For histogram/summary points this is the distribution sum; pair with count. */
+    value: number
+    /** Observations behind this point: 1 for gauges/counters, the distribution count for histograms/summaries. */
+    count: number
+    /** Unit of the value, if any. */
+    unit: string
+    /** For counters: 'delta' or 'cumulative' (decides whether rate() must diff). Empty for gauges. */
+    aggregation_temporality: string
+    /** True for monotonically increasing counters. */
+    is_monotonic: boolean
+    /** Service that emitted the metric. */
+    service_name: string
+    /** Trace this emission belongs to (hex, same form the tracing product uses); empty if none. Use it to pivot to the trace. */
+    trace_id: string
+    /** Span this emission belongs to (hex); empty if none. */
+    span_id: string
+    /** Per-emission attributes (high-cardinality labels on the data point). */
+    attributes: _MetricEventSampleApiAttributes
+    /** Attributes of the resource (host, pod, service version) that emitted the metric. */
+    resource_attributes: _MetricEventSampleApiResourceAttributes
+}
+
+export interface _MetricSamplesResponseApi {
+    /** Raw emissions ordered by timestamp descending. */
+    results: _MetricEventSampleApi[]
+}
+
+export interface MetricsSuggestedDashboardApi {
+    /** Suggestion id. */
+    id: string
+    /** The bank dashboard that the suggestion is for. */
+    template_id: string
+    /** Dashboard name. */
+    name: string
+    /** What the dashboard shows. */
+    description: string
+    /** Why the dashboard suits this project. Can be empty. */
+    reason: string
+    /** Number of charts on the dashboard. */
+    panel_count: number
+    /** Number of the project's metrics that the dashboard uses. */
+    matched_metric_count: number
+    /** Share of the dashboard's charts that have data in this project. */
+    coverage: number
+    /**
+     * The dashboard that someone in the project created from this suggestion.
+     * @nullable
+     */
+    dashboard_id: number | null
+}
+
+export interface _MetricClassicHistogramApi {
+    /** The histogram's name without a suffix. */
+    base_name: string
+    /** The `_bucket` name, with the `le` label. PromQL reads this one. */
+    bucket: string
+    /** The `_sum` name: the total of the observed values. */
+    sum: string
+    /** The `_count` name: the number of observations. */
+    count: string
+}
+
+export interface _MetricNameApi {
+    /** Metric name as it appears in the team's data. */
+    name: string
+    /** OTel metric type (gauge, sum, histogram, summary, exponential_histogram). */
+    metric_type: string
+    /** Unit of the metric value, if any (e.g. 'ms', 'By'). */
+    unit?: string
+    /**
+     * When the newest datapoint for this metric arrived, ISO 8601.
+     * @nullable
+     */
+    last_seen?: string | null
+    /** A small downsampled series of the metric's recent shape, for a sparkline. */
+    sparkline?: number[]
+    /**
+     * Start of the earliest hour this metric arrived in, within retention, ISO 8601. Only present when `first_seen` was requested.
+     * @nullable
+     */
+    first_seen?: string | null
+    /** Approximate number of distinct series (label sets) in the last 24 hours. Only present when `series_stats` was requested. */
+    series_count?: number
+    /** Number of distinct datapoint attribute keys in the last 24 hours. Only present when `series_stats` was requested. */
+    tag_key_count?: number
+    /** Set when this entry folds a Prometheus classic histogram's three names. Absent otherwise. */
+    classic_histogram?: _MetricClassicHistogramApi
+}
+
+export interface _MetricNamesResponseApi {
+    /** Distinct metric names ordered by recent activity. */
+    results: _MetricNameApi[]
+}
+
+export interface _MetricCatalogValuesParamsApi {
+    /**
+     * Substring filter (case-insensitive) applied to metric names.
+     * @maxLength 255
+     */
+    value?: string
+    /**
+     * Max number of names to return. Defaults to 100; maximum 1000.
+     * @minimum 1
+     * @maximum 1000
+     */
+    limit?: number
+    /**
+     * Comma-separated services to narrow the list to, e.g. `service=web,worker`. Omit for every service. Send it empty to select only series whose sender did not set `service.name`. A service name containing a comma cannot be selected.
+     * @maxLength 1024
+     */
+    service?: string
+    /**
+     * Exact metric names to load as a batch. Overrides value and limit.
+     * @minItems 1
+     * @maxItems 20
+     * @items.maxLength 255
+     */
+    names: string[]
+}
+
+/**
+ * * `custom` - custom
+ * * `promql` - promql
+ * * `sql` - sql
+ * * `textbox` - textbox
+ */
+export type MetricVariableSourceEnumApi = (typeof MetricVariableSourceEnumApi)[keyof typeof MetricVariableSourceEnumApi]
+
+export const MetricVariableSourceEnumApi = {
+    Custom: 'custom',
+    Promql: 'promql',
+    Sql: 'sql',
+    Textbox: 'textbox',
+} as const
+
+export interface _MetricVariableSelectionApi {
+    /**
+     * Variable name. Queries refer to it as `$name`.
+     * @maxLength 128
+     * @pattern ^[A-Za-z_][A-Za-z0-9_]*$
+     */
+    name: string
+    /**
+     * The selected values. When `all` is true, the options that All stands for.
+     * @maxItems 1000
+     * @items.maxLength 1024
+     */
+    values: string[]
+    /** True when the variable is set to All. */
+    all?: boolean
+    /**
+     * The text that All puts in a PromQL query. `.*` when it is empty.
+     * @maxLength 1024
+     * @nullable
+     */
+    allValue?: string | null
+}
+
+export interface _MetricVariableOptionsRequestApi {
+    /** Where the options come from: a static list, a PromQL query, a SQL query, or free text.
+     *
+     * * `custom` - custom
+     * * `promql` - promql
+     * * `sql` - sql
+     * * `textbox` - textbox */
+    source: MetricVariableSourceEnumApi
+    /**
+     * The options query when `source` is `promql` or `sql`. It can refer to other variables as `$name`. PromQL supports label_values(label), label_values(selector, label), label_names(), metrics(regex) and query_result(expr). SQL returns the options in its first column.
+     * @maxLength 10000
+     * @nullable
+     */
+    query?: string | null
+    /**
+     * The options when `source` is `custom`.
+     * @maxItems 1000
+     * @nullable
+     * @items.maxLength 1024
+     */
+    customValues?: string[] | null
+    /**
+     * A regex that filters the options of a query, as `pattern` or `/pattern/flags`. With a capture group, each option is its first group. An invalid regex is rejected before any query runs.
+     * @maxLength 1024
+     * @nullable
+     */
+    regex?: string | null
+    /** The current selection of the other dashboard variables that the query can refer to. */
+    variables?: _MetricVariableSelectionApi[]
+    /**
+     * Start of the window that options come from, as in a dashboard date filter: ISO 8601 or a relative date such as '-7d'. Defaults to 24 hours ago.
+     * @maxLength 64
+     * @nullable
+     */
+    dateFrom?: string | null
+    /**
+     * End of the window that options come from, in the same format as dateFrom. Defaults to now.
+     * @maxLength 64
+     * @nullable
+     */
+    dateTo?: string | null
+}
+
+export interface _MetricVariableOptionsResponseApi {
+    /** The options of the variable, at most 1,000. */
+    results: string[]
+}
+
+export type MetricsAttributeValuesRetrieveParams = {
+    /**
+     * Lower bound (inclusive) of the window values are suggested from. ISO 8601. Defaults to 24 hours ago.
+     * @nullable
+     */
+    dateFrom?: string | null
+    /**
+     * Upper bound (exclusive) of the window. ISO 8601. Defaults to now.
+     * @nullable
+     */
+    dateTo?: string | null
+    /**
+     * Attribute key to list values for (e.g. 'env'). 'service_name'/'service.name' list service names.
+     * @minLength 1
+     * @maxLength 255
+     */
+    key: string
+    /**
+     * Max number of values to return. Defaults to 100; maximum 1000.
+     * @minimum 1
+     * @maximum 1000
+     */
+    limit?: number
+    /**
+     * Exact metric name to limit values to. Omit to list values across all metrics.
+     * @maxLength 255
+     */
+    metricName?: string
+    /**
+     * Substring filter (case-insensitive) applied to values. Named 'value' to match the property-values autocomplete convention.
+     * @maxLength 1024
+     */
+    value?: string
+}
+
+export type MetricsAttributesRetrieveParams = {
+    /**
+     * Lower bound (inclusive) of the window keys are suggested from. ISO 8601. Defaults to 24 hours ago.
+     * @nullable
+     */
+    dateFrom?: string | null
+    /**
+     * Upper bound (exclusive) of the window. ISO 8601. Defaults to now.
+     * @nullable
+     */
+    dateTo?: string | null
+    /**
+     * Max number of keys to return. Defaults to 100; maximum 1000.
+     * @minimum 1
+     * @maximum 1000
+     */
+    limit?: number
+    /**
+     * Exact metric name to limit attribute keys to. Omit to list keys across all metrics.
+     * @maxLength 255
+     */
+    metricName?: string
+    /**
+     * Substring filter (case-insensitive) applied to attribute keys.
+     * @maxLength 255
+     */
+    search?: string
+    /**
+     * Also list keys whose values contain the search term, on searches of 4 or more characters. Value matches come after key matches and carry matchedOn='value' with the matching matchedValue.
+     */
+    search_values?: boolean
+}
+
+export type MetricsDashboardTemplatesListParams = {
+    /**
+     * Only templates with this status.
+     */
+    status?: MetricsDashboardTemplatesListStatus
+}
+
+export type MetricsDashboardTemplatesListStatus =
+    (typeof MetricsDashboardTemplatesListStatus)[keyof typeof MetricsDashboardTemplatesListStatus]
+
+export const MetricsDashboardTemplatesListStatus = {
+    Approved: 'approved',
+    Failed: 'failed',
+    Generating: 'generating',
+    PendingReview: 'pending_review',
+    Rejected: 'rejected',
+} as const
+
+export type MetricsDashboardTemplatesPictureRetrieveParams = {
+    /**
+     * Check round, from 1.
+     */
+    round: number
+}
+
+export type MetricsErrorSpikesRetrieveParams = {
+    /**
+     * Lower bound (inclusive) for the spike window. ISO 8601.
+     */
+    dateFrom: string
+    /**
+     * Upper bound (exclusive) for the spike window. Defaults to now if omitted.
+     */
+    dateTo?: string
+}
+
+export type MetricsNamesRetrieveParams = {
+    /**
+     * Max number of names to return. Defaults to 100; maximum 1000.
+     * @minimum 1
+     * @maximum 1000
+     */
+    limit?: number
+    /**
+     * Comma-separated services to narrow the list to, e.g. `service=web,worker`. Omit for every service. Send it empty to select only series whose sender did not set `service.name`. A service name containing a comma cannot be selected.
+     * @maxLength 1024
+     */
+    service?: string
+    /**
+     * Substring filter (case-insensitive) applied to metric names.
+     * @maxLength 255
+     */
+    value?: string
+}
+
+export type MetricsQueryCountsRetrieveParams = {
+    /**
+     * Number of UTC days to count, today included.
+     * @minimum 1
+     * @maximum 90
+     */
+    days?: number
+    /**
+     * Maximum number of metrics to return.
+     * @minimum 1
+     * @maximum 1000
+     */
+    limit?: number
+}
+
+export type MetricsValuesRetrieveParams = {
+    /**
+     * Add `first_seen`: the earliest hour each name arrived in, within retention.
+     */
+    first_seen?: boolean
+    /**
+     * Fold a Prometheus classic histogram's `<name>_bucket`, `<name>_sum` and `<name>_count` into one `<name>_bucket` entry with `classic_histogram` set. Only folds when all three are in the page.
+     */
+    fold_histograms?: boolean
+    /**
+     * Max number of names to return. Defaults to 100; maximum 1000.
+     * @minimum 1
+     * @maximum 1000
+     */
+    limit?: number
+    /**
+     * How `value` matches a name. `substring` (default) and `prefix` are case-insensitive. `regex` is an RE2 pattern run with ClickHouse match(): case-sensitive and unanchored, so use `^` and `$` to anchor and `(?i)` to ignore case.
+     *
+     * * `substring` - substring
+     * * `prefix` - prefix
+     * * `regex` - regex
+     * @minLength 1
+     */
+    match?: MetricsValuesRetrieveMatch
+    /**
+     * Add `series_count` and `tag_key_count` for each name, over the last 24 hours.
+     */
+    series_stats?: boolean
+    /**
+     * Comma-separated services to narrow the list to, e.g. `service=web,worker`. Omit for every service. Send it empty to select only series whose sender did not set `service.name`. A service name containing a comma cannot be selected.
+     * @maxLength 1024
+     */
+    service?: string
+    /**
+     * Attach a 24-point sparkline of the last 6 hours to each name. Turn off for a smaller, faster response.
+     */
+    sparklines?: boolean
+    /**
+     * Filter applied to metric names; `match` decides how. Empty lists every name, ordered by how many services report it.
+     * @maxLength 255
+     */
+    value?: string
+}
+
+export type MetricsValuesRetrieveMatch = (typeof MetricsValuesRetrieveMatch)[keyof typeof MetricsValuesRetrieveMatch]
+
+export const MetricsValuesRetrieveMatch = {
+    Substring: 'substring',
+    Prefix: 'prefix',
+    Regex: 'regex',
+} as const

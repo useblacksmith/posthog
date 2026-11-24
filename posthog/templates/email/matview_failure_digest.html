@@ -1,0 +1,92 @@
+{% extends "email/base.html" %}
+{% block preheader %}{{ summary }} in {{ team.name }}{% endblock %}
+{% block heading %}Materialized view failures{% endblock %}
+{% block section %}
+    <p style="color: #374151;">
+        In project <strong>{{ team.name }}</strong>: {{ summary }}. Their data may be out of date until a run succeeds.
+    </p>
+    {% for section in sections %}
+        <h3 style="color: #111827; font-size: 1em; margin: 20px 0 4px 0;">{{ section.title }} ({{ section.views|length }})</h3>
+        <p style="color: #6b7280; font-size: 0.85em; margin: 0 0 8px 0;">{{ section.description }}</p>
+        <div style="background-color: #ffffff;
+                    border: 1px solid #e5e7eb;
+                    border-left: 4px solid {{ section.color }};
+                    border-radius: 8px;
+                    padding: 8px 20px;
+                    margin-bottom: 12px">
+            <table width="100%"
+                   cellpadding="0"
+                   cellspacing="0"
+                   border="0"
+                   style="border-collapse: collapse">
+                {% for view in section.views %}
+                    <tr>
+                        <td align="left"
+                            style="padding: 9px 8px 9px 0;
+                                   border-top: {% if forloop.first %}0{% else %}1px solid #f3f4f6{% endif %};
+                                   vertical-align: top;
+                                   text-align: left;
+                                   white-space: nowrap">
+                            <a href="{{ view.url }}"
+                               target="_blank"
+                               style="text-decoration: none;
+                                      color: #111827;
+                                      font-weight: 600;
+                                      font-size: 0.9em">{{ view.name|truncatechars:40 }}</a>
+                            <br />
+                            <span style="color: #9ca3af; font-size: 0.75em;">
+                                {% if section.key == "new" %}
+                                    First failed {{ view.failing_since }}
+                                {% else %}
+                                    Failing since {{ view.failing_since }}, {{ view.failed_runs }} failed run{{ view.failed_runs|pluralize }}
+                                {% endif %}
+                            </span>
+                        </td>
+                        <td align="left"
+                            style="padding: 9px 8px;
+                                   border-top: {% if forloop.first %}0{% else %}1px solid #f3f4f6{% endif %};
+                                   vertical-align: top;
+                                   text-align: left;
+                                   color: #6b7280;
+                                   font-size: 0.85em;
+                                   word-break: break-word">
+                            {{ view.error|truncatechars:90 }}
+                            {% if view.suspended %}
+                                <br />
+                                <span style="color: #b91c1c; font-size: 0.9em;">Suspended after repeated failures. Fix the error, then select Resume on the view.</span>
+                            {% elif view.schedule == "paused" %}
+                                <br />
+                                <span style="color: #92400e; font-size: 0.9em;">Paused. Choose a sync frequency in the view's materialization settings to restart it.</span>
+                            {% elif view.schedule == "reverted" %}
+                                <br />
+                                <span style="color: #92400e; font-size: 0.9em;">Not scheduled. Materialize the view again to restart it.</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+            </table>
+        </div>
+    {% endfor %}
+    {% if omitted_count %}
+        <p style="font-size: 0.9em; color: #374151; margin-top: 8px;">
+            &hellip;and <strong>{{ omitted_count }}</strong> more failing view{{ omitted_count|pluralize }}.
+            <a href="{{ views_url }}"
+               target="_blank"
+               style="color: #111827;
+                      font-weight: 600">View them all in PostHog</a>.
+        </p>
+    {% endif %}
+    <p style="font-size: 0.85em; color: #6b7280; margin-top: 16px;">
+        Click a view name to open it in the SQL editor and see its full error details.
+    </p>
+{% endblock %}
+{% block footer %}
+    Need help?
+    <a href="https://posthog.com/questions?{{ utm_tags }}" target="_blank"><b>Visit support</b></a>
+    or
+    <a href="https://posthog.com/docs/data-warehouse/views?{{ utm_tags }}"
+       target="_blank"><b>read our documentation</b></a>.
+    <br />
+    <br />
+    <a href="{% absolute_uri '/settings/user-notifications' %}">Manage these notifications in PostHog</a>
+{% endblock %}

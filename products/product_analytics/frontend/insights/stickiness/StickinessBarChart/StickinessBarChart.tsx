@@ -1,0 +1,235 @@
+import { useValues } from 'kea'
+import { useCallback, useMemo } from 'react'
+
+import { TimeSeriesBarChart } from '@posthog/quill-charts'
+import type { PointClickData, Series, TimeSeriesBarChartConfig, TooltipContext } from '@posthog/quill-charts'
+
+import { makeChartErrorHandler } from 'lib/charts/chartErrorHandler'
+import { useChartConfig, useChartTheme } from 'lib/charts/hooks'
+import { InsightEmptyState } from 'scenes/insights/EmptyStates'
+import { insightLogic } from 'scenes/insights/insightLogic'
+import { teamLogic } from 'scenes/teamLogic'
+import { openPersonsModal } from 'scenes/trends/persons-modal/PersonsModal'
+
+import { cohortsModel } from '~/models/cohortsModel'
+import { groupsModel } from '~/models/groupsModel'
+import { propertyDefinitionsModel } from '~/models/propertyDefinitionsModel'
+import { InsightVizNode } from '~/queries/schema/schema-general'
+import { QueryContext } from '~/queries/types'
+import { ChartDisplayType } from '~/types'
+
+import type { SeriesDatum } from 'products/product_analytics/frontend/insights/shared/InsightTooltip/insightTooltipUtils'
+import { trendsDataLogic } from 'products/product_analytics/frontend/insights/trends/trendsDataLogic'
+import type { IndexedTrendResult } from 'products/product_analytics/frontend/insights/trends/types'
+
+import { hasTrendsChartData } from '../../shared/hasTrendsChartData'
+import { InsightSeriesTooltip } from '../../shared/InsightSeriesTooltip'
+import { getSeriesIdentification } from '../../shared/seriesIdentification'
+import { getTrendsSeriesDisplayLabel } from '../../trends/shared/getTrendsSeriesDisplayLabel'
+import {
+    buildTrendsSeriesMeta,
+    resolveGroupTypeLabel,
+    type TrendsSeriesMeta,
+} from '../../trends/shared/trendsSeriesMeta'
+import { useInsightsLegendConfig } from '../../trends/shared/useInsightsLegendConfig'
+import { handleStickinessChartClick } from '../StickinessLineChart/handleStickinessChartClick'
+import {
+    buildStickinessTooltipTitle,
+    stickinessPercentFormatter,
+    STICKINESS_TOOLTIP_CONFIG,
+} from '../StickinessLineChart/stickinessChartTransforms'
+import { buildStickinessBarSeries, buildStickinessBarTimeSeriesConfig } from './stickinessBarChartTransforms'
+
+interface StickinessBarChartProps {
+    context?: QueryContext<InsightVizNode>
+}
+
+const handleChartError = makeChartErrorHandler('stickiness-bar-chart')
+
+export function StickinessBarChart({ context }: StickinessBarChartProps): JSX.Element | null {
+    const theme = useChartTheme()
+    const { insightProps } = useValues(insightLogic)
+    const tooltipConfig = STICKINESS_TOOLTIP_CONFIG
+
+    const legendConfig = useInsightsLegendConfig({ insightProps })
+
+    const {
+        indexedResults,
+        display,
+        interval,
+        yAxisScaleType,
+        getTrendsColor,
+        currentPeriodResult,
+        breakdownFilter,
+        trendsFilter,
+        labelGroupType,
+        hasPersonsModal,
+        actionNames,
+        querySource,
+        showValuesOnSeries,
+        isSingleSeriesDefinition,
+    } = useValues(trendsDataLogic(insightProps))
+    const { timezone, baseCurrency } = useValues(teamLogic)
+    const { aggregationLabel } = useValues(groupsModel)
+    const { allCohorts } = useValues(cohortsModel)
+    const { formatPropertyValueForDisplay } = useValues(propertyDefinitionsModel)
+
+    const buildMeta = useCallback(
+        (r: IndexedTrendResult): TrendsSeriesMeta => buildTrendsSeriesMeta(r, querySource, actionNames),
+        [querySource, actionNames]
+    )
+
+    const seriesIdentification = useMemo(
+        () => getSeriesIdentification((indexedResults ?? []).map(buildMeta)),
+        [indexedResults, buildMeta]
+    )
+
+    const getLabel = useCallback(
+        (r: IndexedTrendResult): string =>
+            getTrendsSeriesDisplayLabel(r, {
+                querySource,
+                actionNames,
+                breakdownFilter,
+                cohorts: allCohorts?.results,
+                formatPropertyValueForDisplay,
+                isSingleSeriesDefinition,
+                seriesIdentification,
+            }),
+        [
+            querySource,
+            actionNames,
+            breakdownFilter,
+            allCohorts?.results,
+            formatPropertyValueForDisplay,
+            isSingleSeriesDefinition,
+            seriesIdentification,
+        ]
+    )
+
+    // Inverted polarity vs legacy `isStacked` in `ActionsLineGraph`; matches `TrendsBarChart`.
+    const isGrouped = display === ChartDisplayType.ActionsUnstackedBar
+
+    const resolvedGroupTypeLabel = context?.groupTypeLabel ?? resolveGroupTypeLabel(labelGroupType, aggregationLabel)
+
+    const labels = currentPeriodResult?.labels ?? []
+
+    const hasData = hasTrendsChartData(indexedResults)
+
+    // `TimeSeriesBarChart` has a single y-axis — `showMultipleYAxes` is intentionally not forwarded.
+    const series: Series<TrendsSeriesMeta>[] = useMemo(
+        () =>
+            buildStickinessBarSeries<IndexedTrendResult, TrendsSeriesMeta>(indexedResults ?? [], {
+                getColor: getTrendsColor,
+                // Hidden series stay listed (dimmed) and are excluded via config.legend.hiddenKeys
+                // instead of being dropped here, so the legend can restore them.
+                getHidden: undefined,
+                getLabel,
+                buildMeta,
+            }),
+        [indexedResults, getTrendsColor, getLabel, buildMeta]
+    )
+
+    const chartConfig: TimeSeriesBarChartConfig = useChartConfig(
+        () => ({
+            ...buildStickinessBarTimeSeriesConfig({
+                yAxisScaleType,
+                isGrouped,
+                valueLabels: showValuesOnSeries ? { formatter: stickinessPercentFormatter } : false,
+                tooltip: tooltipConfig,
+            }),
+            // Interactive legend is a component concern, kept out of the pure transform.
+            legend: legendConfig,
+        }),
+        [yAxisScaleType, isGrouped, showValuesOnSeries, legendConfig, tooltipConfig]
+    )
+
+    // Close over the primitives so the click memos don't invalidate when unrelated
+    // context fields change. `openPersonsModal` is a stable module import.
+    const onDataPointClick = context?.onDataPointClick
+    const formatCompareLabel = context?.formatCompareLabel
+    const hasClickHandler = !!onDataPointClick || !!hasPersonsModal
+
+    const clickDeps = useMemo(
+        () => ({
+            context: onDataPointClick ? { onDataPointClick } : undefined,
+            hasPersonsModal: !!hasPersonsModal,
+            interval,
+            querySource,
+            indexedResults: indexedResults ?? [],
+            openPersonsModal,
+        }),
+        [onDataPointClick, hasPersonsModal, interval, querySource, indexedResults]
+    )
+
+    const onPointClick = useCallback(
+        (clickData: PointClickData) => {
+            handleStickinessChartClick(clickData.series.key, clickData.dataIndex, clickDeps)
+        },
+        [clickDeps]
+    )
+
+    const altTitle = useMemo(() => buildStickinessTooltipTitle(interval), [interval])
+
+    const renderTooltip = useCallback(
+        (ctx: TooltipContext<TrendsSeriesMeta>) => {
+            const onRowClick = hasClickHandler
+                ? (datum: SeriesDatum) => {
+                      const seriesKey = ctx.seriesData[datum.datasetIndex].series.key
+                      handleStickinessChartClick(seriesKey, datum.dataIndex, clickDeps)
+                  }
+                : undefined
+            const sharedProps = {
+                context: ctx,
+                timezone,
+                interval: interval ?? undefined,
+                breakdownFilter: breakdownFilter ?? undefined,
+                trendsFilter,
+                showPercentView: true as const,
+                isPercentStackView: false as const,
+                baseCurrency,
+                groupTypeLabel: resolvedGroupTypeLabel,
+                formatCompareLabel,
+                onRowClick,
+                altTitle,
+            }
+            return <InsightSeriesTooltip {...sharedProps} />
+        },
+        [
+            timezone,
+            interval,
+            breakdownFilter,
+            trendsFilter,
+            baseCurrency,
+            resolvedGroupTypeLabel,
+            formatCompareLabel,
+            hasClickHandler,
+            clickDeps,
+            altTitle,
+        ]
+    )
+
+    if (!hasData) {
+        return (
+            <InsightEmptyState
+                heading={context?.emptyStateHeading}
+                detail={context?.emptyStateDetail}
+                sampleDataVariant="bar"
+            />
+        )
+    }
+
+    return (
+        <TimeSeriesBarChart<TrendsSeriesMeta>
+            series={series}
+            labels={labels}
+            theme={theme}
+            config={chartConfig}
+            tooltip={renderTooltip}
+            onPointClick={hasClickHandler ? onPointClick : undefined}
+            onPointContextMenu={context?.dashboardResultMenu && hasClickHandler ? onPointClick : undefined}
+            className="BarGraph"
+            dataAttr="stickiness-bar-graph"
+            onError={handleChartError}
+        />
+    )
+}

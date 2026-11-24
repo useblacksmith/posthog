@@ -1,0 +1,81 @@
+from posthog.job_owners import JobOwners
+from posthog.models.health_issue import HealthIssue
+from posthog.temporal.health_checks.framework import (
+    _SEVERITY_WEIGHT,
+    AlertContent,
+    Remediation,
+    SignalContent,
+    build_signal_extra,
+)
+from posthog.temporal.health_checks.models import HealthCheckResult
+from posthog.temporal.health_checks.rollups.checks import RollupHealthCheck
+from posthog.temporal.health_checks.rollups.freshness import RollupWindow
+
+from products.web_analytics.backend.models.health_rollups import EventsHealthDaily
+from products.web_analytics.backend.temporal.health_checks.rollup_reads import events_health_totals
+
+SCROLL_DEPTH_LOOKBACK_DAYS = 30
+
+
+class ScrollDepthCheck(RollupHealthCheck):
+    name = "scroll_depth"
+    kind = "scroll_depth"
+    owner = JobOwners.TEAM_WEB_ANALYTICS
+    schedule = "15 5 * * *"
+    active_since_days = 30
+    rollup_model = EventsHealthDaily
+    window_days = SCROLL_DEPTH_LOOKBACK_DAYS
+    remediation = Remediation(
+        human="""
+            Open the Web analytics health page. Scroll depth is collected automatically by posthog-js as
+            part of $pageleave when autocapture is enabled, so the usual fix is to update to a recent
+            posthog-js version and make sure autocapture (and DOM / scroll tracking) hasn't been disabled.
+        """,
+        agent="""
+            Use `execute-sql` to inspect a recent $pageleave event's properties and confirm the scroll
+            fields are missing. Then fix it in the user's codebase: bump posthog-js to a recent version and
+            check the `posthog.init` config doesn't disable autocapture or DOM/scroll tracking. Use
+            `docs-search` for scroll-depth / autocapture configuration. Once posthog-js starts sending
+            scroll metadata, the issue clears on the next check run.
+        """,
+    )
+
+    @classmethod
+    def render_alert(cls, issue: HealthIssue) -> AlertContent:
+        return AlertContent(
+            title="Scroll-depth tracking disabled",
+            summary=issue.payload.get("reason", "$pageleave events have no scroll-depth metadata"),
+            link="/web/health",
+        )
+
+    @classmethod
+    def render_signal(cls, issue: HealthIssue) -> SignalContent | None:
+        title = "Scroll-depth tracking disabled"
+        summary = issue.payload.get("reason", "$pageleave events have no scroll-depth metadata.")
+        return SignalContent(
+            description=(
+                f"This project's `$pageleave` events carry no scroll-depth metadata over the last "
+                f"{SCROLL_DEPTH_LOOKBACK_DAYS} days, so scroll-depth reports in web analytics will be empty. "
+                "This usually means scroll-depth autocapture is disabled in the SDK config. Recommend enabling "
+                "it so engagement-by-scroll-depth is captured."
+            ),
+            weight=_SEVERITY_WEIGHT[issue.severity],
+            extra=build_signal_extra(issue, title=title, summary=summary, link="/web/health"),
+        )
+
+    def detect_from_rollup(self, team_ids: list[int], window: RollupWindow) -> dict[int, list[HealthCheckResult]]:
+        return {
+            team_id: [_scroll_depth_result()]
+            for team_id, totals in events_health_totals(team_ids, window).items()
+            if totals.pageleaves > 0 and totals.pageleaves_with_scroll_depth == 0
+        }
+
+
+def _scroll_depth_result() -> HealthCheckResult:
+    return HealthCheckResult(
+        severity=HealthIssue.Severity.WARNING,
+        payload={
+            "reason": f"Team has $pageleave events but scroll depth tracking is not enabled in last {SCROLL_DEPTH_LOOKBACK_DAYS} days"
+        },
+        hash_keys=[],
+    )

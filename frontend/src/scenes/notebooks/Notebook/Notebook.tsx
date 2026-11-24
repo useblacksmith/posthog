@@ -1,0 +1,216 @@
+import './Notebook.scss'
+
+import clsx from 'clsx'
+import { BindLogic, useActions, useValues } from 'kea'
+import { useEffect, useLayoutEffect, useState } from 'react'
+
+import { NotFound } from 'lib/components/NotFound'
+import { JSONContent } from 'lib/components/RichContentEditor/types'
+import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
+import { useResizeBreakpoints } from 'lib/hooks/useResizeObserver'
+import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
+import { NotebookLogicProps, notebookLogic } from 'scenes/notebooks/Notebook/notebookLogic'
+
+import { ErrorBoundary } from '~/layout/ErrorBoundary'
+import { SCRATCHPAD_NOTEBOOK } from '~/models/notebooksModel'
+
+import { NotebookChangesNotice } from 'products/notebooks/frontend/NotebookChangesNotice'
+import { NotebookPrintControls } from 'products/notebooks/frontend/NotebookPrintControls'
+import { useAttachedContext } from 'products/posthog_ai/frontend/api/logics'
+
+import { getMarkdownNotebookMarkdown } from './markdownNotebookV2'
+import { MarkdownNotebookV2 } from './MarkdownNotebookV2Renderer'
+import { NotebookColumnLeft } from './NotebookColumnLeft'
+import { NotebookColumnRight } from './NotebookColumnRight'
+import { NotebookHistoryWarning } from './NotebookHistory'
+import { NotebookLoadingState } from './NotebookLoadingState'
+import { NotebookMergeConflictDetails } from './NotebookMergeConflictDetails'
+import { notebookSettingsLogic } from './notebookSettingsLogic'
+
+// Counts mounted notebooks so the <body> marker class survives overlapping mounts
+// (e.g. one in the scene and one in the side panel)
+let markdownNotebookMountCount = 0
+
+export type NotebookProps = NotebookLogicProps & {
+    collapsedToolbarContainer?: HTMLElement | null
+    initialContent?: JSONContent
+    editable?: boolean
+    className?: string
+    markdownSourceOpen?: boolean
+    onMarkdownSourceOpenChange?: (isOpen: boolean) => void
+}
+
+export function Notebook({
+    shortId,
+    mode,
+    editable = true,
+    initialContent,
+    cachedNotebook,
+    cachedInsightsByShortId,
+    cachedInlineQueryResultsByNodeId,
+    className,
+    collapsedToolbarContainer,
+    markdownSourceOpen,
+    onMarkdownSourceOpenChange,
+}: NotebookProps): JSX.Element {
+    const logicProps: NotebookLogicProps = {
+        shortId,
+        mode,
+        cachedNotebook,
+        cachedInsightsByShortId,
+        cachedInlineQueryResultsByNodeId,
+    }
+    const logic = notebookLogic(logicProps)
+    const {
+        notebook,
+        notebookLoading,
+        isEditable,
+        isTemplate,
+        notebookMissing,
+        isShared,
+        isLocalOnly,
+        shouldBeEditable,
+    } = useValues(logic)
+    const {
+        duplicateNotebook,
+        loadNotebook,
+        notebookEditorMounted,
+        notebookEditorUnmounted,
+        setEditable,
+        setLocalContent,
+        setContainerSize,
+    } = useActions(logic)
+    const { isMarkdownExpanded } = useValues(notebookSettingsLogic)
+    useAttachedContext(
+        notebook && !isShared
+            ? [
+                  { type: 'notebook', key: shortId, label: notebook.title ?? 'Notebook' },
+                  {
+                      type: 'instructions',
+                      hidden: true,
+                      value: 'The user is working in a notebook. Notebook documents use MDX: Markdown with live component tags. Add cells with notebooks-add-cell instead of returning fenced tags as a chat answer. Before building a visualization, search reusable-widgets-list for a suitable saved widget, then inspect reusable-widgets-retrieve and notebooks-get. Bind matching dataframes directly, even if their names differ from the input slots. Use Hog only when columns need reshaping. Insert a Widget component and call notebooks-widget-attach with its node_id and explicit input bindings. When a specific widget and existing node are supplied, attach that widget there without creating another node. Never put live component tags inside code fences. If catalog tools are unavailable, do not invent widget IDs.',
+                  },
+              ]
+            : null
+    )
+
+    useEffect(() => {
+        if (initialContent && mode === 'canvas') {
+            setLocalContent(initialContent)
+        }
+        // oxlint-disable-next-line exhaustive-deps
+    }, [notebook])
+
+    useOnMountEffect(() => {
+        if (!notebook && !notebookLoading) {
+            loadNotebook()
+        }
+    })
+
+    // A retained notebook is present on the first render. Rendering it read-only and then switching every block
+    // to editable rewrites `contenteditable` across the whole document, so the content waits for this value.
+    const [editableApplied, setEditableApplied] = useState(shouldBeEditable === editable)
+    useLayoutEffect(() => {
+        notebookEditorMounted()
+        return () => notebookEditorUnmounted()
+    }, [notebookEditorMounted, notebookEditorUnmounted])
+
+    useLayoutEffect(() => {
+        setEditable(editable)
+        setEditableApplied(true)
+    }, [editable]) // oxlint-disable-line exhaustive-deps
+
+    const { ref, size } = useResizeBreakpoints({
+        0: 'small',
+        1000: 'medium',
+    })
+
+    useEffect(() => {
+        setContainerSize(size as 'small' | 'medium')
+    }, [size]) // oxlint-disable-line exhaustive-deps
+
+    // Marker class replacing `body:has(.Notebook--markdown-v2)` in Notebook.scss: a near-root
+    // `:has()` anchor makes every DOM class change cost a whole-document style recalc in Blink
+    useLayoutEffect(() => {
+        if (++markdownNotebookMountCount === 1) {
+            document.body.classList.add('has-markdown-v2-notebook')
+        }
+        return () => {
+            if (--markdownNotebookMountCount === 0) {
+                document.body.classList.remove('has-markdown-v2-notebook')
+            }
+        }
+    }, [])
+
+    return (
+        <BindLogic logic={notebookLogic} props={logicProps}>
+            {(!notebook && notebookLoading) || !editableApplied ? (
+                <NotebookLoadingState />
+            ) : notebookMissing ? (
+                <NotFound object="notebook" />
+            ) : (
+                <div
+                    className={clsx(
+                        'Notebook',
+                        !isMarkdownExpanded && 'Notebook--compact',
+                        isMarkdownExpanded && 'Notebook--expanded',
+                        mode && `Notebook--${mode}`,
+                        size === 'small' && `Notebook--single-column`,
+                        isEditable && 'Notebook--editable',
+                        'Notebook--markdown-v2',
+                        className
+                    )}
+                    ref={ref}
+                    data-notebook-short-id={shortId}
+                >
+                    <NotebookPrintControls shortId={shortId} />
+                    {isTemplate && (
+                        <LemonBanner
+                            type="info"
+                            action={{
+                                onClick: duplicateNotebook,
+                                children: 'Create copy',
+                            }}
+                            className="mb-6"
+                        >
+                            <b>This is a template.</b> You can create a copy of it to edit and use as your own.
+                        </LemonBanner>
+                    )}
+                    <NotebookHistoryWarning />
+                    {notebook && !isShared && !isTemplate && !isLocalOnly && mode !== 'canvas' && (
+                        <NotebookChangesNotice
+                            notebookId={shortId}
+                            markdown={getMarkdownNotebookMarkdown(notebook.content)}
+                        />
+                    )}
+                    <NotebookMergeConflictDetails />
+                    {shortId === SCRATCHPAD_NOTEBOOK.short_id ? (
+                        <LemonBanner
+                            type="info"
+                            action={{
+                                children: 'Convert to notebook',
+                                onClick: duplicateNotebook,
+                            }}
+                            className="mb-6"
+                        >
+                            This is your scratchpad. It is only visible to you and is persisted only in this browser.
+                            It's a great place to gather ideas before turning into a saved Notebook!
+                        </LemonBanner>
+                    ) : null}
+
+                    <div className="Notebook_content">
+                        <NotebookColumnLeft />
+                        <ErrorBoundary>
+                            <MarkdownNotebookV2
+                                collapsedToolbarContainer={collapsedToolbarContainer}
+                                debugOpen={markdownSourceOpen}
+                                onDebugOpenChange={onMarkdownSourceOpenChange}
+                            />
+                        </ErrorBoundary>
+                        <NotebookColumnRight />
+                    </div>
+                </div>
+            )}
+        </BindLogic>
+    )
+}

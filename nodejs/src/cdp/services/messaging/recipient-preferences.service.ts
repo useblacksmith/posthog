@@ -1,0 +1,305 @@
+import { HogFlowAction } from '~/cdp/schema/hogflow'
+import { acceptedSendEmailFields } from '~/cdp/services/hogflows/transactional-email'
+import { RedisV2 } from '~/common/redis/redis-v2'
+import { logger } from '~/common/utils/logger'
+
+import { CyclotronJobInvocationHogFunction, MessageOptOutRecord } from '../../types'
+import { NATIVE_PUSH_TEMPLATE_ID, pushRecipientOtherThanRunPerson } from '../../utils/push-subscription-utils'
+import { workflowStepDispatchKeyFromInvocation } from '../../utils/workflow-step-dispatch-key'
+import { PersonsManagerService } from '../managers/persons-manager.service'
+import { RecipientsManagerService } from '../managers/recipients-manager.service'
+import { TeamWorkflowsConfigService } from '../managers/team-workflows-config.service'
+import { EmailSuppressionService } from './email-suppression.service'
+import { removeSuppressedRecipients } from './helpers/suppressed-recipients'
+import { parseWorkflowEmailPause } from './helpers/workflow-email-pause'
+
+type MessageFunctionActionType = 'function_email' | 'function_sms' | 'function_push'
+
+type MessageAction = Extract<HogFlowAction, { type: MessageFunctionActionType }>
+
+// Why the send was skipped, so callers can render a user-facing log/metric that names the actual
+// reason instead of collapsing suppression and opt-out into a single "opted out" message.
+export type RecipientSkipReason = 'suppressed' | 'opted_out'
+
+// One Lua script, so two concurrent sends to one person cannot both pass with one slot left. Each slot
+// is keyed on the step visit. The email queue and send retries run the same step visit again, so a
+// visit that already holds a slot passes. That run also moves the slot score to now, because the email
+// queue can delay the actual send by hours and the window must start when the email goes out.
+// A capped call returns the time in ms when the next slot frees up: the oldest slot that must leave
+// the window before the count drops below the cap. An allowed call returns 0.
+const FREQUENCY_CAP_SCRIPT = `
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', tonumber(ARGV[1]) - tonumber(ARGV[2]))
+if not redis.call('ZSCORE', KEYS[1], ARGV[4]) then
+    local count = redis.call('ZCARD', KEYS[1])
+    if count >= tonumber(ARGV[3]) then
+        local freeing = redis.call('ZRANGE', KEYS[1], count - tonumber(ARGV[3]), count - tonumber(ARGV[3]), 'WITHSCORES')
+        return tonumber(freeing[2]) + tonumber(ARGV[2])
+    end
+end
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 0
+`
+
+export type FrequencyCapCheck =
+    | { capped: false }
+    // nextSlotAt is when the person can get a marketing message again, in ms. holdHours is how long the
+    // team lets a capped message wait for that slot; null means skip it.
+    | { capped: true; nextSlotAt: number; holdHours: number | null }
+
+// An email address names the same person in any case, so an opt-out recorded earlier in the run applies to every
+// spelling of it. Push distinct IDs and phone numbers match exactly.
+const sameRecipient = (a: string, b: string, anyCase: boolean): boolean =>
+    a === b || (anyCase && a.toLowerCase() === b.toLowerCase())
+
+export class RecipientPreferencesService {
+    constructor(
+        private recipientsManager: RecipientsManagerService,
+        private emailSuppressionService: EmailSuppressionService,
+        private frequencyCap?: {
+            teamWorkflowsConfig: TeamWorkflowsConfigService
+            valkey: RedisV2
+            persons: Pick<PersonsManagerService, 'getCyclotronPerson'>
+        }
+    ) {}
+
+    /** Reports whether the person is at the cap. When they are not, records this send against the cap. */
+    public async checkFrequencyCap(
+        invocation: CyclotronJobInvocationHogFunction,
+        action: HogFlowAction
+    ): Promise<FrequencyCapCheck> {
+        const messageAction = this.asMessageAction(action)
+        const frequencyCap = this.frequencyCap
+        if (
+            !frequencyCap ||
+            !messageAction ||
+            messageAction.config.message_category_type === 'transactional' ||
+            (messageAction.type === 'function_email' && messageAction.config.skip_frequency_cap === true) ||
+            (messageAction.type === 'function_email' &&
+                (await this.emailWorkerWillSkip(invocation, frequencyCap.teamWorkflowsConfig)))
+        ) {
+            return { capped: false }
+        }
+        return this.checkMarketingFrequencyCap({
+            teamId: invocation.teamId,
+            resolvePersonId: () => this.cappedPersonId(invocation, messageAction, frequencyCap.persons),
+            dispatchKey: workflowStepDispatchKeyFromInvocation(invocation) ?? `${invocation.id}:${action.id}`,
+        })
+    }
+
+    public async checkMarketingFrequencyCap({
+        teamId,
+        resolvePersonId,
+        dispatchKey,
+    }: {
+        teamId: number
+        resolvePersonId: () => Promise<string | undefined>
+        dispatchKey: string
+    }): Promise<FrequencyCapCheck> {
+        if (!this.frequencyCap) {
+            return { capped: false }
+        }
+        const { teamWorkflowsConfig, valkey } = this.frequencyCap
+        try {
+            const { max_messages, window_days, hold_hours } = await teamWorkflowsConfig.getFrequencyCap(teamId)
+            if (!max_messages || !window_days) {
+                return { capped: false }
+            }
+            const personId = await resolvePersonId()
+            if (!personId) {
+                return { capped: false }
+            }
+            const nextSlotAt = await valkey.useClient(
+                { name: 'workflows-frequency-cap', failOpen: true },
+                (client) =>
+                    client.eval(
+                        FREQUENCY_CAP_SCRIPT,
+                        1,
+                        `@posthog/workflows-frequency-cap/${teamId}/${personId}`,
+                        Date.now(),
+                        window_days * 24 * 60 * 60 * 1000,
+                        max_messages,
+                        dispatchKey
+                    ) as Promise<number>
+            )
+            return nextSlotAt ? { capped: true, nextSlotAt, holdHours: hold_hours } : { capped: false }
+        } catch (error) {
+            // Fail open: a config or Valkey pool error must never block a send. failOpen above only
+            // covers errors inside the Valkey callback.
+            logger.error(`Failed to check the frequency cap for team ${teamId}:`, error)
+            return { capped: false }
+        }
+    }
+
+    private async emailWorkerWillSkip(
+        invocation: CyclotronJobInvocationHogFunction,
+        teamWorkflowsConfig: TeamWorkflowsConfigService
+    ): Promise<boolean> {
+        const recipient = invocation.state.globals.inputs?.email?.to?.email
+        return (
+            typeof recipient !== 'string' ||
+            !recipient.trim() ||
+            parseWorkflowEmailPause(invocation.hogFunction.metadata) !== null ||
+            (await teamWorkflowsConfig.getEmailSendingSuspension(invocation.teamId)) !== null
+        )
+    }
+
+    private async cappedPersonId(
+        invocation: CyclotronJobInvocationHogFunction,
+        action: MessageAction,
+        persons: Pick<PersonsManagerService, 'getCyclotronPerson'>
+    ): Promise<string | undefined> {
+        const { globals } = invocation.state
+        const named =
+            action.type === 'function_push'
+                ? pushRecipientOtherThanRunPerson(globals.inputs?.distinctId, globals)
+                : null
+        if (!named) {
+            return globals.person?.id
+        }
+        return (await persons.getCyclotronPerson(invocation.teamId, named, 'distinct_id'))?.id
+    }
+
+    public async shouldSkipAction(
+        invocation: CyclotronJobInvocationHogFunction,
+        hogFlowAction: HogFlowAction,
+        runOptOuts: MessageOptOutRecord[] = []
+    ): Promise<RecipientSkipReason | null> {
+        const action = this.asMessageAction(hogFlowAction)
+        if (!action) {
+            return null
+        }
+
+        // Suppression is mostly a deliverability signal, not a messaging preference. We check it even for
+        // transactional messages, and before the transactional opt-out bypass below. For those, only a hard
+        // bounce blocks the send, because then the address can't receive mail.
+        if (await this.isRecipientSuppressed(invocation, action)) {
+            return 'suppressed'
+        }
+
+        // Transactional messages are not eligible for opt-outs, so they send regardless of
+        // whether the recipient has opted out of this category or of all marketing messaging.
+        if (action.config.message_category_type === 'transactional') {
+            return null
+        }
+
+        return (await this.isRecipientOptedOutOfAction(invocation, action, runOptOuts)) ? 'opted_out' : null
+    }
+
+    private async isRecipientSuppressed(
+        invocation: CyclotronJobInvocationHogFunction,
+        action: MessageAction
+    ): Promise<boolean> {
+        // Suppression is driven by email bounces, so it only applies to email sends.
+        if (action.type !== 'function_email') {
+            return false
+        }
+
+        // Skip only when `to` is suppressed and no cc address can take its place. EmailService
+        // removes the other suppressed addresses at send time, and the email still goes to the rest.
+        const emailInputs = {
+            ...invocation.state.globals.inputs?.email,
+            ...acceptedSendEmailFields(invocation.state.send),
+        }
+        const result = await removeSuppressedRecipients(
+            {
+                to: { email: typeof emailInputs?.to?.email === 'string' ? emailInputs.to.email : undefined },
+                cc: typeof emailInputs?.cc === 'string' ? emailInputs.cc : undefined,
+                bcc: typeof emailInputs?.bcc === 'string' ? emailInputs.bcc : undefined,
+            },
+            (email) =>
+                this.emailSuppressionService.isKnownSuppressed(invocation.teamId, email, {
+                    transactional: action.config.message_category_type === 'transactional',
+                })
+        )
+        return result.skip
+    }
+
+    // A generic function step saved through the API can run the push template, and it then sends like a push step.
+    private asMessageAction(action: HogFlowAction): MessageAction | null {
+        if (['function_email', 'function_sms', 'function_push'].includes(action.type)) {
+            return action as MessageAction
+        }
+        if (action.type === 'function' && action.config.template_id === NATIVE_PUSH_TEMPLATE_ID) {
+            return { ...action, type: 'function_push' } as unknown as MessageAction
+        }
+        return null
+    }
+
+    private async isRecipientOptedOutOfAction(
+        invocation: CyclotronJobInvocationHogFunction,
+        action: MessageAction,
+        runOptOuts: MessageOptOutRecord[]
+    ): Promise<boolean> {
+        let identifier
+
+        if (action.type === 'function_sms') {
+            identifier = invocation.state.globals.inputs?.to_number
+        } else if (action.type === 'function_email') {
+            identifier = invocation.state.globals.inputs?.email?.to?.email
+        } else if (action.type === 'function_push') {
+            // Push has no email/phone "to" field. Key the opt-out on the person the push is delivered to:
+            // the person the Distinct ID input names, or the run's person when it names them. Fall back to
+            // the event distinct_id when the run's person has no resolved one.
+            const { globals } = invocation.state
+            identifier =
+                pushRecipientOtherThanRunPerson(globals.inputs?.distinctId, globals) ??
+                globals.person?.distinct_id ??
+                globals.event?.distinct_id
+        }
+
+        if (!identifier) {
+            // EmailService skips a send with no `to` and records email_missing_recipient, so let it through.
+            if (action.type === 'function_email') {
+                return false
+            }
+            throw new Error(
+                `No recipient identifier found for message action [Action:${action.id}]. Check that the message 'to' field is set correctly for this person.`
+            )
+        }
+
+        // Grab the recipient preferences for the action category
+        const categoryId = action.config.message_category_id || '$all'
+        const trimmedIdentifier = String(identifier).trim()
+        if (
+            runOptOuts.some(
+                (optOut) =>
+                    sameRecipient(optOut.identifier, trimmedIdentifier, action.type === 'function_email') &&
+                    (optOut.categoryId === categoryId || optOut.categoryId === '$all')
+            )
+        ) {
+            return true
+        }
+
+        try {
+            const recipient = await this.recipientsManager.get({
+                teamId: invocation.teamId,
+                identifier: identifier,
+                ...(action.type === 'function_email' ? { anyCase: true } : {}),
+            })
+
+            if (!recipient) {
+                /**
+                 * If the recipient lookup succeeded and the recipient doesn't exist, default to `false`
+                 * as it is the Messaging customer's responsibility to ensure new users opt-in to messaging
+                 * during onboarding.
+                 */
+                return false
+            }
+
+            const messageCategoryPreference = this.recipientsManager.getPreference(recipient, categoryId)
+            const allMarketingPreferences = this.recipientsManager.getAllMarketingMessagingPreference(recipient)
+
+            /**
+             * NB: A recipient may have opted out of all marketing messaging but NOT a specific category,
+             * so we always check both.
+             *
+             * This would commonly happen if the recipient opted out before the category was created.
+             */
+            return messageCategoryPreference === 'OPTED_OUT' || allMarketingPreferences === 'OPTED_OUT'
+        } catch (error) {
+            logger.error(`Failed to fetch recipient preferences for ${identifier}:`, error)
+            return false
+        }
+    }
+}

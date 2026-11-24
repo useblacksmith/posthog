@@ -1,0 +1,214 @@
+import { useActions, useValues } from 'kea'
+import { useEffect } from 'react'
+
+import { IconPlusSmall, IconRefresh } from '@posthog/icons'
+import { LemonButton } from '@posthog/lemon-ui'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+import { More } from 'lib/lemon-ui/LemonButton/More'
+import { LemonInput } from 'lib/lemon-ui/LemonInput'
+import { LemonSegmentedButton } from 'lib/lemon-ui/LemonSegmentedButton'
+import { LemonTable, LemonTableColumns } from 'lib/lemon-ui/LemonTable'
+import { LemonTag } from 'lib/lemon-ui/LemonTag'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+
+import { SuggestedCertificationsTable } from 'products/warehouse_suggestions/frontend/components/SuggestedCertificationsTable'
+
+import {
+    CERTIFICATIONS_PAGE_SIZE,
+    CERTIFICATIONS_TABLE_ID,
+    CertificationStatusFilter,
+    certificationsLogic,
+} from '../certificationsLogic'
+import { certificationStatusTag } from '../certificationStatusTag'
+import { compareText, reportCatalogTableSorted } from '../common'
+import { NewCertificationModal } from '../components/NewCertificationModal'
+import { confirmRevokeCertification } from '../confirmRevokeCertification'
+import type { DataCatalogCertificationApi } from '../generated/api.schemas'
+
+const STATUS_FILTER_OPTIONS: { value: CertificationStatusFilter; label: string }[] = [
+    { value: 'all', label: 'All' },
+    { value: 'proposed', label: 'Proposed' },
+    { value: 'certified', label: 'Certified' },
+    { value: 'deprecated', label: 'Deprecated' },
+]
+
+export function CertificationsTab(): JSX.Element {
+    const {
+        filteredCertifications,
+        certificationsLoading,
+        filters,
+        actionsInFlight,
+        highlightedCertificationId,
+        highlightPending,
+    } = useValues(certificationsLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const {
+        setFilters,
+        loadCertifications,
+        suggestionAccepted,
+        openNewCertificationModal,
+        certifyCertification,
+        deprecateCertification,
+        revokeCertification,
+        highlightCertification,
+    } = useActions(certificationsLogic)
+
+    useEffect(() => {
+        if (!highlightedCertificationId || highlightPending) {
+            return
+        }
+        document
+            .querySelector(`[data-row-key="${highlightedCertificationId}"]`)
+            ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }, [highlightedCertificationId, highlightPending])
+
+    const columns: LemonTableColumns<DataCatalogCertificationApi> = [
+        {
+            title: 'Target',
+            key: 'target_name',
+            render: (_, certification) => certification.target_name,
+            sorter: (a, b) => compareText(a.target_name, b.target_name),
+        },
+        {
+            title: 'Type',
+            key: 'target_type',
+            render: (_, certification) => <LemonTag type="option">{certification.target_type}</LemonTag>,
+            sorter: (a, b) => compareText(a.target_type, b.target_type),
+        },
+        {
+            title: 'Status',
+            key: 'status',
+            render: (_, certification) => {
+                const tag = certificationStatusTag(certification)
+                return <LemonTag type={tag.type}>{tag.label}</LemonTag>
+            },
+            sorter: (a, b) => compareText(a.status, b.status) || compareText(a.proposed_status, b.proposed_status),
+        },
+        {
+            title: 'Notes',
+            key: 'notes',
+            render: (_, certification) => certification.notes || <span className="text-secondary">-</span>,
+            sorter: (a, b) => compareText(a.notes, b.notes),
+        },
+        {
+            title: 'Certified by',
+            key: 'certified_by',
+            render: (_, certification) =>
+                certification.certified_by?.email || <span className="text-secondary">-</span>,
+            sorter: (a, b) => compareText(a.certified_by?.email, b.certified_by?.email),
+        },
+        {
+            key: 'actions',
+            width: 0,
+            render: (_, certification) => {
+                const inFlight = !!actionsInFlight[certification.id]
+                return (
+                    <More
+                        overlay={
+                            <>
+                                {certification.status !== 'certified' && (
+                                    <LemonButton
+                                        fullWidth
+                                        loading={inFlight}
+                                        onClick={() => certifyCertification(certification.id)}
+                                    >
+                                        Certify
+                                    </LemonButton>
+                                )}
+                                {certification.status !== 'deprecated' && (
+                                    <LemonButton
+                                        fullWidth
+                                        loading={inFlight}
+                                        onClick={() => deprecateCertification(certification.id)}
+                                    >
+                                        Deprecate
+                                    </LemonButton>
+                                )}
+                                <LemonButton
+                                    fullWidth
+                                    status="danger"
+                                    disabledReason={inFlight ? 'Working' : undefined}
+                                    onClick={() =>
+                                        confirmRevokeCertification(certification, () =>
+                                            revokeCertification(certification.id)
+                                        )
+                                    }
+                                >
+                                    Revoke
+                                </LemonButton>
+                            </>
+                        }
+                    />
+                )
+            },
+        },
+    ]
+
+    return (
+        <div className="flex flex-col gap-4">
+            {featureFlags[FEATURE_FLAGS.WAREHOUSE_SUGGESTIONS] && (
+                <SuggestedCertificationsTable
+                    onAccepted={() => suggestionAccepted()}
+                    onViewAccepted={(suggestion) => {
+                        const certificationId = suggestion.created_asset?.certification_id
+                        if (typeof certificationId === 'string') {
+                            highlightCertification(certificationId)
+                        }
+                    }}
+                />
+            )}
+            <div className="flex justify-between gap-2 flex-wrap items-center">
+                <LemonInput
+                    type="search"
+                    placeholder="Search certifications"
+                    value={filters.search}
+                    onChange={(search) => setFilters({ search })}
+                />
+                <div className="flex items-center gap-2 flex-wrap">
+                    <LemonSegmentedButton
+                        value={filters.status}
+                        onChange={(status) => setFilters({ status })}
+                        options={STATUS_FILTER_OPTIONS}
+                        size="small"
+                    />
+                    <LemonButton
+                        type="secondary"
+                        icon={<IconRefresh />}
+                        size="small"
+                        loading={certificationsLoading}
+                        onClick={() => loadCertifications()}
+                    >
+                        Reload
+                    </LemonButton>
+                    <LemonButton
+                        type="primary"
+                        icon={<IconPlusSmall />}
+                        size="small"
+                        onClick={openNewCertificationModal}
+                        data-attr="data-catalog-new-certification-button"
+                    >
+                        Propose certification
+                    </LemonButton>
+                </div>
+            </div>
+            <LemonTable
+                key={highlightedCertificationId ?? CERTIFICATIONS_TABLE_ID}
+                id={CERTIFICATIONS_TABLE_ID}
+                data-attr="data-catalog-certifications-table"
+                dataSource={filteredCertifications}
+                rowKey="id"
+                columns={columns}
+                loading={certificationsLoading}
+                pagination={{ pageSize: CERTIFICATIONS_PAGE_SIZE }}
+                rowClassName={(certification) =>
+                    certification.id === highlightedCertificationId ? 'bg-accent-highlight-secondary' : null
+                }
+                emptyState="No certifications match your filters."
+                nouns={['certification', 'certifications']}
+                onSort={(sorting) => reportCatalogTableSorted('certifications', sorting)}
+            />
+            <NewCertificationModal />
+        </div>
+    )
+}

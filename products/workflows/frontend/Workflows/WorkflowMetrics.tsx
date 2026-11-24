@@ -1,0 +1,502 @@
+import { useActions, useValues } from 'kea'
+import { router } from 'kea-router'
+import { useMemo } from 'react'
+
+import * as greekPng from '@posthog/brand/hoggies/png/greek'
+import { IconLetter } from '@posthog/icons'
+import { LemonButton, LemonCollapse, LemonSelect, LemonSelectOptions, ProfilePicture, Spinner } from '@posthog/lemon-ui'
+
+import { pngHoggie } from 'lib/brand/hoggies'
+import { getColorVar } from 'lib/colors'
+import { AppMetricsFilters } from 'lib/components/AppMetrics/AppMetricsFilters'
+import { appMetricsLogic } from 'lib/components/AppMetrics/appMetricsLogic'
+import { AppMetricsTrends } from 'lib/components/AppMetrics/AppMetricsTrends'
+import { TZLabel } from 'lib/components/TZLabel'
+import { dayjs } from 'lib/dayjs'
+import { urls } from 'scenes/urls'
+
+import { batchWorkflowJobsLogic } from './batchWorkflowJobsLogic'
+import { EmailMetricsSummary } from './EmailMetricsSummary'
+import { getHogFlowStep } from './hogflows/steps/HogFlowSteps'
+import { HogFlowBatchJob } from './hogflows/types'
+import { metricsRangeFromSearchParams, metricsRangeSearchParams } from './metricsDrillParams'
+import { PushMetricsSummary } from './PushMetricsSummary'
+import { WorkflowLogicProps, workflowLogic } from './workflowLogic'
+import { WorkflowMetricCard } from './WorkflowMetricCard'
+import { WorkflowMetricsSummary } from './WorkflowMetricsSummary'
+import {
+    type EmailMetricName,
+    METRIC_COLORS,
+    buildEmailMetricInvocationSearchParams,
+} from './workflowMetricsSummaryLogic'
+
+const HedgehogGreek = pngHoggie(greekPng)
+
+const OVERVIEW_OPTION_VALUE = '__workflow_overview__'
+
+export const WORKFLOW_METRICS_INFO: Record<string, { name: string; description: string; color: string }> = {
+    succeeded: {
+        name: 'Success',
+        description: 'Total number of events processed successfully',
+        color: METRIC_COLORS['Success'],
+    },
+    failed: {
+        name: 'Failure',
+        description: 'Total number of events that had errors during processing',
+        color: METRIC_COLORS['Failure'],
+    },
+    rate_limited: {
+        name: 'Rate Limited',
+        description: 'Total number of events that were rate limited',
+        color: METRIC_COLORS['Rate Limited'],
+    },
+    triggered: {
+        name: 'Triggered',
+        description: 'Total number of events that were triggered',
+        color: METRIC_COLORS['Triggered'],
+    },
+    email_sandbox_sent: {
+        name: 'Test sender emails sent',
+        description: 'Emails sent from the PostHog test sender',
+        color: METRIC_COLORS['Sent'],
+    },
+    email_sandbox_failed: {
+        name: 'Test sender emails failed',
+        description: 'Emails from the PostHog test sender that could not be sent',
+        color: METRIC_COLORS['Failed'],
+    },
+    email_sandbox_blocked: {
+        name: 'Test sender emails blocked',
+        description:
+            'Emails from the PostHog test sender that a check stopped, such as a recipient who is not a verified member',
+        color: METRIC_COLORS['Bounce prevented'],
+    },
+    email_sandbox_delivered: {
+        name: 'Test sender emails delivered',
+        description: 'Emails from the PostHog test sender that the recipient mail server accepted',
+        color: METRIC_COLORS['Delivered'],
+    },
+    email_sandbox_bounced: {
+        name: 'Test sender emails bounced',
+        description: 'Emails from the PostHog test sender that bounced',
+        color: METRIC_COLORS['Bounced'],
+    },
+    email_sandbox_complained: {
+        name: 'Test sender emails marked as spam',
+        description: 'Emails from the PostHog test sender that a recipient marked as spam',
+        color: METRIC_COLORS['Marked as spam'],
+    },
+}
+
+export interface WorkflowMetricsProps extends WorkflowLogicProps {
+    /**
+     * Set on a page outside the workflow editor, which takes email metric clicks instead of the Invocations tab.
+     * The step picker is hidden because it opens the workflow.
+     */
+    onEmailMetricClick?: (metric: EmailMetricName, range: { dateFrom: string; dateTo: string }) => void
+    onShowInvocations?: (searchParams: Record<string, string>) => void
+}
+
+function WorkflowRunMetrics(props: WorkflowMetricsProps): JSX.Element {
+    const logicKey = `hog-flow-metrics-${props.id}`
+    const { searchParams } = useValues(router)
+    const { workflow, originalWorkflow, hogFunctionTemplatesById } = useValues(workflowLogic)
+    // A step a staged draft removes still has live metrics, and the overview links to it.
+    const knownActions = useMemo(
+        () => [
+            ...workflow.actions,
+            ...(originalWorkflow?.actions ?? []).filter((live) => !workflow.actions.some((a) => a.id === live.id)),
+        ],
+        [workflow.actions, originalWorkflow?.actions]
+    )
+
+    // Seed the drilled-in step from ?action= so a refreshed or shared metrics link restores it, but
+    // only honor a value that points at a real step — a stale/deleted/mistyped id would otherwise
+    // select a nonexistent instance and get stuck in the generic step view. While the workflow is
+    // still loading (no actions yet) we honor it optimistically so a shared link doesn't flash the
+    // overview first. Later changes (clicks, back/forward) are synced by workflowSceneLogic's urlToAction.
+    const requestedAction = (searchParams.action as string) || undefined
+    const instanceId =
+        requestedAction && (!knownActions.length || knownActions.some((action) => action.id === requestedAction))
+            ? requestedAction
+            : undefined
+
+    const logic = appMetricsLogic({
+        logicKey,
+        loadOnChanges: true,
+        loadOnMount: true,
+        defaultParams: metricsRangeFromSearchParams(searchParams),
+        forceParams: {
+            appSource: 'hog_flow',
+            appSourceId: props.id,
+            breakdownBy: 'metric_name',
+            instanceId,
+        },
+    })
+
+    const { appMetricsTrendsLoading, appMetricsTrends, getSingleTrendSeries, params, getDateRangeAbsolute } =
+        useValues(logic)
+
+    const selectedAction = knownActions.find((action) => action.id === params.instanceId)
+
+    const modifiedAppMetricsTrends = useMemo(
+        () =>
+            appMetricsTrends
+                ? {
+                      ...appMetricsTrends,
+                      series: appMetricsTrends.series.map((series) => ({
+                          ...series,
+                          name:
+                              WORKFLOW_METRICS_INFO[series.name as keyof typeof WORKFLOW_METRICS_INFO]?.name ??
+                              series.name,
+                      })),
+                  }
+                : null,
+        [appMetricsTrends]
+    )
+
+    const workflowStepOptions: LemonSelectOptions<string> = useMemo(
+        () => [
+            {
+                options: [{ label: 'Whole workflow', value: OVERVIEW_OPTION_VALUE }],
+            },
+            {
+                // A titled section makes it obvious you can drill into a single step's metrics.
+                title: 'Per step',
+                options: knownActions
+                    .filter((action) => action.id !== 'trigger_node')
+                    .map((action) => {
+                        const Step = getHogFlowStep(action, hogFunctionTemplatesById)
+                        return {
+                            label: action.name,
+                            icon: Step?.icon,
+                            value: action.id,
+                        }
+                    }),
+            },
+        ],
+        [knownActions, hogFunctionTemplatesById]
+    )
+
+    // Drill an email metric into the invocations behind it over the current window.
+    const drillIntoEmailMetric = (metricKey: EmailMetricName): void => {
+        const { dateFrom, dateTo } = getDateRangeAbsolute()
+        if (props.onEmailMetricClick) {
+            props.onEmailMetricClick(metricKey, { dateFrom: dateFrom.toISOString(), dateTo: dateTo.toISOString() })
+            return
+        }
+        if (!props.id) {
+            return
+        }
+        const invocationSearchParams = buildEmailMetricInvocationSearchParams(
+            metricKey,
+            dateFrom.toISOString(),
+            dateTo.toISOString()
+        )
+        if (!invocationSearchParams) {
+            return
+        }
+        if (props.onShowInvocations) {
+            props.onShowInvocations(invocationSearchParams)
+        } else {
+            router.actions.push(urls.workflow(props.id, 'invocations'), invocationSearchParams)
+        }
+    }
+    const outsideEditor = !!props.onEmailMetricClick || !!props.onShowInvocations
+
+    // Reflect the selected step in the URL (?action=) so it survives refresh/share/back-forward. The
+    // actual params.instanceId update is applied by workflowSceneLogic's urlToAction watching this.
+    const selectMetricsAction = (actionId?: string): void => {
+        if (!props.id) {
+            return
+        }
+        const { action: _prev, date_from: _from, date_to: _to, interval: _interval, ...rest } = searchParams
+        // A range in the URL came from a drill link; replace it with the range picked since, or urlToAction restores the old one.
+        const hadRange = _from !== undefined || _to !== undefined || _interval !== undefined
+        const next = { ...rest, ...(hadRange ? metricsRangeSearchParams(params) : {}) }
+        router.actions.push(urls.workflow(props.id, 'metrics'), actionId ? { ...next, action: actionId } : next)
+    }
+
+    return (
+        <div className="flex flex-col gap-2" data-attr="workflow-metrics">
+            <div className="flex flex-row gap-2 flex-wrap justify-end items-center">
+                <div className="flex flex-row gap-2 items-center flex-wrap">
+                    {!outsideEditor && (
+                        <>
+                            <span className="text-muted text-xs whitespace-nowrap">Metrics for</span>
+                            <LemonSelect
+                                size="small"
+                                options={workflowStepOptions}
+                                value={params.instanceId ?? OVERVIEW_OPTION_VALUE}
+                                onChange={(value) =>
+                                    selectMetricsAction(value === OVERVIEW_OPTION_VALUE ? undefined : value)
+                                }
+                            />
+                        </>
+                    )}
+                    {selectedAction?.type === 'function_email' && props.id && !outsideEditor ? (
+                        <LemonButton
+                            type="secondary"
+                            size="small"
+                            icon={<IconLetter />}
+                            to={`${urls.workflow(props.id, 'assets')}?assetAction=${encodeURIComponent(params.instanceId as string)}`}
+                        >
+                            View sent emails
+                        </LemonButton>
+                    ) : null}
+                </div>
+                <AppMetricsFilters logicKey={logicKey} />
+            </div>
+
+            {!params.instanceId || params.instanceId === OVERVIEW_OPTION_VALUE ? (
+                <WorkflowMetricsSummary
+                    logicKey={logicKey}
+                    id={props.id ?? ''}
+                    defaultRange={{ dateFrom: params.dateFrom, dateTo: params.dateTo, interval: params.interval }}
+                    onSelectAction={outsideEditor ? undefined : (actionId) => selectMetricsAction(actionId)}
+                    onMetricClick={drillIntoEmailMetric}
+                />
+            ) : selectedAction?.type === 'function_email' ? (
+                <EmailMetricsSummary logicKey={logicKey} onMetricClick={drillIntoEmailMetric} />
+            ) : selectedAction?.type === 'function_push' ? (
+                <PushMetricsSummary logicKey={logicKey} />
+            ) : (
+                <RunOutcomeMetrics
+                    loading={appMetricsTrendsLoading}
+                    getSingleTrendSeries={getSingleTrendSeries}
+                    appMetricsTrends={modifiedAppMetricsTrends}
+                />
+            )}
+        </div>
+    )
+}
+
+type AppMetricsValues = ReturnType<typeof appMetricsLogic.build>['values']
+
+function RunOutcomeMetrics({
+    loading,
+    getSingleTrendSeries,
+    appMetricsTrends,
+}: {
+    loading: boolean
+    getSingleTrendSeries: AppMetricsValues['getSingleTrendSeries']
+    appMetricsTrends: AppMetricsValues['appMetricsTrends']
+}): JSX.Element {
+    return (
+        <>
+            <div className="flex flex-row gap-2 flex-wrap justify-center">
+                {['succeeded', 'failed'].map((key) => (
+                    <WorkflowMetricCard
+                        key={key}
+                        name={WORKFLOW_METRICS_INFO[key].name}
+                        description={WORKFLOW_METRICS_INFO[key].description}
+                        loading={loading}
+                        timeSeries={getSingleTrendSeries(key)}
+                        previousPeriodTimeSeries={getSingleTrendSeries(key, true)}
+                        color={WORKFLOW_METRICS_INFO[key].color}
+                        colorIfZero={getColorVar('muted')}
+                    />
+                ))}
+            </div>
+            <AppMetricsTrends appMetricsTrends={appMetricsTrends} loading={loading} seriesColors={METRIC_COLORS} />
+        </>
+    )
+}
+
+function BatchJobMetricsHeader({ job }: { job: HogFlowBatchJob }): JSX.Element {
+    return (
+        <div className="flex gap-2 w-full justify-between">
+            <strong>{job.id}</strong>
+            <div className="flex items-center gap-2">
+                <TZLabel title="Created at" time={job.created_at} />
+                {job.created_by ? (
+                    <ProfilePicture user={{ email: job.created_by.email || '' }} showName size="sm" />
+                ) : (
+                    <span className="text-muted text-sm">Scheduled run</span>
+                )}
+            </div>
+        </div>
+    )
+}
+
+function BatchJobMetrics({ job, requestedAction }: { job: HogFlowBatchJob; requestedAction?: string }): JSX.Element {
+    const logicKey = `hog-flow-metrics-batch-${job.id}`
+    const { workflow, originalWorkflow, hogFunctionTemplatesById } = useValues(workflowLogic)
+    // A step a staged draft removes still has live metrics, and the overview links to it.
+    const knownActions = [...workflow.actions, ...(originalWorkflow?.actions ?? [])]
+
+    const jobStart = dayjs(job.created_at).subtract(1, 'hour')
+    const isFinished = job.status === 'completed' || job.status === 'cancelled' || job.status === 'failed'
+    const jobEnd = isFinished ? dayjs(job.updated_at).add(1, 'hour') : dayjs()
+
+    const logic = appMetricsLogic({
+        logicKey,
+        loadOnChanges: true,
+        loadOnMount: true,
+        defaultParams: {
+            dateFrom: jobStart.toISOString(),
+            dateTo: jobEnd.toISOString(),
+            instanceId: knownActions.some((action) => action.id === requestedAction) ? requestedAction : undefined,
+        },
+        forceParams: {
+            appSource: 'hog_flow',
+            appSourceId: job.id,
+            breakdownBy: 'metric_name',
+        },
+    })
+
+    const { appMetricsTrendsLoading, appMetricsTrends, getSingleTrendSeries, params } = useValues(logic)
+    const { setParams } = useActions(logic)
+
+    const selectedAction = knownActions.find((action) => action.id === params.instanceId)
+
+    const modifiedAppMetricsTrends = useMemo(
+        () =>
+            appMetricsTrends
+                ? {
+                      ...appMetricsTrends,
+                      series: appMetricsTrends.series.map((series) => ({
+                          ...series,
+                          name:
+                              WORKFLOW_METRICS_INFO[series.name as keyof typeof WORKFLOW_METRICS_INFO]?.name ??
+                              series.name,
+                      })),
+                  }
+                : null,
+        [appMetricsTrends]
+    )
+
+    const workflowStepOptions: LemonSelectOptions<string> = useMemo(
+        () => [
+            {
+                options: [{ label: 'Whole workflow', value: OVERVIEW_OPTION_VALUE }],
+            },
+            {
+                // A titled section makes it obvious you can drill into a single step's metrics.
+                title: 'Per step',
+                options: workflow.actions
+                    .filter((action) => action.id !== 'trigger_node')
+                    .map((action) => {
+                        const Step = getHogFlowStep(action, hogFunctionTemplatesById)
+                        return {
+                            label: action.name,
+                            icon: Step?.icon,
+                            value: action.id,
+                        }
+                    }),
+            },
+        ],
+        [workflow.actions, hogFunctionTemplatesById]
+    )
+
+    return (
+        <div className="flex flex-col gap-2">
+            <div className="flex flex-row gap-2 flex-wrap justify-end items-center">
+                <div className="flex flex-row gap-2 items-center flex-wrap">
+                    <span className="text-muted text-xs whitespace-nowrap">Metrics for</span>
+                    <LemonSelect
+                        size="small"
+                        options={workflowStepOptions}
+                        value={params.instanceId ?? OVERVIEW_OPTION_VALUE}
+                        onChange={(value) =>
+                            setParams({
+                                ...params,
+                                instanceId: value === OVERVIEW_OPTION_VALUE ? undefined : value,
+                            })
+                        }
+                    />
+                    {selectedAction?.type === 'function_email' ? (
+                        <LemonButton
+                            type="secondary"
+                            size="small"
+                            icon={<IconLetter />}
+                            to={`${urls.workflow(workflow.id, 'assets')}?assetAction=${encodeURIComponent(params.instanceId as string)}`}
+                        >
+                            View sent emails
+                        </LemonButton>
+                    ) : null}
+                </div>
+                <AppMetricsFilters logicKey={logicKey} />
+            </div>
+
+            {!params.instanceId || params.instanceId === OVERVIEW_OPTION_VALUE ? (
+                <WorkflowMetricsSummary
+                    logicKey={logicKey}
+                    id={workflow.id}
+                    appSourceId={job.id}
+                    onSelectAction={(actionId) => setParams({ ...params, instanceId: actionId })}
+                />
+            ) : selectedAction?.type === 'function_email' ? (
+                <EmailMetricsSummary logicKey={logicKey} />
+            ) : selectedAction?.type === 'function_push' ? (
+                <PushMetricsSummary logicKey={logicKey} />
+            ) : (
+                <RunOutcomeMetrics
+                    loading={appMetricsTrendsLoading}
+                    getSingleTrendSeries={getSingleTrendSeries}
+                    appMetricsTrends={modifiedAppMetricsTrends}
+                />
+            )}
+        </div>
+    )
+}
+
+function WorkflowBatchMetrics(props: WorkflowLogicProps): JSX.Element {
+    const { jobs, batchWorkflowJobsLoading } = useValues(batchWorkflowJobsLogic(props))
+    const { searchParams } = useValues(router)
+    // The overview links to a step of one run with ?run= and ?action=, so open that run's panel on that step.
+    const requestedRun = jobs.find((job) => job.id === searchParams.run)?.id
+    const requestedAction = typeof searchParams.action === 'string' ? searchParams.action : undefined
+
+    if (batchWorkflowJobsLoading) {
+        return (
+            <div className="flex justify-center">
+                <Spinner size="medium" />
+            </div>
+        )
+    }
+
+    if (!jobs.length) {
+        return (
+            <div className="flex flex-col bg-surface-primary rounded px-4 py-8 items-center text-center mx-auto">
+                <HedgehogGreek width="100" height="100" className="mb-4" />
+                <h2 className="text-xl leading-tight">No batch workflow jobs have been run yet</h2>
+                <p className="text-sm text-balance text-tertiary">
+                    Once a batch workflow job is triggered, metrics will appear here.
+                </p>
+            </div>
+        )
+    }
+
+    return (
+        <div className="flex flex-col gap-2">
+            <LemonCollapse
+                defaultActiveKey={requestedRun}
+                panels={jobs.map((job) => ({
+                    key: job.id,
+                    header: <BatchJobMetricsHeader job={job} />,
+                    content: (
+                        <BatchJobMetrics
+                            job={job}
+                            requestedAction={job.id === requestedRun ? requestedAction : undefined}
+                        />
+                    ),
+                }))}
+            />
+        </div>
+    )
+}
+
+export function WorkflowMetrics(props: WorkflowMetricsProps): JSX.Element {
+    const { workflow, workflowLoading } = useValues(workflowLogic(props))
+
+    if (workflowLoading) {
+        return (
+            <div className="flex justify-center">
+                <Spinner size="medium" />
+            </div>
+        )
+    }
+
+    return workflow?.trigger?.type === 'batch' ? <WorkflowBatchMetrics {...props} /> : <WorkflowRunMetrics {...props} />
+}
