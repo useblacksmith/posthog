@@ -46,7 +46,7 @@ jobs:
                       rm -rf frontend/node_modules/.cache/blacksmith-jest
                       export BLACKSMITH_JEST=$([ "$arm" = a ] && echo 0 || echo 1)
                       if [ "$arm" != a ]; then rm -rf "$dist"; tar xzf .bench/dist-$([ "$arm" = b ] && echo 010 || echo fix).tgz -C "$(dirname "$dist")"; fi
-                      export BS_KEY="perf-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ORDER-$REP-$round"
+                      export BS_KEY="perf-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ORDER-$REP-$round-$arm"
                       t0=$(head -1 /proc/stat)
                       start=$(date +%s.%N)
                       pnpm --filter=@posthog/frontend test --maxWorkers=100% > /tmp/jest.log 2>&1
