@@ -1,0 +1,79 @@
+from drf_spectacular.utils import extend_schema_field, extend_schema_serializer
+from rest_framework import serializers
+
+from posthog.models import User
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.models.activity_logging.property_value_visibility import PropertyValueVisibility
+
+
+class UserMinimalSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["first_name", "email"]
+
+
+class ChangeSerializer(serializers.Serializer):
+    type = serializers.CharField(read_only=True)
+    action = serializers.CharField(read_only=True)
+    field = serializers.CharField(read_only=True)
+    before = serializers.JSONField(read_only=True)
+    after = serializers.JSONField(read_only=True)
+
+
+class MergeSerializer(serializers.Serializer):
+    type = serializers.CharField(read_only=True)
+    # mypy being weird about this specific field
+    source = serializers.JSONField(read_only=True)  # type: ignore
+    target = serializers.JSONField(read_only=True)
+
+
+class TriggerSerializer(serializers.Serializer):
+    job_type = serializers.CharField(read_only=True)
+    job_id = serializers.CharField(read_only=True)
+    payload = serializers.JSONField(read_only=True)
+
+
+class DetailSerializer(serializers.Serializer):
+    id = serializers.CharField(read_only=True)
+    changes = ChangeSerializer(many=True, required=False)
+    merge = MergeSerializer(required=False)
+    trigger = TriggerSerializer(required=False)
+    name = serializers.CharField(read_only=True)
+    short_id = serializers.CharField(read_only=True)
+    type = serializers.CharField(read_only=True)
+
+
+@extend_schema_serializer(component_name="ActivityLogEntry")
+class ActivityLogSerializer(serializers.Serializer):
+    id = serializers.UUIDField(read_only=True)
+    user = serializers.SerializerMethodField()
+    activity = serializers.CharField(read_only=True)
+    scope = serializers.CharField(read_only=True)
+    item_id = serializers.CharField(read_only=True)
+    detail = DetailSerializer(source="safe_detail", required=False)
+    created_at = serializers.DateTimeField(read_only=True)
+    is_system = serializers.BooleanField(
+        read_only=True, help_text="Whether the activity was performed by the system rather than a user."
+    )
+    was_impersonated = serializers.BooleanField(
+        read_only=True, help_text="Whether the acting user was being impersonated by PostHog staff."
+    )
+    client = serializers.CharField(
+        read_only=True,
+        allow_null=True,
+        help_text="API client that triggered the activity. Self-reported through the x-posthog-client request header (e.g. 'mcp'), or 'scout:<skill_name>' when a scout run made the change, which the server derives from the run's own token. Null for requests that did neither.",
+    )
+
+    def to_representation(self, instance: ActivityLog) -> dict:
+        data = super().to_representation(instance)
+        visibility = PropertyValueVisibility.from_serializer_context(self.context)
+        if visibility is not None:
+            data["detail"] = visibility.apply(instance, data.get("detail"))
+        return data
+
+    @extend_schema_field({"type": "object", "nullable": True})
+    def get_user(self, activity_log: ActivityLog):
+        if activity_log.is_system:
+            return {"first_name": "System", "email": None, "is_system": True}
+        else:
+            return UserMinimalSerializer(activity_log.user).data

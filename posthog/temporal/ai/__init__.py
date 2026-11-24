@@ -1,0 +1,47 @@
+from posthog.temporal.ai.anomaly_investigation import (
+    AnomalyInvestigationWorkflow,
+    investigate_anomaly_activity,
+    record_investigation_deliveries_started_activity,
+)
+from posthog.temporal.ai.chat_agent import (
+    AssistantConversationRunnerWorkflow,
+    ChatAgentWorkflow,
+    process_chat_agent_activity,
+    process_conversation_activity,
+)
+from posthog.temporal.ai.checkpoint_compaction import CHECKPOINT_COMPACTION_ACTIVITIES, CHECKPOINT_COMPACTION_WORKFLOWS
+from posthog.temporal.ai.research_agent import ResearchAgentWorkflow, process_research_agent_activity
+
+from products.posthog_ai.backend.temporal.activities import mirror_conversation_to_task_activity
+from products.posthog_ai.backend.temporal.workflows import ConversationMirrorWorkflow
+
+from .llm_traces_summaries.summarize_traces import (
+    SummarizeLLMTracesInputs,
+    SummarizeLLMTracesWorkflow,
+    summarize_llm_traces_activity,
+)
+
+AI_WORKFLOWS = [
+    ConversationMirrorWorkflow,
+    AssistantConversationRunnerWorkflow,
+    ChatAgentWorkflow,
+    ResearchAgentWorkflow,
+    SummarizeLLMTracesWorkflow,
+    AnomalyInvestigationWorkflow,
+    *CHECKPOINT_COMPACTION_WORKFLOWS,
+]
+
+AI_ACTIVITIES = [
+    process_conversation_activity,
+    process_chat_agent_activity,
+    mirror_conversation_to_task_activity,
+    process_research_agent_activity,
+    summarize_llm_traces_activity,
+    investigate_anomaly_activity,
+    record_investigation_deliveries_started_activity,
+    *CHECKPOINT_COMPACTION_ACTIVITIES,
+]
+
+__all__ = [
+    "SummarizeLLMTracesInputs",
+]

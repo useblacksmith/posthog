@@ -1,0 +1,423 @@
+import {
+    AccountsTableAccountField,
+    AccountsTableAccountFieldOperator,
+    AccountsTableCustomPropertyOperator,
+    AccountsTableRelationshipOperator,
+    AccountsTableSortDirection,
+    NodeKind,
+} from '~/queries/schema/schema-general'
+import { AccountCustomPropertyFilter, PropertyFilterType, PropertyOperator } from '~/types'
+
+import type {
+    AccountRelationshipDefinitionApi,
+    CustomPropertyDefinitionApi,
+} from 'products/customer_analytics/frontend/generated/api.schemas'
+
+import { relationshipAlias } from './accountsColumnConfigLogic'
+import type { AccountPropertyFilter, AccountRelationshipFilter } from './accountsPropertyFilters'
+import {
+    AccountsTableQueryPlan,
+    BuildAccountsTableQueryPlanInput,
+    accountsTableCell,
+    accountsTableDatasetKey,
+    buildAccountsTableQueryPlan,
+} from './accountsTableQuery'
+
+const RELATIONSHIP_ID = '11111111-2222-3333-4444-555555555555'
+const CUSTOM_PROPERTY_ID = '66666666-7777-8888-9999-aaaaaaaaaaaa'
+
+const definition = {
+    id: CUSTOM_PROPERTY_ID,
+    name: 'MRR',
+    display_type: 'currency',
+} as CustomPropertyDefinitionApi
+
+function accountFieldFilter(overrides: Partial<AccountPropertyFilter> = {}): AccountPropertyFilter {
+    return {
+        type: PropertyFilterType.Account,
+        key: AccountsTableAccountField.IgnoredAt,
+        operator: PropertyOperator.IsSet,
+        value: null,
+        ...overrides,
+    }
+}
+
+function relationshipFilter(overrides: Partial<AccountRelationshipFilter> = {}): AccountRelationshipFilter {
+    return {
+        type: PropertyFilterType.AccountRelationship,
+        key: RELATIONSHIP_ID,
+        operator: PropertyOperator.Exact,
+        value: [7],
+        ...overrides,
+    }
+}
+
+function customFilter(overrides: Partial<AccountCustomPropertyFilter> = {}): AccountCustomPropertyFilter {
+    return {
+        type: PropertyFilterType.AccountCustomProperty,
+        key: CUSTOM_PROPERTY_ID,
+        operator: PropertyOperator.GreaterThan,
+        value: 10,
+        ...overrides,
+    }
+}
+
+function queryInput(overrides: Partial<BuildAccountsTableQueryPlanInput> = {}): BuildAccountsTableQueryPlanInput {
+    return {
+        querySelectColumns: [
+            'name',
+            'accounts.tags.names AS tag_names',
+            'accounts.notebooks.count AS notebook_count',
+            `accounts.relationships.values.\`${RELATIONSHIP_ID}\` AS ${relationshipAlias(RELATIONSHIP_ID)}`,
+        ],
+        visibleColumnNames: ['name', 'tag_names', 'notebook_count', relationshipAlias(RELATIONSHIP_ID)],
+        searchQuery: '',
+        tagsFilter: [],
+        assignmentStatus: 'all',
+        assignedToFilter: [],
+        tileFilter: null,
+        accountFilters: [],
+        accountFilterGroups: [],
+        relationshipDefinitionsById: {
+            [RELATIONSHIP_ID]: { id: RELATIONSHIP_ID, name: 'CSM' } as AccountRelationshipDefinitionApi,
+        },
+        customPropertyDefinitionsById: { [CUSTOM_PROPERTY_ID]: definition },
+        columnDisplay: {},
+        serverSortOrder: null,
+        ...overrides,
+    }
+}
+
+describe('accountsTableQuery', () => {
+    it('translates supported columns, filters, and server-side sorting', () => {
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                searchQuery: ' acme ',
+                tagsFilter: ['enterprise'],
+                assignmentStatus: 'assigned',
+                assignedToFilter: [7, 9],
+                accountFilters: [relationshipFilter(), customFilter()],
+                serverSortOrder: { column: relationshipAlias(RELATIONSHIP_ID), direction: 'desc' },
+            })
+        )
+
+        expect(plan?.query).toMatchObject({
+            kind: NodeKind.AccountsTableQuery,
+            columns: [
+                { kind: 'account_field', field: AccountsTableAccountField.Name },
+                { kind: 'tags' },
+                { kind: 'note_count' },
+                { kind: 'relationship', definitionId: RELATIONSHIP_ID },
+            ],
+            filters: [
+                { kind: 'search', query: 'acme' },
+                { kind: 'tags', tagNames: ['enterprise'] },
+                { kind: 'assigned_to', userIds: [7, 9] },
+                {
+                    kind: 'relationship',
+                    definitionId: RELATIONSHIP_ID,
+                    operator: AccountsTableRelationshipOperator.Exact,
+                    userIds: [7],
+                },
+                {
+                    kind: 'custom_property',
+                    definitionId: CUSTOM_PROPERTY_ID,
+                    operator: AccountsTableCustomPropertyOperator.GreaterThan,
+                    values: [10],
+                },
+            ],
+            sort: {
+                column: { kind: 'relationship', definitionId: RELATIONSHIP_ID },
+                direction: AccountsTableSortDirection.Descending,
+            },
+        })
+    })
+
+    it('keeps global filters outside OR groups of supported property filters', () => {
+        const input = queryInput({
+            searchQuery: 'Account',
+            accountFilters: [relationshipFilter(), customFilter({ operator: PropertyOperator.IsNotSet, value: null })],
+            accountFilterGroups: [[customFilter({ operator: PropertyOperator.Exact, value: 20 })]],
+        })
+        const plan = buildAccountsTableQueryPlan(input)
+
+        expect(plan.query.filters).toEqual([{ kind: 'search', query: 'Account' }])
+        expect(plan.query.filterGroups).toEqual([
+            [
+                { kind: 'relationship', definitionId: RELATIONSHIP_ID, operator: 'exact', userIds: [7] },
+                { kind: 'custom_property', definitionId: CUSTOM_PROPERTY_ID, operator: 'is_not_set', values: [] },
+            ],
+            [{ kind: 'custom_property', definitionId: CUSTOM_PROPERTY_ID, operator: 'exact', values: [20] }],
+        ])
+        expect(accountsTableDatasetKey(input)).not.toEqual(
+            accountsTableDatasetKey({ ...input, accountFilterGroups: [[accountFieldFilter()]] })
+        )
+    })
+
+    it('sends restored definition IDs to the backend for validation', () => {
+        const validName = accountFieldFilter({
+            key: AccountsTableAccountField.Name,
+            operator: PropertyOperator.Exact,
+            value: 'Example',
+        })
+        const missingProperty = customFilter({ key: '99999999-9999-9999-9999-999999999999' })
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                accountFilters: [validName, missingProperty],
+                accountFilterGroups: [[relationshipFilter(), missingProperty], [missingProperty]],
+            })
+        )
+
+        expect(plan.query.filters).toEqual([])
+        const missing = { kind: 'custom_property', definitionId: missingProperty.key, operator: 'gt', values: [10] }
+        expect(plan.query.ignoreMissingDefinitions).toBe(true)
+        expect(plan.query.filterGroups).toEqual([
+            [
+                {
+                    kind: 'account_field',
+                    field: AccountsTableAccountField.Name,
+                    operator: 'exact',
+                    values: ['Example'],
+                },
+                missing,
+            ],
+            [{ kind: 'relationship', definitionId: RELATIONSHIP_ID, operator: 'exact', userIds: [7] }, missing],
+            [missing],
+        ])
+    })
+
+    it('translates typed native account field filters', () => {
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                accountFilters: [
+                    accountFieldFilter(),
+                    accountFieldFilter({
+                        key: AccountsTableAccountField.CreatedAt,
+                        operator: PropertyOperator.IsDateAfter,
+                        value: '2026-08-01',
+                    }),
+                ],
+            })
+        )
+
+        expect(plan.query.filters).toEqual([
+            {
+                kind: 'account_field',
+                field: AccountsTableAccountField.IgnoredAt,
+                operator: AccountsTableAccountFieldOperator.IsSet,
+                values: [],
+            },
+            {
+                kind: 'account_field',
+                field: AccountsTableAccountField.CreatedAt,
+                operator: AccountsTableAccountFieldOperator.DateAfter,
+                values: ['2026-08-01'],
+            },
+        ])
+    })
+
+    it('omits incompatible native account field filters', () => {
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                accountFilters: [
+                    accountFieldFilter({
+                        key: AccountsTableAccountField.Name,
+                        operator: PropertyOperator.IsDateAfter,
+                        value: '2026-08-01',
+                    }),
+                ],
+            })
+        )
+
+        expect(plan.query.filters).toEqual([])
+    })
+
+    it.each([
+        ['all', undefined],
+        ['assigned', { kind: 'assigned' }],
+        ['unassigned', { kind: 'unassigned' }],
+    ] as const)('maps the %s assignment status to its query filter', (assignmentStatus, expected) => {
+        const plan = buildAccountsTableQueryPlan(queryInput({ assignmentStatus }))
+
+        expect(plan.query.filters).toEqual(expected ? [expected] : [])
+    })
+
+    it('narrows the assigned status to specific users when any are selected', () => {
+        const plan = buildAccountsTableQueryPlan(queryInput({ assignmentStatus: 'assigned', assignedToFilter: [7] }))
+
+        expect(plan.query.filters).toEqual([{ kind: 'assigned_to', userIds: [7] }])
+    })
+
+    it('ignores selected users outside the assigned status', () => {
+        const plan = buildAccountsTableQueryPlan(queryInput({ assignmentStatus: 'all', assignedToFilter: [7] }))
+
+        expect(plan.query.filters).toEqual([])
+    })
+
+    it('translates saved custom-property history display configuration', () => {
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                querySelectColumns: [
+                    'name',
+                    `accounts.custom_properties_history.values.\`${CUSTOM_PROPERTY_ID}\` AS cp_value`,
+                ],
+                visibleColumnNames: ['name', 'cp_value'],
+                columnDisplay: { [CUSTOM_PROPERTY_ID]: { mode: 'sparkline', window_days: 30 } },
+                serverSortOrder: { column: 'cp_value', direction: 'asc' },
+            })
+        )
+
+        expect(plan?.query.columns[1]).toEqual({
+            kind: 'custom_property_history',
+            definitionId: CUSTOM_PROPERTY_ID,
+            windowDays: 30,
+        })
+        expect(plan?.query.sort).toEqual({
+            column: { kind: 'custom_property', definitionId: CUSTOM_PROPERTY_ID },
+            direction: AccountsTableSortDirection.Ascending,
+        })
+    })
+
+    it('drops unsupported columns instead of changing runners', () => {
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                querySelectColumns: ['name', 'arbitrary_hogql()'],
+                visibleColumnNames: ['name', 'unsupported'],
+            })
+        )
+
+        expect(plan.query.columns).toEqual([{ kind: 'account_field', field: 'name' }])
+        expect(plan.columns.map((column) => column.visibleName)).toEqual(['name'])
+    })
+
+    it('translates a threshold tile into a typed list filter', () => {
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                tileFilter: {
+                    tileId: 'tile',
+                    filter: {
+                        kind: 'custom_property',
+                        definitionId: CUSTOM_PROPERTY_ID,
+                        operator: AccountsTableCustomPropertyOperator.GreaterThan,
+                        values: [1],
+                    },
+                },
+            })
+        )
+
+        expect(plan.query.filters).toEqual([
+            {
+                kind: 'custom_property',
+                definitionId: CUSTOM_PROPERTY_ID,
+                operator: AccountsTableCustomPropertyOperator.GreaterThan,
+                values: [1],
+            },
+        ])
+    })
+
+    it('excludes unset accounts from a not-equal threshold tile', () => {
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                tileFilter: {
+                    tileId: 'tile',
+                    filter: {
+                        kind: 'custom_property',
+                        definitionId: CUSTOM_PROPERTY_ID,
+                        operator: AccountsTableCustomPropertyOperator.IsNot,
+                        values: [1],
+                    },
+                },
+            })
+        )
+
+        expect(plan.query.filters).toEqual([
+            {
+                kind: 'custom_property',
+                definitionId: CUSTOM_PROPERTY_ID,
+                operator: AccountsTableCustomPropertyOperator.IsSet,
+                values: [],
+            },
+            {
+                kind: 'custom_property',
+                definitionId: CUSTOM_PROPERTY_ID,
+                operator: AccountsTableCustomPropertyOperator.IsNot,
+                values: [1],
+            },
+        ])
+    })
+
+    it.each([
+        [PropertyOperator.IContains, 'text', 'standard'],
+        [PropertyOperator.GreaterThan, 'currency', 10],
+        [PropertyOperator.IsDateBefore, 'datetime', '2026-01-01'],
+    ] as const)('keeps filter transport independent of definition metadata for %s', (operator, displayType, value) => {
+        const input = queryInput({
+            accountFilters: [customFilter({ operator, value }), relationshipFilter()],
+            customPropertyDefinitionsById: { [CUSTOM_PROPERTY_ID]: { ...definition, display_type: displayType } },
+        })
+        const known = buildAccountsTableQueryPlan(input)
+        const unknown = buildAccountsTableQueryPlan({
+            ...input,
+            customPropertyDefinitionsById: {},
+            relationshipDefinitionsById: {},
+        })
+        expect(unknown.query).toEqual(known.query)
+        expect(unknown.query.filters).toHaveLength(2)
+    })
+
+    it.each([
+        ['regex', 'currency', PropertyOperator.Regex],
+        ['comparison on text', 'text', PropertyOperator.GreaterThan],
+        ['contains on number', 'number', PropertyOperator.IContains],
+        ['date on text', 'text', PropertyOperator.IsDateAfter],
+    ] as const)('omits unsupported %s filters', (_, displayType, operator) => {
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                customPropertyDefinitionsById: { [CUSTOM_PROPERTY_ID]: { ...definition, display_type: displayType } },
+                accountFilters: [customFilter({ operator })],
+            })
+        )
+        expect(plan.query.filters).toEqual([])
+    })
+
+    it('keeps contains filters for link properties', () => {
+        const linkDefinition = { ...definition, display_type: 'link' } as CustomPropertyDefinitionApi
+        const plan = buildAccountsTableQueryPlan(
+            queryInput({
+                customPropertyDefinitionsById: { [CUSTOM_PROPERTY_ID]: linkDefinition },
+                accountFilters: [customFilter({ operator: PropertyOperator.IContains, value: 'example.com' })],
+            })
+        )
+
+        expect(plan.query.filters).toEqual([
+            {
+                kind: 'custom_property',
+                definitionId: CUSTOM_PROPERTY_ID,
+                operator: AccountsTableCustomPropertyOperator.Contains,
+                values: ['example.com'],
+            },
+        ])
+    })
+
+    it('reads cells directly from keyed rows', () => {
+        const plan = buildAccountsTableQueryPlan(queryInput()) as AccountsTableQueryPlan
+        const row = {
+            id: 'account-id',
+            name: 'Acme',
+            externalId: 'acme-1',
+            accountFields: { name: 'Acme' },
+            tags: ['enterprise'],
+            noteCount: 2,
+            relationships: { [RELATIONSHIP_ID]: [42] },
+            customProperties: {},
+            customPropertyHistory: {},
+        }
+
+        expect(plan.columns.map((column) => accountsTableCell(row, column.visibleName, plan))).toEqual([
+            { id: 'account-id', name: 'Acme', external_id: 'acme-1' },
+            ['enterprise'],
+            2,
+            [42],
+        ])
+    })
+})

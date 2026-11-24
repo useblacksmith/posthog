@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+
+set -e
+
+echo "Upgrading PostHog. This will cause a few minutes of downtime."
+read -r -p "Do you want to upgrade PostHog? [y/N] " response
+if [[ "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]
+then
+    echo "OK!"
+else
+    exit
+fi
+
+if [ "$REGISTRY_URL" == "" ]
+then
+export REGISTRY_URL="posthog/posthog"
+fi
+
+export POSTHOG_APP_TAG="${POSTHOG_APP_TAG:-latest}"
+
+echo "Checking for named postgres and clickhouse volumes to avoid data loss when upgrading from < 1.39"
+if docker volume ls | grep -Pzoq 'clickhouse-data\n(.|\n)*postgres-data\n'
+then
+    DOCKER_VOLUMES_MISSING=FALSE
+    echo "Found postgres and clickhouse volumes, proceeding..."
+else
+    DOCKER_VOLUMES_MISSING=TRUE
+    echo ""
+    echo ""
+    echo "🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨"
+    echo "🚨🚨🚨 WARNING: POTENTIAL DATA LOSS 🚨🚨🚨🚨🚨"
+    echo "🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨"
+    echo ""
+    echo ""
+    echo "We were unable to find named clickhouse and postgres volumes."
+    echo "If you created your PostHog stack PRIOR TO August 12th, 2022 / v1.39.0, the Postgres and Clickhouse containers did NOT have persistent named volumes by default."
+    echo "If you choose to upgrade, you 💣 will likely lose data 💣 contained in these anonymous volumes."
+    echo ""
+    echo "See the discussion here for more information: https://github.com/PostHog/posthog/pull/11256"
+    echo ""
+    echo "WE STRONGLY RECOMMEND YOU:"
+    echo ""
+    echo "🛑 Stop this script and do not proceed"
+    echo "✅ Back up your entire environment/installation (vm, host, etc.), including all docker containers and volumes:"
+    echo "✅ Specifically back up the contents of :"
+    echo "  ☑ /var/lib/postgresql/data in the postgres (*_db_1) container"
+    echo "  ☑ /var/lib/clickhouse in the clickhouse (*_clickhouse_1) container"
+    echo "and be ready to check/recopy the data before you boot PostHog next."
+    read -r -p "Do you want to proceed anyway? [y/N] " response
+    if [[ "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]
+    then
+        echo "OK!"
+    else
+        exit
+    fi
+fi
+
+# Upgrading pulls a full set of new images, which needs significant free disk.
+# A nearly full disk fails the pull or leaves containers crashing mid-upgrade,
+# so check up front and offer to prune old images before anything is changed.
+# This runs after the data-loss volume check above so the user has acknowledged
+# that warning before `docker system prune` removes any stopped containers.
+DOCKER_ROOT_DIR=$(docker info --format '{{ .DockerRootDir }}' 2>/dev/null || echo /var/lib/docker)
+disk_use_pct() {
+    df -P "$DOCKER_ROOT_DIR" 2>/dev/null | awk 'NR==2 { gsub(/%/,""); print $5 }'
+}
+DISK_USE=$(disk_use_pct)
+if [ -n "$DISK_USE" ] && [ "$DISK_USE" -ge 80 ]; then
+    echo ""
+    echo "⚠️  The disk holding Docker data ($DOCKER_ROOT_DIR) is ${DISK_USE}% full."
+    echo "The upgrade pulls a full set of new images and may fail or leave the stack broken without enough free space."
+    read -r -p "Remove unused Docker images and build cache now? (docker system prune -a --force) [y/N] " response
+    if [[ "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+        docker system prune -a --force
+        DISK_USE=$(disk_use_pct)
+        echo "Disk is now ${DISK_USE:-unknown}% full."
+    fi
+    if [ -n "$DISK_USE" ] && [ "$DISK_USE" -ge 90 ]; then
+        read -r -p "Disk is still ${DISK_USE}% full. Continue with the upgrade anyway? [y/N] " response
+        if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+            echo "Upgrade cancelled. Free up disk space and try again."
+            exit 1
+        fi
+    fi
+fi
+
+# a previous version of the deploy script should have been quoting the caddy_host env var
+tmp="$(mktemp)"
+awk '
+  /^[[:space:]]*($|#)/ { print; next }        # keep blanks/comments
+  {
+    # split on first "=" only
+    p = index($0, "="); if (!p) { print; next }
+    key = substr($0,1,p-1); val = substr($0,p+1)
+
+    # trim
+    sub(/^[[:space:]]+/,"",key); sub(/[[:space:]]+$/,"",key)
+    sub(/^[[:space:]]+/,"",val); sub(/[[:space:]]+$/,"",val)
+
+    # already quoted?
+    if (val ~ /^".*"$/ || val ~ /^'\''.*'\''$/) { print key "=" val; next }
+
+    # quote if value has space, comma, or ://
+    if (val ~ /[[:space:],]|:\/\//) {
+      gsub(/"/, "\\\"", val)
+      print key "=\"" val "\""
+    } else {
+      print key "=" val
+    }
+  }
+' .env > "$tmp" && mv "$tmp" .env
+
+# Compose fills the proxy Caddyfile from .env, not from the service environment.
+# Installs from before July 2025 have no CADDY_HOST, so Caddy serves http://localhost:8000 instead of DOMAIN.
+read_env_value() {
+    grep "^$1=" .env | tail -n 1 | cut -d '=' -f2- | sed -e 's/^["'\'']//' -e 's/["'\'']$//'
+}
+if [[ -f ".env" ]] && [ -z "$(read_env_value CADDY_HOST)" ]; then
+    ENV_DOMAIN=$(read_env_value DOMAIN)
+    if [ -n "$ENV_DOMAIN" ]; then
+        echo "CADDY_HOST=\"$ENV_DOMAIN, http://, https://\"" >> .env
+        echo "Added missing CADDY_HOST to .env file"
+    fi
+fi
+if [[ -f ".env" ]] && [ -z "$(read_env_value CADDY_TLS_BLOCK)" ]; then
+    ENV_TLS_BLOCK=$(read_env_value TLS_BLOCK)
+    if [ -n "$ENV_TLS_BLOCK" ]; then
+        echo "CADDY_TLS_BLOCK=\"$ENV_TLS_BLOCK\"" >> .env
+        echo "Added missing CADDY_TLS_BLOCK to .env file"
+    fi
+fi
+
+if [[ -f ".env" ]]; then
+    # An .env edited by hand can still hold the shared object storage keys from the public
+    # compose file. Drop them so the secrets loop below generates new ones. This runs before
+    # the export, because compose prefers an exported value to the one in .env.
+    sed -i -E "/^OBJECT_STORAGE_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=[\"']?object_storage_root_(user|password)[\"']?$/d" .env
+    set -a           # auto-export all variables
+    . ./.env         # or: source .env
+    set +a
+else
+    echo "No .env file found. Please create it with POSTHOG_SECRET and DOMAIN set."
+    exit 1
+fi
+
+# we introduced ENCRYPTION_SALT_KEYS and so if there isn't one, need to add it
+# check for it in the .env file
+if ! grep -q "ENCRYPTION_SALT_KEYS" .env; then
+    ENCRYPTION_KEY=$(openssl rand -hex 16)
+    echo "ENCRYPTION_SALT_KEYS=$ENCRYPTION_KEY" >> .env
+    echo "Added missing ENCRYPTION_SALT_KEYS to .env file"
+    source .env
+    # The earlier `set -a` is off by now, so the new key needs an explicit export to reach the Compose renderer.
+    export ENCRYPTION_SALT_KEYS
+else
+    # Read the existing key
+    EXISTING_KEY=$(grep "ENCRYPTION_SALT_KEYS" .env | cut -d '=' -f2)
+    
+    # Check if the existing key is in the correct format (32 bytes base64url)
+    if [[ ! $EXISTING_KEY =~ ^[A-Za-z0-9_-]{32}$ ]]; then
+        echo "ENCRYPTION_SALT_KEYS is not in the correct fernet format and will not work"
+        echo "🛑 Stop this script and do not proceed"
+        echo "remove ENCRYPTION_SALT_KEYS from .env and try again"
+        exit 1
+    fi
+fi
+
+# Secrets that each get their own random value. A leak of a service-to-service secret from one
+# container cannot yield POSTHOG_SECRET (Django's SECRET_KEY). The object storage keys sign
+# requests that Caddy forwards from the internet to objectstorage, so every install needs keys of
+# its own. Installs from before a secret existed have none, so add it. Keep this list in step with
+# dedicatedSecretKeys in bin/hobby-installer.
+for key in INTERNAL_REQUEST_TOKEN BROWSERLESS_SECRET RECORDING_API_JWT_SECRET \
+    OBJECT_STORAGE_ACCESS_KEY_ID OBJECT_STORAGE_SECRET_ACCESS_KEY; do
+    if ! grep -qE "^$key=.+" .env; then
+        echo "$key=$(openssl rand -hex 32)" >> .env
+        echo "Added missing $key to .env file"
+    fi
+done
+# .env holds Django's SECRET_KEY and the object storage keys, so only its owner may read it.
+chmod 600 .env || echo "Could not restrict .env to its owner. Run: chmod 600 .env"
+
+# PostHog's AI features (the Max assistant, SQL/regex assist) run on your own LLM provider key.
+# If none is configured yet, offer to add one. Existing keys are never touched — we only append
+# when the key is absent, so this is safe to run on every upgrade.
+# Only prompt on an interactive terminal so a non-interactive upgrade doesn't block on stdin.
+# Match `KEY=<value>` (note the trailing `.+`): a blank `KEY=` counts as missing, so a user who
+# skipped the key at install still gets prompted. Read silently (-s) — these are secrets.
+if [ -t 0 ] && ! grep -qE "^ANTHROPIC_API_KEY=.+" .env; then
+    echo ""
+    echo "PostHog AI runs on an Anthropic API key, which isn't configured yet."
+    read -rsp "Enter an Anthropic API key to enable PostHog AI (leave blank to skip): " ANTHROPIC_API_KEY_INPUT
+    echo
+    if [ -n "$ANTHROPIC_API_KEY_INPUT" ]; then
+        echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY_INPUT" >> .env
+        echo "Added ANTHROPIC_API_KEY to .env file"
+    fi
+fi
+if [ -t 0 ] && ! grep -qE "^OPENAI_API_KEY=.+" .env; then
+    read -rsp "Enter an OpenAI API key to enable SQL and regex AI assist (leave blank to skip): " OPENAI_API_KEY_INPUT
+    echo
+    if [ -n "$OPENAI_API_KEY_INPUT" ]; then
+        echo "OPENAI_API_KEY=$OPENAI_API_KEY_INPUT" >> .env
+        echo "Added OPENAI_API_KEY to .env file"
+    fi
+fi
+
+# MinIO is no longer in the stack. This asks for a decision while the old stack still
+# runs, because the objects cannot be moved after the swap without a temporary MinIO
+# container. The marker also covers the older SESSION_RECORDING_STORAGE_MIGRATED_TO_SEAWEEDFS
+# prompt, whose migration script read the same MinIO service.
+if ! grep -q "OBJECT_STORAGE_MINIO_REMOVED" .env; then
+  echo ""
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "📦 OBJECT STORAGE UPDATE: MinIO is removed"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  echo "MinIO stopped publishing Docker images, so this version replaces it with"
+  echo "SeaweedFS. SeaweedFS starts on a new volume and cannot read the MinIO format."
+  echo ""
+  echo "Your objects stay on disk in the 'objectstorage' volume, but the stack stops"
+  echo "reading them. Until you copy them across, these are unavailable:"
+  echo ""
+  echo "  - exported assets (CSV, PNG, PDF, video)"
+  echo "  - uploaded media, such as images in notebooks"
+  echo "  - error tracking symbol sets"
+  echo "  - session recordings that are still in MinIO"
+  echo ""
+  echo "Postgres and ClickHouse are untouched, so events, persons, insights, dashboards,"
+  echo "feature flags and experiments all survive the upgrade."
+  echo ""
+  echo "You have two options:"
+  echo ""
+  echo "1. ⏸  Stop here and stay on your current version."
+  echo "   Copy the objects out of MinIO yourself, then run this upgrade again."
+  echo ""
+  echo "2. ▶️  Continue the upgrade."
+  echo "   The old volume is kept. Copy the objects into SeaweedFS afterwards with:"
+  echo ""
+  echo "     ./posthog/bin/migrate-storage-hobby"
+  echo ""
+  echo "   Run it from this directory. It reads the old volume through a temporary MinIO"
+  echo "   container, so it pulls the MinIO image once."
+  echo ""
+  echo "Both options are described in detail here:"
+  echo "https://github.com/PostHog/posthog/blob/master/docs/internal/hobby-minio-removal.md"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  read -r -p "Continue the upgrade? [y/N] " response
+  if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]
+  then
+    echo "Upgrade cancelled. No changes made."
+    exit 1
+  fi
+  echo "OBJECT_STORAGE_MINIO_REMOVED=acknowledged" >> .env
+  source .env
+fi
+
+export POSTHOG_APP_TAG="${POSTHOG_APP_TAG:-latest-release}"
+
+# Check if current compose file uses postgres:12-alpine (needs migration before upgrade)
+if grep -qE 'postgres:12-alpine|postgres:12' posthog/docker-compose.hobby.yml 2>/dev/null; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🐘 PostgreSQL 12 → 15 UPGRADE REQUIRED"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Your docker-compose stack is using postgres:12-alpine."
+    echo "The new PostHog version requires PostgreSQL 15."
+    echo ""
+    echo "⚠️  This migration deletes data, and isn't tested in your envronment. Reject auto-update to receive manual upgrade instructions."
+    echo ""
+    read -r -p "Do you want to automatically upgrade PostgreSQL 12 → 15? [y/N] " pg_response
+    if [[ "$pg_response" =~ ^([yY][eE][sS]|[yY])+$ ]]; then
+        echo ""
+        echo "Step 1: Creating backup..."
+        BACKUP_FILE="backup_pg12_$(date +%Y%m%d_%H%M%S).sql.gz"
+
+        if ! docker-compose exec -T db pg_dumpall --clean -U posthog | gzip > "$BACKUP_FILE"; then
+            echo "❌ Backup command failed!"
+            rm -f "$BACKUP_FILE"
+            exit 1
+        fi
+
+        if [ ! -f "$BACKUP_FILE" ]; then
+            echo "❌ Backup file was not created!"
+            exit 1
+        fi
+
+        BACKUP_SIZE_BYTES=$(stat -f%z "$BACKUP_FILE" 2>/dev/null || stat -c%s "$BACKUP_FILE" 2>/dev/null || echo "0")
+        if [ "$BACKUP_SIZE_BYTES" -lt 1000 ]; then
+            echo "❌ Backup file is too small (${BACKUP_SIZE_BYTES} bytes) - backup likely failed!"
+            echo "   Expected at least 1KB for a valid PostgreSQL dump."
+            rm -f "$BACKUP_FILE"
+            exit 1
+        fi
+
+        if ! gunzip -t "$BACKUP_FILE" 2>/dev/null; then
+            echo "❌ Backup file is corrupted (gzip integrity check failed)!"
+            rm -f "$BACKUP_FILE"
+            exit 1
+        fi
+
+        BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
+        echo "✅ Backup complete and verified: $BACKUP_FILE ($BACKUP_SIZE)"
+
+        echo ""
+        echo "Step 2: Stopping docker-compose stack..."
+        docker-compose down
+
+        echo ""
+        echo "Step 3: Removing postgres-data volume..."
+        docker volume rm postgres-data || true
+
+        # Save backup filename to a flag file for restore after git pull
+        echo "$BACKUP_FILE" > .pg12_migration_pending
+        echo ""
+        echo "✅ Backup saved. Continuing with PostHog upgrade..."
+        echo "   Data will be restored after the new database starts."
+        echo ""
+    else
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Manual upgrade steps:"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "  1. Backup:"
+        echo "     docker-compose exec -T db pg_dumpall --clean -U posthog | gzip > backup.sql.gz"
+        echo ""
+        echo "  2. Stop:"
+        echo "     docker-compose down"
+        echo ""
+        echo "  3. Remove volume:"
+        echo "     docker volume rm postgres-data"
+        echo ""
+        echo "  4. Upgrade PostHog code (git pull - pulls postgres:15 compose files)"
+        echo ""
+        echo "  5. Start:"
+        echo "     docker-compose up -d db"
+        echo ""
+        echo "  6. Restore:"
+        echo "     gunzip -c backup.sql.gz | docker-compose exec -T db psql -U posthog"
+        echo ""
+        echo "  7. Upgrade password to SCRAM-SHA-256:"
+        echo "     docker compose exec -T db psql -U posthog -c \"ALTER USER posthog WITH PASSWORD 'posthog';\" > /dev/null 2>&1"
+        echo ""
+        echo "Please complete the manual upgrade before continuing."
+        exit 1
+    fi
+fi
+
+# Async migrations only exist for upgrades from versioned releases (the last one
+# targets PostHog <= 1.49.99). Every versioned release ships posthog/version.py and
+# it was removed once PostHog moved to continuous deployment, so its presence in the
+# current checkout (inspected before git pull replaces it) tells us whether the
+# async migrations check is needed. CHECK_ASYNC_MIGRATIONS=1/0 overrides either way.
+ASYNC_MIGRATIONS_CHECK_NEEDED=FALSE
+if [ -f posthog/posthog/version.py ]; then
+    ASYNC_MIGRATIONS_CHECK_NEEDED=TRUE
+    echo "Detected an old versioned PostHog release ($(grep VERSION posthog/posthog/version.py || true)), the async migrations check will run"
+fi
+
+cd posthog
+git pull --prune
+cd ../
+
+# Redis containers consolidated: redis (6.2) removed, only redis7 (7.2) remains
+if docker volume ls -q | grep -q '^redis-data$'; then
+    echo ""
+    echo "ℹ️  Redis consolidated to single container (7.2). Old 'redis-data' volume can be removed:"
+    echo "   docker volume rm redis-data"
+    echo ""
+fi
+
+# Download GeoLite2-City.mmdb if it doesn't exist
+echo "Downloading GeoIP database file"
+apt-get update && 
+apt-get install -y --no-install-recommends curl ca-certificates brotli && 
+mkdir -p ./share && 
+if [ ! -f ./share/GeoLite2-City.mmdb ]; then 
+    curl -L 'https://mmdbcdn.posthog.net/' --http1.1 | brotli --decompress --output=./share/GeoLite2-City.mmdb && 
+    echo '{\"date\": \"'$(date +%Y-%m-%d)'\"}' > ./share/GeoLite2-City.json && 
+    chmod 644 ./share/GeoLite2-City.mmdb &&
+    chmod 644 ./share/GeoLite2-City.json
+fi
+
+# Upgrade Docker Compose to version 2.33.1
+echo "Setting up Docker Compose"
+sudo rm /usr/local/bin/docker-compose
+sudo curl -L "https://github.com/docker/compose/releases/download/v2.33.1/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || true
+sudo chmod +x /usr/local/bin/docker-compose
+
+rm -f docker-compose.yml
+cp posthog/docker-compose.base.yml docker-compose.base.yml
+cp posthog/docker-compose.hobby.yml docker-compose.yml.tmpl
+cp posthog/.env.services .env.services
+bash posthog/bin/helpers/render-hobby-compose.sh < docker-compose.yml.tmpl > docker-compose.yml
+rm docker-compose.yml.tmpl
+
+docker-compose pull
+
+RUN_ASYNC_MIGRATIONS_CHECK="$ASYNC_MIGRATIONS_CHECK_NEEDED"
+if [[ "${CHECK_ASYNC_MIGRATIONS:-}" =~ ^([yY][eE][sS]|[yY]|1|[tT][rR][uU][eE])$ ]]; then
+    RUN_ASYNC_MIGRATIONS_CHECK=TRUE
+elif [[ "${CHECK_ASYNC_MIGRATIONS:-}" =~ ^([nN][oO]|[nN]|0|[fF][aA][lL][sS][eE])$ ]]; then
+    RUN_ASYNC_MIGRATIONS_CHECK=FALSE
+fi
+
+# Mid pg12 -> pg15 migration the postgres volume is empty until data is restored
+# after the stack restarts, so there is no async migration state to check yet.
+if [ -f ".pg12_migration_pending" ]; then
+    RUN_ASYNC_MIGRATIONS_CHECK=FALSE
+fi
+
+if [ "$RUN_ASYNC_MIGRATIONS_CHECK" == 'TRUE' ]; then
+    echo "Checking if async migrations are up to date"
+    # The asyncmigrationscheck container has no depends_on, so bring up the data
+    # stores it needs before running it (a previously interrupted upgrade can leave
+    # the stack stopped). It reads async migration state from Postgres and boots the
+    # Django app, which connects to Redis and ClickHouse. We deliberately avoid a
+    # full `up -d` so the web container doesn't run its migrate entrypoint first.
+    sudo -E docker-compose up -d db redis7 clickhouse
+    sudo -E docker-compose run --rm asyncmigrationscheck
+else
+    echo "Skipping async migrations check, it's only needed when upgrading from a versioned release (set CHECK_ASYNC_MIGRATIONS=1 to force it)"
+fi
+
+echo "Stopping the stack!"
+docker-compose stop
+
+# rewrite entrypoint
+# TODO: this is duplicated from bin/deploy-hobby. We should refactor this into a
+# single script.
+cat > compose/start <<EOF
+#!/bin/bash
+./compose/wait
+./bin/migrate
+./bin/docker-server
+EOF
+
+if [ ${DOCKER_VOLUMES_MISSING} == 'TRUE' ];
+then
+    echo ""
+    echo ""
+    echo "🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨"
+    echo "🚨🚨🚨🚨WARNING: LAST CHANCE TO AVOID DATA LOSS 🚨🚨🚨"
+    echo "🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨"
+    echo ""
+    echo ""
+    echo "Before we restart the stack, you should restore data you have backed up from the previous warning."
+    echo ""
+    echo ""
+fi
+
+read -r -p "Do you want to restart the PostHog stack now ? (docker-compose up) [y/N] " response
+if [[ "$response" =~ ^([yY][eE][sS]|[yY])+$ ]]
+then
+    echo "OK, Restarting the stack!"
+    sudo -E docker-compose up -d --remove-orphans
+else
+    echo "OK, we are leaving the stack OFFLINE. Run 'sudo -E docker-compose up -d --remove-orphans' when you are ready to start it."
+    exit
+fi
+
+# Restore PostgreSQL data if we did a pg12 -> pg15 migration
+if [ -f ".pg12_migration_pending" ]; then
+    PG12_BACKUP_FILE=$(cat .pg12_migration_pending)
+    rm -f .pg12_migration_pending
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🐘 Restoring PostgreSQL data from backup"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Waiting for PostgreSQL 15 to be ready..."
+    sleep 20
+
+    echo "Restoring data from $PG12_BACKUP_FILE..."
+    if gunzip -c "$PG12_BACKUP_FILE" | docker-compose exec -T db psql -U posthog; then
+        echo "✅ Data restored successfully!"
+
+        echo ""
+        echo "Upgrading password to SCRAM-SHA-256..."
+        docker-compose exec -T db psql -U posthog -c "ALTER USER posthog WITH PASSWORD 'posthog';" > /dev/null 2>&1
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "✅ PostgreSQL 12 → 15 migration complete!"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "Backup saved at: $PG12_BACKUP_FILE"
+        echo "You can delete it once you've verified everything works."
+        echo ""
+    else
+        echo "❌ Data restore failed!"
+        echo ""
+        echo "Your backup is saved at: $PG12_BACKUP_FILE"
+        echo ""
+        echo "To manually restore, run:"
+        echo "  gunzip -c $PG12_BACKUP_FILE | docker-compose exec -T db psql -U posthog"
+        echo ""
+        exit 1
+    fi
+fi
+
+echo "Consider running 'docker system prune -a' to clean up old images and free disk space"
+echo "PostHog upgraded successfully!"

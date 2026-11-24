@@ -1,0 +1,1857 @@
+"""Intent clustering pipeline for MCP analytics.
+
+Pure functions, each independently testable, that together build a cluster
+snapshot of MCP intents. The Temporal activity in
+``posthog/temporal/mcp_analytics/intent_clustering/activities.py`` orchestrates
+them and persists the result.
+
+Why pure functions: the algorithm is the riskiest part of this feature. Keeping
+each stage as a pure function over numpy arrays / dataclasses makes the
+algorithm validatable without touching ClickHouse, Postgres, or the embedding
+service.
+
+Intent sources: the corpus is per tool call, and events are its only source.
+Each call carries its own ``$mcp_intent``; calls without one inherit the most
+recent prior intent in the same session (last observation carried forward), so
+tools are credited to the intent they actually served rather than to the
+session's opening statement. The on-demand ``MCPSession.intent`` LLM summaries
+are deliberately *not* overlaid: a summary describes a whole session, so
+attributing it to each of that session's calls is the smear this corpus exists
+to remove. Sessions whose intent was only ever summarised therefore sit outside
+clustering; ``intent_coverage_pct`` reports how much of the window that leaves
+out.
+The snapshot also carries a tool-centric pivot: per tool, which intent clusters
+it serves, its share of each (capture), how contested those clusters are, and,
+where a ``$mcp_tools_list`` catalog was observed, how often agents discover the
+tool when it is advertised.
+"""
+
+import re
+import math
+import asyncio
+import hashlib
+from collections import Counter, defaultdict
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+import structlog
+from sklearn.cluster import AgglomerativeClustering
+
+from posthog.hogql import ast
+from posthog.hogql.parser import parse_expr, parse_select
+from posthog.hogql.query import execute_hogql_query
+
+from posthog.api.embedding_worker import EmbeddingResponse, async_generate_embedding
+from posthog.clickhouse.query_tagging import Feature, Product, tags_context
+from posthog.dataclasses import frozen
+from posthog.models.team.team import Team
+from posthog.sync import database_sync_to_async
+
+from products.mcp_analytics.backend.constants import MAX_SNAPSHOT_CLUSTERS, MCP_TOOL_CALL_EVENT, MCP_TOOLS_LIST_EVENT
+from products.mcp_analytics.backend.hogql_queries.base import EFFECTIVE_DESCRIPTION_SQL, EFFECTIVE_TOOL_SQL
+from products.mcp_analytics.backend.models import MCPIntentEmbeddingCache
+
+logger = structlog.get_logger(__name__)
+
+# Constants
+SNAPSHOT_VERSION = 2
+EMBEDDING_MODEL = "text-embedding-3-small-1536"
+EMBEDDING_PREFIX = "User intent: "
+# Descriptions share the intent embedding cache; the prefix keys them apart so
+# identical text embedded as an intent and as a description never collides.
+DESCRIPTION_EMBEDDING_PREFIX = "Tool description: "
+DEFAULT_LOOKBACK_DAYS = 7
+# Intents that reach embedding and clustering. Average-linkage clustering is
+# O(n²) in time and memory: on 1536-d vectors 5,000 intents cluster in ~17s
+# with ~250 MB of distance matrix, while 10,000 take ~70s and ~1 GB, too close
+# to the compute activity budget. The prior value was 1000; the corpus caps
+# below (sessions, calls per tool) scale with this one.
+DEFAULT_TOP_N_INTENTS = 5000
+# Cosine distance at which agglomerative merging stops. 0.2 left >90% of clusters
+# as singletons on production intents, because same-topic paraphrases of free
+# text sit around 0.25-0.45 apart on this model. 0.4 merges paraphrases while
+# keeping distinct topics apart.
+DEFAULT_DISTANCE_THRESHOLD = 0.4
+MAX_SAMPLE_INTENTS_PER_CLUSTER = 3
+
+# Clusters below this member count collapse into one long-tail aggregate instead
+# of rendering as rows: a page of singleton "clusters" is just a session list.
+MIN_CLUSTER_INTENTS = 2
+MAX_LONG_TAIL_SAMPLES = 10
+
+# An intent text that opens this many sessions in the window is automation
+# (scouts, crons, scheduled agents): people almost never type the same free text
+# twice. Detected by repetition because automation runs under the same clients
+# and distinct_ids as interactive use, so identity properties can't split them.
+RECURRING_MIN_SESSIONS = 3
+MAX_RECURRING_INTENTS = 50
+# The exclusion set is fetched wider than the display list, so a team with more
+# recurring texts than the table shows doesn't leak the rest back into the corpus.
+MAX_RECURRING_EXCLUSIONS = 500
+# Cosine distance under which two recurring texts count as one automation worded
+# two ways. Much tighter than DEFAULT_DISTANCE_THRESHOLD: merging hides entries,
+# so only near-paraphrases should join.
+RECURRING_MERGE_DISTANCE = 0.2
+# The merge is optional, so it gives up well inside the compute activity budget
+# when the embedding worker stalls instead of failing the whole recompute.
+RECURRING_MERGE_TIMEOUT_SECONDS = 60
+MAX_SAMPLE_VARIANTS = 5
+
+# Mirrors the capture-side clip in services/mcp (MAX_CAPTURED_DESCRIPTION_LENGTH);
+# re-applied here because external SDKs may stamp longer values.
+MAX_DESCRIPTION_LENGTH = 512
+# Below this many advertised sessions a discovery rate is noise, so it stays null.
+MIN_ADVERTISED_SESSIONS = 5
+# Payload bounds for the snapshot blob. Only the two top-level caps report what they
+# dropped (`dropped_tools`, `dropped_overlap_pairs` in computed_with); the per-cluster
+# caps below truncate silently, so `computed_with` is not a completeness check for them.
+# The per-tool cluster cap is the exception: `n_clusters_served` carries the pre-cap
+# count, so a tool showing 20 entries can still say how many it really serves.
+MAX_TOOLS_IN_SNAPSHOT = 300
+MAX_CLUSTERS_PER_TOOL = 20
+MAX_SWITCHES_PER_CLUSTER = 10
+MAX_SELF_RETRIES_PER_CLUSTER = 5
+MAX_CONFUSION_PAIRS = 50
+# Pair expansion is O(n^2) in a cluster's tool count, and event senders control
+# tool names, so only each cluster's highest-volume tools enter it. Tail tools
+# contribute at most their own tiny min(count) anyway.
+MAX_OVERLAP_TOOLS_PER_CLUSTER = 20
+
+# Placeholder the session summariser writes when a session has no recordable intent.
+# No event ever carries it, so this only bites if a summary is ever fed back into the
+# corpus — kept as a guard so that path can't form a pseudo-cluster of "empty" sessions.
+NO_INTENT_RECORDED_FALLBACK = "No agent intent was recorded for this session."
+
+# Embedding cache + concurrency
+# 1536-d float32 embedding = 6144 bytes. 5,000-intent corpus × 6144 ≈ 31 MB/team.
+# Cap concurrent embedding worker requests so we don't dogpile when a team's
+# corpus has hundreds of misses on first run while staying well under any
+# per-team rate limit on the embedding provider.
+EMBED_CONCURRENCY = 20
+
+# How many tool-call steps to show in the per-cluster Sankey before the
+# outcome column. Sessions with fewer steps pad with None so the column
+# count stays fixed; the UI renders those as an "Ended" node.
+JOURNEY_DEPTH = 4
+MAX_JOURNEY_PATHS_PER_CLUSTER = 10
+
+
+@dataclass(frozen=True)
+class IntentRecord:
+    """One unique intent text, with the per-call tool statistics attributed to it."""
+
+    intent_text: str
+    frequency: int
+    session_count: int = 0
+    tool_counts: dict[str, int] = field(default_factory=dict)
+    error_counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CallRecord:
+    """One tool call after intent attribution. ``intent_text`` is None when the
+    call happened before its session's first recorded intent."""
+
+    session_id: str
+    tool: str
+    intent_text: str | None
+    is_error: bool
+
+
+@dataclass(frozen=True)
+class CorpusStats:
+    """Attribution accounting for the sampled corpus, surfaced in computed_with
+    so the UI can state how much of the traffic the clusters actually explain."""
+
+    total_calls: int
+    attributed_calls: int
+    imputed_calls: int
+    kept_calls: int
+
+
+@dataclass(frozen=True)
+class WindowStats:
+    """Whole-window aggregates (not sampled) used for coverage reporting."""
+
+    total_calls: int
+    calls_with_intent: int
+    sessions: int
+
+
+@frozen
+class RecurringIntent:
+    """An intent text that opens many sessions verbatim: automated traffic."""
+
+    intent_text: str
+    session_count: int
+    call_count: int
+    error_count: int
+    # Every wording merged into this entry, most common first, intent_text included.
+    # Empty for an unmerged entry, whose only wording is intent_text.
+    variants: tuple[str, ...] = ()
+
+
+# Intent corpus -----------------------------------------------------------
+
+# Total corpus budget. Raised alongside stratified sampling: the per-tool floors
+# below have to fit inside it before any of the budget goes to the dominant
+# tools, and the per-tool call cap (below) stops the extra sessions from
+# belonging only to those tools. The IN-tuple stays sane because per-session
+# queries chunk the ids (CORPUS_SESSION_CHUNK_SIZE).
+MAX_CORPUS_SESSIONS = 15000
+
+# Each tool keeps at least this many sessions in the corpus, so a low/mid-volume
+# tool (logs/tracing/metrics) survives sampling instead of being erased by the
+# dominant exec/scout traffic. ~400 is the statistical floor for reading a
+# discovery/capture rate to ±5%. Doubles as the per-tool candidate pool size in
+# ``fetch_tools_by_session``: a pool bigger than the floor buys nothing, since
+# the rest of the corpus budget comes from the uniform sample.
+MIN_SESSIONS_PER_TOOL = 400
+
+# No tool may contribute more than this many attributed calls to the corpus.
+# Stops one dominant tool from occupying the entire intent space; the freed
+# budget is what lets mid/low tools cluster into real themes rather than noise.
+MAX_CALLS_PER_TOOL = 7500
+
+# Sender-controlled tool names only ever expand the ``_SESSION_TOOLS_SQL``
+# buckets. One session honestly uses a handful of distinct tools, so bound how
+# many distinct tools a single session can contribute — an attacker emitting
+# thousands of unique names can't fan the buckets out from one session.
+MAX_DISTINCT_TOOLS_PER_SESSION_BUCKET = 500
+
+# execute_hogql_query injects LIMIT 100 into any query without an explicit
+# LIMIT — far below what the per-session queries return at production scale
+# (one-plus rows per corpus session). Cap explicitly at the HogQL per-query
+# maximum so results are never silently truncated.
+MAX_QUERY_ROWS = 50_000
+
+# Per-session queries run over the corpus ids in chunks of this size, so the
+# inlined IN-tuple stays small and each chunk's rows fit under MAX_QUERY_ROWS.
+CORPUS_SESSION_CHUNK_SIZE = 2000
+
+# Only a session's first calls enter the corpus. Without this bound a few long
+# sessions fill MAX_QUERY_ROWS, and the ORDER BY session_id cut then drops
+# whole sessions by id. Chunk size x this bound must stay within
+# MAX_QUERY_ROWS so a chunk can never be truncated.
+MAX_CALLS_PER_SESSION = 25
+
+# Chunking bounds each query, not the rows retained across chunks: the corpus
+# can reach MAX_CORPUS_SESSIONS x MAX_CALLS_PER_SESSION rows before the per-tool
+# cap and the intent cap run. Intents and tool names are sender-controlled, so
+# stop fetching chunks once their retained text passes this many characters.
+# Real one- or two-sentence intents stay well under it at the full row count.
+MAX_CORPUS_TEXT_CHARS = 100_000_000
+
+# Event-sourced intents are free text written by the calling agent — clip them
+# so one oversized value can't blow up embedding requests (the worker's model
+# has a token ceiling) or bloat the snapshot blob. Real intents are one or two
+# sentences; anything past this length adds no clustering signal. Clipping
+# happens inside the corpus SQL (HogQL left → leftUTF8) so oversized values
+# never leave ClickHouse — up to MAX_QUERY_ROWS of them would otherwise
+# materialize in worker memory; build_call_corpus re-clips as defense for
+# callers that feed it rows from elsewhere.
+MAX_INTENT_TEXT_LENGTH = 1000
+
+# Tool names are sender-controlled too, so they get the same SQL-boundary clip.
+# Must be applied identically across the calls, descriptions, and
+# advertised-catalog queries, or pivot and discovery keys stop matching for
+# oversized names. Real tool names are well under 100 chars.
+MAX_TOOL_NAME_LENGTH = 256
+
+# The advertised catalog is a sender-controlled array inside a sender-controlled number
+# of $mcp_tools_list events, and the union aggregates both. Clipping name *length* alone
+# leaves two unbounded dimensions, so each event's array is sliced and each session's
+# events are capped before the union materializes. A real catalog is a few hundred tools
+# listed once or twice per session, so both bounds sit far above honest traffic.
+MAX_TOOLS_PER_ADVERTISED_LIST = 500
+MAX_ADVERTISED_LIST_EVENTS_PER_SESSION = 20
+# The two caps above still multiply (events x names, across every sampled session), so
+# the distinct union itself is also bounded per session. This is the bound that limits
+# what leaves ClickHouse and lands in worker memory; the honest case (a few hundred
+# distinct tools per catalog) sits comfortably under it.
+MAX_ADVERTISED_TOOLS_PER_SESSION = 1000
+
+# Sessions that recorded at least one $mcp_intent, sampled deterministically.
+# Ordering by cityHash64(session_id) is a pseudo-random sample: unbiased across
+# the window (newest-first would collapse the corpus to the last few hours at
+# production volume) and stable across reruns, so repeat runs re-hit the
+# embedding cache.
+# NB: `$session_id` is the materialised events column ('' when absent), NOT the
+# `properties.` accessor — same rationale as logic.py's session SQL.
+_CORPUS_SESSION_SAMPLE_SQL = """
+SELECT $session_id AS session_id
+FROM events
+WHERE event = {event}
+    AND timestamp >= now() - INTERVAL {lookback_days} DAY
+    AND $session_id != ''
+    AND coalesce(toString(properties.$mcp_intent), '') != ''
+GROUP BY session_id
+HAVING {not_recurring}
+ORDER BY cityHash64(session_id)
+LIMIT {max_sessions}
+"""
+
+# Every tool call of the sampled sessions, in call order, with the call's own
+# intent (may be empty; attribution happens in build_call_corpus). The
+# effective-tool coalesce matches every other MCP analytics surface, so
+# exec-wrapped inner calls resolve to the inner tool here too.
+_SESSION_CALLS_SQL = """
+SELECT
+    $session_id AS session_id,
+    left({tool_expr}, {max_tool_len}) AS tool,
+    left(coalesce(toString(properties.$mcp_intent), ''), {max_intent_len}) AS intent,
+    toString(properties.$mcp_is_error) IN ('true', '1') AS is_error
+FROM events
+WHERE event = {event}
+    AND $session_id IN {session_ids}
+    AND timestamp >= now() - INTERVAL {lookback_days} DAY
+    AND notEmpty({tool_expr_where})
+ORDER BY session_id, timestamp
+LIMIT {max_calls_per_session} BY session_id
+LIMIT {max_rows}
+"""
+
+# Union of $mcp_listed_tool_names across a session's $mcp_tools_list events —
+# the catalog the agent actually saw, which is the denominator for discovery
+# rates. The coalesce to '[]' matters: the property accessor is Nullable and
+# JSONExtract of a Nullable into Array(String) is a ClickHouse type error.
+_SESSION_ADVERTISED_TOOLS_SQL = """
+SELECT
+    session_id,
+    arraySlice(
+        arrayDistinct(arrayMap(x -> left(x, {max_tool_len}), arrayFlatten(groupArray(listed)))),
+        1,
+        {max_advertised_tools}
+    ) AS advertised_tools
+FROM (
+    SELECT
+        $session_id AS session_id,
+        arraySlice(
+            JSONExtract(coalesce(toString(properties.$mcp_listed_tool_names), '[]'), 'Array(String)'),
+            1,
+            {max_tools_per_list}
+        ) AS listed
+    FROM events
+    WHERE event = {event}
+        AND $session_id IN {session_ids}
+        AND timestamp >= now() - INTERVAL {lookback_days} DAY
+        AND $session_id != ''
+    ORDER BY timestamp
+    LIMIT {max_list_events} BY session_id
+)
+GROUP BY session_id
+LIMIT {max_rows}
+"""
+
+# Whole-window totals for the coverage metrics in computed_with. One cheap
+# aggregate row; deliberately unsampled so the UI can honestly relate the
+# sampled corpus to the traffic it represents. The notEmpty tool predicate
+# mirrors _SESSION_CALLS_SQL — the coverage banner reads these percentages
+# against the corpus, so both have to describe the same population.
+_WINDOW_STATS_SQL = """
+SELECT
+    count() AS total_calls,
+    countIf(coalesce(toString(properties.$mcp_intent), '') != '') AS calls_with_intent,
+    uniq($session_id) AS sessions
+FROM events
+WHERE event = {event}
+    AND timestamp >= now() - INTERVAL {lookback_days} DAY
+    AND $session_id != ''
+    AND notEmpty({tool_expr_where})
+"""
+
+# Latest observed description per effective tool. argMax(description, timestamp)
+# picks the newest revision, which is the one agents currently see.
+# The tool filter is applied before GROUP BY so aggregate state only exists for the
+# bounded corpus tool set — without it, a sender emitting unique tool names per call
+# forces argMax state for every name before LIMIT applies.
+_TOOL_DESCRIPTIONS_SQL = """
+SELECT
+    left({tool_expr}, {max_tool_len}) AS tool,
+    argMax(left({description_expr}, {max_desc_len}), timestamp) AS description
+FROM events
+WHERE event = {event}
+    AND timestamp >= now() - INTERVAL {lookback_days} DAY
+    AND left({tool_expr_where}, {max_tool_len}) IN {tools}
+    AND notEmpty({description_expr_where})
+GROUP BY tool
+LIMIT {max_rows}
+"""
+
+
+# ASCII whitespace that Python's str.strip() removes.
+_INTENT_WHITESPACE = " \t\n\r\x0b\x0c"
+
+# Automations embed a fresh run ID in every intent ("Scout run <uuid>"), so
+# without masking each run is its own text and never reaches the threshold.
+# UUIDs, long hex IDs and long digit runs become one placeholder. Alternation
+# order matters: both re2 and Python take the first branch that matches at a
+# position, so a UUID is masked whole before its hex groups could be.
+RECURRING_ID_PATTERN = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,}|[0-9]{6,}"
+)
+RECURRING_ID_PLACEHOLDER = "<id>"
+_RECURRING_ID_RE = re.compile(RECURRING_ID_PATTERN)
+
+# A session's first intent, normalized the way ``_recurring_key`` normalizes
+# ``fetch_session_calls`` rows: clipped, trimmed, skipping the summariser
+# placeholder, and with run IDs masked. Recurrence is counted and excluded on
+# this key, so texts that differ only by an ID count together against the threshold.
+_FIRST_INTENT_SQL = """
+replaceRegexpAll(
+    argMinIf(
+        trim(left(coalesce(toString(properties.$mcp_intent), ''), {max_intent_len}), {intent_ws}),
+        timestamp,
+        trim(left(coalesce(toString(properties.$mcp_intent), ''), {max_intent_len}), {intent_ws})
+            NOT IN ('', {no_intent_fallback})
+    ),
+    {id_pattern},
+    {id_placeholder}
+)
+"""
+
+# First intent per session over the whole window (unsampled), rolled up by
+# normalized text. Call and error counts cover every call of the session, while
+# the first-intent pick only considers intent-bearing calls.
+_RECURRING_INTENTS_SQL = """
+SELECT
+    first_intent,
+    count() AS n_sessions,
+    sum(calls) AS call_count,
+    sum(errors) AS error_count
+FROM (
+    SELECT
+        $session_id AS session_id,
+        {first_intent} AS first_intent,
+        count() AS calls,
+        countIf(toString(properties.$mcp_is_error) IN ('true', '1')) AS errors
+    FROM events
+    WHERE event = {event}
+        AND timestamp >= now() - INTERVAL {lookback_days} DAY
+        AND $session_id != ''
+        AND notEmpty({tool_expr_where})
+    GROUP BY session_id
+    HAVING first_intent != ''
+)
+GROUP BY first_intent
+HAVING n_sessions >= {min_sessions}
+ORDER BY n_sessions DESC
+LIMIT {max_recurring}
+"""
+
+
+def _run_corpus_query(team: Team, query: ast.SelectQuery | ast.SelectSetQuery) -> list[Any]:
+    with tags_context(product=Product.MCP, feature=Feature.QUERY, team_id=team.id):
+        response = execute_hogql_query(query=query, team=team)
+    return response.results or []
+
+
+def _session_ids_tuple(session_ids: list[str]) -> ast.Tuple:
+    return ast.Tuple(exprs=[ast.Constant(value=sid) for sid in session_ids])
+
+
+def _first_intent_expr() -> ast.Expr:
+    return parse_expr(
+        _FIRST_INTENT_SQL,
+        placeholders={
+            "max_intent_len": ast.Constant(value=MAX_INTENT_TEXT_LENGTH),
+            "intent_ws": ast.Constant(value=_INTENT_WHITESPACE),
+            "no_intent_fallback": ast.Constant(value=NO_INTENT_RECORDED_FALLBACK),
+            "id_pattern": ast.Constant(value=RECURRING_ID_PATTERN),
+            "id_placeholder": ast.Constant(value=RECURRING_ID_PLACEHOLDER),
+        },
+    )
+
+
+def _not_recurring_expr(recurring_texts: Collection[str]) -> ast.Expr:
+    """Per-session HAVING predicate that drops sessions opened by a recurring text.
+
+    Applied where sessions are sampled, so recurring traffic never takes corpus
+    budget that human sessions would otherwise fill.
+    """
+    if not recurring_texts:
+        return ast.Constant(value=True)
+    return ast.CompareOperation(
+        op=ast.CompareOperationOp.NotIn,
+        left=_first_intent_expr(),
+        right=ast.Tuple(exprs=[ast.Constant(value=text) for text in sorted(recurring_texts)]),
+    )
+
+
+def sample_corpus_sessions(
+    team: Team,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_sessions: int = MAX_CORPUS_SESSIONS,
+    recurring_texts: Collection[str] = (),
+) -> list[str]:
+    """Deterministically sample sessions that recorded at least one intent and don't open with a recurring text."""
+    query = parse_select(
+        _CORPUS_SESSION_SAMPLE_SQL,
+        placeholders={
+            "event": ast.Constant(value=MCP_TOOL_CALL_EVENT),
+            "lookback_days": ast.Constant(value=lookback_days),
+            "max_sessions": ast.Constant(value=max_sessions),
+            "not_recurring": _not_recurring_expr(recurring_texts),
+        },
+    )
+    return [str(row[0]) for row in _run_corpus_query(team, query) if row[0]]
+
+
+# ``(session_id, tool, raw_intent, is_error)``, as returned by ``fetch_session_calls``.
+SessionCallRow = tuple[str, str, str, bool]
+
+
+def fetch_session_calls(
+    team: Team,
+    session_ids: list[str],
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> list[tuple[str, str, str, bool]]:
+    """Return ``(session_id, tool, raw_intent, is_error)`` rows in call order.
+
+    At most ``MAX_CALLS_PER_SESSION`` calls per session, queried in chunks of
+    ``CORPUS_SESSION_CHUNK_SIZE`` sessions. Stops before the next chunk once the
+    retained text reaches ``MAX_CORPUS_TEXT_CHARS``.
+    """
+    rows: list[SessionCallRow] = []
+    text_chars = 0
+    chunks = _chunked(session_ids)
+    for fetched, chunk in enumerate(chunks):
+        if text_chars >= MAX_CORPUS_TEXT_CHARS:
+            logger.warning(
+                "mcpa.intent_clustering.session_calls_text_budget_reached",
+                team_id=team.id,
+                max_text_chars=MAX_CORPUS_TEXT_CHARS,
+                skipped_chunks=len(chunks) - fetched,
+            )
+            break
+        chunk_rows = _fetch_session_calls_chunk(team, chunk, lookback_days)
+        text_chars += sum(len(tool) + len(intent) for _, tool, intent, _ in chunk_rows)
+        rows.extend(chunk_rows)
+    return rows
+
+
+def _chunked(session_ids: list[str]) -> list[list[str]]:
+    return [
+        session_ids[i : i + CORPUS_SESSION_CHUNK_SIZE] for i in range(0, len(session_ids), CORPUS_SESSION_CHUNK_SIZE)
+    ]
+
+
+def _fetch_session_calls_chunk(team: Team, session_ids: list[str], lookback_days: int) -> list[SessionCallRow]:
+    query = parse_select(
+        _SESSION_CALLS_SQL,
+        placeholders={
+            "event": ast.Constant(value=MCP_TOOL_CALL_EVENT),
+            "tool_expr": parse_expr(EFFECTIVE_TOOL_SQL),
+            "tool_expr_where": parse_expr(EFFECTIVE_TOOL_SQL),
+            "session_ids": _session_ids_tuple(session_ids),
+            "lookback_days": ast.Constant(value=lookback_days),
+            "max_rows": ast.Constant(value=MAX_QUERY_ROWS),
+            "max_calls_per_session": ast.Constant(value=MAX_CALLS_PER_SESSION),
+            "max_tool_len": ast.Constant(value=MAX_TOOL_NAME_LENGTH),
+            "max_intent_len": ast.Constant(value=MAX_INTENT_TEXT_LENGTH),
+        },
+    )
+    rows = [
+        (str(row[0] or ""), str(row[1] or ""), str(row[2] or ""), bool(row[3]))
+        for row in _run_corpus_query(team, query)
+    ]
+    if len(rows) >= MAX_QUERY_ROWS:
+        # The window's calls exceeded the per-query cap: the corpus silently
+        # under-represents the sampled sessions. Surface it rather than let the
+        # coverage numbers lie.
+        logger.warning(
+            "mcpa.intent_clustering.session_calls_truncated",
+            team_id=team.id,
+            max_rows=MAX_QUERY_ROWS,
+            sessions=len(session_ids),
+        )
+    return rows
+
+
+def _normalize_intent(raw: str) -> str:
+    text = str(raw or "").strip()
+    if text == NO_INTENT_RECORDED_FALLBACK:
+        return ""
+    return text[:MAX_INTENT_TEXT_LENGTH]
+
+
+def _recurring_key(raw: str) -> str:
+    """The text recurrence is counted on: ``_normalize_intent`` with run IDs masked, matching ``_FIRST_INTENT_SQL``."""
+    return _RECURRING_ID_RE.sub(RECURRING_ID_PLACEHOLDER, _normalize_intent(raw))
+
+
+def fetch_recurring_intents(
+    team: Team,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    min_sessions: int = RECURRING_MIN_SESSIONS,
+    limit: int = MAX_RECURRING_EXCLUSIONS,
+) -> list[RecurringIntent]:
+    """Intent texts that open ``min_sessions`` or more sessions in the window, by session count desc.
+
+    Texts are returned with run IDs masked (``RECURRING_ID_PLACEHOLDER``), the same key exclusion matches on.
+    """
+    query = parse_select(
+        _RECURRING_INTENTS_SQL,
+        placeholders={
+            "event": ast.Constant(value=MCP_TOOL_CALL_EVENT),
+            "tool_expr_where": parse_expr(EFFECTIVE_TOOL_SQL),
+            "lookback_days": ast.Constant(value=lookback_days),
+            "min_sessions": ast.Constant(value=min_sessions),
+            "max_recurring": ast.Constant(value=limit),
+            "first_intent": _first_intent_expr(),
+        },
+    )
+    # Normalize like build_call_corpus so exclusion compares like with like, and
+    # merge any rows that normalization collapses together.
+    merged: dict[str, list[int]] = {}
+    for row in _run_corpus_query(team, query):
+        text = _recurring_key(row[0])
+        if not text:
+            continue
+        totals = merged.setdefault(text, [0, 0, 0])
+        totals[0] += int(row[1] or 0)
+        totals[1] += int(row[2] or 0)
+        totals[2] += int(row[3] or 0)
+    out = [
+        RecurringIntent(intent_text=text, session_count=sessions, call_count=calls, error_count=errors)
+        for text, (sessions, calls, errors) in merged.items()
+    ]
+    out.sort(key=lambda r: (-r.session_count, r.intent_text))
+    return out
+
+
+def recurring_exclusion_texts(recurring: Sequence[RecurringIntent]) -> set[str]:
+    """Every wording of every recurring entry, so a merged entry excludes all its variants."""
+    return {text for r in recurring for text in (r.variants or (r.intent_text,))}
+
+
+async def merge_reworded_recurring(
+    team: Team, recurring: list[RecurringIntent], max_distance: float = RECURRING_MERGE_DISTANCE
+) -> list[RecurringIntent]:
+    """Merge recurring texts that word the same automation step differently.
+
+    Greedy, most common first: a text joins the first group whose leading wording is
+    within ``max_distance`` (cosine) of it, otherwise it starts a group. Comparing to the
+    leader only stops near-matches chaining into unrelated texts. Falls back to the
+    exact-text list when embedding fails or runs past ``RECURRING_MERGE_TIMEOUT_SECONDS``, so a
+    worker outage never fails the recompute.
+    """
+    if len(recurring) < 2:
+        return recurring
+    try:
+        embeddings, valid = await asyncio.wait_for(
+            embed_texts_async(team, [r.intent_text for r in recurring]), timeout=RECURRING_MERGE_TIMEOUT_SECONDS
+        )
+    except Exception:
+        logger.warning("mcpa.intent_clustering.recurring_merge_unavailable", team_id=team.id, exc_info=True)
+        return recurring
+    if len(valid) < 2:
+        return recurring
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    unit = embeddings / np.where(norms == 0, 1.0, norms)
+    groups: list[list[int]] = []  # indexes into `recurring`; the first is the leader
+    leader_rows: list[int] = []  # row in `unit` per group
+    unembedded = set(range(len(recurring))) - set(valid)
+    for row, idx in enumerate(valid):
+        distances = 1.0 - unit[leader_rows] @ unit[row] if leader_rows else np.array([])
+        if len(distances) and distances.min() < max_distance:
+            groups[int(distances.argmin())].append(idx)
+        else:
+            groups.append([idx])
+            leader_rows.append(row)
+    groups.extend([i] for i in sorted(unembedded))
+    merged: list[RecurringIntent] = []
+    for members in groups:
+        items = [recurring[i] for i in members]
+        merged.append(
+            RecurringIntent(
+                intent_text=items[0].intent_text,
+                session_count=sum(r.session_count for r in items),
+                call_count=sum(r.call_count for r in items),
+                error_count=sum(r.error_count for r in items),
+                variants=tuple(r.intent_text for r in items),
+            )
+        )
+    merged.sort(key=lambda r: (-r.session_count, r.intent_text))
+    return merged
+
+
+def exclude_recurring_sessions(rows: list[SessionCallRow], recurring_texts: Collection[str]) -> list[SessionCallRow]:
+    """Drop every call of a session whose first intent is a recurring text.
+
+    The whole session goes, not just the matching calls: its later calls would
+    otherwise inherit nothing and its follow-up intents are the same automation.
+    """
+    if not recurring_texts:
+        return rows
+    first_intent: dict[str, str] = {}
+    for session_id, _, raw_intent, _ in rows:
+        if session_id in first_intent:
+            continue
+        text = _recurring_key(raw_intent)
+        if text:
+            first_intent[session_id] = text
+    excluded = {sid for sid, text in first_intent.items() if text in recurring_texts}
+    return [row for row in rows if row[0] not in excluded]
+
+
+def fetch_advertised_tools(
+    team: Team,
+    session_ids: list[str],
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    keep_tools: Collection[str] | None = None,
+) -> dict[str, set[str]]:
+    """Return ``{session_id: advertised tool names}`` for sessions with a tools-list event.
+
+    Sessions with no ``$mcp_tools_list`` event are absent from the result, not
+    empty — absence means "advertisement unknown", which callers must exclude
+    from discovery denominators rather than treat as "nothing advertised".
+
+    ``keep_tools`` narrows each session's catalog to those names. A session whose
+    catalog has none of them stays in the result with an empty set, so it still
+    counts as advertised. Catalogs are sender-controlled and wide, so retaining
+    them whole across every corpus session can exhaust worker memory.
+    """
+    out: dict[str, set[str]] = {}
+    for chunk in _chunked(session_ids):
+        query = parse_select(
+            _SESSION_ADVERTISED_TOOLS_SQL,
+            placeholders={
+                "event": ast.Constant(value=MCP_TOOLS_LIST_EVENT),
+                "session_ids": _session_ids_tuple(chunk),
+                "lookback_days": ast.Constant(value=lookback_days),
+                "max_rows": ast.Constant(value=MAX_QUERY_ROWS),
+                "max_tool_len": ast.Constant(value=MAX_TOOL_NAME_LENGTH),
+                "max_tools_per_list": ast.Constant(value=MAX_TOOLS_PER_ADVERTISED_LIST),
+                "max_list_events": ast.Constant(value=MAX_ADVERTISED_LIST_EVENTS_PER_SESSION),
+                "max_advertised_tools": ast.Constant(value=MAX_ADVERTISED_TOOLS_PER_SESSION),
+            },
+        )
+        for row in _run_corpus_query(team, query):
+            session_id = str(row[0] or "")
+            tools = {str(tool) for tool in (row[1] or []) if tool}
+            if session_id and tools:
+                out[session_id] = tools if keep_tools is None else tools.intersection(keep_tools)
+    return out
+
+
+def fetch_window_stats(team: Team, lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> WindowStats:
+    """Whole-window call/intent/session totals for coverage reporting."""
+    query = parse_select(
+        _WINDOW_STATS_SQL,
+        placeholders={
+            "event": ast.Constant(value=MCP_TOOL_CALL_EVENT),
+            "tool_expr_where": parse_expr(EFFECTIVE_TOOL_SQL),
+            "lookback_days": ast.Constant(value=lookback_days),
+        },
+    )
+    rows = _run_corpus_query(team, query)
+    if not rows:
+        return WindowStats(total_calls=0, calls_with_intent=0, sessions=0)
+    row = rows[0]
+    return WindowStats(
+        total_calls=int(row[0] or 0),
+        calls_with_intent=int(row[1] or 0),
+        sessions=int(row[2] or 0),
+    )
+
+
+# Intent-bearing sessions bucketed by effective tool, capped *per tool*.
+#
+# A single cap on candidate sessions cannot work here: the hash-ordered cut runs
+# before any bucketing, so at high total volume a low/mid-volume tool's handful
+# of sessions falls outside it and the per-tool floor has nothing left to keep —
+# the erasure this pipeline exists to prevent. ``LIMIT n BY tool`` gives each
+# tool its own pool, so whether a tool reaches the corpus stops depending on the
+# team's total session count.
+#
+# Both dimensions are sender-controlled, so each is bounded: ``groupUniqArray``
+# de-duplicates a session's tool names in aggregate state and ``arraySlice``
+# caps how many of them leave it, while the per-tool cap and the absolute row
+# cap bound the rows. Grouping by session alone (rather than session x tool)
+# keeps the aggregation one dimension wide, and lets a session qualify on any of
+# its calls carrying an intent — the population ``sample_corpus_sessions`` draws
+# from.
+#
+# ``cityHash64`` here and in ``sample_corpus_sessions`` is a fast pseudo-random
+# ordering, not a security boundary — the memory/CPU protection comes from the
+# numeric caps, not the hash. ``arraySort`` keeps the per-session tool slice
+# stable across reruns so repeat runs re-hit the embedding cache.
+_SESSION_TOOLS_SQL = """
+SELECT session_id, arrayJoin(tools) AS tool
+FROM (
+    SELECT
+        $session_id AS session_id,
+        arraySlice(arraySort(groupUniqArray(left({tool_expr}, {max_tool_len}))), 1, {max_distinct_tools}) AS tools,
+        countIf(coalesce(toString(properties.$mcp_intent), '') != '') AS intent_calls
+    FROM events
+    WHERE event = {event}
+        AND timestamp >= now() - INTERVAL {lookback_days} DAY
+        AND $session_id != ''
+        AND notEmpty({tool_expr_where})
+    GROUP BY session_id
+    HAVING intent_calls > 0 AND {not_recurring}
+)
+ORDER BY cityHash64(session_id)
+LIMIT {max_sessions_per_tool} BY tool
+LIMIT {max_rows}
+"""
+
+
+def fetch_tools_by_session(
+    team: Team,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    max_sessions_per_tool: int = MIN_SESSIONS_PER_TOOL,
+    recurring_texts: Collection[str] = (),
+) -> dict[str, set[str]]:
+    """Return ``{tool: {intent-bearing session_ids}}``, capped per tool, without recurring sessions.
+
+    Each tool gets its own deterministic cityHash pool, so a tool's presence in
+    the corpus is independent of the team's total session count. The pool only
+    has to cover the tool's floor — ``select_corpus_sessions`` spends whatever
+    budget is left on the uniform sample.
+    """
+    query = parse_select(
+        _SESSION_TOOLS_SQL,
+        placeholders={
+            "event": ast.Constant(value=MCP_TOOL_CALL_EVENT),
+            "tool_expr": parse_expr(EFFECTIVE_TOOL_SQL),
+            "tool_expr_where": parse_expr(EFFECTIVE_TOOL_SQL),
+            "lookback_days": ast.Constant(value=lookback_days),
+            "max_tool_len": ast.Constant(value=MAX_TOOL_NAME_LENGTH),
+            "max_sessions_per_tool": ast.Constant(value=max_sessions_per_tool),
+            "max_distinct_tools": ast.Constant(value=MAX_DISTINCT_TOOLS_PER_SESSION_BUCKET),
+            "max_rows": ast.Constant(value=MAX_QUERY_ROWS),
+            "not_recurring": _not_recurring_expr(recurring_texts),
+        },
+    )
+    rows = _run_corpus_query(team, query)
+    if len(rows) >= MAX_QUERY_ROWS:
+        # The row cap hit before every tool's pool came back, so some tool's
+        # bucket is short of its floor. Say so rather than let the missing tool
+        # read as a traffic change.
+        logger.warning(
+            "mcpa.intent_clustering.tool_buckets_truncated",
+            team_id=team.id,
+            max_rows=MAX_QUERY_ROWS,
+            max_sessions_per_tool=max_sessions_per_tool,
+        )
+    out: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        session_id, tool = str(row[0] or ""), str(row[1] or "")
+        if session_id and tool:
+            out[tool].add(session_id)
+    return dict(out)
+
+
+def stratify_session_ids(
+    tool_sessions: dict[str, set[str]],
+    min_sessions_per_tool: int,
+    max_total_sessions: int,
+) -> set[str]:
+    """Choose corpus sessions so no tool is erased by the dominant tools.
+
+    The prior uniform sample drew sessions proportionally to traffic, so in a
+    window where ``exec``/scout dominate, a low/mid-volume tool's handful of
+    sessions is statistically dropped and the tool becomes invisible to
+    clustering. This guarantees each tool keeps up to ``min_sessions_per_tool``
+    sessions (its full set when smaller), then fills any remaining budget with
+    the highest-volume tools, capped at ``max_total_sessions``.
+
+    Deterministic: per-tool session ids take the sorted-prefix, so reruns
+    re-hit the same ids and the embedding cache.
+
+    Every tool is visited: the budget is apportioned across tools rather than
+    consumed by the first ones, so a later (or alphabetically later equal-volume)
+    tool is never skipped, and the result is always within ``max_total_sessions``
+    regardless of how the floors interact with the budget.
+    """
+    tools = sorted(tool_sessions)
+    if not tools or max_total_sessions <= 0:
+        return set()
+
+    # The budget cannot always give every tool its full floor (many tools x
+    # floor swamps max_total_sessions), so the effective per-tool floor is
+    # min(the request, an even share of the budget). Even-share is the only
+    # allocation that never starves a tool while always fitting the budget.
+    budget_floor = max(1, max_total_sessions // len(tools))
+    floor_size = max(1, min(min_sessions_per_tool, budget_floor))
+
+    selected: set[str] = set()
+    # Ascending volume secures scarce tools' floors before dominant tools add
+    # their own (shared ids are de-duped through ``selected``).
+    for tool in sorted(tools, key=lambda t: (len(tool_sessions[t]), t)):
+        selected.update(sorted(tool_sessions[tool])[:floor_size])
+
+    # Spend the remainder on the highest-volume tools, which hold the bulk of
+    # the window's calls, keeping the whole result within budget.
+    room = max_total_sessions - len(selected)
+    if room > 0:
+        for tool in sorted(tools, key=lambda t: (-len(tool_sessions[t]), t)):
+            if room <= 0:
+                break
+            for sid in sorted(tool_sessions[tool]):
+                if room <= 0:
+                    break
+                if sid not in selected:
+                    selected.add(sid)
+                    room -= 1
+    return selected
+
+
+def select_corpus_sessions(
+    tool_sessions: dict[str, set[str]],
+    uniform_sample: Sequence[str],
+    min_sessions_per_tool: int,
+    max_total_sessions: int,
+) -> list[str]:
+    """The corpus session ids: per-tool floors first, uniform sample for the rest.
+
+    The floors are what keep a low/mid-volume tool in the corpus at any traffic
+    volume, but they only cover each tool's floor, so on their own they would
+    shrink the corpus for a team with a handful of tools. Spending the remaining
+    budget on the uniform hash sample keeps the corpus full size and keeps the
+    bulk of the window's traffic represented — the per-tool call cap is what
+    stops that bulk from crowding the intent space later.
+
+    ``uniform_sample`` is also the whole corpus when the per-tool buckets are
+    unavailable, so a capture or schema gap degrades to the prior behavior
+    rather than emptying the corpus.
+    """
+    if max_total_sessions <= 0:
+        return []
+    selected = stratify_session_ids(tool_sessions, min_sessions_per_tool, max_total_sessions)
+    for session_id in uniform_sample:
+        if len(selected) >= max_total_sessions:
+            break
+        selected.add(session_id)
+    return sorted(selected)
+
+
+@frozen
+class ToolCallCapResult:
+    """Outcome of ``cap_per_tool_call_volume``: the kept rows plus, for each
+    over-capped tool, how many of its calls were kept vs dropped."""
+
+    kept_rows: list[tuple[str, str, str, bool]]
+    per_tool_report: dict[str, dict[str, int]]
+
+
+def cap_per_tool_call_volume(
+    rows: list[tuple[str, str, str, bool]],
+    max_calls_per_tool: int,
+) -> ToolCallCapResult:
+    """Down-sample an over-represented tool's raw call rows before attribution.
+
+    Row-level (pre-attribution) so intents and LOCF see the capped population.
+    Deterministic: keeps an even stride across the tool's rows so the surviving
+    calls still span the tool's whole session/intent range rather than a prefix.
+    Each over-capped tool reports how many calls were ``kept`` vs ``dropped``.
+    """
+    tool_row_indexes: dict[str, list[int]] = defaultdict(list)
+    for idx, (_, tool, _, _) in enumerate(rows):
+        tool_row_indexes[tool].append(idx)
+
+    keep_indexes: set[int] = set()
+    report: dict[str, dict[str, int]] = {}
+    for tool, indexes in tool_row_indexes.items():
+        total = len(indexes)
+        if total <= max_calls_per_tool:
+            keep_indexes.update(indexes)
+            continue
+        # Even stride keeps breadth across the tool's calls.
+        stride = total / max_calls_per_tool
+        kept_positions = {int(i * stride) for i in range(max_calls_per_tool)}
+        kept = {indexes[pos] for pos in kept_positions}
+        keep_indexes.update(kept)
+        report[tool] = {"kept": len(kept), "dropped": total - len(kept)}
+
+    kept_rows = [row for idx, row in enumerate(rows) if idx in keep_indexes]
+    return ToolCallCapResult(kept_rows=kept_rows, per_tool_report=report)
+
+
+def fetch_tool_descriptions(
+    team: Team, tools: Collection[str], lookback_days: int = DEFAULT_LOOKBACK_DAYS
+) -> dict[str, str]:
+    """Latest observed description per effective tool, clipped for embedding.
+
+    ``tools`` bounds the aggregation: only the given (already clipped) tool names
+    enter the GROUP BY, so sender-invented names never build aggregate state.
+    """
+    if not tools:
+        return {}
+    query = parse_select(
+        _TOOL_DESCRIPTIONS_SQL,
+        placeholders={
+            "event": ast.Constant(value=MCP_TOOL_CALL_EVENT),
+            "tool_expr": parse_expr(EFFECTIVE_TOOL_SQL),
+            "tool_expr_where": parse_expr(EFFECTIVE_TOOL_SQL),
+            "description_expr": parse_expr(EFFECTIVE_DESCRIPTION_SQL),
+            "description_expr_where": parse_expr(EFFECTIVE_DESCRIPTION_SQL),
+            "tools": ast.Tuple(exprs=[ast.Constant(value=tool) for tool in sorted(tools)]),
+            "lookback_days": ast.Constant(value=lookback_days),
+            "max_rows": ast.Constant(value=MAX_QUERY_ROWS),
+            "max_tool_len": ast.Constant(value=MAX_TOOL_NAME_LENGTH),
+            "max_desc_len": ast.Constant(value=MAX_DESCRIPTION_LENGTH),
+        },
+    )
+    return {
+        str(row[0]): str(row[1])[:MAX_DESCRIPTION_LENGTH] for row in _run_corpus_query(team, query) if row[0] and row[1]
+    }
+
+
+def build_call_corpus(
+    rows: list[tuple[str, str, str, bool]],
+    top_n: int = DEFAULT_TOP_N_INTENTS,
+) -> tuple[list[IntentRecord], dict[str, list[CallRecord]], CorpusStats]:
+    """Attribute each call to an intent and roll up per-intent tool statistics.
+
+    Attribution is per call: a call's own ``$mcp_intent`` when present, else the
+    most recent prior intent in the same session (last observation carried
+    forward — agents typically state a goal once and then chain calls under it).
+    Calls before a session's first intent stay unattributed; they remain in
+    ``calls_by_session`` but never enter records, journeys, or switch counts.
+
+    ``rows`` must be in call order within each session (the SQL guarantees it);
+    LOCF depends on that ordering.
+    """
+    calls_by_session: dict[str, list[CallRecord]] = {}
+    last_intent: dict[str, str] = {}
+    total_calls = attributed_calls = imputed_calls = 0
+
+    for session_id, tool, raw_intent, is_error in rows:
+        if not session_id or not tool:
+            continue
+        total_calls += 1
+        text = str(raw_intent or "").strip()
+        # Guards against a summariser placeholder reaching the corpus; see the
+        # constant. It is not an intent, and clustering it forms a pseudo-cluster.
+        if text == NO_INTENT_RECORDED_FALLBACK:
+            text = ""
+        text = text[:MAX_INTENT_TEXT_LENGTH]
+
+        intent_text: str | None
+        if text:
+            intent_text = text
+            last_intent[session_id] = text
+        else:
+            intent_text = last_intent.get(session_id)
+            if intent_text is not None:
+                imputed_calls += 1
+        if intent_text is not None:
+            attributed_calls += 1
+
+        calls_by_session.setdefault(session_id, []).append(
+            CallRecord(session_id=session_id, tool=tool, intent_text=intent_text, is_error=is_error)
+        )
+
+    rollup: dict[str, dict[str, dict[str, int]]] = {}
+    sessions_by_intent: dict[str, set[str]] = defaultdict(set)
+    for session_id, calls in calls_by_session.items():
+        for call in calls:
+            if call.intent_text is None:
+                continue
+            bucket = rollup.setdefault(call.intent_text, {"tool_counts": {}, "error_counts": {}})
+            bucket["tool_counts"][call.tool] = bucket["tool_counts"].get(call.tool, 0) + 1
+            if call.is_error:
+                bucket["error_counts"][call.tool] = bucket["error_counts"].get(call.tool, 0) + 1
+            sessions_by_intent[call.intent_text].add(session_id)
+
+    records = [
+        IntentRecord(
+            intent_text=text,
+            frequency=sum(data["tool_counts"].values()),
+            session_count=len(sessions_by_intent[text]),
+            tool_counts=data["tool_counts"],
+            error_counts=data["error_counts"],
+        )
+        for text, data in rollup.items()
+    ]
+    # Secondary key keeps the cut deterministic when frequencies tie.
+    records.sort(key=lambda r: (-r.frequency, r.intent_text))
+    kept = records[:top_n]
+
+    stats = CorpusStats(
+        total_calls=total_calls,
+        attributed_calls=attributed_calls,
+        imputed_calls=imputed_calls,
+        kept_calls=sum(r.frequency for r in kept),
+    )
+    return kept, calls_by_session, stats
+
+
+# Cluster flows ------------------------------------------------------------
+
+
+def compute_cluster_flows(
+    records: list[IntentRecord],
+    labels: np.ndarray,
+    calls_by_session: dict[str, list[CallRecord]],
+) -> dict[int, dict[str, Any]]:
+    """Per-cluster journeys, error switches, self-retries, and session sets.
+
+    A session belongs to every cluster its attributed calls touch; each
+    cluster's journey and outcome come from that session's *own* calls for the
+    cluster (its C-subsequence), so an error on an unrelated intent in the same
+    session cannot mark this cluster's journey as errored. A switch is an
+    errored call immediately followed, within the subsequence, by a call to a
+    different tool; the same tool again is a self-retry.
+    """
+    intent_to_cluster = {records[i].intent_text: int(labels[i]) for i in range(len(records))}
+
+    path_counts: dict[int, Counter[tuple[tuple[str | None, ...], str]]] = defaultdict(Counter)
+    switch_counts: dict[int, Counter[tuple[str, str]]] = defaultdict(Counter)
+    retry_counts: dict[int, Counter[str]] = defaultdict(Counter)
+    session_ids: dict[int, set[str]] = defaultdict(set)
+
+    for session_id, calls in calls_by_session.items():
+        per_cluster: dict[int, list[CallRecord]] = defaultdict(list)
+        for call in calls:
+            if call.intent_text is None:
+                continue
+            cluster_id = intent_to_cluster.get(call.intent_text)
+            if cluster_id is None:
+                continue
+            per_cluster[cluster_id].append(call)
+
+        for cluster_id, subsequence in per_cluster.items():
+            session_ids[cluster_id].add(session_id)
+            steps: list[str | None] = [call.tool for call in subsequence[:JOURNEY_DEPTH]]
+            steps += [None] * (JOURNEY_DEPTH - len(steps))
+            outcome = "error" if any(call.is_error for call in subsequence) else "completed"
+            path_counts[cluster_id][(tuple(steps), outcome)] += 1
+
+            for prev, nxt in zip(subsequence, subsequence[1:]):
+                if not prev.is_error:
+                    continue
+                if nxt.tool == prev.tool:
+                    retry_counts[cluster_id][prev.tool] += 1
+                else:
+                    switch_counts[cluster_id][(prev.tool, nxt.tool)] += 1
+
+    flows: dict[int, dict[str, Any]] = {}
+    for cluster_id in session_ids:
+        ranked = path_counts[cluster_id].most_common()
+        leak = next(
+            (
+                {"steps": list(steps), "outcome": outcome, "count": count}
+                for (steps, outcome), count in ranked
+                if outcome != "completed"
+            ),
+            None,
+        )
+        flows[cluster_id] = {
+            "journey": {
+                "paths": [
+                    {"steps": list(steps), "outcome": outcome, "count": count}
+                    for (steps, outcome), count in ranked[:MAX_JOURNEY_PATHS_PER_CLUSTER]
+                ],
+                "total_sessions": sum(path_counts[cluster_id].values()),
+                "leak": leak,
+            },
+            "switches": [
+                {"from_tool": from_tool, "to_tool": to_tool, "count": count}
+                for (from_tool, to_tool), count in switch_counts[cluster_id].most_common(MAX_SWITCHES_PER_CLUSTER)
+            ],
+            "self_retries": [
+                {"tool": tool, "count": count}
+                for tool, count in retry_counts[cluster_id].most_common(MAX_SELF_RETRIES_PER_CLUSTER)
+            ],
+            "session_ids": session_ids[cluster_id],
+        }
+    return flows
+
+
+# Embeddings --------------------------------------------------------------
+
+
+def _content_hash(text: str, prefix: str = EMBEDDING_PREFIX) -> str:
+    """SHA-256 of the prefixed text — what we actually embed."""
+    return hashlib.sha256((prefix + text).encode("utf-8")).hexdigest()
+
+
+def _encode_embedding(vector: list[float]) -> bytes:
+    """Encode an embedding to compact bytes for cache storage."""
+    return np.asarray(vector, dtype=np.float32).tobytes()
+
+
+def _decode_embedding(blob: bytes) -> np.ndarray:
+    """Decode cached bytes back into a 1-D float32 vector."""
+    return np.frombuffer(blob, dtype=np.float32)
+
+
+@database_sync_to_async
+def _load_cached_embeddings(team: Team, hashes: list[str], model: str) -> dict[str, np.ndarray]:
+    """Return ``{content_hash: embedding}`` for cache hits."""
+    if not hashes:
+        return {}
+    rows = MCPIntentEmbeddingCache.objects.filter(
+        team=team,
+        content_hash__in=hashes,
+        model=model,
+    ).values_list("content_hash", "embedding")
+    return {content_hash: _decode_embedding(bytes(blob)) for content_hash, blob in rows}
+
+
+@database_sync_to_async
+def _persist_embedding(team: Team, content_hash: str, model: str, vector: list[float]) -> None:
+    """Insert (or no-op) a single cache row. Concurrent identical inserts are tolerated.
+
+    Uses ``get_or_create`` rather than ``update_or_create`` because the content hash
+    deterministically maps to the embedding bytes — there is nothing to update if the
+    row already exists. ``get_or_create`` avoids the spurious UPDATE that
+    ``update_or_create`` would issue on a creation race.
+    """
+    MCPIntentEmbeddingCache.objects.get_or_create(
+        team=team,
+        content_hash=content_hash,
+        model=model,
+        defaults={"embedding": _encode_embedding(vector)},
+    )
+
+
+async def _embed_one_with_cache(
+    team: Team,
+    text: str,
+    content_hash: str,
+    semaphore: asyncio.Semaphore,
+    cached: dict[str, np.ndarray],
+    prefix: str,
+) -> np.ndarray | None:
+    """Return the embedding for ``text``, hitting the cache when possible.
+
+    Concurrency is bounded by ``semaphore``; cache reads come pre-loaded in
+    ``cached`` so the hot path is a dict lookup. Misses go through
+    ``async_generate_embedding`` and write back on success.
+    """
+    hit = cached.get(content_hash)
+    if hit is not None:
+        return hit
+    async with semaphore:
+        try:
+            response: EmbeddingResponse = await async_generate_embedding(team, prefix + text, model=EMBEDDING_MODEL)
+        except Exception:
+            return None
+    try:
+        await _persist_embedding(team, content_hash, EMBEDDING_MODEL, response.embedding)
+    except Exception:
+        # A concurrent insert for the same (team, hash, model) is fine —
+        # the unique constraint guarantees the row exists. Don't fail the
+        # whole batch over a race.
+        pass
+    return np.asarray(response.embedding, dtype=np.float32)
+
+
+async def embed_texts_async(
+    team: Team, texts: list[str], prefix: str = EMBEDDING_PREFIX
+) -> tuple[np.ndarray, list[int]]:
+    """Embed a list of texts concurrently, with a per-team cache.
+
+    ``prefix`` names the embedding kind (intent vs tool description) and is part
+    of the cache key, so identical text embedded under two prefixes gets two
+    cache rows.
+
+    Returns (embeddings, valid_indices) where ``valid_indices`` are the indices
+    into ``texts`` for which embedding succeeded. Skipped indices have no row
+    in the returned matrix. Callers must align downstream data structures with
+    ``valid_indices``.
+
+    Cache key is ``(team, sha256(prefix + text), model)``. Hits return the
+    stored bytes; misses call the embedding worker and write back. Worker
+    concurrency is capped at ``EMBED_CONCURRENCY``.
+    """
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    hashes = [_content_hash(t, prefix) for t in texts]
+    cached = await _load_cached_embeddings(team, hashes, EMBEDDING_MODEL)
+    semaphore = asyncio.Semaphore(EMBED_CONCURRENCY)
+
+    results = await asyncio.gather(
+        *[
+            _embed_one_with_cache(team, text, content_hash, semaphore, cached, prefix)
+            for text, content_hash in zip(texts, hashes)
+        ]
+    )
+
+    vectors: list[np.ndarray] = []
+    valid_indices: list[int] = []
+    for i, vector in enumerate(results):
+        if vector is None:
+            continue
+        vectors.append(vector)
+        valid_indices.append(i)
+
+    failed_count = len(texts) - len(valid_indices)
+    if failed_count:
+        # Failures are swallowed per text so one bad request can't sink the
+        # batch — surface the aggregate so a degraded embedding worker is
+        # visible instead of silently shrinking the corpus.
+        logger.warning(
+            "mcpa.intent_clustering.embedding_failures",
+            team_id=team.id,
+            failed=failed_count,
+            total=len(texts),
+        )
+
+    if not vectors:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    return np.stack(vectors).astype(np.float32, copy=False), valid_indices
+
+
+# Clustering --------------------------------------------------------------
+
+
+def cluster_embeddings(
+    embeddings: np.ndarray,
+    distance_threshold: float = DEFAULT_DISTANCE_THRESHOLD,
+) -> np.ndarray:
+    """Run agglomerative clustering on embedding vectors.
+
+    Uses average linkage and cosine distance. ``distance_threshold`` is the
+    user-facing knob: smaller -> tighter clusters, more of them.
+    Output: an integer label per embedding, all >= 0 (no noise sentinel).
+    """
+    n = len(embeddings)
+    if n == 0:
+        return np.array([], dtype=np.int64)
+    if n == 1:
+        return np.array([0], dtype=np.int64)
+
+    clusterer = AgglomerativeClustering(
+        metric="cosine",
+        linkage="average",
+        distance_threshold=distance_threshold,
+        n_clusters=None,
+    )
+    return clusterer.fit_predict(embeddings)
+
+
+# Snapshot building -------------------------------------------------------
+
+
+def _routing_entropy(tool_counts: dict[str, int]) -> float:
+    """Shannon entropy of the tool distribution, normalised to [0, 1].
+
+    0 = perfectly consistent (one tool dominates), 1 = uniformly spread.
+    Single-tool clusters return 0.
+    """
+    total = sum(tool_counts.values())
+    if total <= 0:
+        return 0.0
+    probabilities = [count / total for count in tool_counts.values() if count > 0]
+    if len(probabilities) <= 1:
+        return 0.0
+    entropy = -sum(p * math.log(p) for p in probabilities)
+    return entropy / math.log(len(probabilities))
+
+
+def _medoid_index(embeddings: np.ndarray, indices: list[int]) -> int:
+    """Return the index (into ``indices``) whose embedding is closest to the
+    cluster centroid by cosine distance."""
+    if len(indices) == 1:
+        return indices[0]
+    cluster_matrix = embeddings[indices]
+    centroid = cluster_matrix.mean(axis=0)
+    centroid_norm = np.linalg.norm(centroid) or 1.0
+    row_norms = np.linalg.norm(cluster_matrix, axis=1)
+    row_norms = np.where(row_norms == 0, 1.0, row_norms)
+    cosine_sims = (cluster_matrix @ centroid) / (row_norms * centroid_norm)
+    best_local = int(np.argmax(cosine_sims))
+    return indices[best_local]
+
+
+def top_corpus_tools(records: list[IntentRecord], max_tools: int = MAX_TOOLS_IN_SNAPSHOT) -> set[str]:
+    """The top ``max_tools`` corpus tools by attributed call volume — the same
+    population and cap the tool pivot uses. Everything description-related
+    (the ClickHouse aggregation, the embedding fan-out) is bounded to this set."""
+    totals: Counter[str] = Counter()
+    for record in records:
+        for tool, count in record.tool_counts.items():
+            totals[tool] += count
+    return {tool for tool, _ in sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:max_tools]}
+
+
+def compute_description_fit(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    description_embeddings: dict[str, np.ndarray],
+) -> dict[str, dict[int, float]]:
+    """Cosine similarity between each tool's description and each cluster centroid.
+
+    Returns ``{tool: {cluster_id: fit}}``; tools without a description embedding
+    are absent. High fit + low capture is the "agents should find this tool for
+    this intent but don't" signal.
+    """
+    if not description_embeddings or len(embeddings) == 0:
+        return {}
+
+    centroids: dict[int, np.ndarray] = {}
+    for cluster_id in {int(label) for label in labels.tolist()}:
+        member_matrix = embeddings[labels == cluster_id]
+        centroid = member_matrix.mean(axis=0)
+        centroids[cluster_id] = centroid / (np.linalg.norm(centroid) or 1.0)
+
+    fit: dict[str, dict[int, float]] = {}
+    for tool, vector in description_embeddings.items():
+        unit = np.asarray(vector, dtype=np.float32)
+        unit = unit / (np.linalg.norm(unit) or 1.0)
+        fit[tool] = {cluster_id: round(float(unit @ centroid), 3) for cluster_id, centroid in centroids.items()}
+    return fit
+
+
+def compute_tool_pivot(
+    clusters: list[dict[str, Any]],
+    calls_by_session: dict[str, list[CallRecord]],
+    advertised_by_session: dict[str, set[str]],
+    tool_descriptions: dict[str, str],
+    description_fit: dict[str, dict[int, float]],
+    max_tools: int = MAX_TOOLS_IN_SNAPSHOT,
+    max_clusters_per_tool: int = MAX_CLUSTERS_PER_TOOL,
+    snapshot_cluster_ids: Collection[int] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Pivot the built clusters into a per-tool view.
+
+    Per tool: total attributed calls/errors, the clusters it serves (with its
+    capture share, rank, and strongest competitor in each), a call-weighted
+    contested score, and a discovery rate against the sessions that advertised
+    the tool (null below ``MIN_ADVERTISED_SESSIONS`` — not enough signal).
+    Returns ``(tools, dropped_count)`` with tools capped at ``max_tools`` by
+    call volume.
+
+    Totals cover every cluster in ``clusters``. ``snapshot_cluster_ids``, when
+    given, restricts which clusters get a per-cluster *entry*: callers pass the
+    ids that survived the snapshot's cluster cap so every ``cluster_id`` in the
+    blob still resolves against a cluster the blob carries, while the totals
+    keep counting the calls of the clusters the cap dropped. ``n_clusters_served``
+    is the pre-cap count, so the UI can say when an entry list is partial.
+
+    Entries deliberately carry no per-cluster constants (label, cluster totals,
+    entropy): repeating them per tool x cluster is what turns this pivot into a
+    multi-megabyte blob. Clients join on ``cluster_id``.
+    """
+    per_tool_clusters: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    call_totals: Counter[str] = Counter()
+    error_totals: Counter[str] = Counter()
+    clusters_served: Counter[str] = Counter()
+    weighted_entropy: dict[str, float] = defaultdict(float)
+
+    for cluster in clusters:
+        distribution = cluster["tool_distribution"]
+        in_snapshot = snapshot_cluster_ids is None or cluster["id"] in snapshot_cluster_ids
+        for rank, entry in enumerate(distribution, start=1):
+            tool = entry["tool"]
+            call_totals[tool] += entry["count"]
+            error_totals[tool] += entry["errors"]
+            clusters_served[tool] += 1
+            weighted_entropy[tool] += entry["count"] * cluster["routing_entropy"]
+            if not in_snapshot:
+                continue
+            competitor = next(
+                ({"tool": other["tool"], "pct": other["pct"]} for other in distribution if other["tool"] != tool),
+                None,
+            )
+            per_tool_clusters[tool].append(
+                {
+                    "cluster_id": cluster["id"],
+                    "calls": entry["count"],
+                    "capture_pct": entry["pct"],
+                    "rank": rank,
+                    "description_fit": description_fit.get(tool, {}).get(cluster["id"]),
+                    "top_competitor": competitor,
+                }
+            )
+
+    # Attributed calls only, matching call_count and the session sets
+    # compute_tool_overlaps builds. Counting unattributed calls here would let a
+    # tool post a healthy discovery rate off calls that never entered a cluster.
+    sessions_calling: dict[str, set[str]] = defaultdict(set)
+    for session_id, calls in calls_by_session.items():
+        for call in calls:
+            if call.intent_text is None:
+                continue
+            sessions_calling[call.tool].add(session_id)
+
+    # Inverted once rather than per tool: the tool set is sender-controlled and uncapped
+    # at this point, so scanning every advertised session for each of them is O(tools x
+    # sessions) on values a caller chooses.
+    # Only corpus sessions count. A session the row cap dropped contributes nothing to
+    # the numerator, so leaving it in the denominator biases discovery rates down
+    # precisely when truncation fires.
+    advertised_sessions_by_tool: dict[str, set[str]] = defaultdict(set)
+    for session_id, advertised in advertised_by_session.items():
+        if session_id not in calls_by_session:
+            continue
+        for advertised_tool in advertised:
+            advertised_sessions_by_tool[advertised_tool].add(session_id)
+
+    tools: list[dict[str, Any]] = []
+    for tool, call_count in call_totals.items():
+        advertised_sessions = advertised_sessions_by_tool[tool]
+        called_when_advertised = len(advertised_sessions & sessions_calling[tool])
+        discovery_rate_pct = (
+            round(100.0 * called_when_advertised / len(advertised_sessions), 1)
+            if len(advertised_sessions) >= MIN_ADVERTISED_SESSIONS
+            else None
+        )
+        tools.append(
+            {
+                "tool": tool,
+                "call_count": call_count,
+                "error_count": error_totals[tool],
+                "session_count": len(sessions_calling[tool]),
+                "contested_score": round(weighted_entropy[tool] / call_count, 3) if call_count else None,
+                "n_clusters_served": clusters_served[tool],
+                "advertised_sessions": len(advertised_sessions),
+                "called_when_advertised": called_when_advertised,
+                "discovery_rate_pct": discovery_rate_pct,
+                "description": tool_descriptions.get(tool),
+                "clusters": sorted(per_tool_clusters[tool], key=lambda entry: entry["calls"], reverse=True)[
+                    :max_clusters_per_tool
+                ],
+            }
+        )
+
+    tools.sort(key=lambda t: (-t["call_count"], t["tool"]))
+    dropped = max(0, len(tools) - max_tools)
+    return tools[:max_tools], dropped
+
+
+def compute_tool_overlaps(
+    clusters: list[dict[str, Any]],
+    calls_by_session: dict[str, list[CallRecord]],
+    max_pairs: int = MAX_CONFUSION_PAIRS,
+    max_tools_per_cluster: int = MAX_OVERLAP_TOOLS_PER_CLUSTER,
+) -> tuple[list[dict[str, Any]], int]:
+    """Tool pairs competing for the same intents.
+
+    ``contested_calls`` is the sum over clusters of ``min(calls_a, calls_b)`` —
+    the volume both tools could plausibly have taken. The session counts split
+    substitution from cooperation: pairs used together in the same sessions are
+    workflows, pairs whose sessions pick one or the other are confusion.
+    Returns ``(pairs, dropped_count)`` capped at ``max_pairs``; only each
+    cluster's top ``max_tools_per_cluster`` tools enter pair expansion.
+    """
+    contested: dict[tuple[str, str], int] = defaultdict(int)
+    top_cluster: dict[tuple[str, str], tuple[int, int]] = {}
+
+    for cluster in clusters:
+        # tool_distribution is sorted by count desc, so this keeps the head.
+        distribution = cluster["tool_distribution"][:max_tools_per_cluster]
+        for i in range(len(distribution)):
+            for j in range(i + 1, len(distribution)):
+                tool_i, tool_j = str(distribution[i]["tool"]), str(distribution[j]["tool"])
+                pair = (tool_i, tool_j) if tool_i <= tool_j else (tool_j, tool_i)
+                overlap = min(distribution[i]["count"], distribution[j]["count"])
+                if overlap <= 0:
+                    continue
+                contested[pair] += overlap
+                best = top_cluster.get(pair)
+                if best is None or overlap > best[0]:
+                    top_cluster[pair] = (overlap, cluster["id"])
+
+    session_tools = {
+        session_id: {call.tool for call in calls if call.intent_text is not None}
+        for session_id, calls in calls_by_session.items()
+    }
+
+    ranked = sorted(contested.items(), key=lambda item: (-item[1], item[0]))
+    pairs: list[dict[str, Any]] = []
+    for (tool_a, tool_b), contested_calls in ranked[:max_pairs]:
+        pairs.append(
+            {
+                "tool_a": tool_a,
+                "tool_b": tool_b,
+                "contested_calls": contested_calls,
+                "sessions_with_both": sum(1 for tools in session_tools.values() if tool_a in tools and tool_b in tools),
+                "sessions_with_either": sum(
+                    1 for tools in session_tools.values() if tool_a in tools or tool_b in tools
+                ),
+                "top_cluster_id": top_cluster[(tool_a, tool_b)][1],
+            }
+        )
+    dropped = max(0, len(ranked) - max_pairs)
+    return pairs, dropped
+
+
+def _pct(numerator: float, denominator: float) -> float:
+    return round(100.0 * numerator / denominator, 1) if denominator else 0.0
+
+
+def build_snapshot(
+    records: list[IntentRecord],
+    labels: np.ndarray,
+    embeddings: np.ndarray,
+    distance_threshold: float = DEFAULT_DISTANCE_THRESHOLD,
+    calls_by_session: dict[str, list[CallRecord]] | None = None,
+    advertised_by_session: dict[str, set[str]] | None = None,
+    tool_descriptions: dict[str, str] | None = None,
+    description_embeddings: dict[str, np.ndarray] | None = None,
+    corpus_stats: CorpusStats | None = None,
+    window_stats: WindowStats | None = None,
+    recurring: list[RecurringIntent] | None = None,
+    min_cluster_intents: int = MIN_CLUSTER_INTENTS,
+) -> dict[str, Any]:
+    """Aggregate clusters into the JSONB snapshot shape persisted in Postgres.
+
+    ``records``, ``labels``, and ``embeddings`` must be aligned: position ``i``
+    in each refers to the same intent.
+
+    All keyword arguments are optional so degraded runs still snapshot: without
+    ``calls_by_session`` there are no journeys, switches, pivot, or overlaps;
+    without descriptions there is no fit. Missing coverage inputs serialize as
+    null meta fields, never as fabricated zeros.
+    """
+    if len(records) == 0:
+        return empty_snapshot(
+            distance_threshold, n_intents=0, corpus_stats=corpus_stats, window_stats=window_stats, recurring=recurring
+        )
+    assert len(records) == len(labels) == len(embeddings), (
+        f"records ({len(records)}), labels ({len(labels)}), and embeddings ({len(embeddings)}) must be the same length"
+    )
+
+    flows = compute_cluster_flows(records, labels, calls_by_session or {})
+
+    clusters_by_label: dict[int, list[int]] = defaultdict(list)
+    for i, label in enumerate(labels.tolist()):
+        clusters_by_label[int(label)].append(i)
+
+    clusters: list[dict[str, Any]] = []
+    for cluster_id, member_idx in clusters_by_label.items():
+        members = [records[i] for i in member_idx]
+
+        tool_counts: Counter[str] = Counter()
+        error_counts: Counter[str] = Counter()
+        for record in members:
+            tool_counts.update(record.tool_counts)
+            error_counts.update(record.error_counts)
+
+        total_calls = sum(tool_counts.values())
+        tool_distribution = [
+            {
+                "tool": tool,
+                "count": count,
+                "pct": _pct(count, total_calls),
+                "errors": int(error_counts.get(tool, 0)),
+                "error_rate_pct": _pct(error_counts.get(tool, 0), count),
+            }
+            for tool, count in tool_counts.most_common()
+        ]
+
+        medoid_pos = _medoid_index(embeddings, member_idx)
+        sample_intents = [
+            record.intent_text
+            for record in sorted(members, key=lambda r: r.frequency, reverse=True)[:MAX_SAMPLE_INTENTS_PER_CLUSTER]
+        ]
+
+        flow = flows.get(cluster_id, {})
+        # Distinct sessions when call data is available; the per-record sum
+        # double-counts sessions whose calls span several member intents.
+        session_count = (
+            len(flow["session_ids"]) if "session_ids" in flow else int(sum(r.session_count for r in members))
+        )
+
+        clusters.append(
+            {
+                "id": cluster_id,
+                "label": records[medoid_pos].intent_text,
+                "intent_count": len(members),
+                "session_count": session_count,
+                "call_count": total_calls,
+                "error_count": int(sum(error_counts.values())),
+                "error_rate_pct": _pct(sum(error_counts.values()), total_calls),
+                "tool_distribution": tool_distribution,
+                "sample_intents": sample_intents,
+                "routing_entropy": round(_routing_entropy(tool_counts), 3),
+                "journey": flow.get("journey"),
+                "switches": flow.get("switches", []),
+                "self_retries": flow.get("self_retries", []),
+            }
+        )
+
+    # Sort clusters by call volume desc so the UI shows the most impactful first.
+    clusters.sort(key=lambda c: c["call_count"], reverse=True)
+
+    # Sub-threshold clusters become one long-tail aggregate instead of rows. They
+    # stay in ``clusters`` so the tool pivot totals still count their calls.
+    kept = [c for c in clusters if c["intent_count"] >= min_cluster_intents]
+    long_tail = _long_tail([c for c in clusters if c["intent_count"] < min_cluster_intents], flows)
+
+    # Persist only the highest-volume clusters; ``n_clusters`` keeps the full
+    # count so the UI can say how many the run actually found.
+    n_clusters_total = len(kept)
+    snapshot_clusters = kept[:MAX_SNAPSHOT_CLUSTERS]
+
+    fit = compute_description_fit(embeddings, labels, description_embeddings or {})
+    if calls_by_session is not None:
+        # The pivot totals read every cluster so the cap above never quietly
+        # removes calls from a tool's counts, while its entries stay restricted
+        # to the clusters this blob carries. Overlaps stay on the persisted
+        # clusters because ``top_cluster_id`` has to resolve within the blob.
+        tools, dropped_tools = compute_tool_pivot(
+            clusters,
+            calls_by_session,
+            advertised_by_session or {},
+            tool_descriptions or {},
+            fit,
+            snapshot_cluster_ids={cluster["id"] for cluster in snapshot_clusters},
+        )
+        tool_overlaps, dropped_pairs = compute_tool_overlaps(snapshot_clusters, calls_by_session)
+    else:
+        tools, dropped_tools, tool_overlaps, dropped_pairs = [], 0, [], 0
+
+    described_tools = sum(1 for tool in tools if tool["description"])
+    meta: dict[str, Any] = {
+        "distance_threshold": distance_threshold,
+        "embedding_model": EMBEDDING_MODEL,
+        "n_intents": len(records),
+        "n_clusters": n_clusters_total,
+        "n_long_tail_intents": long_tail["intent_count"] if long_tail else 0,
+        "corpus": "per_call",
+        "sampled_sessions": len(calls_by_session) if calls_by_session is not None else None,
+        "window_sessions": window_stats.sessions if window_stats else None,
+        "session_coverage_pct": (
+            _pct(len(calls_by_session), window_stats.sessions)
+            if calls_by_session is not None and window_stats
+            else None
+        ),
+        "intent_coverage_pct": _pct(window_stats.calls_with_intent, window_stats.total_calls) if window_stats else None,
+        "imputed_call_pct": _pct(corpus_stats.imputed_calls, corpus_stats.attributed_calls) if corpus_stats else None,
+        "unattributed_call_pct": (
+            _pct(corpus_stats.total_calls - corpus_stats.attributed_calls, corpus_stats.total_calls)
+            if corpus_stats
+            else None
+        ),
+        "corpus_call_coverage_pct": (
+            _pct(corpus_stats.kept_calls, corpus_stats.attributed_calls) if corpus_stats else None
+        ),
+        "advertisement_coverage_pct": (
+            _pct(len(set(advertised_by_session) & set(calls_by_session)), len(calls_by_session))
+            if calls_by_session and advertised_by_session is not None
+            else None
+        ),
+        "n_tools": len(tools),
+        "dropped_tools": dropped_tools,
+        "dropped_overlap_pairs": dropped_pairs,
+        "description_coverage_pct": _pct(described_tools, len(tools)) if tools else None,
+        # Representation honesty: these per-tool numbers come from a *balanced
+        # sample*, never the population. Downstream surfaces must warn before
+        # treating a tool's capture/discovery rate as its true traffic share.
+        "sampled": True,
+        "corpus_strategy": "stratified_by_tool",
+        "sampling_warning": (
+            "Intent clusters are computed from a stratified sample of sessions "
+            "(per-tool floors, dominant tools capped). Per-tool capture and "
+            "discovery rates are sample statistics, not population totals."
+        ),
+    }
+
+    return {
+        "version": SNAPSHOT_VERSION,
+        "clusters": snapshot_clusters,
+        "long_tail": long_tail,
+        "recurring": _serialize_recurring(recurring),
+        "tools": tools,
+        "tool_overlaps": tool_overlaps,
+        "computed_with": meta,
+    }
+
+
+def _long_tail(tail: list[dict[str, Any]], flows: dict[int, dict[str, Any]]) -> dict[str, Any] | None:
+    if not tail:
+        return None
+    tail_flows = [flows.get(c["id"], {}) for c in tail]
+    # A session that touches several tail clusters counts once, as in the per-cluster counts.
+    if all("session_ids" in flow for flow in tail_flows):
+        session_count = len(set().union(*(flow["session_ids"] for flow in tail_flows)))
+    else:
+        session_count = sum(c["session_count"] for c in tail)
+    calls = sum(c["call_count"] for c in tail)
+    errors = sum(c["error_count"] for c in tail)
+    samples = [
+        intent
+        for cluster in sorted(tail, key=lambda c: c["call_count"], reverse=True)
+        for intent in cluster["sample_intents"]
+    ]
+    return {
+        "intent_count": sum(c["intent_count"] for c in tail),
+        "session_count": session_count,
+        "call_count": calls,
+        "error_count": errors,
+        "error_rate_pct": _pct(errors, calls),
+        "sample_intents": samples[:MAX_LONG_TAIL_SAMPLES],
+    }
+
+
+def _serialize_recurring(recurring: list[RecurringIntent] | None) -> list[dict[str, Any]]:
+    return [
+        {
+            "intent_text": r.intent_text,
+            "session_count": r.session_count,
+            "call_count": r.call_count,
+            "error_count": r.error_count,
+            "error_rate_pct": _pct(r.error_count, r.call_count),
+            "variant_count": max(len(r.variants), 1),
+            "sample_variants": list(r.variants[:MAX_SAMPLE_VARIANTS]) if len(r.variants) > 1 else [],
+        }
+        for r in (recurring or [])[:MAX_RECURRING_INTENTS]
+    ]
+
+
+def empty_snapshot(
+    distance_threshold: float,
+    n_intents: int,
+    corpus_stats: CorpusStats | None = None,
+    window_stats: WindowStats | None = None,
+    recurring: list[RecurringIntent] | None = None,
+) -> dict[str, Any]:
+    """The no-clusters blob, keeping whatever coverage the run did establish.
+
+    A window full of traffic that carried no attributable intent must not read
+    the same as a window with no traffic at all: "0% of calls carried an intent"
+    is the actionable message, all-null is a dead end.
+    """
+    return {
+        "version": SNAPSHOT_VERSION,
+        "clusters": [],
+        "long_tail": None,
+        "recurring": _serialize_recurring(recurring),
+        "tools": [],
+        "tool_overlaps": [],
+        "computed_with": {
+            "distance_threshold": distance_threshold,
+            "embedding_model": EMBEDDING_MODEL,
+            "n_intents": n_intents,
+            "n_clusters": 0,
+            "n_long_tail_intents": 0,
+            "corpus": "per_call",
+            "sampled_sessions": None,
+            "window_sessions": window_stats.sessions if window_stats else None,
+            "session_coverage_pct": None,
+            "intent_coverage_pct": (
+                _pct(window_stats.calls_with_intent, window_stats.total_calls) if window_stats else None
+            ),
+            "imputed_call_pct": None,
+            "unattributed_call_pct": (
+                _pct(corpus_stats.total_calls - corpus_stats.attributed_calls, corpus_stats.total_calls)
+                if corpus_stats
+                else None
+            ),
+            "corpus_call_coverage_pct": None,
+            "advertisement_coverage_pct": None,
+            "n_tools": 0,
+            "dropped_tools": 0,
+            "dropped_overlap_pairs": 0,
+            "description_coverage_pct": None,
+            "sampled": True,
+            "corpus_strategy": "stratified_by_tool",
+            "sampling_warning": (
+                "Intent clusters are computed from a stratified sample of sessions "
+                "(per-tool floors, dominant tools capped). Per-tool capture and "
+                "discovery rates are sample statistics, not population totals."
+            ),
+        },
+    }

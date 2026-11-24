@@ -1,0 +1,392 @@
+import os
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, ExitStack
+from dataclasses import dataclass
+from typing import Any
+
+import pytest
+from unittest.mock import MagicMock, patch
+
+from django.core.cache import cache
+from django.test import Client, override_settings
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from posthog.models.scoping import team_scope
+from posthog.temporal.common.errors import describe_failure
+
+from products.stamphog.backend.logic.engine_pregate import GateAttestation
+from products.stamphog.backend.temporal.activities import (
+    MarkReviewFailedInput,
+    ReviewSandboxInput,
+    StamphogReviewInput,
+    checkout_review_sandbox,
+    destroy_review_sandbox,
+    dismiss_stale_approvals,
+    fetch_review_context,
+    list_in_flight_reviewer_bots,
+    mark_review_failed,
+    post_verdict,
+    refuse_on_pre_gates,
+    reuse_withheld_verdict,
+    review_in_sandbox,
+    signal_review_started,
+    start_review_sandbox,
+)
+from products.stamphog.backend.tests import fakes
+
+PRODUCT_DATABASES = {"default", "stamphog_db_writer", "stamphog_db_reader"}
+
+
+@pytest.fixture(autouse=True)
+def _set_team_scope(request):
+    """Set team context for raw pytest tests that hit the database.
+
+    ProductTeamModel is fail-closed — queries without context raise
+    TeamScopeError. TestCase / APIBaseTest subclasses create their own team in
+    setUp() and are skipped here (getfixturevalue("team") would duplicate-create
+    with the same api_token); those use StamphogTeamScopedTestMixin instead.
+    """
+    if request.node.get_closest_marker("django_db") is None:
+        yield
+        return
+
+    is_django_testcase = request.cls is not None and any(cls.__name__ == "TestCase" for cls in request.cls.__mro__)
+    if is_django_testcase:
+        yield
+        return
+
+    team = request.getfixturevalue("team")
+    with team_scope(team.id):
+        yield
+
+
+class StamphogTeamScopedTestMixin:
+    """Mixin for TestCase / APIBaseTest tests that use ProductTeamModel.
+
+    Wraps setUp/tearDown with team_scope so the test body's queries find a
+    scope. Place BEFORE APIBaseTest in the MRO so its setUp runs first
+    (creating self.team) and ours can use it.
+    """
+
+    _team_scope_cm: AbstractContextManager[None] | None = None
+
+    def setUp(self) -> None:
+        super().setUp()  # type: ignore[misc]
+        cm = team_scope(self.team.id)  # type: ignore[attr-defined]
+        cm.__enter__()
+        self._team_scope_cm = cm
+
+    def tearDown(self) -> None:
+        if self._team_scope_cm is not None:
+            try:
+                self._team_scope_cm.__exit__(None, None, None)
+            finally:
+                self._team_scope_cm = None
+        super().tearDown()  # type: ignore[misc]
+
+
+WEBHOOK_PATH = "/webhooks/stamphog/github"
+FAST_REFUSAL_SUMMARY = "Terraform changes need a human reviewer."
+WEBHOOK_SECRET = "integration-webhook-secret"
+
+
+def _generate_app_private_key() -> str:
+    """Ephemeral RSA key so the real App-JWT mint path runs (the token POST itself is faked)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+
+def _fake_gateway_post(url: str, **kwargs: Any) -> MagicMock:
+    """The ai-gateway's token routes; any other POST through the shared requests module fails loudly."""
+    response = MagicMock(text="")
+    if url.endswith("/v1/tokens"):
+        response.status_code = 201
+        minted: dict[str, Any] = {"token": "phe_test_run", "expires_at": "2026-01-01T00:00:00Z", "cap_usd": "5"}
+        # A gateway that supports the model pin echoes it back.
+        if allowed_models := (kwargs.get("json") or {}).get("allowed_models"):
+            minted["allowed_models"] = allowed_models
+        response.json.return_value = minted
+    elif url.endswith("/v1/tokens/revoke"):
+        response.status_code = 200
+        response.json.return_value = {"revoked": True}
+    else:
+        raise AssertionError(f"unexpected POST through the faked gateway client: {url}")
+    return response
+
+
+def _run_activity(activity_fn: Any, arg: Any) -> Any:
+    """Run a stamphog activity's plain sync body in-thread.
+
+    The activities are ``@activity.defn`` over ``@asyncify``; ``__wrapped__`` is the original
+    sync function, callable directly so it shares the test's DB connection (production drives the
+    same body from a Temporal worker thread instead).
+    """
+    return activity_fn.__wrapped__(arg)
+
+
+def _inline_check_out(inp: StamphogReviewInput) -> ReviewSandboxInput | None:
+    """The workflow's _check_out_sandbox: start the sandbox, then check the PR out in it."""
+    started = _run_activity(start_review_sandbox, inp)
+    if not started.get("sandbox_id"):
+        return None
+    sandbox_id = started["sandbox_id"]
+    checkout = _run_activity(
+        checkout_review_sandbox,
+        ReviewSandboxInput(review_run_id=inp.review_run_id, team_id=inp.team_id, sandbox_id=sandbox_id),
+    )
+    if checkout.get("skipped"):
+        return None
+    return ReviewSandboxInput(
+        review_run_id=inp.review_run_id,
+        team_id=inp.team_id,
+        sandbox_id=sandbox_id,
+        merge_base_sha=checkout["merge_base_sha"],
+    )
+
+
+def _discard_input(inp: StamphogReviewInput, checked_out: ReviewSandboxInput | None) -> ReviewSandboxInput:
+    """The workflow's teardown input: the started sandbox's id, or empty to read the stored one."""
+    sandbox_id = checked_out.sandbox_id if checked_out is not None else ""
+    return ReviewSandboxInput(review_run_id=inp.review_run_id, team_id=inp.team_id, sandbox_id=sandbox_id)
+
+
+def _inline_review_workflow(review_run_id: str, team_id: int) -> None:
+    """Stand in for the Temporal client by driving the real activities in order.
+
+    Mirrors StamphogReviewWorkflow: dismiss stale approvals FIRST (fail-closed — even a context-fetch
+    failure must not leave an earlier head's approval standing), signal the review has started (the
+    "review in flight" 👀), then fetch context, refuse on the pre-gates or else review in the (faked)
+    sandbox, post the verdict; on any error mark the run failed, exactly like the workflow's failure
+    path. The workflow runs the sandbox start and checkout beside the context fetch and the pre-check.
+    Here they run in order after the context fetch, and a failure surfaces where the workflow awaits
+    them: at the review, or never, when a pre-check verdict discards the sandbox.
+    """
+    inp = StamphogReviewInput(review_run_id=review_run_id, team_id=team_id)
+    checked_out: ReviewSandboxInput | None = None
+    try:
+        _run_activity(dismiss_stale_approvals, inp)
+        _run_activity(signal_review_started, inp)
+        if _run_activity(reuse_withheld_verdict, inp)["reused"]:
+            _run_activity(post_verdict, inp)
+            return
+        _run_activity(fetch_review_context, inp)
+        checkout_error: Exception | None = None
+        try:
+            checked_out = _inline_check_out(inp)
+        except Exception as e:  # noqa: BLE001 — the workflow sees it only when it awaits the checkout
+            checkout_error = e
+        try:
+            refused = _run_activity(refuse_on_pre_gates, inp)["refused"]
+        except Exception:  # noqa: BLE001 — the workflow falls through when the pre-gates activity fails
+            refused = False
+        if not refused:
+            # One bot-wait poll, no sleeping: mirrors the workflow's loop semantics (refresh the
+            # reactions snapshot, then proceed) without its durable timers.
+            _run_activity(list_in_flight_reviewer_bots, inp)
+            if checkout_error is not None:
+                raise checkout_error
+            if checked_out is not None:
+                _run_activity(review_in_sandbox, checked_out)
+        _run_activity(post_verdict, inp)
+        if refused:
+            _run_activity(destroy_review_sandbox, _discard_input(inp, checked_out))
+    except Exception as e:  # noqa: BLE001 — mirror the workflow's failure path
+        try:
+            _run_activity(
+                mark_review_failed,
+                MarkReviewFailedInput(review_run_id, team_id, describe_failure(e)),
+            )
+        finally:
+            _run_activity(destroy_review_sandbox, _discard_input(inp, checked_out))
+
+
+@dataclass
+class StamphogChain:
+    """Handle for a wired-up full chain: the GitHub recorder plus a webhook poster."""
+
+    recorder: fakes.GitHubRecorder
+    client: Client
+    # Every file the fake sandbox had written into the checkout, as (path, payload) — lets a test
+    # assert what was injected (e.g. default policy files when the repo carries none).
+    sandbox_writes: list[tuple[str, bytes]]
+    # The fake sandbox class itself, so a test can script failure modes (destroy_error) and read
+    # captured create() configs (created_configs). Typed Any: the class attrs are fake-only.
+    sandbox_class: Any
+    # The worker's own gate check before an approval. The fake PRs carry no complete file list or
+    # folder files, so it attests by default, and a test sets ``return_value`` to refuse.
+    attest_gates: MagicMock
+
+    def post_webhook(self, payload: dict[str, Any], *, delivery_id: str) -> int:
+        body = fakes.encode(payload)
+        return self.client.post(
+            WEBHOOK_PATH,
+            data=body,
+            content_type="application/json",
+            HTTP_X_HUB_SIGNATURE_256=fakes.sign_payload(body, WEBHOOK_SECRET),
+            HTTP_X_GITHUB_EVENT="pull_request",
+            HTTP_X_GITHUB_DELIVERY=delivery_id,
+        ).status_code
+
+
+def _run_on_commit_immediately(fn: Callable[[], object], using: str | None = None, robust: bool = False) -> None:
+    fn()
+
+
+@pytest.fixture
+def stamphog_chain() -> Iterator[StamphogChain]:
+    """Wire the four chain boundaries (GitHub, Slack, sandbox, LLM) to deterministic fakes.
+
+    The Temporal client is replaced with an inline runner of the real activities, and the task's
+    ``on_commit`` fires inline (the test's outer transaction never really commits). Everything else
+    runs as production code.
+    """
+    # The chain caches GitHub reads (installation tokens, the ownership reader's head commit and
+    # blobs), and those entries outlive one test, so a test would answer with the files of the one
+    # before it.
+    cache.clear()
+    recorder = fakes.GitHubRecorder()
+    # review-guidance.md is a required trusted policy file — run_review_in_sandbox fails closed without
+    # it — so seed it for the whole chain; individual tests still set/override policy.yml as they need.
+    recorder.policy_files[".stamphog/review-guidance.md"] = "Review PostHog PRs against the repo's norms.\n"
+    fake_slack = fakes.FakeSlackIntegration
+    fake_slack.reset(channels=[])
+    sandbox_writes: list[tuple[str, bytes]] = []
+    fake_sandbox = fakes.make_fake_sandbox_class(fakes.approved_engine_output(), write_sink=sandbox_writes)
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            override_settings(
+                STAMPHOG_GITHUB_APP_WEBHOOK_SECRET=WEBHOOK_SECRET,
+                STAMPHOG_GITHUB_APP_ID="123456",
+                STAMPHOG_GITHUB_APP_PRIVATE_KEY=_generate_app_private_key(),
+            )
+        )
+        # The pair selects the Go ai-gateway and its token routes are faked; tests asserting on the
+        # mint re-patch requests.post.
+        stack.enter_context(
+            override_settings(AI_GATEWAY_URL="https://ai-gateway.test/v1", AI_GATEWAY_API_KEY="phs_test_mint")
+        )
+        stack.enter_context(patch("products.stamphog.backend.temporal.activities.requests.post", _fake_gateway_post))
+        # The fast refusal's LLM note is a network call. Tests asserting on the fallback re-patch it.
+        stack.enter_context(
+            patch(
+                "products.stamphog.backend.temporal.activities.summarize_refusal",
+                return_value=FAST_REFUSAL_SUMMARY,
+            )
+        )
+        # The pre-check's engine process emits its analytics event when a capture key is set; keep it
+        # from reaching a real project from a developer machine.
+        stack.enter_context(patch.dict(os.environ, {"POSTHOG_API_KEY": ""}))
+        # mark_review_failed emits a failure event through the real analytics client — a network
+        # boundary, faked like the rest. Tests asserting on the event re-patch this locally.
+        stack.enter_context(patch("products.stamphog.backend.temporal.activities.ph_scoped_capture"))
+        stack.enter_context(
+            patch("products.stamphog.backend.logic.github_client.github_request", recorder.github_request)
+        )
+        # Routing reads the repo's owners.yaml through the shared ownership reader, which talks to
+        # GitHub itself rather than through the stamphog client.
+        stack.enter_context(patch("posthog.ownership.github_files.github_request", recorder.github_request))
+        stack.enter_context(
+            patch(
+                "products.stamphog.backend.logic.github_client.remember_observed_core_limit",
+                fakes.noop_remember_observed_core_limit,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "products.stamphog.backend.logic.github_client.raise_if_github_rate_limited",
+                fakes.noop_raise_if_github_rate_limited,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "products.stamphog.backend.temporal.activities.get_sandbox_class_for_backend",
+                lambda backend: fake_sandbox,
+            )
+        )
+        stack.enter_context(
+            patch("products.stamphog.backend.tasks.tasks.execute_stamphog_review_workflow", _inline_review_workflow)
+        )
+        stack.enter_context(
+            patch("products.stamphog.backend.tasks.tasks.transaction.on_commit", side_effect=_run_on_commit_immediately)
+        )
+        stack.enter_context(patch("products.stamphog.backend.logic.slack_digest.SlackIntegration", fake_slack))
+        stack.enter_context(patch("posthog.slack.channels.SlackIntegration", fake_slack))
+        stack.enter_context(
+            patch(
+                "products.stamphog.backend.logic.digest.build_ai_gateway_anthropic_client",
+                side_effect=RuntimeError("no gateway in tests"),
+            )
+        )
+        attest_gates = stack.enter_context(
+            patch(
+                "products.stamphog.backend.temporal.activities._attest_gates",
+                return_value=GateAttestation(attested=True, reason="", gates=[]),
+            )
+        )
+        yield StamphogChain(
+            recorder=recorder,
+            client=Client(),
+            sandbox_writes=sandbox_writes,
+            sandbox_class=fake_sandbox,
+            attest_gates=attest_gates,
+        )
+
+
+ROUTING_APP_SLUG = "stamphog-test"
+
+
+@dataclass(frozen=True)
+class RoutingChain:
+    """Handle for the reviewer routing boundaries: GitHub, the cut model, and analytics."""
+
+    recorder: fakes.GitHubRecorder
+    cut_model: fakes.FakeCutModel
+    captured: MagicMock
+
+
+@pytest.fixture
+def routing_chain() -> Iterator[RoutingChain]:
+    """Wire reviewer routing's boundaries to fakes and run everything between them as real code."""
+    # The ownership reader caches head commits and blobs across tests, keyed by the scripted files.
+    cache.clear()
+    recorder = fakes.GitHubRecorder()
+    cut_model = fakes.FakeCutModel()
+    captured = MagicMock()
+    with ExitStack() as stack:
+        stack.enter_context(
+            override_settings(
+                STAMPHOG_GITHUB_APP_ID="123456",
+                STAMPHOG_GITHUB_APP_PRIVATE_KEY=_generate_app_private_key(),
+                STAMPHOG_GITHUB_APP_SLUG=ROUTING_APP_SLUG,
+                AI_GATEWAY_URL="https://ai-gateway.test/v1",
+                AI_GATEWAY_API_KEY="phs_test_mint",
+            )
+        )
+        stack.enter_context(patch("products.stamphog.backend.logic.gateway_tokens.requests.post", _fake_gateway_post))
+        stack.enter_context(patch("products.stamphog.backend.logic.routing.model.Anthropic", cut_model.client))
+        capture_scope = stack.enter_context(patch("products.stamphog.backend.logic.routing.service.ph_scoped_capture"))
+        capture_scope.return_value.__enter__.return_value = captured
+        stack.enter_context(
+            patch("products.stamphog.backend.logic.github_client.github_request", recorder.github_request)
+        )
+        stack.enter_context(patch("posthog.ownership.github_files.github_request", recorder.github_request))
+        stack.enter_context(
+            patch(
+                "products.stamphog.backend.logic.github_client.remember_observed_core_limit",
+                fakes.noop_remember_observed_core_limit,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "products.stamphog.backend.logic.github_client.raise_if_github_rate_limited",
+                fakes.noop_raise_if_github_rate_limited,
+            )
+        )
+        yield RoutingChain(recorder=recorder, cut_model=cut_model, captured=captured)

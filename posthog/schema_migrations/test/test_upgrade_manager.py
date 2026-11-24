@@ -1,0 +1,42 @@
+import pytest
+from unittest.mock import Mock
+
+from posthog.schema import NodeKind
+
+import posthog.schema_migrations as schema_migrations_module
+from posthog.schema_migrations import LATEST_VERSIONS, MIGRATIONS, SchemaMigration
+from posthog.schema_migrations.upgrade_manager import upgrade_insight
+
+
+class SampleMigration(SchemaMigration):
+    targets = {NodeKind.TRENDS_QUERY: 1}
+
+    def transform(self, query):
+        query["aggregationGroupTypeIndex"] = query.pop("aggregation_group_type_index")
+        return query
+
+
+@pytest.fixture(autouse=True)
+def setup_migrations():
+    LATEST_VERSIONS.clear()
+    MIGRATIONS.clear()
+
+    MIGRATIONS[NodeKind.TRENDS_QUERY] = {1: SampleMigration()}
+    LATEST_VERSIONS[NodeKind.TRENDS_QUERY] = 2
+    # Mark as discovered so upgrade() doesn't replace the stub with the real migrations
+    schema_migrations_module._migrations_discovered = True
+
+    yield
+
+    LATEST_VERSIONS.clear()
+    MIGRATIONS.clear()
+    schema_migrations_module._migrations_discovered = False
+
+
+def test_upgrade_insight_context_manager():
+    mock_insight = Mock()
+    mock_insight.query = {"kind": NodeKind.TRENDS_QUERY, "version": 1, "aggregation_group_type_index": 2}
+    upgraded_query = {"kind": NodeKind.TRENDS_QUERY, "version": 2, "aggregationGroupTypeIndex": 2}
+
+    with upgrade_insight(mock_insight):
+        assert mock_insight.query == upgraded_query

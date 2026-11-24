@@ -1,0 +1,149 @@
+from typing import Literal
+from uuid import UUID
+
+MAX_ATTEMPTS = 2
+# Replay of histories without BLOCKER_AWARE_LOOP_PATCH must iterate this many times so the
+# recorded refine/draft/validate command count matches.
+LEGACY_MAX_ATTEMPTS = 5
+
+# Histories without this marker must retain the legacy persistence command during replay.
+DEFER_KNOWLEDGE_GAPS_UNTIL_RESOLUTION_PATCH = "defer-knowledge-gaps-until-resolution-2026-09"
+# Histories without this marker must retain the LEGACY_MAX_ATTEMPTS SCORE_THRESHOLD loop.
+BLOCKER_AWARE_LOOP_PATCH = "blocker-aware-loop-2026-09"
+# Histories without this marker treat blocked_on_customer as findings, not a clarifying question.
+TIERED_CLARIFY_PATCH = "tiered-clarify-2026-09"
+# Histories without this marker retry every knowledge blocker and send an answerable draft
+# that has no clarifying question to findings.
+GROUNDING_AWARE_GATE_PATCH = "grounding-aware-gate-2026-11"
+MAX_THREAT_TYPE_CHARS = 100
+MAX_CLARIFICATION_ROUNDS = 1
+MAX_CLARIFYING_QUESTION_CHARS = 500
+
+# Stable namespace for deterministic per-ticket trace ids (uuid5).
+AI_REPLY_TRACE_NAMESPACE = UUID("a1b2c3d4-5678-4e9f-ab12-cd34ef567890")
+# Gate used when BLOCKER_AWARE_LOOP_PATCH is absent. Replay of those histories still
+# compares validator confidence to this value.
+SCORE_THRESHOLD = 0.5
+# Validator and draft are uncalibrated judges, so auto-send requires both plus coverage and grounding.
+AUTO_SEND_THRESHOLD = 0.85
+AUTO_SEND_MIN_COVERAGE = 0.8
+DRAFT_SELF_CONFIDENCE_FLOOR = 0.7
+SUGGEST_THRESHOLD = 0.5
+
+DRAFT_VERDICTS = ("answerable", "blocked_on_customer", "blocked_on_knowledge", "out_of_scope")
+VALIDATE_BLOCKERS = ("none", "customer_info", "knowledge", "contradiction")
+RERANK_TOP_K = 8
+# Marks a chunk the team never wrote: a past ticket resolution the learning run kept. Both the
+# retrieved-chunk list and the always-on block use it, so the model reads one vocabulary.
+LEARNED_CHUNK_LABEL = "[learned from support]"
+LEARNED_CHUNK_NOTE = (
+    f"Learned chunks ({LEARNED_CHUNK_LABEL}) reflect how the team resolved a past ticket. Treat them as team practice."
+)
+# Ticket types whose replies may ever be published to the (untrusted) ticket author.
+# diagnostic/account_billing draw on project data and must stay private regardless of settings.
+PUBLISHABLE_TICKET_TYPES = {"how_to"}
+RETRIEVE_LIMIT = 15
+DRAFT_POLL_SECONDS = 900
+# The draft activity returns a blocked draft on its last attempt instead of raising.
+DRAFT_ACTIVITY_MAX_ATTEMPTS = 2
+WIDEN_RADIUS = 3
+
+# Temporal records every activity input/output in workflow history (per-payload limit ~2 MiB,
+# total history limit ~50 MiB). This loop replays ticket_context + chunks into refine/draft/
+# validate across up to MAX_ATTEMPTS iterations, so bound both at the source to keep history
+# small. Downstream prompts already slice harder than these caps, so nothing useful is lost.
+MAX_TICKET_CONTEXT_CHARS = 16000
+MAX_CHUNK_CONTENT_CHARS = 2000
+MAX_CHUNKS = 25
+# Per-item caps still apply. This bound keeps one validation prompt from carrying every
+# cited chunk plus every source excerpt at those caps.
+MAX_VALIDATE_EVIDENCE_CHARS = 12000
+# The draft's `sources` are model-controlled (count + excerpt length), so bound them before
+# they flow into validate's input and the workflow's best-so-far tracking.
+MAX_SOURCES = 25
+MAX_EXCERPT_CHARS = 1000
+MAX_INVESTIGATION_SUMMARY_CHARS = 4000
+MAX_UNKNOWNS = 10
+MAX_UNKNOWN_CHARS = 300
+MAX_CLARIFYING_QUESTIONS = 2
+# The safety filter and draft prompt must review/consume the exact same ticket text. This
+# constant is the single source of truth for that window; the workflow slices once and passes
+# the result to both activities so there's no mismatch.
+MAX_SAFETY_REVIEWED_CHARS = 6000
+
+# Plain-LLM utility calls go through the internal LLM gateway via the raw Anthropic SDK —
+# the gateway captures $ai_generation itself, so no langchain wrapper.
+# UTILITY_MODEL (haiku) is cheap/fast for query refinement. Validation grounds correct replies
+# against sources, so it uses a stronger sonnet-class model to avoid under-scoring good answers.
+UTILITY_MODEL = "claude-haiku-4-5"
+VALIDATOR_MODEL = "claude-sonnet-4-6"
+
+# Bound each utility LLM call so a dropped/slow gateway connection fails fast and Temporal
+# retries (per each activity's retry policy) instead of the SDK hanging on its long default
+# timeout. Kept under the activities' 2-minute start_to_close so the SDK error wins (a retryable
+# ApplicationError) rather than a Temporal ActivityTaskTimeout.
+LLM_REQUEST_TIMEOUT_SECONDS = 90.0
+
+# One-shot triage of each ticket up front. `how_to`/`account_billing` are retrieval-solvable;
+# `diagnostic` needs the customer's own data (drives PR 3's wider read scopes); `bug` is answered by
+# researching our own code, which the signals pipeline does separately and writes back onto the
+# ticket; `unactionable` (spam, bare feedback, no question) short-circuits before the expensive
+# draft loop.
+TICKET_TYPES = ("how_to", "diagnostic", "account_billing", "bug", "unactionable")
+
+# Scopes for a reply that may be auto-sent to the (untrusted) ticket author. Deliberately the
+# narrowest set: only what docs-search (project:read) and business-knowledge search
+# (business_knowledge:read) need. No project config or customer data, so nothing beyond public
+# docs + the team's own knowledge base can reach an untrusted author even if the agent (or an
+# injected ticket instruction) tries to call a tool the prompt didn't advertise.
+PUBLISHABLE_DRAFT_SCOPES: list[str] = [
+    "business_knowledge:read",
+    "project:read",
+]
+
+# Base read scopes for a human-reviewed draft that is NOT opted into ai_diagnostics_enabled:
+# docs + BK, project metadata, taxonomy, and flag/experiment/survey/dashboard config. Some of
+# these (survey:read, feature_flag:read) can also return row-level data (individual survey
+# responses, per-user flag evaluations / blast radius), so this set is only safe because the
+# reply is human-reviewed before it can reach the author -- never use it for an auto-sent reply.
+BASE_DRAFT_SCOPES: list[str] = [
+    "business_knowledge:read",
+    "project:read",
+    "event_definition:read",
+    "property_definition:read",
+    "feature_flag:read",
+    "experiment:read",
+    "survey:read",
+    "action:read",
+    "annotation:read",
+    "dashboard:read",
+]
+
+# When the team opted into ai_diagnostics_enabled, the draft gets the "read_only" preset
+# (all reads, including customer data tools like execute-sql, session recordings, error
+# tracking, logs). The preset string is passed directly to CustomPromptSandboxContext.
+# The prompt layer + support_review_reply_activity backstop external-connection data.
+# Typed as a bare Literal (not oauth.McpScopePreset) to keep this module import-free of
+# Django/ORM -- it's loaded inside the Temporal workflow sandbox via pipeline.py.
+DIAGNOSTIC_SCOPES_PRESET: Literal["read_only"] = "read_only"
+
+# Sandbox agent model for the draft step. Must be in the LLM gateway `conversations`
+# product allowlist (services/llm-gateway/src/llm_gateway/products/config.py) — support-reply
+# sandbox tasks route through that product via @posthog/agent's resolveGatewayProduct().
+DRAFT_MODEL = "claude-sonnet-5"
+DRAFT_RUNTIME_ADAPTER = "claude"
+
+# One-line bias appended to refine/draft/validate prompts so each step focuses on what the
+# ticket type actually needs answered.
+TICKET_TYPE_HINTS: dict[str, str] = {
+    "how_to": "This is a how-to/usage question — answer it from product documentation and the team's knowledge base.",
+    "diagnostic": "This is a diagnostic ticket — the customer reports something broken or unexpected for their account; focus on what's failing and why.",
+    "account_billing": "This is an account/billing question — focus on the customer's plan, usage, limits, and billing specifics.",
+    "unactionable": "This ticket has no answerable support question.",
+    "bug": (
+        "This reads as a defect in the product itself, not a usage or account question. Do not offer a fix or a "
+        "workaround assembled from documentation, because the behavior described is not what the docs describe. "
+        "Acknowledge the report and gather only what an engineer would need to reproduce it: affected version or SDK, "
+        "exact steps, when it started, error text, and screenshots."
+    ),
+}

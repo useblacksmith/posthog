@@ -1,0 +1,32 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+        "after": {
+            "description": "ISO timestamp — only return jobs created after this date (e.g. \"2025-01-01T00:00:00Z\").",
+            "type": "string"
+        },
+        "before": {
+            "description": "ISO timestamp — only return jobs created before this date (e.g. \"2025-12-31T23:59:59Z\").",
+            "type": "string"
+        },
+        "id": {
+            "description": "UUID of the data warehouse source (from external-data-sources-list). Not a table (schema) id.",
+            "type": "string"
+        },
+        "limit": {
+            "description": "Maximum number of jobs to return, from 1 to 100 (default 20). Jobs are newest first. To get older jobs, pass the returned `next_before` as `before`.",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+        },
+        "schemas": {
+            "description": "Filter jobs by table schema names (e.g. [\"users\", \"orders\"]). Only returns jobs for these tables.",
+            "items": {
+                "type": "string"
+            },
+            "type": "array"
+        }
+    },
+    "required": ["id"],
+    "type": "object"
+}

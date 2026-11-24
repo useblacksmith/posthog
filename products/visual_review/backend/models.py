@@ -1,0 +1,669 @@
+"""Django models for visual_review."""
+
+from __future__ import annotations
+
+import uuid
+
+from django.db import models
+
+from posthog.models.scoping.product_mixin import ProductTeamModel
+from posthog.models.utils import uuid7
+
+from .facade.enums import (
+    ActorType,
+    AutoQuarantineMode,
+    BaselineApprovalState,
+    BaselineEntrySource,
+    BaselineEvidence,
+    BaselineMode,
+    ClassificationReason,
+    QuarantineLiftState,
+    ReviewDecision,
+    ReviewState,
+    RunGate,
+    RunPurpose,
+    RunStatus,
+    RunType,
+    SnapshotResult,
+    ToleratedReason,
+)
+
+
+class Repo(ProductTeamModel):
+    """
+    A visual review repo tied to a GitHub repository.
+
+    Identity is the GitHub numeric repo ID (survives renames and org transfers).
+    repo_full_name is kept for API calls and display, auto-updated on rename detection.
+    """
+
+    # nosemgrep: prefer-uuid7-django-pk -- TODO: migrate to uuid7 (UUIDModel)
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # GitHub identity: numeric ID is stable, full_name is for API calls + display
+    repo_external_id = models.BigIntegerField()
+    repo_full_name = models.CharField(max_length=255)
+
+    # Baseline file paths per run type
+    # e.g., {"storybook": ".storybook/snapshots.yml", "playwright": "playwright/snapshots.yml"}
+    baseline_file_paths = models.JSONField(default=dict, blank=True)
+
+    # Whether to post a PR comment prompting reviewers when visual changes are detected.
+    # Default off — teams opt in when they want commenting, and it stays off during
+    # auto-approve rollout phases where comments would be noise.
+    enable_pr_comments = models.BooleanField(default=False)
+
+    # Off by default: the digest posts into other teams' Slack channels, so a repo opts in.
+    debt_digest_enabled = models.BooleanField(default=False, db_default=False)
+
+    # Off by default, because an automatic quarantine hides a gate failure from every pull request.
+    auto_quarantine_mode = models.CharField(
+        max_length=10,
+        choices=AutoQuarantineMode.choices,
+        default=AutoQuarantineMode.OFF.value,
+        db_default=AutoQuarantineMode.OFF.value,
+    )
+
+    baseline_mode = models.CharField(
+        max_length=10, choices=BaselineMode.choices, default=BaselineMode.YAML.value, db_default=BaselineMode.YAML.value
+    )
+    # Off: every commit status follows the yaml rules, also in shadow mode. Ledger mode needs it on.
+    commit_status_gate_enabled = models.BooleanField(default=False, db_default=False)
+
+    # HMAC signing keys for baseline hash verification: {kid: secret_hex}
+    # Supports key rotation — new signatures use the latest key, verification
+    # accepts any valid kid. Auto-generated on first use.
+    signing_keys = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["team_id", "repo_external_id"], name="unique_repo_per_team"),
+        ]
+
+    def __str__(self) -> str:
+        return self.repo_full_name
+
+    def get_active_signing_key(self) -> tuple[str, str]:
+        """Return ``(kid, secret_hex)`` for the active signing key.
+
+        Auto-generates a key on first access and persists it.
+        """
+        from .signing import generate_signing_key
+
+        keys: dict[str, str] = self.signing_keys or {}
+        if keys:
+            kid = max(keys)  # lexicographic latest
+            return kid, keys[kid]
+
+        kid, secret_hex = generate_signing_key()
+        self.signing_keys = {kid: secret_hex}
+        self.save(update_fields=["signing_keys"])
+        return kid, secret_hex
+
+
+class Artifact(ProductTeamModel):
+    """
+    Content-addressed image storage.
+
+    Same hash = same artifact. Deduplicated across all runs in a repo.
+    """
+
+    # nosemgrep: prefer-uuid7-django-pk -- TODO: migrate to uuid7 (UUIDModel)
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    repo = models.ForeignKey(Repo, on_delete=models.CASCADE, related_name="artifacts")
+
+    content_hash = models.CharField(max_length=128, db_index=True)
+    storage_path = models.CharField(max_length=1024)
+
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    size_bytes = models.PositiveIntegerField(null=True, blank=True)
+
+    thumbnail = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["repo", "content_hash"], name="unique_artifact_hash_per_repo"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.content_hash[:12]}..."
+
+
+class Run(ProductTeamModel):
+    """
+    A visual test run from CI.
+
+    Created when CI posts a manifest. Tracks status through diff processing.
+    """
+
+    # nosemgrep: prefer-uuid7-django-pk -- TODO: migrate to uuid7 (UUIDModel)
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    repo = models.ForeignKey(Repo, on_delete=models.CASCADE, related_name="runs")
+
+    status = models.CharField(
+        max_length=20, choices=[(s.value, s.value) for s in RunStatus], default=RunStatus.PENDING.value
+    )
+    run_type = models.CharField(max_length=64, default=RunType.OTHER.value)
+
+    # Git context
+    commit_sha = models.CharField(max_length=40)
+    branch = models.CharField(max_length=255)
+    pr_number = models.PositiveIntegerField(null=True, blank=True)
+
+    # Purpose and review
+    purpose = models.CharField(
+        max_length=20, choices=[(p.value, p.value) for p in RunPurpose], default=RunPurpose.REVIEW.value
+    )
+    review_decision = models.CharField(
+        max_length=20, choices=[(d.value, d.value) for d in ReviewDecision], default=ReviewDecision.PENDING.value
+    )
+    # Legacy — derived from review_decision, kept for backward compat during migration
+    approved = models.BooleanField(default=False)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    # References posthog.User in the main database — plain integer, no FK.
+    approved_by_id = models.BigIntegerField(null=True, blank=True)
+
+    # Summary (populated after diff processing)
+    total_snapshots = models.PositiveIntegerField(default=0)
+    changed_count = models.PositiveIntegerField(default=0)
+    new_count = models.PositiveIntegerField(default=0)
+    removed_count = models.PositiveIntegerField(default=0)
+    tolerated_match_count = models.PositiveIntegerField(default=0)
+
+    error_message = models.TextField(blank=True)
+
+    # Supersession: set when a newer run is created for the same (repo, branch, run_type).
+    # NULL = this is the latest run for its group. Non-NULL = superseded, points to the replacing run.
+    superseded_by = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="supersedes"
+    )
+
+    # Flexible metadata (not indexed)
+    # e.g., {"pr_title": "...", "base_branch": "main", "ci_job_url": "..."}
+    metadata = models.JSONField(default=dict, blank=True)
+
+    # CI ran only a subset of the test suite
+    is_partial = models.BooleanField(default=False)
+
+    gate = models.CharField(
+        max_length=20, choices=RunGate.choices, default=RunGate.CI_JOB.value, db_default=RunGate.CI_JOB.value
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["repo", "branch", "run_type", "superseded_by"], name="run_branch_type_current"),
+            models.Index(fields=["repo", "pr_number"], name="run_repo_pr"),
+            models.Index(fields=["commit_sha"], name="run_commit_sha"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["repo", "branch", "run_type"],
+                condition=models.Q(superseded_by__isnull=True),
+                name="unique_latest_run_per_group",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"Run {self.id} ({self.status})"
+
+
+class RunSnapshot(ProductTeamModel):
+    """
+    A single snapshot within a run.
+
+    Links current captured image to baseline. Stores diff results.
+    """
+
+    # nosemgrep: prefer-uuid7-django-pk -- TODO: migrate to uuid7 (UUIDModel)
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # No index of its own: every index on this table that starts with the run serves those lookups.
+    run = models.ForeignKey(Run, on_delete=models.CASCADE, related_name="snapshots", db_index=False)
+
+    identifier = models.CharField(max_length=512)
+
+    # Hash values (stored for linking artifacts after upload)
+    current_hash = models.CharField(max_length=128, blank=True)
+    baseline_hash = models.CharField(max_length=128, blank=True)
+
+    # Dimensions from manifest (used for artifact creation during complete)
+    current_width = models.PositiveIntegerField(null=True, blank=True)
+    current_height = models.PositiveIntegerField(null=True, blank=True)
+
+    # Current artifact (from this CI run)
+    current_artifact = models.ForeignKey(
+        Artifact, on_delete=models.SET_NULL, null=True, blank=True, related_name="current_snapshots"
+    )
+
+    # Baseline artifact (from .snapshots.yml)
+    baseline_artifact = models.ForeignKey(
+        Artifact, on_delete=models.SET_NULL, null=True, blank=True, related_name="baseline_snapshots"
+    )
+
+    # Diff artifact (generated by diff engine)
+    diff_artifact = models.ForeignKey(
+        Artifact, on_delete=models.SET_NULL, null=True, blank=True, related_name="diff_snapshots"
+    )
+
+    result = models.CharField(
+        max_length=20, choices=[(r.value, r.value) for r in SnapshotResult], default=SnapshotResult.UNCHANGED.value
+    )
+    # Why this snapshot was classified as UNCHANGED (empty for CHANGED/NEW/REMOVED)
+    classification_reason = models.CharField(
+        max_length=20, choices=[(r.value, r.value) for r in ClassificationReason], blank=True, default=""
+    )
+    # Set when classification used a tolerated alternate hash
+    tolerated_hash_match = models.ForeignKey(
+        "ToleratedHash", on_delete=models.SET_NULL, null=True, blank=True, related_name="matched_snapshots"
+    )
+
+    # Frozen at run finalization — reflects quarantine policy at that point in time
+    is_quarantined = models.BooleanField(default=False)
+
+    # Diff metrics. `diff_percentage` always means "fraction of pixels that
+    # differ" — the previous behavior where the SSIM tier overwrote this with
+    # SSIM dissimilarity is gone (split into `ssim_score` + `change_kind`
+    # below). Pre-split rows have been backfilled accordingly: SSIM-tier
+    # rows have `diff_percentage = NULL`, `ssim_score` derived from the
+    # original dissimilarity, and `change_kind = 'structural'`.
+    diff_percentage = models.FloatField(null=True, blank=True)
+    diff_pixel_count = models.PositiveIntegerField(null=True, blank=True)
+    # SSIM score (0.0–1.0). 1.0 = identical, lower = more structurally
+    # different. Populated for every diffed snapshot regardless of which
+    # tier classified it.
+    ssim_score = models.FloatField(null=True, blank=True)
+    # Categorical: see ChangeKind enum. Empty for snapshots that haven't
+    # been diffed (NEW, REMOVED, exact-match UNCHANGED).
+    change_kind = models.CharField(max_length=24, blank=True, default="")
+    # System-computed metadata produced by the diff pipeline (not the
+    # uploader's `metadata` field above, which is for ingestion-time
+    # context like browser/viewport). Storage is JSONB but the Python
+    # shape is governed by `DiffMetadata` in `diff_metadata.py` — all
+    # writes go through `.model_dump()` and reads through
+    # `.model_validate()`. Currently holds `cluster_summary`; future
+    # additions like `engine_version` land alongside without a schema
+    # migration.
+    diff_metadata = models.JSONField(default=dict, blank=True)
+
+    # Review state — only set on actionable snapshots (CHANGED, NEW, REMOVED).
+    # Empty for unchanged snapshots that don't need review.
+    review_state = models.CharField(
+        max_length=20,
+        choices=[(s.value, s.value) for s in ReviewState],
+        blank=True,
+        default="",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    # References posthog.User in the main database — plain integer, no FK.
+    reviewed_by_id = models.BigIntegerField(null=True, blank=True)
+    review_comment = models.TextField(blank=True)  # For rejection reasons or notes
+    # Hash that was approved (specific to approval action)
+    approved_hash = models.CharField(max_length=128, blank=True)
+
+    # Flexible metadata (not indexed)
+    # e.g., {"browser": "chrome", "viewport": "desktop", "is_flaky": true, "is_critical": true, "page_group": "Checkout"}
+    metadata = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["run", "identifier"], name="unique_snapshot_identifier_per_run"),
+        ]
+        indexes = [
+            # Covering, so the flakiness reads (a run's rows by result, filtered on reason, team and
+            # identifier) are index-only scans instead of reads of the whole table. The reason is in
+            # the key so the absorbed-row read skips the exact matches, which are most of a run.
+            models.Index(
+                fields=["run", "result", "classification_reason"],
+                include=[
+                    "review_state",
+                    "identifier",
+                    "diff_percentage",
+                    "tolerated_hash_match",
+                    "team_id",
+                ],
+                name="snapshot_run_result_reason",
+            ),
+            models.Index(fields=["run", "review_state"], name="snapshot_run_review_state"),
+            models.Index(fields=["identifier"], name="snapshot_identifier"),
+            models.Index(fields=["current_hash"], name="snapshot_current_hash"),
+            models.Index(fields=["baseline_hash"], name="snapshot_baseline_hash"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.identifier} ({self.result})"
+
+
+class ToleratedHash(ProductTeamModel):
+    """
+    Previously seen alternate hashes that were determined acceptable for a
+    specific baseline and snapshot identifier, allowing future runs to skip
+    expensive diff processing.
+
+    Keyed by (repo, identifier, baseline_hash, content_hash). A row accepts the
+    pair in both directions, so it still matches when the baseline flips to the
+    alternate render. When the baseline moves to any other hash, old tolerations
+    expire naturally because neither hash matches.
+    """
+
+    # nosemgrep: prefer-uuid7-django-pk -- TODO: migrate to uuid7 (UUIDModel)
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    repo = models.ForeignKey(Repo, on_delete=models.CASCADE, related_name="tolerated_hashes")
+
+    identifier = models.CharField(max_length=512)
+    baseline_hash = models.CharField(max_length=128)
+    alternate_hash = models.CharField(max_length=128)
+
+    reason = models.CharField(
+        max_length=20,
+        choices=[(r.value, r.value) for r in ToleratedReason],
+    )
+
+    # Which run caused this toleration to be recorded
+    source_run = models.ForeignKey(Run, on_delete=models.SET_NULL, null=True, blank=True)
+    created_by_id = models.BigIntegerField(null=True, blank=True)
+
+    diff_percentage = models.FloatField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["repo", "identifier", "baseline_hash", "alternate_hash"],
+                name="unique_tolerated_hash",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["repo", "identifier", "baseline_hash"], name="tolerated_lookup"),
+            # Recency reads (pile-ups, digest, the baselines page's windowed counts) scan only the
+            # window instead of every toleration the repo ever recorded.
+            models.Index(fields=["repo", "created_at"], name="tolerated_repo_created"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.identifier} {self.alternate_hash[:12]}... ({self.reason})"
+
+
+class QuarantinedIdentifier(ProductTeamModel):
+    """
+    Tracks quarantine events for snapshot identifiers.
+
+    Each row is a quarantine event — multiple rows per identifier form
+    a history. The active quarantine is the latest row where expires_at
+    is NULL or in the future. Unquarantining sets expires_at = now()
+    rather than deleting, preserving the audit trail.
+
+    Quarantined snapshots are still captured, classified, and diffed
+    (for metrics), but excluded from the gate at run finalization.
+    The decision is frozen on RunSnapshot.is_quarantined so historical
+    runs remain stable even if quarantine policy changes later.
+    """
+
+    # nosemgrep: prefer-uuid7-django-pk -- TODO: migrate to uuid7 (UUIDModel)
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    repo = models.ForeignKey(Repo, on_delete=models.CASCADE, related_name="quarantined_identifiers")
+
+    identifier = models.CharField(max_length=512)
+    run_type = models.CharField(max_length=64)
+    reason = models.CharField(max_length=255)
+    source = models.CharField(
+        max_length=10,
+        choices=[(a.value, a.value) for a in ActorType],
+        default=ActorType.HUMAN.value,
+    )
+
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_by_id = models.BigIntegerField(null=True, blank=True)
+    # The run whose failing snapshot prompted the quarantine. Nullable because
+    # quarantines can also be created from the snapshot history page where no
+    # specific failing run is in context, and entries pre-dating this column
+    # have no source. SET_NULL so a deleted/archived Run doesn't cascade-drop
+    # the quarantine — the audit trail (reason, who, when) still matters.
+    source_run = models.ForeignKey(
+        Run,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="originated_quarantines",
+    )
+    # The default-branch head when the quarantine was lifted. A run on a commit that does not
+    # contain it still treats the identifier as quarantined: that branch forked before the lift,
+    # so it lacks what the lift relied on, such as a baseline entry that landed on the default
+    # branch. Null for a quarantine that expired on its own or was lifted before this column.
+    lifted_at_sha = models.CharField(max_length=40, null=True, blank=True)
+    # Empty unless visual review lifted the quarantine by itself.
+    lift_reason = models.CharField(max_length=255, blank=True, default="", db_default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["repo", "run_type", "identifier"], name="quarantine_lookup"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.identifier} ({self.reason[:40]})"
+
+
+class QuarantineLiftRequest(ProductTeamModel):
+    """
+    A request to lift one quarantine event once a pull request merges.
+
+    A pull request that fixes a flaky story usually renders it exactly as its
+    baseline, so nothing else records the fix. The request names the picture
+    the fix produces. A default-branch run that contains the merge and renders
+    that picture against a matching baseline lifts the quarantine.
+
+    Not stored on RunSnapshot, because every push supersedes the run and the
+    retention sweep deletes superseded pull request runs.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid7, editable=False)
+    repo = models.ForeignKey(Repo, on_delete=models.CASCADE, related_name="quarantine_lift_requests")
+    # The exact quarantine event. A later quarantine of the same story is a new row, so this
+    # request can never lift it.
+    quarantine = models.ForeignKey(QuarantinedIdentifier, on_delete=models.CASCADE, related_name="lift_requests")
+    identifier = models.CharField(max_length=512)
+    run_type = models.CharField(max_length=64)
+    pr_number = models.IntegerField()
+    expected_hash = models.CharField(max_length=128)
+
+    source_run = models.ForeignKey(
+        Run, on_delete=models.SET_NULL, null=True, blank=True, related_name="requested_quarantine_lifts"
+    )
+    # References posthog.User in the main database, which a foreign key cannot reach.
+    requested_by_id = models.BigIntegerField(null=True, blank=True)
+    source = models.CharField(
+        max_length=10,
+        choices=[(a.value, a.value) for a in ActorType],
+        default=ActorType.HUMAN.value,
+    )
+
+    state = models.CharField(
+        max_length=20,
+        choices=QuarantineLiftState.choices,
+        default=QuarantineLiftState.PENDING.value,
+    )
+    # The latest verification outcome, in words a reviewer can read.
+    detail = models.CharField(max_length=255, blank=True)
+
+    merge_commit_sha = models.CharField(max_length=40, null=True, blank=True)
+    applied_run = models.ForeignKey(
+        Run, on_delete=models.SET_NULL, null=True, blank=True, related_name="applied_quarantine_lifts"
+    )
+    lifted_at_sha = models.CharField(max_length=40, null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["quarantine", "pr_number"],
+                condition=models.Q(state=QuarantineLiftState.PENDING.value),
+                name="unique_pending_lift_per_quarantine_pr",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["repo", "state"], name="quarantine_lift_repo_state"),
+            models.Index(fields=["repo", "pr_number"], name="quarantine_lift_repo_pr"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.identifier} #{self.pr_number} ({self.state})"
+
+
+class BaselineCommit(ProductTeamModel):
+    """
+    One commit on the default branch's first-parent line, with its position in the baseline ledger.
+
+    Position 0 is the commit the ledger was seeded at. A run maps its merge-base commit to a
+    position through this table, and reads the ledger at that position.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid7, editable=False)
+    repo = models.ForeignKey(Repo, on_delete=models.CASCADE, related_name="baseline_commits")
+    position = models.PositiveIntegerField()
+    commit_sha = models.CharField(max_length=40)
+    pr_number = models.IntegerField(null=True, blank=True)
+    # False when the commit subject names a pull request that GitHub does not show as merged yet.
+    # pr_number then holds the named number, so a later pass can land that pull request here.
+    resolved = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["repo", "position"], name="unique_baseline_commit_position"),
+            models.UniqueConstraint(fields=["repo", "commit_sha"], name="unique_baseline_commit_sha"),
+        ]
+        indexes = [
+            models.Index(
+                fields=["repo", "position"],
+                condition=models.Q(resolved=False),
+                name="baseline_commit_unresolved",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.position} {self.commit_sha[:12]}"
+
+
+class BaselineApproval(ProductTeamModel):
+    """
+    One approved change of one identifier in one pull request. An empty hash approves a removal.
+
+    The row outlives the runs it names, because the retention sweep deletes superseded pull
+    request runs long before the pull request merges.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid7, editable=False)
+    repo = models.ForeignKey(Repo, on_delete=models.CASCADE, related_name="baseline_approvals")
+    run_type = models.CharField(max_length=64)
+    pr_number = models.IntegerField()
+    identifier = models.CharField(max_length=512)
+
+    content_hash = models.CharField(max_length=128, blank=True)
+    ledger_base_hash = models.CharField(max_length=128, blank=True)
+    # The baseline the reviewer saw. An earlier approval of this pull request or of a stack parent can supply it.
+    effective_base_hash = models.CharField(max_length=128, blank=True)
+
+    commit_sha = models.CharField(max_length=40)
+    # The newest commit where a run of the pull request reproduced the approval, so it survives a rebase.
+    carried_commit_sha = models.CharField(max_length=40, blank=True)
+
+    source_run = models.ForeignKey(
+        Run, on_delete=models.SET_NULL, null=True, blank=True, related_name="recorded_baseline_approvals"
+    )
+    approved_by_id = models.BigIntegerField(null=True, blank=True)
+    approved_at = models.DateTimeField()
+
+    state = models.CharField(
+        max_length=20, choices=BaselineApprovalState.choices, default=BaselineApprovalState.OPEN.value
+    )
+    detail = models.CharField(max_length=255, blank=True)
+    landed_position = models.PositiveIntegerField(null=True, blank=True)
+    landed_commit_sha = models.CharField(max_length=40, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    evidence = models.CharField(max_length=20, choices=BaselineEvidence.choices, blank=True)
+    evidence_run = models.ForeignKey(
+        Run, on_delete=models.SET_NULL, null=True, blank=True, related_name="evidenced_baseline_approvals"
+    )
+    evidence_commit_sha = models.CharField(max_length=40, blank=True)
+    # Evidence from a later run replaces earlier evidence, and the earlier run row can be gone by then.
+    evidence_run_created_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["repo", "run_type", "pr_number", "identifier"],
+                condition=models.Q(state=BaselineApprovalState.OPEN.value),
+                name="unique_open_baseline_approval",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["repo", "state"], name="baseline_approval_repo_state"),
+            models.Index(fields=["repo", "pr_number"], name="baseline_approval_repo_pr"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.identifier} #{self.pr_number} ({self.state})"
+
+
+class BaselineEntry(ProductTeamModel):
+    """
+    One change of one identifier's baseline in the ledger. Rows are only ever appended.
+
+    The ledger at a position holds, per identifier, the entry with the highest (position, id) at
+    or below that position. An entry with an empty hash removes the identifier.
+    """
+
+    # A sequence, not a uuid7: the id breaks a tie between two entries at one position, so it must grow in
+    # insert order. A uuid7 is random inside a millisecond. Every insert holds the ledger lock.
+    id = models.BigAutoField(primary_key=True)
+    repo = models.ForeignKey(Repo, on_delete=models.CASCADE, related_name="baseline_entries")
+    run_type = models.CharField(max_length=64)
+    identifier = models.CharField(max_length=512)
+    content_hash = models.CharField(max_length=128, blank=True)
+    previous_hash = models.CharField(max_length=128, blank=True)
+    position = models.PositiveIntegerField()
+    commit_sha = models.CharField(max_length=40)
+    source = models.CharField(max_length=10, choices=BaselineEntrySource.choices)
+    approval = models.ForeignKey(
+        BaselineApproval, on_delete=models.SET_NULL, null=True, blank=True, related_name="ledger_entries"
+    )
+    pr_number = models.IntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            # The full ledger read at a position walks every entry of the run type in this order. The hash is
+            # included so that walk stays an index-only read and does not visit the table for each entry.
+            models.Index(
+                fields=["repo", "run_type", "identifier", "-position", "-id"],
+                name="baseline_entry_identifier",
+                include=["content_hash"],
+            ),
+            models.Index(fields=["repo", "run_type", "position"], name="baseline_entry_position"),
+            models.Index(fields=["repo", "content_hash"], name="baseline_entry_hash"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.identifier} @{self.position} ({self.content_hash[:12] or 'removed'})"

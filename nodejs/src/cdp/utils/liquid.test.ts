@@ -1,0 +1,520 @@
+import * as fs from 'fs'
+import * as path from 'path'
+
+import { parseJSON } from '../../common/utils/json-parse'
+import { HogFunctionInvocationGlobalsWithInputs } from '../types'
+import { LiquidRenderBudget, LiquidRenderer } from './liquid'
+
+type PostmarkRenderCase = {
+    name: string
+    part: 'html' | 'subject' | 'text'
+    liquid: string
+    model: Record<string, unknown>
+    expected: string
+    posthog_renders?: string
+}
+
+// Expected outputs come from Mustachio 2.1, and test_postmark_import.py pins the converter's `liquid` to this file.
+const POSTMARK_RENDER_CASES: PostmarkRenderCase[] = parseJSON(
+    fs.readFileSync(
+        path.join(__dirname, '../../../../products/messaging/backend/tests/fixtures/postmark_render_cases.json'),
+        'utf8'
+    )
+)
+
+// .NET and LiquidJS write the same character with different HTML entities. Escaped characters stay escaped, so an
+// escaped quote or tag never equals a raw one.
+const ESCAPED_CHARACTERS: Record<string, string> = {
+    '<': '&lt;',
+    '>': '&gt;',
+    '&': '&amp;',
+    '"': '&quot;',
+    "'": '&#39;',
+}
+const NAMED_ENTITIES: Record<string, string> = { quot: '"', apos: "'", lt: '<', gt: '>', amp: '&' }
+const decodeEntityForms = (html: string): string =>
+    html.replace(/&(#x[0-9a-f]+|#\d+|quot|apos|lt|gt|amp);/gi, (_, entity: string) => {
+        const lower = entity.toLowerCase()
+        const character = lower.startsWith('#x')
+            ? String.fromCodePoint(parseInt(lower.slice(2), 16))
+            : lower.startsWith('#')
+              ? String.fromCodePoint(Number(lower.slice(1)))
+              : NAMED_ENTITIES[lower]
+        return ESCAPED_CHARACTERS[character] ?? character
+    })
+
+describe('LiquidRenderer', () => {
+    let globals: HogFunctionInvocationGlobalsWithInputs
+
+    beforeEach(() => {
+        const fixedTime = new Date('2025-06-01T00:00:00Z')
+        jest.spyOn(Date, 'now').mockReturnValue(fixedTime.getTime())
+
+        globals = {
+            event: {
+                uuid: 'test-uuid',
+                event: 'test_event',
+                distinct_id: 'test-id',
+                properties: {},
+                elements_chain: '',
+                timestamp: '2024-03-20T00:00:00Z',
+                url: 'https://test.com',
+            },
+            person: {
+                id: 'test-id',
+                properties: {
+                    email: 'test_person@example.com',
+                },
+                name: 'test_person',
+                url: 'https://test.com',
+            },
+            groups: {
+                'test-group': {
+                    id: 'test-group-id',
+                    type: 'test-group-type',
+                    index: 0,
+                    url: 'https://test.com',
+                    properties: {},
+                },
+            },
+            project: {
+                id: 1,
+                name: 'test-project',
+                url: 'https://test.com',
+            },
+            source: {
+                name: 'test-source',
+                url: 'https://test.com',
+            },
+            inputs: {},
+        }
+    })
+
+    describe('basic rendering', () => {
+        it('renders simple variables', () => {
+            const template = 'Hello {{ person.name }}!'
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(LiquidRenderer['_liquid']).toBeDefined()
+            expect(result).toMatchInlineSnapshot(`"Hello test_person!"`)
+        })
+    })
+
+    describe('warehouse row record alias', () => {
+        it.each([
+            ['$warehouse_view_row', 'row@example.com'],
+            ['$warehouse_source_row', 'row@example.com'],
+            ['test_event', ''],
+        ])('renders {{ record.email }} for %s as "%s"', (eventName, expected) => {
+            globals.event.event = eventName
+            globals.event.properties = { email: 'row@example.com' }
+
+            expect(LiquidRenderer.renderWithHogFunctionGlobals('{{ record.email }}', globals)).toBe(expected)
+        })
+    })
+
+    describe('memoized initialisation', () => {
+        it('only initialises once', () => {
+            LiquidRenderer['_liquid'] = null
+            LiquidRenderer.renderWithHogFunctionGlobals('Hello {{ person.name }}!', globals)
+            expect(LiquidRenderer['_liquid']).toBeDefined()
+        })
+    })
+
+    describe('custom filters', () => {
+        it('handles default filter', () => {
+            const template = '{{ value | default: "fallback" }}'
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, { ...globals })
+            expect(result).toMatchInlineSnapshot(`"fallback"`)
+        })
+
+        it('handles date filter with %Y%m%d format', () => {
+            const template = '{{ "2024-03-20" | date: "%Y%m%d" }}'
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(result).toMatchInlineSnapshot(`"20240320"`)
+        })
+
+        it('handles date filter with %B %-d, %Y at %l:%M %p format', () => {
+            const template = '{{ "2024-03-20T15:30:00" | date: "%B %-d, %Y at %l:%M %p" }}'
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(result).toMatchInlineSnapshot(`"March 20, 2024 at  3:30 PM"`)
+        })
+
+        it('handles date filter with %l:%M %p format', () => {
+            const template = '{{ "2024-03-20T15:30:00" | date: "%l:%M %p" }}'
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(result).toMatchInlineSnapshot(`" 3:30 PM"`)
+        })
+
+        it('handles "now" in date filter', () => {
+            const template = '{{ "now" | date: "%Y%m%d" }}'
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(result).toMatch(/^\d{8}$/)
+        })
+
+        it.each([
+            ['{{ 1234.5 | currency: "USD" }}', '$1,234.50'],
+            ['{{ "500" | currency }}', '$500.00'],
+            ['{{ -20 | currency: "USD" }}', '-$20.00'],
+            ['{{ 1234.5 | currency: "EUR" }}', '€1,234.50'],
+            ['{{ 1234.5 | currency: "en-GB" }}', '£1,234.50'],
+            ['{{ 1234.5 | currency: "en", "EUR" }}', '€1,234.50'],
+            ['{{ 1234.5 | currency: "de-DE" }}', '1.234,50 €'],
+            ['{{ 10 | currency: "zz-QQ" }}', '10'],
+            ['{{ 10 | currency: "qxy-QQ", "USD" }}', '10'],
+            ['{{ 10 | currency: "en-us" }}', '$10.00'],
+            ['{{ missing | default: "ERROR" | currency: "USD" }}', 'ERROR'],
+            ['{{ missing | currency: "USD" }}', ''],
+            ['{{ 10 | currency: "not-a-code" }}', '10'],
+        ])('formats %s with the currency filter', (template, expected) => {
+            expect(LiquidRenderer.renderWithHogFunctionGlobals(template, globals)).toBe(expected)
+        })
+    })
+
+    describe('unsubscribe_url tag', () => {
+        const url = 'https://example.com/preferences?token=abc&team=1'
+        const escapedUrl = 'https://example.com/preferences?token=abc&amp;team=1'
+
+        // Each tag row sits next to the variable row it has to match.
+        it.each([
+            ['<a href="{{ unsubscribe_url }}">x</a>', true, url, `<a href="${escapedUrl}">x</a>`],
+            ['<a href="{% unsubscribe_url %}">x</a>', true, url, `<a href="${escapedUrl}">x</a>`],
+            ['<a href=" {%- unsubscribe_url -%} ">x</a>', true, url, `<a href="${escapedUrl}">x</a>`],
+            ['Unsubscribe: {{ unsubscribe_url }}', false, url, `Unsubscribe: ${url}`],
+            ['Unsubscribe: {% unsubscribe_url %}', false, url, `Unsubscribe: ${url}`],
+            ['<a href="{{ unsubscribe_url }}">x</a>', true, undefined, '<a href="">x</a>'],
+            ['<a href="{% unsubscribe_url %}">x</a>', true, undefined, '<a href="">x</a>'],
+        ])('renders %s with escapeHtml %s', (template, escapeHtml, unsubscribe_url, expected) => {
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(
+                template,
+                { ...globals, unsubscribe_url },
+                undefined,
+                { escapeHtml }
+            )
+            expect(result).toBe(expected)
+        })
+    })
+
+    describe('HTML decoding', () => {
+        it('decodes HTML entities', () => {
+            const template = '{{ "&lt;div&gt;Hello &amp; World&lt;/div&gt;" }}'
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(result).toMatchInlineSnapshot(`"&lt;div&gt;Hello &amp; World&lt;/div&gt;"`)
+        })
+
+        it('renders liquid elements that have been encoded', () => {
+            const template = '{% if 1 &lt; 2 %}hello!{% endif %}'
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(result).toMatchInlineSnapshot(`"hello!"`)
+        })
+
+        it.each([
+            ['a link variable', '<a href="/?n={{%20person.name%20|%20url_encode%20}}">', '<a href="/?n=test_person">'],
+            ['a quoted string', '{{%20person.missing%20|%20default:%20&quot;a%20b&quot;%20}}', 'a%20b'],
+            ['a tag', '{%%20if%201%20&lt;%202%20%}yes{%%20endif%20%}', 'yes'],
+            ['a quoted string with an escaped quote', '{{%20&quot;a\\&quot;b%20c&quot;%20|%20size%20}}', '7'],
+        ])('reads spaces the email editor saved as %%20 in %s', (_, template, expected) => {
+            expect(LiquidRenderer.renderWithHogFunctionGlobals(template, globals)).toBe(expected)
+        })
+
+        it('preserves $ in template', () => {
+            const template = '{{ "$100" }}'
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(result).toMatchInlineSnapshot(`"$100"`)
+        })
+
+        it("decodes unlayer's encoded complex example 1", () => {
+            const html = `
+<div style="font-size: 14px; line-height: 140%; text-align: left; word-wrap: break-word;">
+    <p style="line-height: 140%;">hey {{person.properties.email}}</p>
+<p style="line-height: 140%;">{% assign event_date_raw = "2025-06-15 14:30:00" %}<br />{% assign event_date = event_date_raw | date: "%Y%m%d" %}</p>
+<p style="line-height: 140%;">{% assign today = "now" | date: "%Y%m%d" %}</p>
+<p style="line-height: 140%;">{% assign event_friendly = event_date_raw | date: "%B %-d, %Y at %l:%M %p" %}<br />{% if event_date &gt; today %}<br />The event is coming up on {{ event_friendly }}.<br />{% elsif event_date == today %}<br />The event is happening today at {{ event_friendly | date: "%l:%M %p" }}!<br />{% else %}<br />This event took place on {{ event_friendly }}.<br />{% endif %}</p>
+  </div>`
+
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(html, globals)
+            expect(result).toMatchInlineSnapshot(`
+                "
+                <div style="font-size: 14px; line-height: 140%; text-align: left; word-wrap: break-word;">
+                    <p style="line-height: 140%;">hey test_person@example.com</p>
+                <p style="line-height: 140%;"><br /></p>
+                <p style="line-height: 140%;"></p>
+                <p style="line-height: 140%;"><br /><br />The event is coming up on June 15, 2025 at  2:30 PM.<br /></p>
+                  </div>"
+            `)
+        })
+
+        it("decodes unlayer's encoded complex example 2", () => {
+            const html = `
+{% assign events_raw = "Launch Party|2025-06-15 18:00:00,Team Retreat|2025-05-28 09:00:00,Product Demo|2025-06-02 14:00:00" %}
+
+{% assign events = events_raw | split: "," %}
+
+{% assign today = "now" | date: "%Y%m%d" %}
+
+<ul>
+  
+  {% for event in events %}
+    {% assign parts       = event | split: "|" %}
+    {% assign event_name  = parts[0] %}
+    {% assign raw_date    = parts[1] %}
+    {% assign event_ymd   = raw_date | date: "%Y%m%d" %}
+    {% assign friendly_dt = raw_date | date: "%B %-d, %Y at %l:%M %p" %}
+    <li>
+      <strong>{{ event_name }}</strong> – 
+      {% if event_ymd > today %}
+        Scheduled on {{ friendly_dt }}
+      {% elsif event_ymd == today %}
+        Happening today at {{ raw_date | date: "%l:%M %p" }}
+      {% else %}
+        Occurred on {{ friendly_dt }}
+      {% endif %}
+    </li>
+  {% endfor %}
+</ul>`
+
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(html, globals)
+            expect(result).toMatchInlineSnapshot(`
+                "
+
+
+
+
+
+
+                <ul>
+                  
+                  
+                    
+                    
+                    
+                    
+                    
+                    <li>
+                      <strong>Launch Party</strong> – 
+                      
+                        Scheduled on June 15, 2025 at  6:00 PM
+                      
+                    </li>
+                  
+                    
+                    
+                    
+                    
+                    
+                    <li>
+                      <strong>Team Retreat</strong> – 
+                      
+                        Occurred on May 28, 2025 at  9:00 AM
+                      
+                    </li>
+                  
+                    
+                    
+                    
+                    
+                    
+                    <li>
+                      <strong>Product Demo</strong> – 
+                      
+                        Scheduled on June 2, 2025 at  2:00 PM
+                      
+                    </li>
+                  
+                </ul>"
+            `)
+        })
+    })
+
+    describe.each(['render', 'include', 'layout'])('file inclusion via the %s tag is disabled', (tag) => {
+        it('does not disclose local files within the working directory', () => {
+            // The partial must live under the worker's cwd: LiquidJS confines file lookups there.
+            const fixtureName = `liquid-fs-fixture-${process.pid}.txt`
+            const fixturePath = path.join(process.cwd(), fixtureName)
+            const secret = 'TOP_SECRET_FILE_CONTENTS'
+            fs.writeFileSync(fixturePath, secret)
+
+            try {
+                LiquidRenderer['_liquid'] = null
+                const template = `{% ${tag} '${fixtureName}' %}`
+
+                let result: string
+                try {
+                    result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+                } catch {
+                    // A thrown lookup error also means the file was not disclosed
+                    result = ''
+                }
+
+                expect(result).not.toContain(secret)
+            } finally {
+                fs.unlinkSync(fixturePath)
+                LiquidRenderer['_liquid'] = null
+            }
+        })
+    })
+
+    describe('resource limits', () => {
+        it.each([
+            [
+                'exponential string growth',
+                "{% assign s = 'aaaaaaaa' %}{% for i in (1..40) %}{% assign s = s | append: s %}{% endfor %}{{ s | size }}",
+                'memory alloc limit exceeded',
+            ],
+            [
+                'CPU-bound nested loop',
+                '{% assign a = (1..100) %}{% for i in a %}{% for j in a %}{% for k in a %}{% for l in a %}{% endfor %}{% endfor %}{% endfor %}{% endfor %}',
+                'template render limit exceeded',
+            ],
+            ['oversized template source', '{{ person.name }}'.padEnd(6_000_000, ' '), 'parse length limit exceeded'],
+            [
+                'literal output amplification',
+                `{% for i in (1..1100) %}${'a'.repeat(10_000)}{% endfor %}`,
+                'liquid output limit exceeded',
+            ],
+        ])('rejects a template with %s instead of blocking the process', (_name, template, expectedError) => {
+            expect(() => LiquidRenderer.renderWithHogFunctionGlobals(template, globals)).toThrow(expectedError)
+        })
+
+        it('renders an email body whose size comes from an inlined image, not from tags', () => {
+            // Real bodies reach megabytes because a logo is inlined as a base64 data URI. They carry a
+            // handful of tags, so tightening the length caps toward the typical template breaks them.
+            const inlinedImage = `<img src="data:image/png;base64,${'A'.repeat(1_500_000)}" />`
+            const template = `<html>${inlinedImage}<p>Hello {{ person.name }}</p></html>`
+
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+
+            expect(result).toContain('Hello test_person')
+            expect(result.length).toBeGreaterThan(1_500_000)
+        })
+
+        it('rejects expression filters, which the render deadline cannot interrupt', () => {
+            const template = '{{ (1..3) | where_exp: "x", "x > 1" | size }}'
+            expect(() => LiquidRenderer.renderWithHogFunctionGlobals(template, globals)).toThrow(
+                'liquid filter where_exp is not supported'
+            )
+        })
+
+        it('decodes many unmatched openers in linear time', () => {
+            const template = '{{'.repeat(50_000)
+            const start = performance.now()
+            expect(() => LiquidRenderer.renderWithHogFunctionGlobals(template, globals)).toThrow('not closed')
+            expect(performance.now() - start).toBeLessThan(1000)
+        })
+
+        it('shares one budget across renders when given one', () => {
+            const budget = new LiquidRenderBudget()
+            const template = `{% for i in (1..600) %}${'a'.repeat(10_000)}{% endfor %}`
+            expect(LiquidRenderer.renderWithHogFunctionGlobals(template, globals, budget)).toHaveLength(6_000_000)
+            expect(() => LiquidRenderer.renderWithHogFunctionGlobals(template, globals, budget)).toThrow(
+                'liquid output limit exceeded'
+            )
+        })
+
+        it('renders normally after a rejected template', () => {
+            expect(() =>
+                LiquidRenderer.renderWithHogFunctionGlobals('{{ person.name }}'.padEnd(6_000_000, ' '), globals)
+            ).toThrow('parse length limit exceeded')
+            expect(LiquidRenderer.renderWithHogFunctionGlobals('Hello {{ person.name }}!', globals)).toBe(
+                'Hello test_person!'
+            )
+        })
+    })
+
+    describe('templates imported from Postmark', () => {
+        it.each(POSTMARK_RENDER_CASES.map((c) => [c.name, c] as const))('%s', (_name, c) => {
+            const rendered = LiquidRenderer.renderWithHogFunctionGlobals(
+                c.liquid,
+                { variables: c.model } as unknown as HogFunctionInvocationGlobalsWithInputs,
+                undefined,
+                { escapeHtml: c.part === 'html' }
+            )
+            expect(decodeEntityForms(rendered)).toEqual(decodeEntityForms(c.posthog_renders ?? c.expected))
+        })
+    })
+
+    describe('renderWithHogFunctionGlobals', () => {
+        it('renders with hog function globals', () => {
+            const template = 'Event: {{ event.event }}, Person: {{ person.name }}'
+            const globals: HogFunctionInvocationGlobalsWithInputs = {
+                event: {
+                    uuid: 'test-uuid',
+                    event: 'test_event',
+                    distinct_id: 'test-id',
+                    properties: {},
+                    elements_chain: '',
+                    timestamp: '2024-03-20T00:00:00Z',
+                    url: 'https://test.com',
+                },
+                person: {
+                    id: 'test-id',
+                    properties: {},
+                    name: 'test_person',
+                    url: 'https://test.com',
+                },
+                groups: {
+                    'test-group': {
+                        id: 'test-group-id',
+                        type: 'test-group-type',
+                        index: 0,
+                        url: 'https://test.com',
+                        properties: {},
+                    },
+                },
+                project: {
+                    id: 1,
+                    name: 'test-project',
+                    url: 'https://test.com',
+                },
+                source: {
+                    name: 'test-source',
+                    url: 'https://test.com',
+                },
+                inputs: {},
+            }
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(result).toMatchInlineSnapshot(`"Event: test_event, Person: test_person"`)
+        })
+
+        it('includes now in context', () => {
+            const template = '{{ now | date: "%Y%m%d" }}'
+            const globals: HogFunctionInvocationGlobalsWithInputs = {
+                event: {
+                    uuid: 'test-uuid',
+                    event: 'test_event',
+                    distinct_id: 'test-id',
+                    properties: {},
+                    elements_chain: '',
+                    timestamp: '2024-03-20T00:00:00Z',
+                    url: 'https://test.com',
+                },
+                person: {
+                    id: 'test-id',
+                    properties: {},
+                    name: 'test_person',
+                    url: 'https://test.com',
+                },
+                groups: {
+                    'test-group': {
+                        id: 'test-group-id',
+                        type: 'test-group-type',
+                        index: 0,
+                        url: 'https://test.com',
+                        properties: {},
+                    },
+                },
+                project: {
+                    id: 1,
+                    name: 'test-project',
+                    url: 'https://test.com',
+                },
+                source: {
+                    name: 'test-source',
+                    url: 'https://test.com',
+                },
+                inputs: {},
+            }
+            const result = LiquidRenderer.renderWithHogFunctionGlobals(template, globals)
+            expect(result).toMatch(/^\d{8}$/)
+        })
+    })
+})

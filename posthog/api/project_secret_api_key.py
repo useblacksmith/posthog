@@ -1,0 +1,325 @@
+from collections.abc import Iterable
+from typing import cast
+
+from django.db import IntegrityError, transaction
+from django.db.models import QuerySet
+from django.utils import timezone
+
+import structlog
+from drf_spectacular.utils import extend_schema_field
+from rest_framework import response, serializers, status, viewsets
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.request import Request
+
+from posthog.api.documentation import extend_schema
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.api.shared import UserBasicSerializer
+from posthog.api.utils import action
+from posthog.auth import PersonalAPIKeyAuthentication, SessionAuthentication
+from posthog.exceptions import InsufficientScope
+from posthog.llm.wizard_blocklist import WIZARD_BLOCKED_DETAIL
+from posthog.models import Organization, Team, User
+from posthog.models.project_secret_api_key import ProjectSecretAPIKey, RevokedTeamSecretToken
+from posthog.models.utils import ai_credential_value, generate_random_token_secret, hash_key_value, mask_key_value
+from posthog.permissions import TeamMemberStrictManagementPermission, TimeSensitiveActionPermission, scopes_caller_lacks
+from posthog.scopes.catalog import API_SCOPE_ACTIONS, API_SCOPE_OBJECTS
+from posthog.scopes.exposure import INTERNAL_API_SCOPE_OBJECTS
+from posthog.scopes.project_secret_api_key import PROJECT_SECRET_API_KEY_ALLOWED_API_SCOPE_ACTION
+from posthog.settings import EE_AVAILABLE
+from posthog.tasks.email import send_feature_flags_secure_api_key_exposed, send_project_secret_api_key_exposed
+from posthog.utils import get_trusted_client_ip
+
+from products.access_control.backend.facade.user_access_control import UserAccessControl
+from products.security.backend.facade.api import access_refused as security_access_refused
+from products.security.backend.facade.contracts import SubjectInput as SecuritySubject
+from products.security.backend.facade.enums import Surface as SecuritySurface
+
+if EE_AVAILABLE:
+    from ee.billing.grants import BillingEntitlement, effective_billing_grants
+
+logger = structlog.get_logger(__name__)
+
+MAX_PROJECT_SECRET_API_KEYS_PER_TEAM = 100
+
+
+def _enforce_caller_holds_scopes(request: Request, scopes: Iterable[str]) -> None:
+    """A project secret API key outlives the credential that issued it, so a scoped caller must not
+    issue one with scopes it lacks."""
+    missing = scopes_caller_lacks(request, scopes)
+    if missing:
+        raise InsufficientScope(
+            missing,
+            detail="Your API key or OAuth token can only issue a project secret API key with scopes it has. "
+            f"Use a key or token that has these scopes: {', '.join(missing)}.",
+        )
+
+
+def _enforce_caller_may_grant_billing_read(request: Request, organization: Organization, scopes: Iterable[str]) -> None:
+    """A key with billing:read reads its project's usage and share of the organization's spend. Only
+    someone with full access to the organization's billing may grant it."""
+    if "billing:read" not in scopes:
+        return
+    if not EE_AVAILABLE:
+        raise PermissionDenied("The billing:read scope needs PostHog's enterprise billing, which this instance lacks.")
+    user = request.user if isinstance(request.user, User) else None
+    grants = effective_billing_grants(
+        organization=organization, user=user, authenticator=getattr(request, "successful_authenticator", None)
+    )
+    if BillingEntitlement.FULL_ACCESS.value not in grants.entitlements:
+        raise PermissionDenied(
+            "Only someone with full access to the organization's billing can give a project secret API key "
+            "the billing:read scope."
+        )
+
+
+def _enforce_caller_may_grant_business_knowledge_read(request: Request, team: Team, scopes: Iterable[str]) -> None:
+    """A key reads business knowledge with no user to check, so the access rules that apply to people
+    run here, on the person who grants the scope."""
+    if "business_knowledge:read" not in scopes:
+        return
+    # The parent project owns the knowledge, so its rules decide for every environment.
+    access = UserAccessControl(
+        user=cast(User, request.user), team=team.parent_team or team, organization_id=str(team.organization_id)
+    )
+    if not access.check_access_level_for_resource("business_knowledge", "viewer"):
+        raise PermissionDenied(
+            "You need access to business knowledge in this project to give a project secret API key "
+            "the business_knowledge:read scope."
+        )
+
+
+def _mirrors_legacy_team_token(key: ProjectSecretAPIKey) -> bool:
+    team = key.team
+    tokens = (team.secret_api_token, team.secret_api_token_backup)
+    return any(token and key.secure_value == hash_key_value(token) for token in tokens)
+
+
+def _enforce_gateway_bans(request: Request, team) -> None:
+    """A phs_ key reaches the gateway with no user attached, so the user bans that
+    other gateway credential paths enforce run here, when the scope is granted."""
+    user = cast(User, request.user)
+    try:
+        refused = security_access_refused(
+            SecuritySubject(
+                email=user.email,
+                user_uuid=str(user.uuid),
+                organization_ids=(str(team.organization_id),),
+                ip=get_trusted_client_ip(getattr(request, "_request", request)),
+            ),
+            SecuritySurface.AI_GATEWAY,
+            call_site="project_secret_api_key",
+        )
+    except Exception:
+        logger.exception("security_access_check_site_failed", call_site="project_secret_api_key")
+        refused = False
+    if refused:
+        raise PermissionDenied(WIZARD_BLOCKED_DETAIL)
+
+
+class ProjectSecretAPIKeySerializer(serializers.ModelSerializer):
+    value = serializers.SerializerMethodField(method_name="get_key_value", read_only=True)
+    scopes = serializers.ListField(
+        child=serializers.CharField(required=True),
+        allow_empty=False,
+        help_text=(
+            "Project-wide API scopes granted to this key. Project secret API keys do not honor object-level "
+            "access controls, so a scope can access resources of that type even when per-resource RBAC would "
+            "hide them from an individual user."
+        ),
+    )
+    created_by = UserBasicSerializer(read_only=True)
+    ai_credential = serializers.SerializerMethodField(
+        help_text=(
+            "Value the AI gateway stamps as $ai_credential on generations made with this key, so gateway "
+            "spend can be grouped by key. Derived from the key's hash, so it changes when the key is rolled."
+        ),
+    )
+
+    class Meta:
+        model = ProjectSecretAPIKey
+        fields = [
+            "id",
+            "label",
+            "value",
+            "mask_value",
+            "created_at",
+            "created_by",
+            "last_used_at",
+            "last_rolled_at",
+            "scopes",
+            "ai_credential",
+        ]
+        read_only_fields = [
+            "id",
+            "mask_value",
+            "created_at",
+            "created_by",
+            "last_used_at",
+            "last_rolled_at",
+        ]
+
+    def get_key_value(self, obj: ProjectSecretAPIKey) -> str:
+        return getattr(obj, "_value", None)  # type: ignore
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_ai_credential(self, obj: ProjectSecretAPIKey) -> str | None:
+        return ai_credential_value(obj.secure_value) if obj.secure_value else None
+
+    def validate_scopes(self, scopes):
+        allowed = set(PROJECT_SECRET_API_KEY_ALLOWED_API_SCOPE_ACTION)
+        # Staff grant llm_gateway:read; a key that already holds it stays saveable by any admin.
+        holds_gateway_scope = self.instance is not None and "llm_gateway:read" in (self.instance.scopes or [])
+        if holds_gateway_scope or self.context["request"].user.is_staff:
+            allowed.add(("llm_gateway", "read"))
+
+        for scope in scopes:
+            if scope == "*":
+                raise serializers.ValidationError(
+                    "Wildcard scope '*' is not allowed for project API keys. Please specify explicit scopes."
+                )
+            scope_parts = scope.split(":")
+            if (
+                len(scope_parts) != 2
+                or scope_parts[0] not in API_SCOPE_OBJECTS
+                or scope_parts[0] in INTERNAL_API_SCOPE_OBJECTS
+                or scope_parts[1] not in API_SCOPE_ACTIONS
+            ):
+                raise serializers.ValidationError(f"Invalid scope: {scope}")
+
+            if (scope_parts[0], scope_parts[1]) not in allowed:
+                allowed_scopes = ", ".join(f"{obj}:{action}" for obj, action in sorted(allowed))
+                raise serializers.ValidationError(
+                    f"Scope '{scope}' can not be assigned to a project secret API key. Allowed scopes: {allowed_scopes}"
+                )
+
+        # An update may keep or remove a scope the caller lacks, because only an added scope widens the key.
+        existing = set(self.instance.scopes or []) if self.instance is not None else set()
+        added = [scope for scope in scopes if scope not in existing]
+        _enforce_caller_holds_scopes(self.context["request"], added)
+        _enforce_caller_may_grant_billing_read(self.context["request"], self.context["view"].team.organization, added)
+        _enforce_caller_may_grant_business_knowledge_read(self.context["request"], self.context["view"].team, added)
+        # Every project member can read the legacy secret token, so the check on the person who grants
+        # the scope does not limit who ends up holding this key.
+        restricted_legacy_scopes = set(added) & {"business_knowledge:read", "person:write"}
+        if restricted_legacy_scopes and self.instance is not None and _mirrors_legacy_team_token(self.instance):
+            raise serializers.ValidationError(
+                "This key is the project's legacy secret token, which every project member can read. "
+                f"Create a new key for these scopes: {', '.join(sorted(restricted_legacy_scopes))}."
+            )
+        if "llm_gateway:read" in added:
+            _enforce_gateway_bans(self.context["request"], self.context["view"].team)
+        return scopes
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["scopes"] = ret["scopes"] or []
+        return ret
+
+    def create(self, validated_data: dict, **kwargs) -> ProjectSecretAPIKey:
+        user = self.context["request"].user
+        team = self.context["view"].team
+        count = ProjectSecretAPIKey.objects.filter(team=team).count()
+        if count >= MAX_PROJECT_SECRET_API_KEYS_PER_TEAM:
+            raise serializers.ValidationError(
+                f"You can only have {MAX_PROJECT_SECRET_API_KEYS_PER_TEAM} project secret API keys. Remove an existing key before creating a new one."
+            )
+
+        key_value = generate_random_token_secret()
+        masked_key_value = mask_key_value(key_value)
+        secure_key_value = hash_key_value(key_value)
+        try:
+            project_secret_api_key = ProjectSecretAPIKey.objects.create(
+                team=team,
+                secure_value=secure_key_value,
+                mask_value=masked_key_value,
+                created_by=cast(User, user),
+                label=validated_data["label"],
+                scopes=validated_data["scopes"],
+            )
+            project_secret_api_key._value = key_value  # type: ignore
+            return project_secret_api_key
+        except IntegrityError as e:
+            if "unique_team_label" in str(e):
+                raise ValidationError(f"Project secret API key with label '{validated_data['label']}' already exists.")
+            raise
+
+    def roll(self, project_secret_api_key: ProjectSecretAPIKey) -> ProjectSecretAPIKey:
+        key_value = generate_random_token_secret()
+        masked_key_value = mask_key_value(key_value)
+        secure_key_value = hash_key_value(key_value)
+
+        project_secret_api_key = super().update(
+            project_secret_api_key,
+            {"secure_value": secure_key_value, "mask_value": masked_key_value, "last_rolled_at": timezone.now()},
+        )
+        project_secret_api_key._value = key_value  # type: ignore
+
+        return project_secret_api_key
+
+
+def roll_project_secret_api_key_and_notify(project_secret_api_key: ProjectSecretAPIKey, more_info: str) -> None:
+    """Single entry point for exposure-driven rolls (GitHub secret scanning, Django admin).
+
+    The key is rolled even when no admin can be emailed: invalidating the leaked value
+    takes priority over notification delivery.
+    """
+    old_mask_value = project_secret_api_key.mask_value
+    serializer = ProjectSecretAPIKeySerializer(instance=project_secret_api_key)
+    serializer.roll(project_secret_api_key)
+    send_project_secret_api_key_exposed(
+        project_secret_api_key.team_id, project_secret_api_key.id, old_mask_value, more_info
+    )
+
+
+def revoke_exposed_project_secret_api_key(project_secret_api_key: ProjectSecretAPIKey, more_info: str) -> bool:
+    """Revoke an exposed key the right way for what it actually is, and return whether it
+    was a mirrored legacy team token.
+
+    A backfilled PSAK (#63111) mirrors the team's legacy secret token: deleting the row
+    is the revocation (rolling would mint an unrelated key that later rotation cannot
+    clean up), and the admins must still rotate the legacy token itself. Any other key
+    gets the ordinary roll-and-notify.
+    """
+    team = project_secret_api_key.team
+    for token in (team.secret_api_token, team.secret_api_token_backup):
+        if token and project_secret_api_key.secure_value == hash_key_value(token):
+            with transaction.atomic():
+                # Remember the hash: the pre-drop rerun of the #63111 backfill must not
+                # give this still-unrotated leaked token a fresh mirror row.
+                RevokedTeamSecretToken.objects.for_team(team.id).get_or_create(
+                    team_id=team.id, secure_value=project_secret_api_key.secure_value
+                )
+                project_secret_api_key.delete()
+            send_feature_flags_secure_api_key_exposed(team.id, mask_key_value(token), more_info)
+            return True
+    roll_project_secret_api_key_and_notify(project_secret_api_key, more_info)
+    return False
+
+
+@extend_schema(extensions={"x-product": "core"})
+class ProjectSecretAPIKeyViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
+    scope_object = "project"
+    scope_object_write_actions = ["create", "update", "partial_update", "patch", "destroy", "roll"]
+    lookup_field = "id"
+    serializer_class = ProjectSecretAPIKeySerializer
+    permission_classes = [TimeSensitiveActionPermission, TeamMemberStrictManagementPermission]
+    authentication_classes = [PersonalAPIKeyAuthentication, SessionAuthentication]
+
+    queryset = ProjectSecretAPIKey.objects.all()
+
+    def safely_get_queryset(self, queryset: QuerySet) -> QuerySet:
+        return queryset.select_related("created_by").order_by("-created_at")
+
+    @extend_schema(
+        description="Roll a project secret API key", request=None, responses={200: ProjectSecretAPIKeySerializer}
+    )
+    @action(methods=["POST"], detail=True, url_path="roll")
+    def roll(self, request, *args, **kwargs):
+        instance = self.get_object()
+        _enforce_caller_holds_scopes(request, instance.scopes or [])
+        # Rolling hands back a usable secret, so it needs what granting the scopes needs.
+        _enforce_caller_may_grant_billing_read(request, self.team.organization, instance.scopes or [])
+        _enforce_caller_may_grant_business_knowledge_read(request, self.team, instance.scopes or [])
+        serializer = cast(ProjectSecretAPIKeySerializer, self.get_serializer(instance))
+        serializer.roll(instance)
+        return response.Response(serializer.data, status=status.HTTP_200_OK)

@@ -1,0 +1,238 @@
+import posthog from 'posthog-js'
+import { type ErrorInfo, type ReactNode, useMemo } from 'react'
+
+import { IconArrowRight, IconInfo } from '@posthog/icons'
+import { createTooltipDateFormatter, useChartTheme, type MetricChange, type Series } from '@posthog/quill-charts'
+import {
+    Metric,
+    MetricDelta,
+    MetricHeader,
+    MetricSparkline,
+    MetricSubtitle,
+    MetricTitle,
+    MetricValue,
+} from '@posthog/quill-components/metric'
+import { cn, Skeleton, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@posthog/quill-primitives'
+
+import { AppMetricsTimeSeriesResponse } from 'lib/components/AppMetrics/appMetricsLogic'
+import { formatPercentageDiff, humanFriendlyNumber } from 'lib/utils/numbers'
+
+import { METRICS_BAD_WHEN_RISING } from './workflowMetricsSummaryLogic'
+
+const SPARKLINE_HEIGHT = 160
+
+// `Metric` is content, not a surface, so the tile keeps the surrounding scene's chrome rather than
+// quill's Card — the step tables and trends chart below it are still Lemon surfaces.
+const CARD_CHROME = 'flex min-w-[16rem] flex-1 flex-col rounded border bg-surface-primary py-3'
+
+// `Metric` contains a render throw to this tile instead of letting it take the scene down, which also
+// keeps it out of error tracking — report it so a silently broken tile is still visible.
+function captureRenderError(error: Error, info: ErrorInfo): void {
+    posthog.captureException(error, {
+        feature: 'workflow-metric-card',
+        componentStack: info.componentStack ?? undefined,
+    })
+}
+
+function DrillArrow({ tooltip }: { tooltip?: string }): JSX.Element {
+    const arrow = <IconArrowRight className="ml-1 inline-block align-text-bottom text-xl text-muted" aria-hidden />
+    if (!tooltip) {
+        return arrow
+    }
+    return (
+        <Tooltip>
+            <TooltipTrigger render={<span className="inline-flex" />}>{arrow}</TooltipTrigger>
+            <TooltipContent>{tooltip}</TooltipContent>
+        </Tooltip>
+    )
+}
+
+export interface WorkflowMetricCardProps {
+    name: string
+    /** Shown as an info tooltip on the title. */
+    description?: ReactNode
+    timeSeries: AppMetricsTimeSeriesResponse | null
+    previousPeriodTimeSeries?: AppMetricsTimeSeriesResponse | null
+    /** Names the previous value, e.g. "Previous run (Oct 12)". The card then shows that value in words
+     *  under its own, instead of a bare change pill. */
+    previousLabel?: string
+    color?: string
+    /** Per-series sparkline colors keyed by series name. When the response has more than one series,
+     *  the tile draws one line per series (colored from here) instead of a single summed line. */
+    seriesColors?: Record<string, string>
+    /** Sparkline color used when the tile total is zero (e.g. a muted grey). */
+    colorIfZero?: string
+    loading?: boolean
+    onClick?: () => void
+    onClickTooltip?: string
+    footer?: ReactNode
+    /** Shorter card, so a page with tables below it does not push them off screen. */
+    compact?: boolean
+    className?: string
+}
+
+// Collapse a response into the numbers the tile reads (per-index sums plus the grand total). A
+// single-metric tile has one series; the combined "messages" tile sums its email + push channels.
+function sumSeries(ts: AppMetricsTimeSeriesResponse | null | undefined): { data: number[]; total: number } {
+    if (!ts || ts.series.length === 0) {
+        return { data: [], total: 0 }
+    }
+    const data = ts.labels.map((_, i) => ts.series.reduce((acc, series) => acc + (series.values[i] ?? 0), 0))
+    return { data, total: data.reduce((acc, v) => acc + v, 0) }
+}
+
+/**
+ * A summary tile built by composing quill's `Metric`, adapting our app-metrics series shape. The click
+ * target, footer, title info icon and loading state are composition-level concerns, so they live here
+ * rather than as `Metric` props.
+ */
+export function WorkflowMetricCard({
+    name,
+    description,
+    timeSeries,
+    previousPeriodTimeSeries,
+    previousLabel,
+    color,
+    seriesColors,
+    colorIfZero,
+    loading,
+    onClick,
+    onClickTooltip,
+    footer,
+    compact,
+    className,
+}: WorkflowMetricCardProps): JSX.Element {
+    const theme = useChartTheme()
+
+    const { data, total } = useMemo(() => sumSeries(timeSeries), [timeSeries])
+    const totalPreviousPeriod = useMemo(() => sumSeries(previousPeriodTimeSeries).total, [previousPeriodTimeSeries])
+
+    // A response with more than one series (e.g. the combined email + push "messages" tile) draws one
+    // line per channel, colored from seriesColors; a single-series tile keeps the one summed line.
+    const sparklineSeries = useMemo<Series[] | undefined>(() => {
+        if (!timeSeries || timeSeries.series.length <= 1) {
+            return undefined
+        }
+        return timeSeries.series.map((s) => ({
+            key: s.name,
+            label: s.name,
+            data: s.values,
+            // The zero-state color has to be set per series — the sparkline ignores the tile-level
+            // `color` whenever `series` is set, so an empty combined tile would keep its channel colors.
+            color: total === 0 ? colorIfZero : seriesColors?.[s.name],
+        }))
+    }, [timeSeries, seriesColors, colorIfZero, total])
+
+    // Hide the pill on a zero/absent previous period rather than showing a bogus ∞%.
+    const change = useMemo<MetricChange | null>(
+        () =>
+            totalPreviousPeriod === 0 ? null : { value: ((total - totalPreviousPeriod) / totalPreviousPeriod) * 100 },
+        [total, totalPreviousPeriod]
+    )
+
+    const labelFormatter = useMemo(
+        () =>
+            timeSeries
+                ? createTooltipDateFormatter({
+                      interval: timeSeries.interval,
+                      timezone: timeSeries.timezone,
+                      allDays: timeSeries.labels,
+                  })
+                : undefined,
+        [timeSeries?.interval, timeSeries?.labels, timeSeries?.timezone]
+    )
+
+    const previousDiff =
+        total === totalPreviousPeriod ? '(no change)' : formatPercentageDiff(total, totalPreviousPeriod)
+    const restingSubtitle = !previousPeriodTimeSeries
+        ? 'Total'
+        : previousLabel
+          ? `${previousLabel}: ${humanFriendlyNumber(totalPreviousPeriod)}${previousDiff ? ` ${previousDiff}` : ''}`
+          : `vs. ${humanFriendlyNumber(totalPreviousPeriod)} prior`
+
+    const cardClassName = cn(
+        CARD_CHROME,
+        className,
+        onClick &&
+            'cursor-pointer transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent'
+    )
+
+    if (loading) {
+        return (
+            <div className={cn(CARD_CHROME, className)}>
+                <div className="flex flex-col px-3">
+                    <Skeleton className="h-4 w-24" />
+                    <Skeleton className="mt-3 h-9 w-32" />
+                    <Skeleton className={compact ? 'mt-3 h-16 w-full' : 'mt-4 h-40 w-full'} />
+                </div>
+            </div>
+        )
+    }
+
+    return (
+        <TooltipProvider>
+            <div
+                className={cardClassName}
+                onClick={onClick}
+                role={onClick ? 'button' : undefined}
+                tabIndex={onClick ? 0 : undefined}
+                // Only the card itself activates the drill — a link or icon inside it keeps its own keys.
+                onKeyDown={(e) => {
+                    if (onClick && e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+                        e.preventDefault()
+                        onClick()
+                    }
+                }}
+            >
+                <Metric
+                    className="px-3"
+                    onError={captureRenderError}
+                    value={total}
+                    data={data}
+                    series={sparklineSeries}
+                    labels={timeSeries?.labels}
+                    formatLabel={labelFormatter}
+                    restingSubtitle={restingSubtitle}
+                    theme={theme}
+                    color={total === 0 ? colorIfZero : color}
+                    change={previousLabel ? null : change}
+                    goodDirection={METRICS_BAD_WHEN_RISING.has(name) ? 'down' : 'up'}
+                    formatValue={(v) => humanFriendlyNumber(v)}
+                    sparklineHeight={SPARKLINE_HEIGHT}
+                >
+                    <MetricHeader>
+                        <MetricTitle className="min-w-0">
+                            {name}
+                            {description != null && (
+                                <Tooltip>
+                                    <TooltipTrigger
+                                        render={
+                                            <span
+                                                className="ml-1 inline-flex align-text-bottom text-xl text-muted"
+                                                onClick={(e) => e.stopPropagation()}
+                                            />
+                                        }
+                                    >
+                                        <IconInfo />
+                                    </TooltipTrigger>
+                                    <TooltipContent>{description}</TooltipContent>
+                                </Tooltip>
+                            )}
+                            {onClick && <DrillArrow tooltip={onClickTooltip} />}
+                        </MetricTitle>
+                        <MetricDelta />
+                    </MetricHeader>
+                    <MetricValue className={compact ? 'mt-1' : 'mt-2'} />
+                    <MetricSubtitle className="mt-1" />
+                    <MetricSparkline className={compact ? '-mx-3 mt-2 h-16' : '-mx-3 mt-4'} />
+                </Metric>
+                {footer && (
+                    // Stop clicks here from firing the tile's drill — the footer carries its own link.
+                    <div className="px-3 pt-2 text-center text-xs" onClick={(e) => e.stopPropagation()}>
+                        {footer}
+                    </div>
+                )}
+            </div>
+        </TooltipProvider>
+    )
+}

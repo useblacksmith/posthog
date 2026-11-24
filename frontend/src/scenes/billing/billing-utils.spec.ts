@@ -1,0 +1,450 @@
+import tk from 'timekeeper'
+
+import { dayjs } from 'lib/dayjs'
+
+import { billingJson } from '~/mocks/fixtures/_billing'
+import billingJsonWithFlatFee from '~/mocks/fixtures/_billing_with_flat_fee.json'
+import type { BillingProductV2Type } from '~/types'
+
+import {
+    convertAmountToUsage,
+    convertLargeNumberToWords,
+    convertUsageToAmount,
+    formatDisplayUsage,
+    formatTierPrice,
+    formatWithDecimals,
+    getProration,
+    projectUsage,
+    summarizeUsage,
+    selectionCoversEveryProject,
+} from './billing-utils'
+
+describe('summarizeUsage', () => {
+    it('should summarise usage', () => {
+        expect(summarizeUsage(0)).toEqual('0')
+        expect(summarizeUsage(999)).toEqual('999')
+        expect(summarizeUsage(1000)).toEqual('1 K')
+        expect(summarizeUsage(3345)).toEqual('3.35 K')
+        expect(summarizeUsage(3600)).toEqual('3.6 K')
+        expect(summarizeUsage(100000)).toEqual('100 K')
+        expect(summarizeUsage(999999)).toEqual('1 M')
+        expect(summarizeUsage(10000000)).toEqual('10 M')
+    })
+})
+
+describe('projectUsage', () => {
+    beforeEach(() => {
+        tk.freeze(new Date('2022-01-01'))
+    })
+    afterEach(() => {
+        tk.reset()
+    })
+    it('should projectUsage based on the remaining days', () => {
+        expect(
+            projectUsage(10000, {
+                current_period_start: dayjs().add(-100, 'hours'),
+                current_period_end: dayjs().add(100, 'hours'),
+                interval: 'month',
+            })
+        ).toEqual(20000)
+
+        expect(
+            projectUsage(10000, {
+                current_period_start: dayjs().add(-1, 'days'),
+                current_period_end: dayjs().add(30, 'days'),
+                interval: 'month',
+            })
+        ).toEqual(310000)
+    })
+
+    it('should not return infinity', () => {
+        expect(
+            projectUsage(10000, {
+                current_period_start: dayjs(),
+                current_period_end: dayjs().add(100, 'hours'),
+                interval: 'month',
+            })
+        ).toEqual(10000)
+    })
+})
+
+const amountToUsageMapping = [
+    { usage: 0, amount: '0.00' },
+    { usage: 1_000_000, amount: '0.00' },
+    { usage: 1_500_000, amount: '155.00' },
+    { usage: 2_000_000, amount: '310.00' },
+    { usage: 6_000_000, amount: '830.00' },
+    { usage: 10_000_000, amount: '1350.00' },
+    { usage: 230_000_000, amount: '10183.50' },
+]
+
+const amountToUsageMappingWithAddons = [
+    { usage: 0, amount: '0.00' },
+    { usage: 1_000_000, amount: '0.00' },
+    { usage: 1_409_086, amount: '155.78' },
+    { usage: 1_818_172, amount: '311.56' },
+    { usage: 4_888_063, amount: '842.89' },
+    { usage: 8_137_188, amount: '1362.75' },
+    { usage: 139_090_972, amount: '9914.62' },
+]
+
+// 20% discount
+const amountToUsageMappingWithPercentDiscount = [
+    { usage: 0, amount: '0.00' },
+    { usage: 1_000_000, amount: '0.00' },
+    { usage: 1_625_000, amount: '155.00' },
+    { usage: 2_500_000, amount: '300.00' },
+    { usage: 7_500_000, amount: '820.00' },
+    { usage: 17_500_000, amount: '1763.80' },
+    { usage: 352_500_000, amount: '8947.60' },
+]
+
+describe('convertUsageToAmount', () => {
+    it.each(amountToUsageMapping)('should convert usage to an amount based on the tiers', (mapping) => {
+        if (billingJson.products[0].tiers) {
+            expect(convertUsageToAmount(mapping.usage, [billingJson.products[0].tiers])).toEqual(mapping.amount)
+        }
+    })
+})
+describe('convertUsageToAmountWithAddons', () => {
+    it.each(amountToUsageMappingWithAddons)('should convert usage to an amount based on the tiers', (mapping) => {
+        if (billingJson.products[0].tiers) {
+            expect(
+                convertUsageToAmount(mapping.usage, [
+                    billingJson.products[0].tiers,
+                    billingJson.products[0].addons[0].tiers || [],
+                ])
+            ).toEqual(mapping.amount)
+        }
+    })
+})
+describe('convertAmountToUsage', () => {
+    it.each(amountToUsageMapping)('should convert amount to a usage based on the tiers', (mapping) => {
+        if (mapping.usage === 0) {
+            // Skip the 0 case as anything below a million is free
+            return
+        }
+        if (billingJson.products[0].tiers) {
+            expect(convertAmountToUsage(mapping.amount, [billingJson.products[0].tiers])).toEqual(mapping.usage)
+        }
+    })
+})
+describe('convertAmountToUsageWithAddons', () => {
+    it.each(amountToUsageMappingWithAddons)('should convert amount to a usage based on the tiers', (mapping) => {
+        if (mapping.usage === 0) {
+            // Skip the 0 case as anything below a million is free
+            return
+        }
+        if (billingJson.products[0].tiers) {
+            expect(
+                convertAmountToUsage(mapping.amount, [
+                    billingJson.products[0].tiers,
+                    billingJson.products[0].addons[0].tiers || [],
+                ])
+            ).toEqual(mapping.usage)
+        }
+    })
+})
+describe('convertUsageToAmountWithPercentDiscount', () => {
+    it.each(amountToUsageMappingWithPercentDiscount)(
+        'should convert usage to an amount based on the tiers',
+        (mapping) => {
+            const discountPercent = 20
+            if (billingJson.products[0].tiers) {
+                expect(convertUsageToAmount(mapping.usage, [billingJson.products[0].tiers], discountPercent)).toEqual(
+                    mapping.amount
+                )
+            }
+        }
+    )
+})
+
+const amountToUsageMappingWithFirstTierFlatFee = [
+    { usage: 5_000_000, amount: '200.00' },
+    { usage: 10_000_000, amount: '575.00' },
+    { usage: 30_000_000, amount: '1725.00' },
+]
+describe('amountToUsageMappingWithFirstTierFlatFee', () => {
+    it.each(amountToUsageMappingWithFirstTierFlatFee)(
+        'should convert usage to an amount based on the tiers',
+        (mapping) => {
+            if (billingJsonWithFlatFee.products[0].tiers) {
+                expect(convertUsageToAmount(mapping.usage, [billingJsonWithFlatFee.products[0].tiers])).toEqual(
+                    mapping.amount
+                )
+            }
+        }
+    )
+    it.each(amountToUsageMappingWithFirstTierFlatFee)(
+        'should convert amount to a usage based on the tiers',
+        (mapping) => {
+            if (billingJsonWithFlatFee.products[0].tiers) {
+                expect(convertAmountToUsage(mapping.amount, [billingJsonWithFlatFee.products[0].tiers])).toEqual(
+                    mapping.usage
+                )
+            }
+        }
+    )
+})
+describe('convertAmountToUsageWithPercentDiscount', () => {
+    it.each(amountToUsageMappingWithPercentDiscount)(
+        'should convert amount to a usage based on the tiers',
+        (mapping) => {
+            if (mapping.usage === 0) {
+                // Skip the 0 case as anything below a million is free
+                return
+            }
+            if (billingJson.products[0].tiers) {
+                const discountPercent = 20
+                expect(convertAmountToUsage(mapping.amount, [billingJson.products[0].tiers], discountPercent)).toEqual(
+                    mapping.usage
+                )
+            }
+        }
+    )
+})
+
+describe('convertLargeNumberToWords', () => {
+    it('should convert large numbers to words', () => {
+        expect(convertLargeNumberToWords(250, null, true, 'survey')).toEqual('First 250 surveys/mo')
+        expect(convertLargeNumberToWords(500, 250, true, 'survey')).toEqual('251-500')
+        expect(convertLargeNumberToWords(1000, 500, true, 'survey')).toEqual('501-1k')
+        expect(convertLargeNumberToWords(10000, 1000, true, 'survey')).toEqual('1-10k')
+        expect(convertLargeNumberToWords(10000000, 1000000, true, 'survey')).toEqual('1-10 million')
+    })
+})
+
+describe('getProration', () => {
+    it('should return proration amount and isProrated when all values are provided', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 30,
+            amountUsd: '100',
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: true,
+            prorationAmount: '50.00',
+        })
+    })
+
+    it('should return 0 proration amount and false isProrated when amountUsd is not provided', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 30,
+            amountUsd: null,
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: false,
+            prorationAmount: '0.00',
+        })
+    })
+
+    it('should return proration amount and false isProrated when subscription is not active', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 30,
+            amountUsd: '100',
+            hasActiveSubscription: false,
+        })
+        expect(result).toEqual({
+            isProrated: false,
+            prorationAmount: '50.00',
+        })
+    })
+
+    it('should handle zero timeTotalInSeconds gracefully', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 0,
+            amountUsd: '100',
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: false,
+            prorationAmount: '0.00',
+        })
+    })
+
+    it('should handle zero timeRemainingInSeconds gracefully', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 0,
+            timeTotalInSeconds: 30,
+            amountUsd: '100',
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: true,
+            prorationAmount: '0.00',
+        })
+    })
+
+    it('should return 0 proration amount and false isProrated when amountUsd is an empty string', () => {
+        const result = getProration({
+            timeRemainingInSeconds: 15,
+            timeTotalInSeconds: 30,
+            amountUsd: '',
+            hasActiveSubscription: true,
+        })
+        expect(result).toEqual({
+            isProrated: false,
+            prorationAmount: '0.00',
+        })
+    })
+})
+
+describe('formatWithDecimals', () => {
+    it('should format very small numbers without scientific notation', () => {
+        // Test various small decimal places
+        expect(formatWithDecimals(0.0000001)).toEqual('0.0000001') // 7 decimal places
+        expect(formatWithDecimals(0.00000001)).toEqual('0.00000001') // 8 decimal places
+        expect(formatWithDecimals(0.000000001)).toEqual('0.000000001') // 9 decimal places
+        expect(formatWithDecimals(0.0000000001)).toEqual('0.0000000001') // 10 decimal places
+        expect(formatWithDecimals(0.00000000001)).toEqual('0') // 11 decimal places - falls back to 10 decimals if not specified, which would be 0.0000000000 so we return 0
+
+        // Edge case at the scientific notation threshold (1e-6)
+        expect(formatWithDecimals(0.000001)).toEqual('0.000001') // Exactly 1e-6
+        expect(formatWithDecimals(0.0000009)).toEqual('0.0000009') // Just below 1e-6
+    })
+
+    it('should remove trailing zeros', () => {
+        // These numbers naturally produce trailing zeros when using toFixed(10), which is the default
+        expect(formatWithDecimals(1 / 8000000)).toEqual('0.000000125') // 0.000000125 -> toFixed(10) = 0.0000001250
+        expect(formatWithDecimals(5 / 4000000)).toEqual('0.00000125') // 0.00000125 -> toFixed(10) = 0.0000012500
+        expect(formatWithDecimals(1 / 2000000)).toEqual('0.0000005') // 0.0000005 -> toFixed(10) = 0.0000005000
+    })
+
+    it('should handle normal numbers', () => {
+        // Normal numbers
+        expect(formatWithDecimals(0)).toEqual('0')
+        expect(formatWithDecimals(1)).toEqual('1')
+        expect(formatWithDecimals(0.1)).toEqual('0.1')
+        expect(formatWithDecimals(0.01)).toEqual('0.01')
+        expect(formatWithDecimals(100.25)).toEqual('100.25')
+
+        // With explicit decimals
+        expect(formatWithDecimals(10.567, 2)).toEqual('10.57')
+        expect(formatWithDecimals(0.000000625, 9)).toEqual('0.000000625')
+
+        // Negative numbers
+        expect(formatWithDecimals(-0.000000625)).toEqual('-0.000000625')
+    })
+})
+
+describe('formatTierPrice', () => {
+    const withDisplay = (display_divisor: number | null, display_unit: string | null): BillingProductV2Type => ({
+        ...billingJson.products[0],
+        display_divisor,
+        display_unit,
+    })
+
+    it.each([
+        ['a per-MB-day price scaled to GB-month', '0.00000166666667', withDisplay(30000, 'GB-month'), '$0.05'],
+        ['a scaled price that rounds up to $0.1', '0.00000333333333', withDisplay(30000, 'GB-month'), '$0.1'],
+        ['a per-MB price scaled to GB', '0.00005', withDisplay(1000, 'GB'), '$0.05'],
+        ['an unscaled price at full precision', '0.000000625', withDisplay(null, null), '$0.000000625'],
+    ])('formats %s', (_name, unitAmountUsd, product, expected) => {
+        expect(formatTierPrice(unitAmountUsd, product)).toEqual(expected)
+    })
+})
+
+describe('formatDisplayUsage', () => {
+    it('should return empty string for null value', () => {
+        const product = { display_divisor: 1000, display_decimals: 2, display_unit: 'GB' } as any
+        expect(formatDisplayUsage(null, product)).toEqual('')
+    })
+
+    it('should return raw formatted number when no display config is set', () => {
+        const product = {} as any
+        expect(formatDisplayUsage(1234567, product)).toEqual('1,234,567')
+        expect(formatDisplayUsage(0, product)).toEqual('0')
+    })
+
+    it('should apply divisor, decimals, and unit (MB to GB)', () => {
+        const product = { display_divisor: 1000, display_decimals: 2, display_unit: 'GB' } as any
+        expect(formatDisplayUsage(27648, product)).toEqual('27.65 GB')
+        expect(formatDisplayUsage(1000, product)).toEqual('1.00 GB')
+        expect(formatDisplayUsage(500, product)).toEqual('0.50 GB')
+    })
+
+    it('should handle divisor without decimals', () => {
+        const product = { display_divisor: 1000, display_unit: 'GB' } as any
+        expect(formatDisplayUsage(27000, product)).toEqual('27 GB')
+    })
+
+    it('should handle decimals without divisor', () => {
+        const product = { display_decimals: 2, display_unit: 'units' } as any
+        expect(formatDisplayUsage(123, product)).toEqual('123.00 units')
+    })
+
+    it('should handle unit without divisor or decimals', () => {
+        const product = { display_unit: 'items' } as any
+        expect(formatDisplayUsage(500, product)).toEqual('500 items')
+    })
+
+    it('should pluralize regular words correctly', () => {
+        const product = { display_divisor: 100, display_decimals: 2, display_unit: 'coin' } as any
+        expect(formatDisplayUsage(3567, product)).toEqual('35.67 coins')
+        expect(formatDisplayUsage(100, product)).toEqual('1.00 coin') // singular when exactly 1
+        expect(formatDisplayUsage(50, product)).toEqual('0.50 coins')
+    })
+
+    it('should not pluralize abbreviations', () => {
+        const product = { display_divisor: 1000, display_decimals: 1, display_unit: 'MB' } as any
+        expect(formatDisplayUsage(5000, product)).toEqual('5.0 MB')
+        expect(formatDisplayUsage(1000, product)).toEqual('1.0 MB')
+    })
+
+    it('should use rounded value for pluralization', () => {
+        // When raw value rounds to 1.00, should use singular
+        const product = { display_divisor: 100, display_decimals: 2, display_unit: 'coin' } as any
+        expect(formatDisplayUsage(99.95, product)).toEqual('1.00 coin') // 0.9995 rounds to 1.00
+        expect(formatDisplayUsage(100.4, product)).toEqual('1.00 coin') // 1.004 rounds to 1.00
+        expect(formatDisplayUsage(99, product)).toEqual('0.99 coins') // 0.99 doesn't round to 1
+        expect(formatDisplayUsage(101, product)).toEqual('1.01 coins') // 1.01 doesn't round to 1
+    })
+
+    it('should use compact fallback when option is set and no display config', () => {
+        const product = { display_unit: null, display_decimals: null, display_divisor: null } as any
+        // Without compactFallback: full number with commas
+        expect(formatDisplayUsage(1234567, product)).toEqual('1,234,567')
+        // With compactFallback: uses compactNumber (same as summarizeUsage)
+        expect(formatDisplayUsage(1234567, product, { compactFallback: true })).toEqual(summarizeUsage(1234567))
+        expect(formatDisplayUsage(1000, product, { compactFallback: true })).toEqual(summarizeUsage(1000))
+        expect(formatDisplayUsage(500, product, { compactFallback: true })).toEqual(summarizeUsage(500))
+    })
+
+    it('should ignore compactFallback when display config is set', () => {
+        const product = { display_divisor: 1000, display_decimals: 2, display_unit: 'GB' } as any
+        // compactFallback has no effect when display formatting is configured
+        expect(formatDisplayUsage(27648, product, { compactFallback: true })).toEqual('27.65 GB')
+        expect(formatDisplayUsage(27648, product, { compactFallback: false })).toEqual('27.65 GB')
+    })
+})
+
+describe('selectionCoversEveryProject', () => {
+    const options = [{ key: '1' }, { key: '2' }, { key: '3' }]
+
+    it('treats selecting every project as no filter', () => {
+        expect(selectionCoversEveryProject([1, 2, 3], options)).toBe(true)
+    })
+
+    it('keeps a partial selection as a filter', () => {
+        expect(selectionCoversEveryProject([1, 2], options)).toBe(false)
+    })
+
+    it('keeps an empty selection alone, since that already means every project', () => {
+        expect(selectionCoversEveryProject([], options)).toBe(false)
+        expect(selectionCoversEveryProject(undefined, options)).toBe(false)
+    })
+
+    it('does not claim coverage before the project list has loaded', () => {
+        expect(selectionCoversEveryProject([1, 2, 3], [])).toBe(false)
+    })
+
+    it('covers a deleted project that still appears as an option', () => {
+        // The options include projects that have usage but no longer exist.
+        expect(selectionCoversEveryProject([1, 2, 3, 99], [...options, { key: '99' }])).toBe(true)
+    })
+})

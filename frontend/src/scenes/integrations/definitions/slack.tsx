@@ -1,0 +1,91 @@
+import { useValues } from 'kea'
+import { combineUrl, router } from 'kea-router'
+
+import { getMissingScopes } from 'lib/integrations/integrationScopes'
+import { IntegrationScopesWarning } from 'lib/integrations/IntegrationScopesWarning'
+import { OAUTH_INTEGRATION_ID_PARAM } from 'lib/integrations/integrationsLogic'
+import { ICONS } from 'lib/integrations/utils'
+import { urls } from 'scenes/urls'
+
+import { IntegrationType } from '~/types'
+
+import {
+    parseSlackSetupReturnTarget,
+    SLACK_SETUP_RETURN_PARAM,
+} from 'products/slack_app/frontend/workspace-setup/slackSetupReturn'
+
+import { SlackIntegration } from '../components/SlackIntegration'
+import { useSlackRequiredScopes } from '../components/slackScopes'
+import { defineIntegration } from '../integrationDefinition'
+import { IntegrationStatus, SettingsSectionComponent } from '../integrationTypes'
+
+// Render the scopes-mismatch banner directly under the OAuth success card so an install with
+// the wrong scope set surfaces it while the user is still in the install flow, instead of
+// hiding it behind a separate trip to Settings → Integrations that they have no reason to take.
+function SlackPostConnect({ integration }: { integration: IntegrationType }): JSX.Element {
+    const requiredScopes = useSlackRequiredScopes()
+    return <IntegrationScopesWarning integration={integration} schema={{ requiredScopes: requiredScopes.join(' ') }} />
+}
+
+// Aggregate status feeding the landing page headline: any install missing required scopes
+// drops the whole page into the "needs attention" state. ``getMissingScopes`` returns []
+// for legacy rows that have no scopes recorded — same fail-open behavior as the banner.
+function useSlackStatus(integrations: IntegrationType[]): IntegrationStatus {
+    const requiredScopes = useSlackRequiredScopes()
+    const anyNeedsAttention = integrations.some(
+        (integration) => getMissingScopes(integration, requiredScopes).length > 0
+    )
+    return anyNeedsAttention ? 'needs_attention' : 'ok'
+}
+
+// Only the install that the OAuth callback just created has its id in the URL, so a later visit keeps "Go to PostHog".
+function useSlackSetupUrl(integrations: IntegrationType[]): string | null {
+    const { searchParams } = useValues(router)
+    const newIntegrationId = Number(searchParams[OAUTH_INTEGRATION_ID_PARAM])
+    if (!integrations.some((integration) => integration.id === newIntegrationId)) {
+        return null
+    }
+    const returnTo = parseSlackSetupReturnTarget(searchParams[SLACK_SETUP_RETURN_PARAM])
+    return combineUrl(urls.slackAppWorkspaceSetup(newIntegrationId), {
+        entry: 'slack_page',
+        ...(returnTo ? { [SLACK_SETUP_RETURN_PARAM]: returnTo } : {}),
+    }).url
+}
+
+// A connect from Settings is deliberate, so it continues to the setup and then returns to Settings.
+function SlackSettingsSection({
+    next,
+    centered,
+    connectSurface,
+}: Parameters<SettingsSectionComponent>[0]): JSX.Element {
+    const returnNext =
+        connectSurface === 'settings'
+            ? combineUrl(urls.integration('slack'), { [SLACK_SETUP_RETURN_PARAM]: 'settings' }).url
+            : next
+    return <SlackIntegration next={returnNext} centered={centered} connectSurface={connectSurface} />
+}
+
+export const Slack = defineIntegration(
+    {
+        slug: 'slack',
+        kind: 'slack',
+        name: 'Slack',
+        logo: ICONS.slack,
+        banner: 'https://res.cloudinary.com/dmukukwp6/image/upload/slack_app_update_docs_f0c917f70a',
+        subtitle: 'Bring PostHog into Slack — from scheduled reports to an AI agent that ships code',
+        description:
+            'Tag @PostHog in any Slack thread to draft pull requests, ship code changes, ask data questions, and run SQL — all without leaving Slack. You also get insights, dashboards, and alerts delivered straight to your channels.',
+        capabilities: [
+            'Tag @PostHog in a thread to draft pull requests and ship code changes',
+            'Tag @PostHog to ask data questions and run SQL',
+            'Subscribe to insights and dashboards for scheduled reports',
+            'Receive alerts and error-tracking notifications in your channels',
+            'Manage feature flags, experiments, and surveys from Slack',
+        ],
+        docsUrl: 'https://posthog.com/docs/libraries/slack',
+        PostConnect: SlackPostConnect,
+        useStatus: useSlackStatus,
+        useSetupUrl: useSlackSetupUrl,
+    },
+    SlackSettingsSection
+)

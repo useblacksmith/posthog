@@ -1,0 +1,518 @@
+use axum::body::Body;
+use axum::extract::{MatchedPath, RawQuery, State};
+use axum::http::{header, HeaderMap, Method};
+use axum::response::IntoResponse;
+use axum_client_ip::InsecureClientIp;
+
+use super::constants::{CAPTURE_V1_PATH, CAPTURE_V1_PATHS};
+use super::context::Context;
+use super::lenient::parse_batch;
+use super::types::Batch;
+use tracing::Level;
+
+use crate::v1::constants::*;
+use crate::{ctx_log, log_stat_error, router, v1};
+
+pub async fn handle_request(
+    state: State<router::State>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    ip: InsecureClientIp,
+    method: Method,
+    path: MatchedPath,
+    body: Body,
+) -> Result<axum::response::Response, v1::Error> {
+    let static_path = pin_static_path(path.as_str());
+    let mut context = Context::new(
+        &headers,
+        &ip,
+        raw_query.clone(),
+        method.clone(),
+        static_path,
+    )
+    .map_err(|err| {
+        log_and_return_header_error(err, &headers, &ip, raw_query.as_deref(), &method, &path)
+    })?;
+
+    // TODO: purposely chatty, for now
+    ctx_log!(Level::INFO, context, "handle_request called");
+
+    let skew_seconds = context.clock_skew().num_milliseconds().saturating_abs() as f64 / 1000.0;
+    metrics::histogram!(CAPTURE_V1_CLOCK_SKEW_SECONDS).record(skew_seconds);
+
+    // Non-fatal: unusable PostHog-Sdk-Info means $lib/$lib_version can't be
+    // materialized for this batch. Count once per request for visibility.
+    if context.sdk_lib_and_version().is_none() {
+        let reason = if context.sdk_info.len() > MAX_SDK_INFO_LEN {
+            "sdk_info_oversized"
+        } else {
+            "sdk_info_unparseable"
+        };
+        metrics::counter!(
+            CAPTURE_V1_WARNING_METRIC,
+            "reason" => reason,
+            "path" => context.path,
+        )
+        .increment(1);
+    }
+
+    let raw_bytes = v1::util::extract_body_with_timeout(
+        body,
+        state.capture_v1_max_compressed_body_bytes,
+        state.body_chunk_read_timeout,
+        state.body_read_chunk_size_kb,
+        context.path,
+    )
+    .await
+    .map_err(|err| {
+        log_stat_error!(err, &context);
+        err
+    })?;
+
+    metrics::histogram!(CAPTURE_V1_PAYLOAD_SIZE, "stage" => "compressed", "encoding" => v1::util::encoding_tag(context.content_encoding.as_deref()))
+        .record(raw_bytes.len() as f64);
+
+    let payload = v1::util::decompress_payload(
+        context.content_encoding.as_deref(),
+        raw_bytes,
+        state.capture_v1_max_decompressed_body_bytes,
+        state.body_read_chunk_size_kb,
+    )
+    .await
+    .map_err(|err| {
+        log_stat_error!(err, &context);
+        err
+    })?;
+
+    metrics::histogram!(CAPTURE_V1_PAYLOAD_SIZE, "stage" => "decompressed", "encoding" => v1::util::encoding_tag(context.content_encoding.as_deref()))
+        .record(payload.len() as f64);
+
+    let batch: Batch = parse_batch(&payload).map_err(|failure| {
+        let err = v1::Error::RequestParsingError(failure);
+        log_stat_error!(err, &context);
+        err
+    })?;
+
+    metrics::histogram!(CAPTURE_V1_EVENT_BATCH_SIZE).record(batch.batch.len() as f64);
+
+    match super::process::process_batch(&state, &mut context, batch).await {
+        Ok(resp) => Ok(resp.into_response()),
+        Err(err) => {
+            log_stat_error!(err, &context);
+            Err(err)
+        }
+    }
+}
+
+/// Resolve a matched route pattern to its `&'static str`, which the Context
+/// carries into every metric and warning this request emits.
+///
+/// `MatchedPath` borrows from the request, so a label taken straight from it
+/// could not be `&'static`; matching it back against the registered set is what
+/// keeps the label a fixed-cardinality literal no matter what the client sent.
+/// An unknown pattern means a route was registered without being listed, which
+/// is a bug rather than client input, so falling back keeps the request served
+/// and the warning says where to look.
+fn pin_static_path(matched: &str) -> &'static str {
+    match CAPTURE_V1_PATHS.iter().find(|p| **p == matched) {
+        Some(path) => path,
+        None => {
+            tracing::warn!(path = matched, "unexpected matched path");
+            CAPTURE_V1_PATH
+        }
+    }
+}
+
+/// Logs a header-validation error before a Context could be constructed.
+/// Manually extracts raw header values for structured logging, then bumps
+/// the error metric with no Context path (falls back to "unknown").
+fn log_and_return_header_error(
+    err: v1::Error,
+    headers: &HeaderMap,
+    ip: &InsecureClientIp,
+    raw_query: Option<&str>,
+    method: &Method,
+    path: &MatchedPath,
+) -> v1::Error {
+    let token = raw_header_str(headers, header::AUTHORIZATION.as_str());
+    let request_id = raw_header_str(headers, POSTHOG_REQUEST_ID);
+    let sdk_info = raw_header_str(headers, POSTHOG_SDK_INFO);
+    let attempt = raw_header_str(headers, POSTHOG_ATTEMPT);
+    let client_ts = raw_header_str(headers, POSTHOG_REQUEST_TIMESTAMP);
+    let user_agent = raw_header_str(headers, "user-agent");
+    let content_type = raw_header_str(headers, "content-type");
+    let content_encoding = raw_header_str(headers, "content-encoding");
+
+    let msg = format!("{}: {err:#}", err.tag());
+    match err.log_level() {
+        Level::WARN => tracing::warn!(
+            token = %token,
+            request_id = %request_id,
+            sdk_info = %sdk_info,
+            attempt = %attempt,
+            client_timestamp = %client_ts,
+            user_agent = %user_agent,
+            content_type = %content_type,
+            content_encoding = %content_encoding,
+            client_ip = %ip.0,
+            method = %method,
+            query = ?raw_query,
+            path = %path.as_str(),
+            "{}", msg
+        ),
+        _ => tracing::error!(
+            token = %token,
+            request_id = %request_id,
+            sdk_info = %sdk_info,
+            attempt = %attempt,
+            client_timestamp = %client_ts,
+            user_agent = %user_agent,
+            content_type = %content_type,
+            content_encoding = %content_encoding,
+            client_ip = %ip.0,
+            method = %method,
+            query = ?raw_query,
+            path = %path.as_str(),
+            "{}", msg
+        ),
+    }
+    err.stat_error(None::<&crate::v1::context::RequestContext>);
+    err
+}
+
+fn raw_header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("absent")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use rstest::rstest;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use crate::router;
+    use crate::v1::analytics::constants::CAPTURE_V1_PATH;
+    use crate::v1::constants::*;
+    use crate::v1::test_utils::{batch_payload, compressed_payload, valid_event, TestStateBuilder};
+
+    fn test_app(state: router::State) -> Router {
+        Router::new()
+            .route(CAPTURE_V1_PATH, axum::routing::post(super::handle_request))
+            .layer(axum::middleware::from_fn(
+                crate::v1::middleware::v1_common_headers,
+            ))
+            .with_state(state)
+    }
+
+    fn valid_request() -> axum::http::request::Builder {
+        Request::builder()
+            .method("POST")
+            .uri(CAPTURE_V1_PATH)
+            .header("Authorization", "Bearer phc_test_token")
+            .header("Content-Type", "application/json")
+            .header("X-Forwarded-For", "127.0.0.1")
+            .header(POSTHOG_SDK_INFO, "posthog-rs/1.0.0")
+            .header(POSTHOG_ATTEMPT, "1")
+            .header(POSTHOG_REQUEST_ID, Uuid::new_v4().to_string())
+            .header(POSTHOG_REQUEST_TIMESTAMP, "2026-03-19T14:30:00Z")
+            .header("User-Agent", "test-agent/1.0")
+    }
+
+    async fn response_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn happy_path_single_event() {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let event = valid_event();
+        let uuid = event.uuid.clone();
+        let payload = batch_payload(&[event]);
+
+        let resp = app
+            .oneshot(valid_request().body(Body::from(payload)).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        let results = body["results"].as_object().unwrap();
+        assert_eq!(results[&uuid]["result"], "ok");
+    }
+
+    #[tokio::test]
+    async fn happy_path_batch() {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let events = vec![valid_event(), valid_event(), valid_event()];
+        let uuids: Vec<String> = events.iter().map(|e| e.uuid.clone()).collect();
+        let payload = batch_payload(&events);
+
+        let resp = app
+            .oneshot(valid_request().body(Body::from(payload)).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        let results = body["results"].as_object().unwrap();
+        for uuid in &uuids {
+            assert_eq!(results[uuid]["result"], "ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_authorization() {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let payload = batch_payload(&[valid_event()]);
+        let req = Request::builder()
+            .method("POST")
+            .uri(CAPTURE_V1_PATH)
+            .header("Content-Type", "application/json")
+            .header("X-Forwarded-For", "127.0.0.1")
+            .header(POSTHOG_SDK_INFO, "posthog-rs/1.0.0")
+            .header(POSTHOG_ATTEMPT, "1")
+            .header(POSTHOG_REQUEST_ID, Uuid::new_v4().to_string())
+            .header(POSTHOG_REQUEST_TIMESTAMP, "2026-03-19T14:30:00Z")
+            .header("User-Agent", "test-agent/1.0")
+            .body(Body::from(payload))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_required_headers() {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let payload = batch_payload(&[valid_event()]);
+        // Only Authorization and Content-Type — missing SDK-Info, Attempt, etc.
+        let req = Request::builder()
+            .method("POST")
+            .uri(CAPTURE_V1_PATH)
+            .header("Authorization", "Bearer phc_test_token")
+            .header("Content-Type", "application/json")
+            .header("X-Forwarded-For", "127.0.0.1")
+            .header("User-Agent", "test-agent/1.0")
+            .body(Body::from(payload))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn empty_body() {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let resp = app
+            .oneshot(valid_request().body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[rstest]
+    #[case::invalid_json(
+        "not json at all {{{",
+        "Failed to parse request body: invalid JSON at line 1, column 2."
+    )]
+    #[case::wrong_type_distinct_id(
+        r#"{"created_at":"2026-03-19T14:30:00Z","batch":[{"event":"e","uuid":"019a0000-0000-7000-8000-000000000001","distinct_id":12345678901234567890123,"timestamp":"2026-03-19T14:30:00Z"}]}"#,
+        "Failed to parse request body: batch[0].distinct_id must be a string, got number."
+    )]
+    #[case::missing_event_name_in_later_event(
+        r#"{"created_at":"2026-03-19T14:30:00Z","batch":[{"event":"e","uuid":"019a0000-0000-7000-8000-000000000001","distinct_id":"d","timestamp":"2026-03-19T14:30:00Z"},{"uuid":"019a0000-0000-7000-8000-000000000002","distinct_id":"alice@example.com","timestamp":"2026-03-19T14:30:00Z"}]}"#,
+        "Failed to parse request body: batch[1].event is missing."
+    )]
+    #[case::wrong_type_created_at(
+        r#"{"created_at":{"secret":"alice@example.com"},"batch":[]}"#,
+        "Failed to parse request body: created_at must be a string, got object."
+    )]
+    #[case::wrong_type_batch(
+        r#"{"created_at":"2026-03-19T14:30:00Z","batch":"alice@example.com"}"#,
+        "Failed to parse request body: wrong JSON type or value at line 1, column 64."
+    )]
+    #[case::truncated(
+        r#"{"created_at":"2026-03-19T14:30:00Z","batch":[{"event":"e""#,
+        "Failed to parse request body: unexpected end of JSON at line 1, column 58."
+    )]
+    #[tokio::test]
+    async fn unparseable_body_describes_the_problem_without_content(
+        #[case] body: &str,
+        #[case] expected_description: &str,
+    ) {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let resp = app
+            .oneshot(valid_request().body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(resp).await;
+        let raw = json.to_string();
+        for value in [
+            "alice@example.com",
+            "12345678901234567890123",
+            "1.2345678901234568e22",
+            "secret",
+        ] {
+            assert!(
+                !raw.contains(value),
+                "response echoes request content: {raw}"
+            );
+        }
+        assert_eq!(json["error"], "request_parsing_error");
+        assert_eq!(json["error_description"], expected_description);
+    }
+
+    #[tokio::test]
+    async fn empty_batch() {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let payload = br#"{"created_at":"2026-03-19T14:30:00Z","batch":[]}"#.to_vec();
+        let resp = app
+            .oneshot(valid_request().body(Body::from(payload)).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gzip_compressed_payload() {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let event = valid_event();
+        let uuid = event.uuid.clone();
+        let raw = batch_payload(&[event]);
+        let compressed = compressed_payload(&raw, "gzip");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(CAPTURE_V1_PATH)
+            .header("Authorization", "Bearer phc_test_token")
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "gzip")
+            .header("X-Forwarded-For", "127.0.0.1")
+            .header(POSTHOG_SDK_INFO, "posthog-rs/1.0.0")
+            .header(POSTHOG_ATTEMPT, "1")
+            .header(POSTHOG_REQUEST_ID, Uuid::new_v4().to_string())
+            .header(POSTHOG_REQUEST_TIMESTAMP, "2026-03-19T14:30:00Z")
+            .header("User-Agent", "test-agent/1.0")
+            .body(Body::from(compressed))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        assert_eq!(body["results"][&uuid]["result"], "ok");
+    }
+
+    #[tokio::test]
+    async fn zstd_compressed_payload() {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let event = valid_event();
+        let uuid = event.uuid.clone();
+        let raw = batch_payload(&[event]);
+        let compressed = compressed_payload(&raw, "zstd");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(CAPTURE_V1_PATH)
+            .header("Authorization", "Bearer phc_test_token")
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "zstd")
+            .header("X-Forwarded-For", "127.0.0.1")
+            .header(POSTHOG_SDK_INFO, "posthog-rs/1.0.0")
+            .header(POSTHOG_ATTEMPT, "1")
+            .header(POSTHOG_REQUEST_ID, Uuid::new_v4().to_string())
+            .header(POSTHOG_REQUEST_TIMESTAMP, "2026-03-19T14:30:00Z")
+            .header("User-Agent", "test-agent/1.0")
+            .body(Body::from(compressed))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_json(resp).await;
+        assert_eq!(body["results"][&uuid]["result"], "ok");
+    }
+
+    #[tokio::test]
+    async fn unsupported_encoding() {
+        let ts = TestStateBuilder::new().build();
+        let app = test_app(ts.state);
+
+        let payload = batch_payload(&[valid_event()]);
+        let req = Request::builder()
+            .method("POST")
+            .uri(CAPTURE_V1_PATH)
+            .header("Authorization", "Bearer phc_test_token")
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "lz4")
+            .header("X-Forwarded-For", "127.0.0.1")
+            .header(POSTHOG_SDK_INFO, "posthog-rs/1.0.0")
+            .header(POSTHOG_ATTEMPT, "1")
+            .header(POSTHOG_REQUEST_ID, Uuid::new_v4().to_string())
+            .header(POSTHOG_REQUEST_TIMESTAMP, "2026-03-19T14:30:00Z")
+            .header("User-Agent", "test-agent/1.0")
+            .body(Body::from(payload))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// Every registered route must map to its own `&'static` label. The
+    /// fallback is silent apart from a log line, so a route registered without
+    /// being added to `CAPTURE_V1_PATHS` would quietly report AI traffic under
+    /// the analytics path -- on metrics and on ingestion warnings alike.
+    #[rstest::rstest]
+    #[case(CAPTURE_V1_PATH)]
+    #[case(crate::v1::analytics::constants::CAPTURE_V1_PATH_TRAILING)]
+    #[case(crate::v1::analytics::constants::CAPTURE_V1_AI_PATH)]
+    #[case(crate::v1::analytics::constants::CAPTURE_V1_AI_PATH_TRAILING)]
+    fn pin_static_path_round_trips_every_registered_route(#[case] path: &str) {
+        assert_eq!(super::pin_static_path(path), path);
+    }
+
+    /// The AI path must not collapse onto the analytics label, which is what
+    /// the fallback would do.
+    #[test]
+    fn pin_static_path_keeps_the_ai_path_distinct() {
+        let ai = super::pin_static_path(crate::v1::analytics::constants::CAPTURE_V1_AI_PATH);
+        assert_ne!(ai, CAPTURE_V1_PATH);
+        assert_eq!(ai, "/i/v1/ai/events");
+    }
+
+    /// An unregistered pattern falls back rather than panicking, so a routing
+    /// mistake degrades a metric label instead of dropping the request.
+    #[test]
+    fn pin_static_path_falls_back_for_an_unregistered_route() {
+        assert_eq!(super::pin_static_path("/i/v1/not/a/route"), CAPTURE_V1_PATH);
+    }
+}

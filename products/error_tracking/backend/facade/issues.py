@@ -1,0 +1,98 @@
+"""Facade for error tracking issue write operations.
+
+Kept separate from ``facade/api.py`` so the assignment/cohort side-effect imports
+(ee RBAC roles, cohorts models, realtime notifications, email tasks) stay off the
+django.setup() path of the read-oriented main facade.
+"""
+
+from typing import Any
+from uuid import UUID
+
+from posthog.ingress.contracts import DeliveryOwnership
+from posthog.models.user import User
+
+from ..logic import (
+    issue_mutations as _mutations,
+    linear_status_sync as _linear_status_sync,
+)
+from ..logic.issue_tags import correction as _issue_tag_correction
+from . import api, contracts
+
+CohortNotFoundError = _mutations.CohortNotFoundError
+AssigneeValidationError = _mutations.AssigneeValidationError
+InvalidIssueStatusError = _mutations.InvalidIssueStatusError
+IssueTagsDisabledError = _issue_tag_correction.IssueTagsDisabledError
+UnknownIssueTagError = _issue_tag_correction.UnknownIssueTagError
+
+
+def update_issue(
+    team_id: int, issue_id: UUID, *, fields: dict[str, Any], user: Any, was_impersonated: bool
+) -> contracts.ErrorTrackingIssueUpdate:
+    outcome = _mutations.update_issue(team_id, issue_id, fields=fields, user=user, was_impersonated=was_impersonated)
+    return contracts.ErrorTrackingIssueUpdate(
+        issue=api._to_issue(outcome.issue), changed_fields=list(outcome.changed_fields)
+    )
+
+
+def merge_issues(
+    team_id: int, issue_id: UUID, source_ids: list[str], *, user: User, was_impersonated: bool
+) -> contracts.ErrorTrackingIssueMerge:
+    outcome = _mutations.merge_issues(team_id, issue_id, source_ids, user=user, was_impersonated=was_impersonated)
+    return contracts.ErrorTrackingIssueMerge(result=outcome.result.value, merged_issue_count=outcome.merged_issue_count)
+
+
+def split_issue(
+    team_id: int, issue_id: UUID, fingerprints: list[dict], *, user: User, was_impersonated: bool
+) -> list[UUID]:
+    return _mutations.split_issue(team_id, issue_id, fingerprints, user=user, was_impersonated=was_impersonated)
+
+
+def set_issue_cohort(team_id: int, issue_id: UUID, cohort_id: int) -> None:
+    _mutations.set_issue_cohort(team_id, issue_id, cohort_id)
+
+
+def assign_issue(
+    team_id: int, issue_id: UUID, assignee: dict[str, Any] | None, *, user: Any, was_impersonated: bool
+) -> bool:
+    return _mutations.assign_issue(team_id, issue_id, assignee, user=user, was_impersonated=was_impersonated)
+
+
+def correct_issue_tag(
+    team_id: int, issue_id: UUID, key: str, applied: bool, *, user: User, was_impersonated: bool
+) -> contracts.ErrorTrackingIssueTagCorrection:
+    return _issue_tag_correction.correct_issue_tag(
+        team_id, issue_id, key, applied, user=user, was_impersonated=was_impersonated
+    )
+
+
+def bulk_update_issues(
+    team_id: int,
+    issue_ids: list[str],
+    *,
+    action: str | None,
+    status: str | None,
+    assignee: dict[str, Any] | None,
+    user: Any,
+    was_impersonated: bool,
+) -> int:
+    return _mutations.bulk_update_issues(
+        team_id,
+        issue_ids,
+        action=action,
+        status=status,
+        assignee=assignee,
+        user=user,
+        was_impersonated=was_impersonated,
+    )
+
+
+def prepare_linear_status_sync_job(payload: dict[str, Any]) -> contracts.LinearStatusSyncJob | None:
+    return _linear_status_sync.prepare_job(payload)
+
+
+def sync_linear_status(job: contracts.LinearStatusSyncJob) -> None:
+    _linear_status_sync.sync_status(job)
+
+
+def linear_delivery_ownership(payload: dict[str, Any]) -> DeliveryOwnership:
+    return _linear_status_sync.delivery_ownership(payload)

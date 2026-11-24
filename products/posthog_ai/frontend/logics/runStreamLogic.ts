@@ -1,0 +1,5941 @@
+import { type EventSourceMessage, createParser } from 'eventsource-parser'
+import {
+    MakeLogicType,
+    getContext,
+    actions,
+    beforeUnmount,
+    connect,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    reducers,
+    selectors,
+} from 'kea'
+import posthog from 'posthog-js'
+
+import { agentConversationEventToAcpNotification } from '@posthog/agent-contracts/acp-conversation'
+import type { AgentConversationEvent } from '@posthog/agent-contracts/agent-conversation'
+
+import api from 'lib/api'
+import { lemonToast } from 'lib/lemon-ui/LemonToast'
+import { preflightLogic } from 'lib/logic/preflightLogic'
+import { uuid } from 'lib/utils/dom'
+import { projectLogic } from 'scenes/projectLogic'
+import { userLogic } from 'scenes/userLogic'
+
+import { attachedContextLogic } from '~/layout/ai/attachedContextLogic'
+
+import {
+    tasksRunsCommandCreate,
+    tasksRunsRetrieve,
+    tasksRunsStreamTokenRetrieve,
+} from 'products/tasks/frontend/generated/api'
+import {
+    type TaskRunBootstrapCreateRequestInitialPermissionModeEnumApi,
+    type TaskRunCommandRequestApi,
+    type TaskRunDetailDTOApi,
+    TaskRuntimeEnumApi,
+} from 'products/tasks/frontend/generated/api.schemas'
+
+import type { UserType } from '../../../../frontend/src/types'
+import { turnSuggestionsStateRetrieve } from '../generated/api'
+import { deliverPermissionResponse, isPermissionTargetEnded } from '../policy/permissionDelivery'
+import { isPlanPermissionRequest } from '../policy/permissionUtils'
+import { parseSandboxQuestions } from '../policy/questionUtils'
+import {
+    defaultPermissionDecision,
+    findAllowOptionId,
+    isConnectedProjectTool,
+    isFullAutoMode,
+} from '../policy/toolPolicy'
+import type {
+    ContextUsage,
+    PermissionRequestRecord,
+    RunArtifacts,
+    RunLifecycleEvent,
+    ProgressStatus,
+    ProgressStep,
+    RunConnectionState,
+    RunTerminalStatus,
+    SdkSession,
+    StagedAttachment,
+    ThreadAttachment,
+    ThreadItem,
+    ThreadItemType,
+    ToolInvocation,
+    ToolInvocationStatus,
+    ToolStreamEvent,
+    ToolStreamPhase,
+    TurnCompleteEvent,
+    TurnSuggestion,
+} from '../types/streamTypes'
+import {
+    type PermissionOption,
+    type PermissionRequestFrame,
+    type PosthogPermissionRequestParams,
+    type PosthogProgressParams,
+    type AgentCommand,
+    type PosthogUsageUpdateParams,
+    type SessionUpdateBody,
+    type SessionUpdateUsage,
+    type SseErrorFrameData,
+    type StoredLogEntry,
+    isKnownSessionUpdate,
+    isNotificationFrame,
+    isPermissionRequestFrame,
+    isPosthogNotification,
+    isSessionUpdateAvailableCommands,
+    isSessionUpdateNotification,
+    isSessionUpdateUsage,
+    isSessionUpdateUserMessage,
+    isTaskRunStateFrame,
+    parseAvailableCommands,
+} from '../types/wireTypes'
+import { extractContextBlockLines } from '../utils/posthogContextBlock'
+import { reconcileThreadItems, reconcileToolInvocations } from '../utils/reconcileFoldedThread'
+import { type ReplySuggestions, parseReplySuggestionsParams } from '../utils/replySuggestions'
+import { extractAgentToolName, getClaudeCodeMeta, resolveToolCall } from '../utils/toolResolver'
+import { parseTurnSuggestionParams } from '../utils/turnSuggestions'
+import { computeTurnTrailers } from '../utils/turnTrailers'
+import { debugLogsLogic } from './debugLogsLogic'
+import { registerHmrStreamAbort } from './devHmrStreamAbort'
+import { foregroundStreamLogic } from './foregroundStreamLogic'
+import {
+    RunStreamRecovery,
+    type RecoveryPhase,
+    isTransientStreamError,
+    STREAM_REQUEST_TIMEOUT_MS,
+    STREAM_HISTORY_TIMEOUT_MS,
+    STREAM_IDLE_TIMEOUT_MS,
+} from './runStreamRecovery'
+import { hasReplayListener, toolStreamEventsLogic } from './toolStreamEventsLogic'
+import type { ToolStreamSubscription } from './toolStreamEventsLogic'
+
+export interface LiveStreamEntry {
+    controller: AbortController
+    /** Reopens this stream after an HMR swap its logic survived. See `devHmrStreamAbort`. */
+    reopen: () => void
+}
+
+interface LiveStreamRegistryHost {
+    __posthogAiLiveStreamControllers?: Set<LiveStreamEntry>
+}
+
+// Dev-only guard against orphaned SSE readers: an HMR swap re-evaluates this module in the same page,
+// and the old build's logic gets discarded with a fresh kea `cache`, so its 'event-source' disposable
+// never runs teardown and its reader keeps the connection open (pinning a granian dev worker) until
+// the tab closes. A fresh evaluation finding entries in the page-global registry therefore means
+// an HMR swap just replaced their build, so abort them (an aborted signal is the silent teardown path,
+// which is why the old logic won't schedule a reconnect). On first load the registry is empty, and a
+// full page load needs none of this because the browser aborts in-flight fetches itself.
+//
+// This only covers swaps that re-evaluate this module. `devHmrStreamAbort` covers the rest, where the
+// logic survives and its stream has to be reopened rather than left closed.
+const liveStreamControllers = new Set<LiveStreamEntry>()
+
+const liveRunStreamsByContext = new WeakMap<object, Map<string, string>>()
+
+function liveRunStreams(): Map<string, string> {
+    const context = getContext()
+    let streams = liveRunStreamsByContext.get(context)
+    if (!streams) {
+        streams = new Map()
+        liveRunStreamsByContext.set(context, streams)
+    }
+    return streams
+}
+
+export function findLiveRunStreamKey(runId: string): string | null {
+    for (const [streamKey, servedRunId] of liveRunStreams()) {
+        if (servedRunId === runId) {
+            return streamKey
+        }
+    }
+    return null
+}
+if (process.env.NODE_ENV === 'development') {
+    const registryHost = globalThis as LiveStreamRegistryHost
+    registryHost.__posthogAiLiveStreamControllers?.forEach((entry) => entry.controller.abort())
+    registryHost.__posthogAiLiveStreamControllers = liveStreamControllers
+    // Jest maps this module to an empty stub, so the call has to stay inside this check.
+    registerHmrStreamAbort()
+}
+
+export type RunSseStatus = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed' | 'error'
+export type RunStatus = 'queued' | 'in_progress' | 'completed' | 'failed' | 'cancelled'
+
+export interface RunStreamLogicProps {
+    /**
+     * Stable logic key. PostHog AI passes the conversation id; a generic task viewer (no conversation)
+     * passes the task id. The logic operates on `(taskId, runId)` internally, so it never needs the
+     * conversation beyond this key and the optional telemetry tag below.
+     */
+    streamKey: string
+    /** Optional telemetry tag — present for PostHog AI conversations, absent for a generic task viewer. */
+    conversationId?: string
+    /**
+     * Read-only/replay mode for a generic run viewer: bootstrap replays the persisted `logs/` snapshot
+     * once and never opens SSE — even for an in-progress run. Folded into the logic key so a read-only
+     * instance can never share state with a live streaming instance, even for the same `streamKey`.
+     */
+    replayOnly?: boolean
+}
+
+/** Reconnect/backoff constants for the SSE drop-recovery loop. */
+export const MAX_SSE_RECONNECT_ATTEMPTS = 10
+export const SSE_RECONNECT_BASE_DELAY_MS = 2_000
+export const SSE_RECONNECT_MAX_DELAY_MS = 30_000
+/**
+ * Retries for the one-shot `logs/` history snapshot fetch. A transient blip here must not tear down an
+ * otherwise-healthy live SSE (which is connected first); only exhausting these attempts does.
+ */
+export const MAX_HISTORY_FETCH_ATTEMPTS = 3
+/**
+ * Re-mint budget for the proxy read token on a 401 handshake — kept separate from the reconnect budget so
+ * bumping reconnects to 10 doesn't balloon the number of token re-mints per open.
+ */
+export const MAX_STREAM_TOKEN_REMINTS = 5
+/**
+ * Cumulative cap across all drops in a run — bounds runaway clean-EOF loops that keep dodging the
+ * per-drop counter (a connection that opens, immediately drops, and reopens resets `reconnectAttempt`
+ * to 0 every cycle, so only this counter catches the loop).
+ */
+export const MAX_CUMULATIVE_RECONNECT_ATTEMPTS = 30
+/** A connection open at least this long before dropping is healthy — its drop is forgiven. */
+export const SSE_HEALTHY_CONNECTION_MS = 60_000
+export const INITIAL_PERMISSION_MODE: TaskRunBootstrapCreateRequestInitialPermissionModeEnumApi = 'auto'
+
+/** The crash-error string the in-sandbox agent server writes on a fatal exception. */
+const AGENT_CRASH_PREFIX = 'Agent server crashed'
+
+/**
+ * `session/update` sub-types that mean the agent is producing output for a turn, and so that a turn is
+ * open. An allowlist, so an unknown or malformed sub-type fails safe to "not generating" rather than
+ * reopening a turn that finished. `tool_call_update` is deliberately absent: it updates a call the turn
+ * already started, and can trail the end of that turn.
+ */
+const AGENT_GENERATING_SESSION_UPDATES: ReadonlySet<string> = new Set([
+    'agent_message',
+    'agent_message_chunk',
+    'agent_thought_chunk',
+    'tool_call',
+    'plan',
+])
+
+function opensAgentTurn(update: SessionUpdateBody): boolean {
+    if (!AGENT_GENERATING_SESSION_UPDATES.has(update.sessionUpdate)) {
+        return false
+    }
+    if (update.sessionUpdate !== 'agent_message_chunk' && update.sessionUpdate !== 'agent_thought_chunk') {
+        return true
+    }
+    return String(update.content?.text ?? update.text ?? '') !== ''
+}
+
+/**
+ * In-band durable end-of-run sentinel emitted by both the Django stream view and the agent-proxy
+ * (`event: stream-end`, `data: {"status":"complete"}`). Distinct from the rotation `end` event (a
+ * 15-min connection recycle that means "reconnect"): the sentinel means the run is finished, so the
+ * client stops reconnecting and drops its resume cursor instead of resuming.
+ */
+const STREAM_END_EVENT = 'stream-end'
+
+/**
+ * Mirror the committed cursor for diagnostics. Recovery only uses the in-memory cursor attached to
+ * the retained transcript; session storage cannot prove that a remounted viewer has that output.
+ */
+function streamResumeKey(runId: string): string {
+    return `posthog-ai:stream-resume:${runId}`
+}
+function writeStreamResumeId(runId: string, eventId: string): void {
+    try {
+        window.sessionStorage.setItem(streamResumeKey(runId), eventId)
+    } catch {
+        // sessionStorage may be unavailable (private mode / quota) — resume from in-memory state only.
+    }
+}
+function clearStreamResumeId(runId: string): void {
+    try {
+        window.sessionStorage.removeItem(streamResumeKey(runId))
+    } catch {
+        // ignore
+    }
+}
+
+/** Resolved live-stream destination: the agent-proxy origin plus the run-scoped read token. */
+export interface StreamProxyTarget {
+    baseUrl: string
+    token: string
+}
+
+/**
+ * Resolve the proxy target for a run, or null to stream from Django. When the server resolves no
+ * base URL — or the mint throws — we fall back to Django so streaming never breaks.
+ */
+export async function resolveStreamTarget(
+    projectId: string,
+    taskId: string,
+    runId: string,
+    signal?: AbortSignal
+): Promise<StreamProxyTarget | null> {
+    try {
+        const { token, stream_base_url } = await tasksRunsStreamTokenRetrieve(
+            projectId,
+            taskId,
+            runId,
+            { resync: true },
+            { signal }
+        )
+        if (!stream_base_url) {
+            return null
+        }
+        return { baseUrl: stream_base_url, token }
+    } catch (error) {
+        if (signal?.aborted) {
+            throw error
+        }
+        return null
+    }
+}
+
+const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(['completed', 'failed', 'cancelled'])
+
+export function isTerminalRunStatus(status: string | null | undefined): boolean {
+    return status != null && TERMINAL_RUN_STATUSES.has(status)
+}
+
+/** Capped exponential backoff: 2s / 4s / 8s / 16s / 30s. `attempt` is 1-based. */
+export function reconnectDelayMs(attempt: number): number {
+    const delay = SSE_RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1)
+    return Math.min(delay, SSE_RECONNECT_MAX_DELAY_MS)
+}
+
+export interface StreamErrorEnvelope {
+    errorTitle: string
+    errorMessage?: string
+    retryable: boolean
+    status?: number
+}
+
+function streamError(errorTitle: string, retryable: boolean, status: number | undefined): StreamErrorEnvelope {
+    return status === undefined ? { errorTitle, retryable } : { errorTitle, retryable, status }
+}
+
+/**
+ * HTTP status → user-visible error envelope for refetch/open failures. Cloud-agent also emits
+ * some of these as `event: error` frames; those carry their own envelope and bypass this table.
+ */
+export function mapHttpStatusToStreamError(status: number | undefined): StreamErrorEnvelope {
+    switch (status) {
+        case 401:
+            return streamError('Cloud authentication expired', true, status)
+        case 403:
+            return streamError('Cloud access denied', true, status)
+        case 404:
+            return streamError('Conversation backing run not found', false, status)
+        case 406:
+            return streamError('Cloud stream unavailable', true, status)
+        default:
+            return streamError(
+                'Cloud stream failed',
+                status === undefined ||
+                    status === 0 ||
+                    status === 408 ||
+                    status === 429 ||
+                    (status >= 500 && status < 600),
+                status
+            )
+    }
+}
+
+/**
+ * Recovers the raw text the user typed from a persisted `_posthog/user_message`. The send paths
+ * prepend context blocks when attachments are present — `<posthog_trusted_context>` and/or
+ * `<posthog_untrusted_context>` from the frontend builder (`utils/posthogContextBlock.ts`), or the
+ * legacy `<posthog_context>` wrapper from the deprecated backend `context_wrapper.py` path and old
+ * persisted history. A task started from Slack carries the thread as `<slack_thread_context>`, and
+ * each Slack follow-up as `<slack_thread_context_update>` (products/slack_app). Stripping every
+ * leading block keeps a replayed prompt identical to the one the live send path echoed via
+ * `pushHumanMessage`.
+ */
+const CONTEXT_BLOCK_TAGS = [
+    'posthog_trusted_context',
+    'posthog_untrusted_context',
+    'posthog_context',
+    'slack_thread_context',
+    'slack_thread_context_update',
+]
+
+export interface SplitUserMessageContent {
+    /** The user's own text, with every leading context block removed. */
+    text: string
+    /** Each stripped context block, raw (tags included), in message order. */
+    contextBlocks: string[]
+}
+
+export function splitUserMessageContent(content: string): SplitUserMessageContent {
+    const contextBlocks: string[] = []
+    let rest = content
+    for (;;) {
+        const tag = CONTEXT_BLOCK_TAGS.find((t) => rest.startsWith(`<${t}>`))
+        if (!tag) {
+            return { text: rest, contextBlocks }
+        }
+        const closeTag = `</${tag}>`
+        const closeIdx = rest.indexOf(closeTag)
+        if (closeIdx === -1) {
+            return { text: rest, contextBlocks }
+        }
+        contextBlocks.push(rest.slice(0, closeIdx + closeTag.length))
+        rest = rest.slice(closeIdx + closeTag.length).replace(/^\n+/, '')
+    }
+}
+
+export function unwrapUserMessageContent(content: string): string {
+    return splitUserMessageContent(content).text
+}
+
+/** Rendered item lines of the context blocks a wrapped user message carries (`[]` when unwrapped). */
+function contextBlockLinesFromUserMessage(text: string): string[] {
+    return splitUserMessageContent(text).contextBlocks.flatMap(extractContextBlockLines)
+}
+
+/**
+ * Pull rendered text out of a `_posthog/user_message` frame's `content`. The seeder writes a plain
+ * string; the live wire may instead carry ACP content blocks (`[{ type: 'text', text }]`). Returns
+ * the concatenated text, or '' when there's nothing renderable.
+ */
+function extractUserMessageText(content: unknown): string {
+    if (typeof content === 'string') {
+        return content
+    }
+    if (Array.isArray(content)) {
+        return content
+            .filter((block) => !isHiddenUserContent(block))
+            .map((block) =>
+                block && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string'
+                    ? (block as { text: string }).text
+                    : ''
+            )
+            .join('')
+    }
+    return ''
+}
+
+function isHiddenUserContent(content: unknown): boolean {
+    if (!isRecord(content) || !isRecord(content._meta) || !isRecord(content._meta.ui)) {
+        return false
+    }
+    return content._meta.ui.hidden === true
+}
+
+function uriPathSegments(uri: string): string[] {
+    let path = uri
+    try {
+        path = new URL(uri).pathname
+    } catch {
+        // A uri the parser rejects still splits on its separators below.
+    }
+    return path.split('/').filter(Boolean)
+}
+
+/** A segment with a broken percent escape stands as it is, rather than throwing through the whole fold. */
+function decodeUriSegment(segment: string): string {
+    try {
+        return decodeURIComponent(segment)
+    } catch {
+        return segment
+    }
+}
+
+/**
+ * The run and artifact a sandbox attachment path names, or null for any other path.
+ *
+ * The agent server writes each artifact to `.posthog/attachments/<runId>/<artifactId>/<name>`
+ * (`hydrateArtifactToPromptBlock`), and that layout is the only place the wire carries the ids. A path that
+ * does not match returns null and renders as a plain name, so a change there degrades rather than breaks.
+ */
+export function artifactRefFromUri(uri: string): { runId: string; artifactId: string } | null {
+    const segments = uriPathSegments(uri)
+    const marker = segments.lastIndexOf('attachments')
+    if (marker < 1 || segments[marker - 1] !== '.posthog' || segments.length < marker + 4) {
+        return null
+    }
+    return { runId: segments[marker + 1], artifactId: segments[marker + 2] }
+}
+
+/**
+ * A file the send carried, or null for any other content block. An attachment arrives as a `resource_link`
+ * to the copy the sandbox wrote to disk; an inline image arrives as an `image` block, which names the file
+ * only through that same `uri`.
+ */
+export function userAttachment(content: unknown): ThreadAttachment | null {
+    if (!isRecord(content) || (content.type !== 'resource_link' && content.type !== 'image')) {
+        return null
+    }
+    const uri = typeof content.uri === 'string' ? content.uri : ''
+    const named = typeof content.name === 'string' && content.name.trim() ? content.name.trim() : null
+    const fromUri = uri ? uriPathSegments(uri).at(-1) : undefined
+    const name = named ?? (fromUri ? decodeUriSegment(fromUri) : null)
+    if (!name) {
+        return null
+    }
+    return { name, ...(uri ? (artifactRefFromUri(uri) ?? {}) : {}) }
+}
+
+/**
+ * Identity is the artifact, never the name: two pasted screenshots are both `image.png`. A known artifact
+ * wins, so a file echoed in both wire forms lands once; otherwise it claims the first entry of that name
+ * still waiting for one, which a send uploads in order.
+ */
+function mergeAttachment(existing: ThreadAttachment[], incoming: ThreadAttachment): ThreadAttachment[] {
+    const byArtifact = incoming.artifactId
+        ? existing.findIndex((candidate) => candidate.artifactId === incoming.artifactId)
+        : -1
+    const target =
+        byArtifact !== -1
+            ? byArtifact
+            : existing.findIndex((candidate) => candidate.name === incoming.name && !candidate.artifactId)
+    if (target === -1) {
+        return [...existing, incoming]
+    }
+    return existing.map((candidate, position) => (position === target ? { ...candidate, ...incoming } : candidate))
+}
+
+/** What an optimistic send knows before its files have artifacts to point at. */
+function optimisticAttachments(value: unknown): ThreadAttachment[] {
+    if (!Array.isArray(value)) {
+        return []
+    }
+    return value.flatMap((entry) => {
+        if (!isRecord(entry) || typeof entry.name !== 'string' || !entry.name.trim()) {
+            return []
+        }
+        return [
+            {
+                name: entry.name.trim(),
+                ...(typeof entry.previewId === 'string' ? { previewId: entry.previewId } : {}),
+            },
+        ]
+    })
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+const LEGACY_PI_ENTRY_TYPES = new Set([
+    'pi_event',
+    'pi_run_started',
+    'pi_extension_event',
+    'extension_ui_request',
+    'extension_ui_response',
+    'extension_error',
+])
+
+function isLegacyPiEntry(entry: unknown): entry is Record<string, unknown> {
+    return isRecord(entry) && LEGACY_PI_ENTRY_TYPES.has(String(entry.type))
+}
+
+function readLegacyPiEntry(entry: Record<string, unknown>): StoredLogEntry | null {
+    const notification =
+        entry.type === 'pi_event' && isRecord(entry.event)
+            ? agentConversationEventToAcpNotification(entry.event as unknown as AgentConversationEvent)
+            : entry.type === 'pi_run_started'
+              ? { method: '_posthog/run_started', params: { runId: entry.runId, taskId: entry.taskId } }
+              : null
+    if (!notification) {
+        return null
+    }
+    const update = notification.params.update
+    if (isRecord(update) && update.title === update.name) {
+        delete update.title
+    }
+    const coveredEventIds = Array.isArray(entry.covered_event_ids)
+        ? entry.covered_event_ids.filter((id): id is string => typeof id === 'string' && id !== '')
+        : []
+    return {
+        type: 'notification',
+        ...(typeof entry.timestamp === 'string' ? { timestamp: entry.timestamp } : {}),
+        ...(typeof entry.event_id === 'string' && entry.event_id ? { event_id: entry.event_id } : {}),
+        ...(typeof entry.source_run_id === 'string' ? { source_run_id: entry.source_run_id } : {}),
+        ...(coveredEventIds.length > 0 ? { covered_event_ids: coveredEventIds } : {}),
+        notification: notification as StoredLogEntry['notification'],
+    }
+}
+
+function normalizeNotificationEntry(entry: unknown): StoredLogEntry | null {
+    if (isNotificationFrame(entry)) {
+        return entry
+    }
+    if (isLegacyPiEntry(entry)) {
+        return readLegacyPiEntry(entry)
+    }
+
+    // Older append_log callers wrote `{ notification }` directly, without the stream envelope.
+    if (!isRecord(entry) || !isRecord(entry.notification)) {
+        return null
+    }
+
+    return {
+        type: 'notification',
+        ...(typeof entry.timestamp === 'string' ? { timestamp: entry.timestamp } : {}),
+        ...(typeof entry.source_run_id === 'string' ? { source_run_id: entry.source_run_id } : {}),
+        ...(typeof entry.event_id === 'string' ? { event_id: entry.event_id } : {}),
+        ...(typeof entry.first_event_id === 'string' ? { first_event_id: entry.first_event_id } : {}),
+        notification: entry.notification,
+    } as StoredLogEntry
+}
+
+function isResumeRun(run: { state?: unknown }): boolean {
+    const state = run.state
+    return isRecord(state) && typeof state.resume_from_run_id === 'string' && state.resume_from_run_id !== ''
+}
+
+/** Bytes of the latest turns a chat reads first; older turns load in pages of `HISTORY_PAGE_BYTES`. */
+const HISTORY_TAIL_BYTES = 1_000_000
+const HISTORY_PAGE_BYTES = 2_000_000
+/** Wait after the latest turns render before the next older page preloads, so it never competes with the open. */
+const OLDER_HISTORY_PRELOAD_DELAY_MS = 1_500
+/** Backoff after an older page fails to load, doubled per failure, and the failures before loading stops. */
+const OLDER_HISTORY_RETRY_DELAY_MS = 5_000
+const OLDER_HISTORY_MAX_FAILURES = 3
+
+export type OlderHistoryState = 'none' | 'idle' | 'loading'
+
+export interface HistoryPage {
+    entries: Record<string, any>[]
+    offset: number
+    count: number
+    preamble: number
+    turnsBefore: number
+    /** The first run of the chain the indexes count from; a chain keeps a limited number of runs. */
+    origin: string
+    /** False for a full log sent without paging headers: its entries carry no full-log index. */
+    indexed: boolean
+}
+
+/**
+ * Where the loaded log starts in the run's resume-chain log. `offset` is the full-log index of the first loaded entry
+ * after the preamble, and `turnsBefore` counts the user turns before it, so turns keep the numbers the full log gives
+ * them. The client log is always the preamble of `offset`, then every entry from `offset` on, then live entries.
+ */
+export interface HistoryCursor {
+    runId: string
+    origin: string
+    offset: number
+    turnsBefore: number
+}
+
+/** Stream backlog entries (`log-N` frames) by their full-log index. */
+const backlogIndexes = new WeakMap<StoredLogEntry, number>()
+
+/** Whether a stream backlog entry is already in the loaded log, or in an older page before it. */
+function isLoadedBacklog(entry: StoredLogEntry, loadedEnd: number | undefined): boolean {
+    const index = backlogIndexes.get(entry)
+    return index !== undefined && loadedEnd !== undefined && index < loadedEnd
+}
+
+/** The synthetic preamble entry that carries the context-block messages from before a page's cut. */
+const CONTEXT_HISTORY_METHOD = '_posthog/context_history'
+
+function contextHistoryLines(params: Record<string, unknown> | undefined): string[] {
+    const messages = params?.messages
+    return Array.isArray(messages)
+        ? messages.flatMap((message) => (typeof message === 'string' ? contextBlockLinesFromUserMessage(message) : []))
+        : []
+}
+
+/** Entries a page carried in its preamble: state from before the page, not entries at their own position. */
+const historyPreambles = new WeakSet<StoredLogEntry>()
+
+/**
+ * Put an older page in front of the log. The page's preamble replaces the preamble at the head of the log, so the log
+ * stays what a read from the page's cut returns. Nothing replays: the latest page already set the current state.
+ */
+function prependHistoryPage(log: RunLog, page: StoredLogEntry[]): RunLog {
+    // A stream that started without a history read keeps live entries the page can also hold; the saved copy
+    // at its own position wins.
+    const coverage = new RunEventCoverage(page)
+    return appendToRunLog(emptyRunLog(), [
+        ...page.map((entry): StoredEntry => ({ entry, source: 'replay' })),
+        ...log.entries.filter(
+            ({ entry, source }) =>
+                !historyPreambles.has(entry) && !(source === 'live' && !!entry.event_id && coverage.covers(entry))
+        ),
+    ])
+}
+
+/** The context-block lines of the user messages in an older page, which the send paths dedupe against. */
+function historyContextLines(entries: StoredLogEntry[]): string[] {
+    return entries.flatMap(({ notification }) => {
+        if (notification.method === CONTEXT_HISTORY_METHOD) {
+            return contextHistoryLines(notification.params)
+        }
+        if (notification.method === '_posthog/user_message') {
+            const content = notification.params?.content
+            if (Array.isArray(content) && content.length > 0 && content.every(isHiddenUserContent)) {
+                return []
+            }
+            return contextBlockLinesFromUserMessage(extractUserMessageText(content))
+        }
+        const update = notification.params?.update
+        if (
+            notification.method === 'session/update' &&
+            isSessionUpdateUserMessage(update) &&
+            update.sessionUpdate === 'user_message' &&
+            !isHiddenUserContent(update.content)
+        ) {
+            return contextBlockLinesFromUserMessage(String(update.content?.text ?? update.text ?? ''))
+        }
+        return []
+    })
+}
+
+/**
+ * `preamble` counts the leading entries that came in a page's preamble. `sourceRunId` names the run that owns the
+ * entries before the first run marker, for a read that continues a loaded log.
+ */
+function normalizeHistory(
+    entries: unknown[],
+    runId: string,
+    resumed: boolean,
+    preamble = 0,
+    sourceRunId?: string
+): StoredLogEntry[] {
+    // Match Desktop's run-marker scoping without changing the shared log payload or its deduplication keys.
+    // A resume chain without a marker has unknown ownership; a single-run history belongs to its requested run.
+    let source: string | undefined = sourceRunId ?? (resumed ? undefined : runId)
+    return entries.flatMap((raw, index) => {
+        const entry = normalizeNotificationEntry(raw)
+        if (!entry) {
+            return []
+        }
+        const { method, params } = entry.notification
+        const marker =
+            method === '_posthog/sdk_session'
+                ? params?.taskRunId
+                : method === '_posthog/run_started'
+                  ? params?.runId
+                  : undefined
+        if (typeof marker === 'string') {
+            source = marker
+        }
+        const normalized = { ...entry, source_run_id: source }
+        if (index < preamble) {
+            historyPreambles.add(normalized)
+        }
+        return [normalized]
+    })
+}
+
+const RUN_ARTIFACT_KEYS = ['prUrl', 'branch', 'baseBranch', 'repo'] as const
+
+/**
+ * Latest-wins fold of git artifacts onto the accumulated snapshot — a non-empty string overwrites,
+ * undefined/empty values are ignored (so a later frame that omits a field never clears it).
+ */
+export function mergeRunArtifacts(existing: RunArtifacts, partial: Partial<RunArtifacts>): RunArtifacts {
+    const next: RunArtifacts = { ...existing }
+    for (const key of RUN_ARTIFACT_KEYS) {
+        const value = partial[key]
+        if (typeof value === 'string' && value !== '') {
+            next[key] = value
+        }
+    }
+    return next
+}
+
+/**
+ * Pull the git artifacts a run-shaped payload exposes. The bootstrap `run` carries
+ * `state.pr_base_branch`, a top-level `branch`, and `output.pr_url`; a live `task_run_state` frame
+ * carries only the top-level `branch` and `output` (no `state`). Both feed through here. The wire is
+ * loosely typed, so `state`/`output` are guarded with `isRecord` before any field read.
+ */
+export function extractRunArtifacts(run: {
+    state?: unknown
+    output?: unknown
+    branch?: string | null
+}): Partial<RunArtifacts> {
+    const partial: Partial<RunArtifacts> = {}
+    const state = isRecord(run.state) ? run.state : undefined
+    const output = isRecord(run.output) ? run.output : undefined
+    if (typeof run.branch === 'string') {
+        partial.branch = run.branch
+    }
+    if (typeof state?.pr_base_branch === 'string') {
+        partial.baseBranch = state.pr_base_branch
+    }
+    if (typeof state?.repository === 'string') {
+        partial.repo = state.repository
+    }
+    if (typeof output?.pr_url === 'string') {
+        partial.prUrl = output.pr_url
+    }
+    return partial
+}
+
+/** Normalize either wire cost shape (a bare number, or `{amount, currency}`) to a number | undefined. */
+function normalizeUsageCost(
+    cost: number | { amount?: number; currency?: string } | null | undefined
+): number | undefined {
+    if (cost == null) {
+        return undefined
+    }
+    if (typeof cost === 'number') {
+        return cost
+    }
+    return typeof cost.amount === 'number' ? cost.amount : undefined
+}
+
+/** Latest-wins fold of an `_posthog/usage_update` ext-notification onto the context-usage snapshot. */
+export function foldUsageNotification(existing: ContextUsage | null, params: PosthogUsageUpdateParams): ContextUsage {
+    const next: ContextUsage = { ...existing }
+    if (params.used != null) {
+        next.tokens = params.used
+    }
+    if (params.breakdown != null) {
+        next.breakdown = params.breakdown
+    }
+    const cost = normalizeUsageCost(params.cost)
+    if (cost !== undefined) {
+        next.cost = cost
+    }
+    return next
+}
+
+/** Latest-wins fold of the numeric `session/update` usage aggregate (drives the percentage ring). */
+export function foldUsageAggregate(existing: ContextUsage | null, update: SessionUpdateUsage): ContextUsage {
+    const next: ContextUsage = { ...existing }
+    if (typeof update.used === 'number') {
+        next.used = update.used
+    }
+    if (typeof update.size === 'number') {
+        next.size = update.size
+    }
+    const cost = normalizeUsageCost(update.cost)
+    if (cost !== undefined) {
+        next.cost = cost
+    }
+    return next
+}
+
+/**
+ * The id of the parent Task tool call when this frame belongs to a subagent's inner work
+ * (`_meta.claudeCode.parentToolCallId`), else undefined. Inner calls are rolled into their parent
+ * Task card rather than surfaced as top-level thread items.
+ */
+export function subagentParentToolCallId(meta: unknown): string | undefined {
+    const parent = getClaudeCodeMeta(meta)?.parentToolCallId
+    return typeof parent === 'string' && parent ? parent : undefined
+}
+
+/**
+ * Permission-denial reason from `_meta.claudeCode.toolResponse`, preferring `decisionReason` over
+ * the generic `message`. Returns undefined when no `_meta` is present (the inline `canUseTool` path),
+ * so the caller can fall back to the content text / existing error.
+ */
+export function extractDenialReason(meta: unknown): string | undefined {
+    const claudeCode = getClaudeCodeMeta(meta)
+    const toolResponse = claudeCode?.toolResponse
+    if (typeof toolResponse !== 'object' || toolResponse === null) {
+        return undefined
+    }
+    const r = toolResponse as { decisionReason?: unknown; message?: unknown }
+    if (typeof r.decisionReason === 'string' && r.decisionReason) {
+        return r.decisionReason
+    }
+    if (typeof r.message === 'string' && r.message) {
+        return r.message
+    }
+    return undefined
+}
+
+/**
+ * Finds the last buffer of `type` for a wire message id, also matching the derived `${id}@<n>` ids
+ * minted when the wire omits `messageId` and every chunk shares the fallback id. Shared by the
+ * assistant-message and agent-thought streams, which both buffer incremental chunks this way.
+ */
+function findLastBufferIndex(state: ThreadItem[], id: string, type: ThreadItemType, incompleteOnly: boolean): number {
+    const prefix = `${id}@`
+    for (let i = state.length - 1; i >= 0; i--) {
+        const item = state[i]
+        if (
+            item.type === type &&
+            (item.id === id || item.id.startsWith(prefix)) &&
+            (!incompleteOnly || !item.complete)
+        ) {
+            return i
+        }
+    }
+    return -1
+}
+
+/**
+ * A debug row carries a `_posthog/console` line from the agent server, and `threadItems` gates it on
+ * `showDebugLogs`, so for most viewers it renders nothing. Ending a streamed message on one splits
+ * the answer wherever the delta happened to end, with nothing between the halves to explain it. A
+ * send the agent has not taken up yet sinks below the whole answer before it renders, so it splits
+ * the halves the same way and is passed over too.
+ */
+function findContinuableBuffer(
+    state: ThreadItem[],
+    id: string,
+    type: ThreadItemType,
+    waitingIds: ReadonlySet<string>
+): number {
+    const prefix = `${id}@`
+    for (let i = state.length - 1; i >= 0; i--) {
+        const item = state[i]
+        if (item.type === type && (item.id === id || item.id.startsWith(prefix))) {
+            return item.complete ? -1 : i
+        }
+        if (item.type !== 'debug' && !waitingIds.has(item.id)) {
+            return -1
+        }
+    }
+    return -1
+}
+
+// The agent takes a queued or steering send up at the next turn boundary, so a placeholder that
+// outlives a second boundary has missed the window its echo could arrive in.
+const SETTLED_AFTER_TURNS = 2
+
+/** The in-progress spinner for a long-running status — retired when it completes, fails, or its boundary lands. */
+function isPendingStatus(item: ThreadItem, status: string): boolean {
+    return item.type === 'status' && item.status === status && item.isComplete !== true
+}
+
+function insertHumanMessageAtTurnStart(state: ThreadItem[], item: ThreadItem): ThreadItem[] {
+    const lastTurnSeparatorIndex = state.findLastIndex((threadItem) => threadItem.type === 'turn_separator')
+    const turnStartIndex = lastTurnSeparatorIndex + 1
+    const currentTurn = state.slice(turnStartIndex)
+
+    if (currentTurn.some((threadItem) => threadItem.type === 'human_message')) {
+        return [...state, item]
+    }
+
+    return [...state.slice(0, turnStartIndex), item, ...currentTurn]
+}
+
+/**
+ * Is this human message already shown in the current turn (since the last separator)? Used to drop a
+ * live wire user echo that's already on screen — the optimistic `_client/human_message` of an idle
+ * send, or the first wire form of a queue-drained send (which can echo in two forms).
+ */
+function currentTurnHasHumanText(state: ThreadItem[], text: string): boolean {
+    for (let i = state.length - 1; i >= 0; i--) {
+        const item = state[i]
+        if (item.type === 'turn_separator') {
+            return false
+        }
+        if (item.type === 'human_message' && item.text === text) {
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * Is this context block already shown as a debug row in the current turn? A send can echo in two
+ * wire forms (`user_message` + `user_message_chunk`), both carrying the wrapped prefix — without
+ * this guard each form would add its own context rows.
+ */
+function currentTurnHasContextBlock(state: ThreadItem[], block: string): boolean {
+    for (let i = state.length - 1; i >= 0; i--) {
+        const item = state[i]
+        if (item.type === 'turn_separator') {
+            return false
+        }
+        if (item.type === 'debug' && item.debugLevel === 'context' && item.text === block) {
+            return true
+        }
+    }
+    return false
+}
+
+function mapAcpStatus(status: unknown): ToolInvocationStatus {
+    switch (status) {
+        case 'in_progress':
+            return 'in_progress'
+        case 'completed':
+            return 'completed'
+        case 'failed':
+            return 'failed'
+        default:
+            return 'pending'
+    }
+}
+
+function normalizeProgressStatus(status: unknown): ProgressStatus {
+    switch (status) {
+        case 'pending':
+        case 'in_progress':
+        case 'completed':
+            return status
+        case 'failed':
+        case 'cancelled':
+            return 'failed'
+        default:
+            return 'in_progress'
+    }
+}
+
+function stringifyOptional(value: unknown): string | undefined {
+    return typeof value === 'string' ? value : undefined
+}
+
+function parsePermissionOption(raw: unknown): PermissionOption | null {
+    if (typeof raw !== 'object' || raw === null) {
+        return null
+    }
+    const r = raw as Record<string, unknown>
+    const optionId = r.optionId
+    const kind = String(r.kind ?? '')
+    // Require only the two fields the card acts on: the `optionId` forwarded on the reply and a
+    // non-empty `kind` to classify. The kind vocabulary tracks the agent adapter (`reject` became
+    // `reject_once`, etc.), so accept any non-empty kind and let the prefix-based mapper resolve the
+    // affordance — an exact-match allowlist silently dropped unknown kinds and blanked the prompt
+    // whenever none survived.
+    if (typeof optionId !== 'string' || !kind) {
+        return null
+    }
+    const meta = r._meta
+    const metaRecord = typeof meta === 'object' && meta !== null ? (meta as Record<string, unknown>) : {}
+    const customInput = metaRecord.customInput === true
+    return {
+        optionId,
+        name: String(r.name ?? ''),
+        kind,
+        customInput,
+        ...(typeof metaRecord.hint === 'string' && metaRecord.hint ? { hint: metaRecord.hint } : {}),
+    }
+}
+
+/**
+ * Parses a permission request into a `PermissionRequestRecord` — either the live
+ * `data.type === 'permission_request'` SSE envelope or the `_posthog/permission_request`
+ * notification params the agent-server persists to the run log (both carry the same fields).
+ * The toolCall payload mirrors the ACP `tool_call` shape. Returns null when the frame is malformed
+ * or carries no usable options. The wire payload is typed, not validated, so every field read keeps
+ * its runtime check.
+ */
+export function parsePermissionRequestFrame(
+    frame: PermissionRequestFrame | PosthogPermissionRequestParams,
+    sourceRunId?: string
+): PermissionRequestRecord | null {
+    const requestId = frame.requestId
+    if (typeof requestId !== 'string') {
+        return null
+    }
+    const toolCall = (frame.toolCall ?? {}) as Record<string, unknown>
+    const toolCallId = String(toolCall.toolCallId ?? frame.toolCallId ?? '')
+    if (!toolCallId) {
+        return null
+    }
+    const options = Array.isArray(frame.options)
+        ? frame.options.map(parsePermissionOption).filter((o): o is PermissionOption => o !== null)
+        : []
+    if (options.length === 0) {
+        return null
+    }
+
+    const rawServerName = String(toolCall.serverName ?? 'posthog')
+    const rawToolName = String(toolCall.toolName ?? '')
+    const input = (toolCall.rawInput ?? toolCall.input ?? {}) as Record<string, unknown>
+
+    // Permission policy needs the canonical MCP name to distinguish external tools from built-ins.
+    const meta = toolCall._meta
+    const metaRecord = typeof meta === 'object' && meta !== null ? (meta as Record<string, unknown>) : {}
+    const toolName = extractAgentToolName(meta) ?? rawToolName
+
+    // `AskUserQuestion` is routed through the permission framework by the agent (Twig): the question
+    // payload rides `_meta.codeToolKind === 'question'` + `_meta.questions`. When present, this renders
+    // the interactive question overlay (not the approve/decline card) and is never auto-approved.
+    const questions = metaRecord.codeToolKind === 'question' ? parseSandboxQuestions(metaRecord) : []
+
+    return {
+        requestId,
+        sourceRunId,
+        toolCallId,
+        toolName,
+        options,
+        title: toolCall.title as string | undefined,
+        description: toolCall.description as string | undefined,
+        ...(questions.length > 0 ? { questions } : {}),
+        rawToolCall: {
+            toolCallId,
+            rawServerName,
+            rawToolName,
+            input,
+            status: mapAcpStatus(toolCall.status),
+            title: toolCall.title as string | undefined,
+            kind: toolCall.kind as string | undefined,
+            locations: toolCall.locations as { path: string; line?: number }[] | undefined,
+            contentBlocks: Array.isArray(toolCall.content) ? toolCall.content : [],
+            meta,
+        },
+    }
+}
+
+/** Who ingested a frame: the `logs/` bootstrap, the live SSE, or a client-injected synthetic entry. */
+export type FrameSource = 'replay' | 'live' | 'client'
+
+/** One frame in the ordered log, tagged with its source so the projection can branch on it (§6 resume filter). */
+export interface StoredEntry {
+    entry: StoredLogEntry
+    source: FrameSource
+}
+
+/**
+ * Ordered raw-frame log, in render order — the single source of truth. `threadItems` and
+ * `toolInvocations` are pure projections of it (see `foldLogToThread`). Frames are appended,
+ * never keyed or per-entry deduped: the only place two independently-identified sources overlap is
+ * the bootstrap seam (the S3 history vs. the live SSE, which is connected *before* the history loads
+ * so no frame is gapped), and that one overlap is reconciled once by `dedupeBufferedAgainstHistory`
+ * before the live tail is appended. Steady-state live frames resume exactly after the last-seen
+ * Redis id (exclusive), so they never re-deliver — a plain append therefore cannot double the thread.
+ *
+ * One principled exception to append-only: `tool_call_update` frames. The agent re-sends the full
+ * accumulated `rawOutput`/`content` snapshot on every update (a long-running tool call can emit
+ * thousands, each hundreds of KB), and neither the S3 log nor the live stream trims them — retaining
+ * every superseded snapshot balloons renderer memory by orders of magnitude while the fold only ever
+ * renders the merged latest. `appendToRunLog` therefore keeps a single field-wise-merged update entry
+ * per `toolCallId` (see `mergeToolCallUpdateEntries`); `toolUpdateIndex` locates it in O(1).
+ */
+export interface RunLog {
+    entries: StoredEntry[]
+    /** Index into `entries` of the retained (merged) `tool_call_update` entry per toolCallId. */
+    toolUpdateIndex: Record<string, number>
+}
+
+interface OptimisticResume {
+    entries: StoredEntry[]
+    message: string
+    historyComplete: boolean
+    turnComplete: boolean
+}
+
+export function emptyRunLog(): RunLog {
+    return { entries: [], toolUpdateIndex: {} }
+}
+
+function windowShowsToolCallInFlight(entries: StoredLogEntry[]): boolean {
+    return entries.some((entry) => {
+        if (entry.notification.method !== 'session/update') {
+            return false
+        }
+        const update = entry.notification.params?.update
+        return isRecord(update) && update.sessionUpdate === 'tool_call_update'
+    })
+}
+
+/** The non-empty toolCallId of a `tool_call_update` frame, or null for every other frame. */
+function toolCallUpdateKey(stored: StoredEntry): string | null {
+    const notification = stored.entry.notification
+    if (notification.method !== 'session/update') {
+        return null
+    }
+    const update = notification.params?.update
+    if (!isRecord(update) || update.sessionUpdate !== 'tool_call_update') {
+        return null
+    }
+    return typeof update.toolCallId === 'string' && update.toolCallId ? update.toolCallId : null
+}
+
+/**
+ * Field-wise merge of a superseded `tool_call_update` entry into its successor for the same tool
+ * call — the log-level twin of `handleToolCallUpdate`'s fold precedence, so folding the one merged
+ * entry yields the same invocation as folding both in sequence. Newer fields win when present;
+ * absent fields fall back to the older update. Verbatim keep-latest would lose data: the wire sends
+ * *partial* updates (e.g. `rawInput` streams in on an early update and the terminal update omits it).
+ */
+function mergeToolCallUpdateEntries(older: StoredEntry, newer: StoredEntry): StoredEntry {
+    const olderNotification = older.entry.notification
+    const newerNotification = newer.entry.notification
+    const olderUpdateRaw = olderNotification.params?.update
+    const newerUpdateRaw = newerNotification.params?.update
+    const olderUpdate = isRecord(olderUpdateRaw) ? olderUpdateRaw : {}
+    const newerUpdate = isRecord(newerUpdateRaw) ? newerUpdateRaw : {}
+
+    const base = { ...olderUpdate }
+    // `rawInput`/`input` are one logical field in the fold (`rawInput ?? input`) — a newer value for
+    // either supersedes both, so a stale older `rawInput` can't shadow a newer `input`.
+    if ((newerUpdate.rawInput && typeof newerUpdate.rawInput === 'object') || isRecord(newerUpdate.input)) {
+        delete base.rawInput
+        delete base.input
+    }
+    const mergedUpdate: Record<string, unknown> = { ...base, ...newerUpdate }
+    // Content replaces only when the newer update actually carries blocks — the fold ignores an
+    // empty list, so an explicitly-empty newer `content` must not erase the older blocks.
+    const olderContent = Array.isArray(olderUpdate.content) ? olderUpdate.content : []
+    const newerContent = Array.isArray(newerUpdate.content) ? newerUpdate.content : []
+    if (olderContent.length > 0 && newerContent.length === 0) {
+        mergedUpdate.content = olderContent
+    }
+
+    return {
+        source: newer.source,
+        entry: {
+            ...newer.entry,
+            notification: {
+                ...newerNotification,
+                // The fold reads the envelope-level error for failed updates — carry the older one
+                // forward when the newer frame doesn't restate it.
+                ...(newerNotification.error == null && olderNotification.error != null
+                    ? { error: olderNotification.error }
+                    : {}),
+                params: { ...newerNotification.params, update: mergedUpdate },
+            },
+        },
+    }
+}
+
+/**
+ * Append frames to the log, collapsing superseded `tool_call_update` snapshots per toolCallId (see
+ * the `RunLog` doc). The merged entry moves to the tail — where the latest update would sit — which
+ * never reorders thread items: a tool card's position comes from its creating `tool_call` frame,
+ * not from updates. Every ingest source (`live`, `replay`, `client`) funnels through here, so the
+ * collapse covers both the live stream and the bootstrap history replay.
+ */
+export function appendToRunLog(state: RunLog, incoming: StoredEntry[]): RunLog {
+    if (incoming.length === 0) {
+        return state
+    }
+    const entries = [...state.entries]
+    const toolUpdateIndex = { ...state.toolUpdateIndex }
+    for (const stored of incoming) {
+        const toolCallId = toolCallUpdateKey(stored)
+        const priorIdx = toolCallId !== null ? toolUpdateIndex[toolCallId] : undefined
+        if (toolCallId === null || priorIdx === undefined) {
+            if (toolCallId !== null) {
+                toolUpdateIndex[toolCallId] = entries.length
+            }
+            entries.push(stored)
+            continue
+        }
+        const merged = mergeToolCallUpdateEntries(entries[priorIdx], stored)
+        entries.splice(priorIdx, 1)
+        for (const [id, idx] of Object.entries(toolUpdateIndex)) {
+            if (idx > priorIdx) {
+                toolUpdateIndex[id] = idx - 1
+            }
+        }
+        toolUpdateIndex[toolCallId] = entries.length
+        entries.push(merged)
+    }
+    return { entries, toolUpdateIndex }
+}
+
+/**
+ * The fixed prefix the agent-server's resume builder prepends to the synthetic "resume context"
+ * prompt it injects between run start and the genuine human turn on a resume run. That prompt is
+ * persisted to the S3 log (it never arrives live), so on bootstrap replay it would otherwise render
+ * as a human bubble. The projection drops it when the bootstrapped run is a resume run (§6).
+ */
+const RESUME_CONTEXT_PREFIX = 'You are resuming a previous conversation.'
+function isResumeContextPrompt(text: string): boolean {
+    return text.startsWith(RESUME_CONTEXT_PREFIX)
+}
+
+function isAgentMessageEntry(entry: StoredLogEntry): boolean {
+    const update = entry.notification.params?.update
+    return (
+        entry.notification.method === 'session/update' &&
+        isRecord(update) &&
+        (update.sessionUpdate === 'agent_message_chunk' ||
+            update.sessionUpdate === 'agent_message' ||
+            update.sessionUpdate === 'agent_thought_chunk')
+    )
+}
+
+const KEPT_TOOL_RESPONSE_FIELDS = ['decisionReason', 'message'] as const
+
+export function reduceToolResponseCopy(entry: StoredLogEntry): void {
+    const update = entry.notification.params?.update
+    const meta = isRecord(update) ? update._meta : undefined
+    const claudeCode = isRecord(meta) ? meta.claudeCode : undefined
+    if (!isRecord(claudeCode) || !('toolResponse' in claudeCode)) {
+        return
+    }
+    const toolResponse = claudeCode.toolResponse
+    const kept = Object.fromEntries(
+        isRecord(toolResponse)
+            ? KEPT_TOOL_RESPONSE_FIELDS.flatMap((key) =>
+                  typeof toolResponse[key] === 'string' ? [[key, toolResponse[key]]] : []
+              )
+            : []
+    )
+    if (Object.keys(kept).length > 0) {
+        claudeCode.toolResponse = kept
+    } else {
+        delete claudeCode.toolResponse
+    }
+}
+
+function persistedHumanText(entry: StoredLogEntry): string | null {
+    if (entry.notification.method === '_posthog/user_message') {
+        return unwrapUserMessageContent(extractUserMessageText(entry.notification.params?.content))
+    }
+    const update = entry.notification.params?.update
+    if (
+        entry.notification.method === 'session/update' &&
+        isSessionUpdateUserMessage(update) &&
+        !isHiddenUserContent(update.content)
+    ) {
+        return unwrapUserMessageContent(String(update.content?.text ?? update.text ?? ''))
+    }
+    return null
+}
+
+function parseAgentEventId(eventId: string): { boot: string; sequence: number } | null {
+    const match = /^(.+)-(\d+)$/.exec(eventId)
+    if (!match) {
+        return null
+    }
+    const sequence = Number(match[2])
+    return Number.isSafeInteger(sequence) ? { boot: match[1], sequence } : null
+}
+
+// The persisted log coalesces chunks and strips adapter fields, so payload equality cannot identify
+// modern overlap. Agent event IDs survive both paths; SSE IDs and timestamps do not.
+function dedupeBufferedAgainstHistory(buffered: StoredLogEntry[], history: StoredLogEntry[]): StoredLogEntry[] {
+    const seamKey = (entry: StoredLogEntry): string =>
+        JSON.stringify([
+            entry.notification.method === '_posthog/permission_request' ||
+            entry.notification.method === '_posthog/permission_resolved'
+                ? entry.source_run_id
+                : undefined,
+            entry.notification,
+        ])
+    const historicalEntries = new Map<string, number[]>()
+    const eventIds = new Map<string, number>()
+    const eventRanges = new Map<string, { first: number; last: number; index: number }[]>()
+    const hasEventId = (entry: StoredLogEntry): entry is StoredLogEntry & { event_id: string } =>
+        typeof entry.event_id === 'string' && entry.event_id !== ''
+    for (const [index, entry] of history.entries()) {
+        const key = seamKey(entry)
+        const entries = historicalEntries.get(key) ?? []
+        entries.push(index)
+        historicalEntries.set(key, entries)
+        if (!hasEventId(entry) || !entry.source_run_id) {
+            continue
+        }
+        eventIds.set(JSON.stringify([entry.source_run_id, entry.event_id]), index)
+        for (const coveredId of entry.covered_event_ids ?? []) {
+            eventIds.set(JSON.stringify([entry.source_run_id, coveredId]), index)
+        }
+        if (!isAgentMessageEntry(entry) || typeof entry.first_event_id !== 'string' || !entry.first_event_id) {
+            continue
+        }
+        eventIds.set(JSON.stringify([entry.source_run_id, entry.first_event_id]), index)
+        const first = parseAgentEventId(entry.first_event_id)
+        const last = parseAgentEventId(entry.event_id)
+        if (first && last && first.boot === last.boot && first.sequence <= last.sequence) {
+            const rangeKey = JSON.stringify([entry.source_run_id, first.boot])
+            const ranges = eventRanges.get(rangeKey) ?? []
+            ranges.push({ first: first.sequence, last: last.sequence, index })
+            eventRanges.set(rangeKey, ranges)
+        }
+    }
+    const consumedHistory = new Set<number>()
+    const survivors: StoredLogEntry[] = []
+    for (const entry of buffered) {
+        let coveredIndex = hasEventId(entry)
+            ? eventIds.get(JSON.stringify([entry.source_run_id, entry.event_id]))
+            : undefined
+        if (coveredIndex === undefined && hasEventId(entry) && isAgentMessageEntry(entry)) {
+            const parsed = parseAgentEventId(entry.event_id)
+            if (parsed) {
+                coveredIndex = eventRanges
+                    .get(JSON.stringify([entry.source_run_id, parsed.boot]))
+                    ?.find(({ first, last }) => first <= parsed.sequence && parsed.sequence <= last)?.index
+            }
+        }
+        if (coveredIndex !== undefined) {
+            consumedHistory.add(coveredIndex)
+            continue
+        }
+
+        // Legacy overlap remains a multiset: each historical copy absorbs only one live copy.
+        // Different stable IDs establish distinct events even when their payloads are identical.
+        const key = seamKey(entry)
+        const matchingIndex = historicalEntries
+            .get(key)
+            ?.find(
+                (index) =>
+                    !consumedHistory.has(index) &&
+                    (!hasEventId(entry) || !hasEventId(history[index])) &&
+                    (!entry.source_run_id ||
+                        !history[index].source_run_id ||
+                        entry.source_run_id === history[index].source_run_id)
+            )
+        if (matchingIndex !== undefined) {
+            consumedHistory.add(matchingIndex)
+            continue
+        }
+        survivors.push(entry)
+    }
+    return survivors
+}
+
+function eventPosition(entry: StoredLogEntry, first = false): { boot: string; sequence: number } | null {
+    const id = first ? (entry.first_event_id ?? entry.event_id) : entry.event_id
+    return id ? parseAgentEventId(id) : null
+}
+
+function coversEntry(cover: StoredLogEntry, entry: StoredLogEntry): boolean {
+    if (
+        !cover.event_id ||
+        !entry.event_id ||
+        cover.source_run_id !== entry.source_run_id ||
+        !isAgentMessageEntry(cover) ||
+        !isAgentMessageEntry(entry)
+    ) {
+        return false
+    }
+    const first = eventPosition(cover, true)
+    const last = eventPosition(cover)
+    const entryFirst = eventPosition(entry, true)
+    const entryLast = eventPosition(entry)
+    return first && last && entryFirst && entryLast
+        ? first.boot === last.boot &&
+              first.boot === entryFirst.boot &&
+              first.boot === entryLast.boot &&
+              first.sequence <= entryFirst.sequence &&
+              last.sequence >= entryLast.sequence
+        : cover.event_id === entry.event_id
+}
+
+class RunEventCoverage {
+    private readonly ids = new Set<string>()
+    private readonly ranges = new Map<string, { first: number; last: number }[]>()
+
+    constructor(entries: StoredLogEntry[]) {
+        entries.forEach((entry) => this.add(entry))
+    }
+
+    add(entry: StoredLogEntry): void {
+        if (!entry.event_id) {
+            return
+        }
+        this.ids.add(JSON.stringify([entry.source_run_id, entry.event_id]))
+        for (const coveredId of entry.covered_event_ids ?? []) {
+            this.ids.add(JSON.stringify([entry.source_run_id, coveredId]))
+        }
+        // Neutral notifications can occur inside a coalesced text range without being superseded.
+        if (!isAgentMessageEntry(entry)) {
+            return
+        }
+        const first = eventPosition(entry, true)
+        const last = eventPosition(entry)
+        if (first && last && first.boot === last.boot && first.sequence <= last.sequence) {
+            const key = JSON.stringify([entry.source_run_id, first.boot])
+            const ranges = this.ranges.get(key) ?? []
+            const range = { first: first.sequence, last: last.sequence }
+            let index = ranges.length
+            while (index > 0 && ranges[index - 1].first > range.first) {
+                index--
+            }
+            if (index > 0 && ranges[index - 1].last + 1 >= range.first) {
+                index--
+                range.first = ranges[index].first
+            }
+            while (index < ranges.length && ranges[index].first <= range.last + 1) {
+                range.last = Math.max(range.last, ranges[index].last)
+                ranges.splice(index, 1)
+            }
+            ranges.splice(index, 0, range)
+            this.ranges.set(key, ranges)
+        }
+    }
+
+    private overlappingRange(entry: StoredLogEntry): { first: number; last: number } | undefined {
+        if (!isAgentMessageEntry(entry)) {
+            return
+        }
+        const first = eventPosition(entry, true)
+        const last = eventPosition(entry)
+        if (!first || !last || first.boot !== last.boot) {
+            return
+        }
+        const ranges = this.ranges.get(JSON.stringify([entry.source_run_id, first.boot])) ?? []
+        let low = 0
+        let high = ranges.length
+        while (low < high) {
+            const middle = (low + high) >>> 1
+            if (ranges[middle].last < first.sequence) {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        const range = ranges[low]
+        return range && range.first <= last.sequence ? range : undefined
+    }
+
+    overlaps(entry: StoredLogEntry): boolean {
+        return this.overlappingRange(entry) !== undefined
+    }
+
+    covers(entry: StoredLogEntry): boolean {
+        if (!entry.event_id) {
+            return false
+        }
+        if (!entry.first_event_id && this.ids.has(JSON.stringify([entry.source_run_id, entry.event_id]))) {
+            return true
+        }
+        const range = this.overlappingRange(entry)
+        const first = eventPosition(entry, true)
+        const last = eventPosition(entry)
+        return !!(range && first && last && range.first <= first.sequence && range.last >= last.sequence)
+    }
+}
+
+function permissionEndedByLaterTurn(eventId: unknown, sourceRunId: string | undefined, log: RunLog): boolean {
+    const position = typeof eventId === 'string' ? parseAgentEventId(eventId) : null
+    if (!position) {
+        return false
+    }
+    return log.entries.some(({ entry }) => {
+        if (entry.notification.method !== '_posthog/turn_complete' || entry.source_run_id !== sourceRunId) {
+            return false
+        }
+        const end = entry.event_id ? parseAgentEventId(entry.event_id) : null
+        return !!end && end.boot === position.boot && end.sequence > position.sequence
+    })
+}
+
+function compareEntryPosition(left: StoredLogEntry, right: StoredLogEntry): number {
+    const a = eventPosition(left)
+    const b = eventPosition(right)
+    if (a && b && a.boot === b.boot) {
+        return a.sequence - b.sequence
+    }
+    return left.timestamp && right.timestamp ? Date.parse(left.timestamp) - Date.parse(right.timestamp) : 0
+}
+
+export function mergeCoalescedRunLog(log: RunLog, entry: StoredLogEntry): RunLog {
+    const entries = log.entries.filter((stored) => !coversEntry(entry, stored.entry))
+    const nextIndex = entries.findIndex((stored) => compareEntryPosition(entry, stored.entry) < 0)
+    entries.splice(nextIndex < 0 ? entries.length : nextIndex, 0, { entry, source: 'live' })
+    return appendToRunLog(emptyRunLog(), entries)
+}
+
+function retainedFramesWithoutOptimisticEchoes(retained: StoredEntry[]): StoredLogEntry[] {
+    const optimisticCounts = new Map<string, number>()
+    return retained.flatMap(({ entry, source }) => {
+        if (entry.notification.method === '_posthog/turn_complete') {
+            optimisticCounts.clear()
+        }
+        if (source === 'client') {
+            if (entry.notification.method === '_client/human_message') {
+                const text = String(entry.notification.params?.content ?? '')
+                optimisticCounts.set(text, (optimisticCounts.get(text) ?? 0) + 1)
+            }
+            return []
+        }
+        const text = source === 'live' ? persistedHumanText(entry) : null
+        const optimistic = text ? (optimisticCounts.get(text) ?? 0) : 0
+        if (text && optimistic > 0) {
+            optimisticCounts.set(text, optimistic - 1)
+            return []
+        }
+        return [entry]
+    })
+}
+
+/**
+ * A follow-up persists under the run it was sent to, not the successor that bootstraps next, so a
+ * persisted turn cancels its local echo whichever run of the chain it belongs to. `unconfirmedEcho`
+ * is the one echo no persisted copy covers yet, matched by identity because the same words can
+ * arrive several times.
+ */
+/**
+ * Row keys of optimistic sends, by the saved message that replaced them (`run:event_id`), so the row keeps the
+ * key it rendered with and the thread does not read the saved message as a new anchor.
+ */
+const sentHumanRowKeys = new Map<string, string>()
+
+function savedEntryKey(entry: StoredLogEntry): string | null {
+    return entry.event_id ? `${entry.source_run_id ?? ''}:${entry.event_id}` : null
+}
+
+/**
+ * The thread of the full conversation for a stream whose older history is not all loaded: the full log, with the
+ * stream's live and client entries after it. Null when the stream already holds its full history, so a caller
+ * that needs no read does not wait.
+ */
+export function readFullThread(
+    streamKey: string
+): Promise<{ threadItems: ThreadItem[]; toolInvocations: Map<string, ToolInvocation> }> | null {
+    const logic = runStreamLogic.findMounted({ streamKey })
+    const cursor = logic?.cache.historyCursor as HistoryCursor | undefined
+    const taskId = logic?.values.bootstrappedTaskId
+    const projectId = logic?.values.currentProjectId
+    if (!logic || !cursor || cursor.offset === 0 || !taskId || projectId == null) {
+        return null
+    }
+    return api.tasks.runs.getLogPage(taskId, cursor.runId, { projectId, view: 'thread' }).then((page) => {
+        const history = normalizeHistory(page.entries, cursor.runId, logic.values.isBootstrapResumeRun)
+        const tail = logic.values.log.entries.filter(({ source }) => source !== 'replay')
+        const folded = foldLogToThread(reconcileRunLog(history, tail, []).entries, {
+            isResumeRun: logic.values.isBootstrapResumeRun,
+            pendingMessage: logic.values.pendingRunMessage,
+            taskId,
+        })
+        const showDebugLogs = logic.values.showDebugLogs
+        return {
+            threadItems: folded.threadItems.filter(
+                (item) => (item.type !== 'debug' || showDebugLogs) && rendersThreadItemContent(item)
+            ),
+            toolInvocations: folded.toolInvocations,
+        }
+    })
+}
+
+export function reconcileRunLog(
+    history: StoredLogEntry[],
+    retained: StoredEntry[],
+    buffered: StoredLogEntry[],
+    unconfirmedEcho?: StoredEntry
+): RunLog {
+    let entries: StoredEntry[] = history.map((entry) => ({ entry, source: 'replay' }))
+    const coverage = new RunEventCoverage(history)
+    const savedHumanCounts = new Map<string, number>()
+    const savedHumanEntries = new Map<string, StoredLogEntry[]>()
+    const matchedSendIds = new Map<string, (string | undefined)[]>()
+    const rememberedHumanTexts = new Map<string, number>()
+    for (const entry of dedupeBufferedAgainstHistory(history, retainedFramesWithoutOptimisticEchoes(retained))) {
+        const text = persistedHumanText(entry)
+        if (!text) {
+            continue
+        }
+        if (entry.notification.method === '_posthog/user_message') {
+            rememberedHumanTexts.set(text, (rememberedHumanTexts.get(text) ?? 0) + 1)
+        } else {
+            const remembered = rememberedHumanTexts.get(text) ?? 0
+            if (remembered > 0) {
+                rememberedHumanTexts.set(text, remembered - 1)
+                continue
+            }
+        }
+        savedHumanCounts.set(text, (savedHumanCounts.get(text) ?? 0) + 1)
+        savedHumanEntries.set(text, [...(savedHumanEntries.get(text) ?? []), entry])
+    }
+    for (const [tailIndex, tail] of [
+        retained,
+        buffered.map((entry): StoredEntry => ({ entry, source: 'live' })),
+    ].entries()) {
+        const survivors = dedupeBufferedAgainstHistory(
+            tail.filter(({ source }) => source !== 'client').map(({ entry }) => entry),
+            entries.map(({ entry }) => entry)
+        )
+        const survivorCounts = new Map<StoredLogEntry, number>()
+        survivors.forEach((entry) => survivorCounts.set(entry, (survivorCounts.get(entry) ?? 0) + 1))
+        for (const stored of tail) {
+            const { entry } = stored
+            if (entry.notification.method === '_client/human_message' && stored !== unconfirmedEcho) {
+                const text = String(entry.notification.params?.content ?? '')
+                const saved = savedHumanCounts.get(text) ?? 0
+                if (saved > 0) {
+                    savedHumanCounts.set(text, saved - 1)
+                    const clientId = entry.notification.params?.clientId
+                    matchedSendIds.set(text, [
+                        ...(matchedSendIds.get(text) ?? []),
+                        typeof clientId === 'string' ? clientId : undefined,
+                    ])
+                    continue
+                }
+            }
+            if (stored.source !== 'client') {
+                const survivorCount = survivorCounts.get(entry) ?? 0
+                if (survivorCount === 0) {
+                    continue
+                }
+                survivorCounts.set(entry, survivorCount - 1)
+                if (entry.event_id) {
+                    if (coverage.covers(entry)) {
+                        continue
+                    }
+                    // A retained coalesced message can be newer than the saved snapshot.
+                    if (entry.first_event_id && coverage.overlaps(entry)) {
+                        entries = entries.filter((existing) => !coversEntry(entry, existing.entry))
+                    }
+                    coverage.add(entry)
+                }
+            }
+            const toolKey = toolCallUpdateKey(stored)
+            const newerToolIndex =
+                toolKey === null ? -1 : entries.findIndex((other) => toolCallUpdateKey(other) === toolKey)
+            const toolOrder = newerToolIndex >= 0 ? compareEntryPosition(entry, entries[newerToolIndex].entry) : 1
+            if (newerToolIndex >= 0 && (toolOrder < 0 || (toolOrder === 0 && tailIndex === 0))) {
+                entries[newerToolIndex] = mergeToolCallUpdateEntries(stored, entries[newerToolIndex])
+                continue
+            }
+            const nextIndex =
+                entry.event_id &&
+                entries.length > 0 &&
+                compareEntryPosition(entry, entries[entries.length - 1].entry) < 0
+                    ? entries.findIndex((other) => compareEntryPosition(entry, other.entry) < 0)
+                    : -1
+            if (nextIndex >= 0) {
+                entries.splice(nextIndex, 0, stored)
+            } else {
+                entries.push(stored)
+            }
+        }
+    }
+    // The sends that matched are the latest saved messages of their text, in order.
+    for (const [text, sendIds] of matchedSendIds) {
+        const saved = (savedHumanEntries.get(text) ?? []).slice(-sendIds.length)
+        sendIds.forEach((clientId, index) => {
+            const key = saved[index] ? savedEntryKey(saved[index]) : null
+            if (clientId && key && !sentHumanRowKeys.has(key)) {
+                sentHumanRowKeys.set(key, `client-${clientId}`)
+            }
+        })
+    }
+    return appendToRunLog(emptyRunLog(), entries)
+}
+
+/**
+ * The invocation a `tool_call` frame creates, replacing any prior invocation for the id. Shared by
+ * the `foldLogToThread` projection and the per-frame tracker in `ingestAcpFrame`, so tool-stream
+ * events carry exactly the invocation the projection derives without re-folding the whole log.
+ */
+function invocationFromToolCall(update: Record<string, unknown>): ToolInvocation | null {
+    const toolCallId = String(update.toolCallId ?? '')
+    if (!toolCallId) {
+        return null
+    }
+    return {
+        toolCallId,
+        rawServerName: String(update.serverName ?? 'posthog'),
+        rawToolName: String(update.toolName ?? ''),
+        input: (update.rawInput ?? update.input ?? {}) as Record<string, unknown>,
+        output: update.rawOutput,
+        status: mapAcpStatus(update.status),
+        title: update.title as string | undefined,
+        kind: update.kind as string | undefined,
+        locations: update.locations as { path: string; line?: number }[] | undefined,
+        contentBlocks: Array.isArray(update.content) ? update.content : [],
+        meta: update._meta,
+    }
+}
+
+/**
+ * Folds one `tool_call_update` frame into the existing invocation (field-wise, newer-wins; the
+ * invocation-level twin of `mergeToolCallUpdateEntries`). A reconnect can deliver a terminal update
+ * whose creating `tool_call` was lost, so with no existing invocation this builds a minimal one and
+ * the card still renders instead of vanishing. Shared by the projection and the per-frame tracker.
+ */
+function invocationFromToolCallUpdate(
+    existing: ToolInvocation | undefined,
+    update: Record<string, unknown>,
+    notification: StoredLogEntry['notification']
+): ToolInvocation | null {
+    const toolCallId = String(update.toolCallId ?? '')
+    if (!toolCallId) {
+        return null
+    }
+    const status = mapAcpStatus(update.status ?? existing?.status)
+    const rawInput =
+        update.rawInput && typeof update.rawInput === 'object'
+            ? (update.rawInput as Record<string, unknown>)
+            : update.input && typeof update.input === 'object'
+              ? (update.input as Record<string, unknown>)
+              : undefined
+    const denialReason = status === 'failed' ? extractDenialReason(update._meta) : undefined
+    const errorMessage =
+        (update.error as { message?: string } | null)?.message ??
+        denialReason ??
+        (status === 'failed' ? notification.error?.message : undefined)
+    const updateContent = Array.isArray(update.content) ? update.content : []
+
+    if (!existing) {
+        return {
+            toolCallId,
+            rawServerName: 'posthog',
+            rawToolName: '',
+            input: rawInput ?? {},
+            status,
+            title: update.title as string | undefined,
+            locations: update.locations as { path: string; line?: number }[] | undefined,
+            contentBlocks: updateContent,
+            meta: update._meta,
+            ...(errorMessage !== undefined ? { error: { message: errorMessage } } : {}),
+        }
+    }
+
+    return {
+        ...existing,
+        status,
+        title: (update.title as string | undefined) ?? existing.title,
+        progress: update.progress ?? existing.progress,
+        output: update.rawOutput ?? existing.output,
+        locations: (update.locations as { path: string; line?: number }[] | undefined) ?? existing.locations,
+        // ACP update semantics: a present `content` replaces the collection (the agent re-sends
+        // the full accumulated blocks) — appending would duplicate every prior snapshot.
+        contentBlocks: updateContent.length > 0 ? updateContent : existing.contentBlocks,
+        error: errorMessage !== undefined ? { message: errorMessage } : existing.error,
+        ...(rawInput ? { input: rawInput } : {}),
+        ...(update._meta ? { meta: update._meta } : {}),
+    }
+}
+
+// Log entries are append-only, so a frame's params object is stable across folds; caching on it keeps
+// the offer's identity stable and the memoized trailer rows from re-rendering on every streamed frame.
+const TURN_SUGGESTION_LEDGER_ATTEMPTS = 3
+const TURN_SUGGESTION_LEDGER_RETRY_MS = 1000
+
+const parsedTurnSuggestions = new WeakMap<object, TurnSuggestion | null>()
+function parseTurnSuggestionFrame(params: object): TurnSuggestion | null {
+    if (!parsedTurnSuggestions.has(params)) {
+        parsedTurnSuggestions.set(params, parseTurnSuggestionParams(params))
+    }
+    return parsedTurnSuggestions.get(params) ?? null
+}
+
+export interface TurnSuggestionFold {
+    latest: TurnSuggestion | null
+    outcomes: Map<number, string>
+}
+
+export interface FoldedThread {
+    threadItems: ThreadItem[]
+    toolInvocations: Map<string, ToolInvocation>
+    turnSuggestions: TurnSuggestionFold
+}
+
+export interface TurnSuggestionLedger {
+    taskId: string
+    muted: boolean
+    resolvedTurns: number[]
+}
+
+export interface PendingRunMessage {
+    runId: string
+    id: string
+    text: string
+}
+
+function readPendingRunMessage(state: unknown, runId: string): PendingRunMessage | null {
+    if (!isRecord(state) || typeof state.pending_user_message !== 'string') {
+        return null
+    }
+    const text = unwrapUserMessageContent(state.pending_user_message)
+    return text
+        ? {
+              runId,
+              id: typeof state.pending_user_message_id === 'string' ? state.pending_user_message_id : runId,
+              text,
+          }
+        : null
+}
+
+const NO_IDS: ReadonlySet<string> = new Set()
+
+export interface FoldOptions {
+    isResumeRun: boolean
+    pendingMessage?: PendingRunMessage | null
+    taskId?: string | null
+}
+
+export interface FoldCheckpoint {
+    entries: StoredEntry[]
+    options: FoldOptions
+    items: ThreadItem[]
+    invocations: Map<string, ToolInvocation>
+    turnSuggestions: TurnSuggestionFold
+    rememberedHumanTexts: Map<string, number>
+    waitingSends: { id: string; text: string; turns: number }[]
+    pairedSends: Map<string, number>
+    toolItemIds: Set<string>
+    counters: {
+        humanCount: number
+        bubbleSeq: number
+        separatorSeq: number
+        errorSeq: number
+        statusSeq: number
+        compactSeq: number
+        clearedSeq: number
+        taskSeq: number
+        consoleSeq: number
+        contextSeq: number
+        openAssistantMessages: number
+    }
+    importedRun: boolean
+    pendingMessageSeen: boolean
+    pendingInsertionIndex: number | undefined
+    bufferedAttachments: ThreadAttachment[]
+}
+
+function sameFoldOptions(a: FoldOptions, b: FoldOptions): boolean {
+    return (
+        a.isResumeRun === b.isResumeRun &&
+        (a.taskId ?? null) === (b.taskId ?? null) &&
+        (a.pendingMessage?.runId ?? null) === (b.pendingMessage?.runId ?? null) &&
+        (a.pendingMessage?.id ?? null) === (b.pendingMessage?.id ?? null) &&
+        (a.pendingMessage?.text ?? null) === (b.pendingMessage?.text ?? null)
+    )
+}
+
+function canResumeFold(checkpoint: FoldCheckpoint, entries: StoredEntry[], options: FoldOptions): boolean {
+    if (checkpoint.entries.length > entries.length || !sameFoldOptions(checkpoint.options, options)) {
+        return false
+    }
+    for (let index = 0; index < checkpoint.entries.length; index++) {
+        if (checkpoint.entries[index] !== entries[index]) {
+            return false
+        }
+    }
+    return true
+}
+
+function lastTurnCompleteIndex(entries: StoredEntry[]): number {
+    for (let index = entries.length - 1; index >= 0; index--) {
+        if (entries[index].entry.notification?.method === '_posthog/turn_complete') {
+            return index
+        }
+    }
+    return -1
+}
+
+/**
+ * Pure projection: fold the ordered log into the rendered thread (and the tool-invocation map the
+ * renderer looks up). The fold rules (chunk buffering with the tail rule, tool-update merge,
+ * human-turn hoisting) are computed deterministically from the ordered log so item ids are stable
+ * across re-folds. `isResumeRun` drives the §6 resume-context filter; per-entry `source` decides
+ * whether a wire user turn renders (replay) or is left to the live echo (live).
+ */
+export function foldLogToThread(entries: StoredEntry[], options: FoldOptions): FoldedThread {
+    return foldLogFromCheckpoint(entries, options, null).folded
+}
+
+export function foldLogFromCheckpoint(
+    entries: StoredEntry[],
+    options: FoldOptions,
+    checkpoint: FoldCheckpoint | null
+): { folded: FoldedThread; checkpoint: FoldCheckpoint | null } {
+    const resume = checkpoint && canResumeFold(checkpoint, entries, options) ? checkpoint : null
+    const checkpointIndex = lastTurnCompleteIndex(entries)
+    let nextCheckpoint = resume && resume.entries.length - 1 === checkpointIndex ? resume : null
+    let items: ThreadItem[] = resume ? [...resume.items] : []
+    const invocations = new Map<string, ToolInvocation>(resume?.invocations)
+    const turnSuggestions: TurnSuggestionFold = {
+        latest: resume?.turnSuggestions.latest ?? null,
+        outcomes: new Map(resume?.turnSuggestions.outcomes),
+    }
+    // Texts already rendered by a `_posthog/user_message`, so a later identical `user_message_chunk`
+    // (resume chains persist the same turn in both forms) is consumed once rather than doubled.
+    const rememberedHumanTexts = new Map<string, number>(resume?.rememberedHumanTexts)
+    // Placeholders the composer drew for sends the agent has not taken up, in send order. A queued or
+    // steering send is echoed only when the agent takes it up, which is a turn later than the bubble,
+    // so the pairing outlives that turn. Text is what an echo matches on, because a client echo
+    // carries no id, and send order keeps repeated sends of one text apart.
+    const waitingSends: { id: string; text: string; turns: number }[] = resume
+        ? resume.waitingSends.map((send) => ({ ...send }))
+        : []
+    // Sends this turn already paired, counted per text so the same send's second wire form takes no
+    // further placeholder while a second send of that text still takes its own.
+    const pairedSends = new Map<string, number>(resume?.pairedSends)
+    let humanCount = resume?.counters.humanCount ?? 0
+    let bubbleSeq = resume?.counters.bubbleSeq ?? 0
+    let separatorSeq = resume?.counters.separatorSeq ?? 0
+    let errorSeq = resume?.counters.errorSeq ?? 0
+    let statusSeq = resume?.counters.statusSeq ?? 0
+    let compactSeq = resume?.counters.compactSeq ?? 0
+    let clearedSeq = resume?.counters.clearedSeq ?? 0
+    let taskSeq = resume?.counters.taskSeq ?? 0
+    let consoleSeq = resume?.counters.consoleSeq ?? 0
+    let contextSeq = resume?.counters.contextSeq ?? 0
+    let timestamp: number | undefined
+    let importedRun = resume?.importedRun ?? false
+    let entryRunId: string | undefined
+    // The agent's `event_id` of the entry being folded. Ids built from it stay the same when older history
+    // loads in front of the log, where the per-type counters behind the fallback ids would shift.
+    let entryKey: string | undefined
+    const seqId = (prefix: string, seq: number): string => (entryKey ? `${prefix}@${entryKey}` : `${prefix}-${seq}`)
+    const bubbleId = (id: string, seq: number): string => `${id}@${entryKey ?? seq}`
+    let pendingMessageSeen = resume?.pendingMessageSeen ?? false
+    let pendingInsertionIndex: number | undefined = resume?.pendingInsertionIndex
+    let bufferedAttachments: ThreadAttachment[] = resume ? [...resume.bufferedAttachments] : []
+
+    /**
+     * A wire turn opens with its message, so that is where a message goes by default. A send the
+     * agent has not taken up opens nothing and waits `atFoot` instead. `reuseId` keeps the row React
+     * already rendered when an echo takes a placeholder's place.
+     */
+    const pushHuman = (
+        text: string,
+        attachments: ThreadAttachment[] = [],
+        placement: { atFoot?: boolean; reuseId?: string } = {}
+    ): string => {
+        if (options.pendingMessage?.text === text && entryRunId === options.pendingMessage.runId) {
+            pendingMessageSeen = true
+        }
+        const carried = [...attachments, ...bufferedAttachments]
+        const item: ThreadItem = {
+            id: placement.reuseId ?? seqId('human', humanCount++),
+            type: 'human_message',
+            text,
+            complete: true,
+            ...(carried.length > 0 && { attachments: carried }),
+            ...(timestamp !== undefined && { startedAt: timestamp }),
+        }
+        if (placement.atFoot) {
+            items.push(item)
+        } else {
+            items = insertHumanMessageAtTurnStart(items, item)
+        }
+        bufferedAttachments = []
+        return item.id
+    }
+
+    /**
+     * A prompt's blocks arrive as consecutive frames with the text first, so the file lands on the message
+     * already rendered — including one an optimistic send drew, which the echo's text dedupe drops. That
+     * entry knows the name but not the ids, so a later frame for the same name fills them in.
+     */
+    const noteAttachment = (found: ThreadAttachment): void => {
+        // The sandbox path names the run and the artifact; the download endpoint also needs the task.
+        const attachment = found.artifactId && options.taskId ? { ...found, taskId: options.taskId } : found
+        for (let index = items.length - 1; index >= 0; index--) {
+            if (items[index].type === 'human_message') {
+                const existing = items[index].attachments ?? []
+                items[index] = { ...items[index], attachments: mergeAttachment(existing, attachment) }
+                return
+            }
+        }
+        bufferedAttachments = mergeAttachment(bufferedAttachments, attachment)
+    }
+
+    // Surface the context blocks a send was wrapped with as copyable debug rows (gated downstream by
+    // `showDebugLogs`, like `_posthog/console` rows). Deduped per turn — a send can echo in two wire
+    // forms, both carrying the same wrapped prefix.
+    const pushContextBlocks = (contextBlocks: string[]): void => {
+        for (const block of contextBlocks) {
+            if (currentTurnHasContextBlock(items, block)) {
+                continue
+            }
+            items.push({ id: `context-${contextSeq++}`, type: 'debug', text: block, debugLevel: 'context' })
+        }
+    }
+
+    const waitingSendIds = (): ReadonlySet<string> =>
+        new Set(waitingSends.filter((send) => send.turns < SETTLED_AFTER_TURNS).map((send) => send.id))
+    const toolItemIds = new Set<string>(resume?.toolItemIds)
+    let openAssistantMessages = resume?.counters.openAssistantMessages ?? 0
+
+    const takeCheckpoint = (index: number): FoldCheckpoint => ({
+        entries: entries.slice(0, index + 1),
+        options,
+        items: [...items],
+        invocations: new Map(invocations),
+        turnSuggestions: { latest: turnSuggestions.latest, outcomes: new Map(turnSuggestions.outcomes) },
+        rememberedHumanTexts: new Map(rememberedHumanTexts),
+        waitingSends: waitingSends.map((send) => ({ ...send })),
+        pairedSends: new Map(pairedSends),
+        toolItemIds: new Set(toolItemIds),
+        counters: {
+            humanCount,
+            bubbleSeq,
+            separatorSeq,
+            errorSeq,
+            statusSeq,
+            compactSeq,
+            clearedSeq,
+            taskSeq,
+            consoleSeq,
+            contextSeq,
+            openAssistantMessages,
+        },
+        importedRun,
+        pendingMessageSeen,
+        pendingInsertionIndex,
+        bufferedAttachments: [...bufferedAttachments],
+    })
+
+    const appendChunk = (id: string, type: ThreadItemType, delta: string): void => {
+        const idx = findContinuableBuffer(items, id, type, waitingSends.length > 0 ? waitingSendIds() : NO_IDS)
+        // Continue the matched buffer only while it's incomplete and only debug rows followed it;
+        // otherwise (no buffer, a finalized one, or one interrupted by a tool call/separator) start
+        // a fresh bubble so text resuming after an interruption renders in chronological order.
+        // Every fresh bubble gets a unique `${id}@<seq>` id — the wire often omits `messageId` (and
+        // the S3 replay always does, since the backend drops chunks), so the bare fallback id would
+        // collide as a React key across messages. The continuation lookup matches the `${id}@`
+        // prefix, so it still works.
+        if (idx === -1) {
+            if (type === 'assistant_message') {
+                openAssistantMessages++
+            }
+            items.push({
+                id: bubbleId(id, bubbleSeq++),
+                type,
+                text: delta,
+                complete: false,
+                ...(timestamp !== undefined && { startedAt: timestamp, endedAt: timestamp }),
+            })
+            return
+        }
+        items[idx] = {
+            ...items[idx],
+            text: (items[idx].text ?? '') + delta,
+            ...(timestamp !== undefined && { endedAt: timestamp }),
+        }
+    }
+
+    const finalizeMessage = (id: string, text: string): void => {
+        let idx = openAssistantMessages > 0 ? findLastBufferIndex(items, id, 'assistant_message', true) : -1
+        if (idx === -1 && openAssistantMessages > 0) {
+            // The wire isn't consistent about carrying `messageId` across a message's chunks and its
+            // closing `agent_message` (the chunks often have one, the finalize doesn't, or vice
+            // versa), so an id-keyed lookup can miss the buffer the chunks opened. Fall back to the
+            // message still being streamed — the last open assistant buffer in the current turn —
+            // and close that, rather than appending a second bubble with the same text. Bounded at
+            // the turn separator so a finalize never reaches back into a prior turn.
+            for (let i = items.length - 1; i >= 0; i--) {
+                if (items[i].type === 'turn_separator') {
+                    break
+                }
+                if (items[i].type === 'assistant_message' && !items[i].complete) {
+                    idx = i
+                    break
+                }
+            }
+        }
+        if (idx === -1) {
+            // No buffer to close (the common replay case: S3 drops chunks, so a finalized message
+            // arrives alone). Push a fresh bubble with a unique id — a bare fallback id would collide
+            // as a React key with every other no-`messageId` message in the thread.
+            items.push({
+                id: bubbleId(id, bubbleSeq++),
+                type: 'assistant_message',
+                text,
+                complete: true,
+                ...(timestamp !== undefined && { startedAt: timestamp, endedAt: timestamp }),
+            })
+            return
+        }
+        openAssistantMessages--
+        items[idx] = { ...items[idx], text, complete: true, ...(timestamp !== undefined && { endedAt: timestamp }) }
+    }
+
+    const upsertInvocationItem = (toolCallId: string, hasStart = true): void => {
+        if (!toolItemIds.has(toolCallId)) {
+            toolItemIds.add(toolCallId)
+            items.push({
+                id: toolCallId,
+                type: 'tool_invocation',
+                toolCallId,
+                ...(hasStart && timestamp !== undefined && { startedAt: timestamp }),
+            })
+        }
+    }
+
+    const renderReplayHuman = (rawText: string, remember: boolean): void => {
+        const { text, contextBlocks } = splitUserMessageContent(rawText)
+        if (!text) {
+            return
+        }
+        if (options.isResumeRun && isResumeContextPrompt(text)) {
+            return
+        }
+        if (!remember) {
+            const seen = rememberedHumanTexts.get(text) ?? 0
+            if (seen > 0) {
+                rememberedHumanTexts.set(text, seen - 1)
+                return
+            }
+        }
+        pushHuman(text)
+        pushContextBlocks(contextBlocks)
+        if (remember) {
+            rememberedHumanTexts.set(text, (rememberedHumanTexts.get(text) ?? 0) + 1)
+        }
+    }
+
+    /** The oldest send of this text the agent has not taken up, which is the one it takes up next. */
+    const takeWaitingPlaceholder = (text: string): string | undefined => {
+        const index = waitingSends.findIndex((send) => send.text === text)
+        return index === -1 ? undefined : waitingSends.splice(index, 1)[0].id
+    }
+
+    const renderLiveHuman = (rawText: string, remember: boolean): void => {
+        const { text, contextBlocks } = splitUserMessageContent(rawText)
+        if (!text) {
+            return
+        }
+        // The blocks ride only the server echo (the optimistic `_client/human_message` carries the raw
+        // text), so push them even when the human text below dedupes against the optimistic render.
+        pushContextBlocks(contextBlocks)
+        // A send echoed in two wire forms is one send: the `_posthog/user_message` form places it and
+        // leaves a credit the `user_message_chunk` form spends. Counting rather than flagging the text
+        // keeps a second send of the same text in one turn from reading as the first send's echo.
+        if (!remember) {
+            const paired = pairedSends.get(text) ?? 0
+            if (paired > 0) {
+                pairedSends.set(text, paired - 1)
+                return
+            }
+        }
+        // The echo says the agent took the send up, so it is what places the message: the placeholder
+        // leaves the foot of the thread and the message renders at the head of the turn it opens,
+        // keeping the attachment previews the placeholder carried. A placeholder already inside this
+        // turn is where it belongs, so it stays put.
+        const waitingId = takeWaitingPlaceholder(text)
+        if (waitingId !== undefined) {
+            if (remember) {
+                pairedSends.set(text, (pairedSends.get(text) ?? 0) + 1)
+            }
+            const index = items.findIndex((item) => item.id === waitingId)
+            if (index >= items.findLastIndex((item) => item.type === 'turn_separator') + 1) {
+                // The placeholder already sits in this turn, which is where the echo would put it.
+                return
+            }
+            if (index === -1) {
+                pushHuman(text)
+                return
+            }
+            const [placeholder] = items.splice(index, 1)
+            pushHuman(text, placeholder.attachments ?? [], { reuseId: placeholder.id })
+            return
+        }
+        // No send of ours is waiting — a drained queue from another tab, or a replayed turn the
+        // current turn already shows.
+        if (currentTurnHasHumanText(items, text)) {
+            return
+        }
+        pushHuman(text)
+    }
+
+    const handleToolCallUpdate = (
+        update: Record<string, unknown>,
+        notification: StoredLogEntry['notification']
+    ): void => {
+        const existing = invocations.get(String(update.toolCallId ?? ''))
+        const next = invocationFromToolCallUpdate(existing, update, notification)
+        if (!next) {
+            return
+        }
+        invocations.set(next.toolCallId, next)
+        if (!existing && !subagentParentToolCallId(update._meta)) {
+            upsertInvocationItem(next.toolCallId, false)
+        }
+        if (
+            timestamp !== undefined &&
+            (next.status === 'completed' || next.status === 'failed') &&
+            toolItemIds.has(next.toolCallId)
+        ) {
+            const index = items.findLastIndex((item) => item.toolCallId === next.toolCallId)
+            if (index !== -1) {
+                items[index] = { ...items[index], endedAt: timestamp }
+            }
+        }
+    }
+
+    // Two frames often describe one failure with the same text; keep the shorter, cleaner one.
+    const pushError = (message: string, variant: 'error' | 'crash', sourceRunId?: string): void => {
+        const last = items[items.length - 1]
+        if (last?.type === 'error' && last.errorMessage && variant === 'error' && last.variant !== 'crash') {
+            const a = last.errorMessage.trim()
+            const b = message.trim()
+            if (a.includes(b) || b.includes(a)) {
+                items[items.length - 1] = { ...last, errorMessage: a.length <= b.length ? a : b }
+                return
+            }
+        }
+        // A follow-up that failed to deliver earlier in this turn was a symptom of this error, so the
+        // undelivered card folds into the real one instead of standing next to it.
+        const turnStart = items.findLastIndex((item) => item.type === 'human_message')
+        const undeliveredIdx = items.findIndex(
+            (item, index) => index > turnStart && item.type === 'error' && item.variant === 'undelivered'
+        )
+        if (undeliveredIdx !== -1) {
+            items.splice(undeliveredIdx, 1)
+        }
+        items.push({
+            id: seqId('error', errorSeq++),
+            type: 'error',
+            errorMessage: message,
+            variant,
+            ...(undeliveredIdx !== -1 ? { undeliveredMessage: true } : {}),
+            ...(sourceRunId ? { sourceRunId } : {}),
+        })
+    }
+    for (let index = resume ? resume.entries.length : 0; index < entries.length; index++) {
+        const { entry, source } = entries[index]
+        entryRunId = entry.source_run_id ?? options.pendingMessage?.runId
+        const clientId = entry.notification.params?.clientId
+        // A saved message that replaces its streamed chunks keeps the first chunk's id, so its row keeps its key.
+        const savedKey = savedEntryKey(entry)
+        const eventKey = (savedKey && sentHumanRowKeys.get(savedKey)) || entry.first_event_id || entry.event_id
+        entryKey =
+            typeof eventKey === 'string' && eventKey
+                ? eventKey
+                : entry.notification.method === '_client/human_message' && typeof clientId === 'string'
+                  ? `client-${clientId}`
+                  : undefined
+        if (
+            options.pendingMessage &&
+            entryRunId === options.pendingMessage.runId &&
+            pendingInsertionIndex === undefined
+        ) {
+            pendingInsertionIndex = items.length
+        }
+        const notification = entry.notification
+        const method = notification.method
+        const params = (notification.params ?? {}) as Record<string, unknown>
+        if (method === '_posthog/run_started') {
+            importedRun = params.imported === true
+        }
+        const updateMeta = isRecord(params.update) && isRecord(params.update._meta) ? params.update._meta : null
+        const recordedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+        timestamp = !importedRun && !updateMeta?.imported && Number.isFinite(recordedAt) ? recordedAt : undefined
+
+        if (method === '_client/human_message') {
+            const optimisticText = String(params.content ?? '')
+            const id = pushHuman(optimisticText, optimisticAttachments(params.attachments), { atFoot: true })
+            waitingSends.push({ id, text: optimisticText, turns: 0 })
+            continue
+        }
+        if (method === '_client/error') {
+            items.push({
+                id: seqId('error', errorSeq++),
+                type: 'error',
+                errorMessage: String(params.message ?? ''),
+                variant: params.variant === 'crash' ? 'crash' : 'error',
+            })
+            continue
+        }
+        if (method === '_posthog/error') {
+            pushError(
+                String(params.message ?? notification.error?.message ?? 'Agent error'),
+                'error',
+                entry.source_run_id
+            )
+            continue
+        }
+        if (method === '_posthog/turn_suggestion') {
+            turnSuggestions.latest = parseTurnSuggestionFrame(params) ?? turnSuggestions.latest
+            continue
+        }
+        if (method === '_posthog/turn_suggestion_resolved') {
+            if (typeof params.turnIndex === 'number' && typeof params.outcome === 'string') {
+                turnSuggestions.outcomes.set(params.turnIndex, params.outcome)
+            }
+            continue
+        }
+        if (method === '_posthog/turn_complete') {
+            const traceId = typeof params.traceId === 'string' ? params.traceId : undefined
+            // A Stop or a steer ends the turn early. Without a notice the thread reads as a turn that went quiet.
+            if (params.stopReason === 'cancelled') {
+                items.push({
+                    id: `turn-cancelled-${separatorSeq}`,
+                    type: 'status',
+                    status: 'turn_cancelled',
+                    isComplete: true,
+                    ...(timestamp !== undefined && { startedAt: timestamp, endedAt: timestamp }),
+                })
+            }
+            items.push({
+                id: seqId('turn', separatorSeq++),
+                type: 'turn_separator',
+                ...(traceId && { traceId }),
+                ...(timestamp !== undefined && { startedAt: timestamp }),
+            })
+            pairedSends.clear()
+            waitingSends.forEach((send) => (send.turns += 1))
+            if (index === checkpointIndex) {
+                nextCheckpoint = takeCheckpoint(index)
+            }
+            continue
+        }
+        if (method === '_posthog/progress') {
+            const group = stringifyOptional(params.group)
+            const step = stringifyOptional(params.step)
+            const label = stringifyOptional(params.label)
+            if (step === 'followup_delivery' && normalizeProgressStatus(params.status) === 'failed') {
+                // The undelivered follow-up is a consequence of the run's error, so it rides the error
+                // card instead of a second failed row. Without a preceding error it becomes the card.
+                items = items.filter((item) => !(item.type === 'progress' && item.progressGroup === group))
+                // The notice follows the send that failed, which is the last one drawn. Retiring it
+                // stops a retry of the same text from taking its placeholder, and keeps a send that
+                // was never delivered where the composer drew it instead of sinking it below the
+                // answers that came after.
+                waitingSends.pop()
+                const last = items[items.length - 1]
+                if (last?.type === 'error' && last.variant !== 'crash') {
+                    items[items.length - 1] = { ...last, undeliveredMessage: true }
+                } else {
+                    items.push({
+                        id: seqId('error', errorSeq++),
+                        type: 'error',
+                        errorMessage: stringifyOptional(params.detail) ?? label ?? 'Message not delivered',
+                        variant: 'undelivered',
+                        undeliveredMessage: true,
+                        ...(entry.source_run_id ? { sourceRunId: entry.source_run_id } : {}),
+                    })
+                }
+                continue
+            }
+            if (group && step && label) {
+                const detail = stringifyOptional(params.detail)
+                const nextStep: ProgressStep = {
+                    key: step,
+                    status: normalizeProgressStatus(params.status),
+                    label,
+                    ...(detail !== undefined ? { detail } : {}),
+                }
+                const idx = items.findIndex((item) => item.type === 'progress' && item.progressGroup === group)
+                if (idx === -1) {
+                    items.push({
+                        id: `progress-${group}`,
+                        type: 'progress',
+                        progressGroup: group,
+                        progressSteps: [nextStep],
+                    })
+                } else {
+                    const existingSteps = items[idx].progressSteps ?? []
+                    const stepIdx = existingSteps.findIndex((s) => s.key === step)
+                    items[idx] = {
+                        ...items[idx],
+                        progressSteps:
+                            stepIdx === -1
+                                ? [...existingSteps, nextStep]
+                                : existingSteps.map((s, i) => (i === stepIdx ? nextStep : s)),
+                    }
+                }
+            }
+            continue
+        }
+        if (method === '_posthog/status') {
+            const status = String(params.status ?? '')
+            const isComplete = params.isComplete === true
+            if (isComplete && (status === 'compacting' || status === 'clearing' || status === 'retrying')) {
+                items = items.filter((item) => !isPendingStatus(item, status))
+            } else if (status === 'clearing_failed' || status === 'compacting_failed') {
+                // A failed clear emits no `conversation_cleared` marker, so retire the spinner
+                // here and report the outcome in its place.
+                items = items.filter(
+                    (item) => !isPendingStatus(item, status === 'clearing_failed' ? 'clearing' : 'compacting')
+                )
+                items.push({
+                    id: seqId('status', statusSeq++),
+                    type: 'status',
+                    status,
+                    isComplete: true,
+                    errorMessage: stringifyOptional(params.error),
+                })
+            } else if (status === 'extension_notice') {
+                items.push({
+                    id: seqId('status', statusSeq++),
+                    type: 'status',
+                    status,
+                    isComplete: true,
+                    message: stringifyOptional(params.message),
+                })
+            } else {
+                items.push({ id: seqId('status', statusSeq++), type: 'status', status, isComplete })
+            }
+            continue
+        }
+        if (method === '_posthog/compact_boundary') {
+            items = items.filter((item) => !isPendingStatus(item, 'compacting'))
+            items.push({
+                id: seqId('compact', compactSeq++),
+                type: 'compact_boundary',
+                trigger: stringifyOptional(params.trigger),
+                preTokens: typeof params.preTokens === 'number' ? params.preTokens : undefined,
+                contextSize: typeof params.contextSize === 'number' ? params.contextSize : undefined,
+            })
+            continue
+        }
+        if (method === '_posthog/conversation_cleared') {
+            // The divider supersedes the spinner visually, but the completing `_posthog/status`
+            // frame is a separate notification that may not have landed yet.
+            items = items.filter((item) => !isPendingStatus(item, 'clearing'))
+            items.push({ id: seqId('cleared', clearedSeq++), type: 'conversation_cleared' })
+            continue
+        }
+        if (method === '_posthog/task_notification') {
+            items.push({
+                id: seqId('task', taskSeq++),
+                type: 'task_notification',
+                status: stringifyOptional(params.status),
+                summary: stringifyOptional(params.summary),
+                ...(timestamp !== undefined && { startedAt: timestamp, endedAt: timestamp }),
+            })
+            continue
+        }
+        if (method === '_posthog/user_message') {
+            const userText = extractUserMessageText(params.content as string | unknown[] | undefined)
+            if (source === 'replay') {
+                renderReplayHuman(userText, true)
+            } else {
+                renderLiveHuman(userText, true)
+            }
+            if (Array.isArray(params.content)) {
+                for (const block of params.content) {
+                    if (isHiddenUserContent(block)) {
+                        continue
+                    }
+                    const attachment = userAttachment(block)
+                    if (attachment) {
+                        noteAttachment(attachment)
+                    }
+                }
+            }
+            continue
+        }
+        if (method === '_posthog/console') {
+            const message = typeof params.message === 'string' ? params.message : ''
+            const level = typeof params.level === 'string' ? params.level : 'info'
+            if (message) {
+                items.push({
+                    id: seqId('console', consoleSeq++),
+                    type: 'debug',
+                    text: message,
+                    debugLevel: level,
+                })
+            }
+            continue
+        }
+        if (method?.startsWith('_posthog/')) {
+            // run_started, usage_update, resources_used, sdk_session, sandbox_output, … — no thread item.
+            continue
+        }
+        if (method !== 'session/update') {
+            // session/prompt and everything else never produces a thread item.
+            continue
+        }
+        const update = params.update
+        if (!isRecord(update)) {
+            continue
+        }
+        const sessionUpdate = update.sessionUpdate
+        if (sessionUpdate === 'user_message_chunk' || sessionUpdate === 'user_message') {
+            if (isHiddenUserContent(update.content)) {
+                continue
+            }
+            // An attached file is its own frame, carrying a resource link instead of text.
+            const attachment = userAttachment(update.content)
+            if (attachment) {
+                noteAttachment(attachment)
+                continue
+            }
+            const content = update.content as { text?: string } | undefined
+            const userText = String(content?.text ?? update.text ?? '')
+            if (source === 'replay') {
+                renderReplayHuman(userText, false)
+            } else {
+                renderLiveHuman(userText, false)
+            }
+            continue
+        }
+        if (sessionUpdate === 'error') {
+            // The Claude adapter reports a stopped run only through this frame; Codex sends it and a
+            // `_posthog/error` with the same text, which `pushError` folds into one card.
+            pushError(
+                String(update.message ?? 'The agent stopped before completing this request.'),
+                'error',
+                entry.source_run_id
+            )
+            continue
+        }
+        const content = update.content as { text?: string } | undefined
+        switch (sessionUpdate) {
+            case 'agent_message_chunk':
+                appendChunk(
+                    String(update.messageId ?? 'current'),
+                    'assistant_message',
+                    String(content?.text ?? update.text ?? '')
+                )
+                break
+            case 'agent_message':
+                finalizeMessage(String(update.messageId ?? 'current'), String(content?.text ?? update.text ?? ''))
+                break
+            case 'agent_thought_chunk':
+                appendChunk(
+                    String(update.messageId ?? 'current-thought'),
+                    'assistant_thought',
+                    String(content?.text ?? update.text ?? '')
+                )
+                break
+            case 'tool_call': {
+                const invocation = invocationFromToolCall(update)
+                if (!invocation) {
+                    break
+                }
+                invocations.set(invocation.toolCallId, invocation)
+                // A subagent's inner tool calls carry the parent Task's id; they belong inside that
+                // card, not as top-level siblings, so keep them out of the thread.
+                if (!subagentParentToolCallId(update._meta)) {
+                    upsertInvocationItem(invocation.toolCallId)
+                }
+                break
+            }
+            case 'tool_call_update':
+                handleToolCallUpdate(update, notification)
+                break
+        }
+    }
+
+    // A send the agent has not taken up sits below everything that has landed, in send order, however
+    // much arrived after the composer drew it. A settled one leaves the sink, so a send whose echo
+    // can no longer pair cannot walk the thread for the rest of the run.
+    const waiting = waitingSendIds()
+    if (waiting.size > 0) {
+        items = [...items.filter((item) => !waiting.has(item.id)), ...items.filter((item) => waiting.has(item.id))]
+    }
+
+    if (options.pendingMessage && !pendingMessageSeen) {
+        // This is a display fallback, not an optimistic send; bootstrap must still read the full log.
+        items.splice(pendingInsertionIndex ?? items.length, 0, {
+            id: `pending-${options.pendingMessage.runId}-${options.pendingMessage.id}`,
+            type: 'human_message',
+            text: options.pendingMessage.text,
+            complete: true,
+        })
+    }
+    return {
+        folded: { threadItems: items, toolInvocations: invocations, turnSuggestions },
+        checkpoint: nextCheckpoint,
+    }
+}
+
+/**
+ * Empty assistant messages, priming thoughts, and step-less progress rows stay in the log for folding.
+ * Hide them from the rendered thread so message wrappers and virtualized consumers cannot reserve
+ * empty bubbles or gap-padded rows. Tool items are always paired with an invocation (see
+ * `upsertInvocationItem`), and `debug` rows are gated separately by `showDebugLogs`, so neither needs
+ * a content check here.
+ */
+function rendersThreadItemContent(item: ThreadItem): boolean {
+    switch (item.type) {
+        case 'assistant_message':
+        case 'assistant_thought':
+            return !!item.text?.trim()
+        case 'progress':
+            return (item.progressSteps?.length ?? 0) > 0
+        default:
+            return true
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface runStreamLogicValues {
+    showDebugLogs: boolean // debugLogsLogic
+    foregroundStreamKeys: Set<string> // foregroundStreamLogic
+    isDev: boolean | undefined // preflightLogic
+    currentProjectId: number | null // projectLogic
+    toolListeners: Record<string, ToolStreamSubscription> // toolStreamEventsLogic
+    user: UserType | null // userLogic
+    availableCommands: AgentCommand[]
+    awaitingOptimisticAttach: boolean
+    bootstrapError: StreamErrorEnvelope | null
+    bootstrapLoading: boolean
+    bootstrappedRunId: string | null
+    bootstrappedTaskId: string | null
+    contextUsage: ContextUsage | null
+    conversationClearSupported: boolean
+    cumulativeReconnectAttempt: number
+    currentMode: string | null
+    currentProgress: string | null
+    currentRunStatus: RunStatus | null
+    currentStage: string | null
+    errorTraceIds: Map<string, string>
+    foldedThread: FoldedThread
+    hasGitArtifacts: boolean
+    hasThreadItems: boolean
+    historyComplete: boolean
+    historyTurnBase: number
+    isBootstrapResumeRun: boolean
+    isThinking: boolean
+    latestTurnTraceId: string | null
+    log: RunLog
+    logBootstrapLoading: boolean
+    olderHistoryState: OlderHistoryState
+    pagedHistory: boolean
+    pendingPermissionRequest: PermissionRequestRecord | null
+    pendingRunMessage: PendingRunMessage | null
+    permissionResponseRequestIds: Set<string>
+    piRuntime: boolean
+    reconnectAttempt: number
+    recoveryState: {
+        attempt: number
+        maxAttempts: number
+        phase: RecoveryPhase
+    } | null
+    replySuggestions: ReplySuggestions | null
+    replySuggestionsFrame: ReplySuggestions | null
+    resolvedPermissionRequestIds: Set<string>
+    respondingToPermission: boolean
+    runArtifacts: RunArtifacts
+    runConnectionState: RunConnectionState | null
+    runOpening: boolean
+    runStarted: boolean
+    sdkSession: SdkSession | null
+    seenPermissionRequestIds: Set<string>
+    showThinkingIndicator: boolean
+    sseStatus: RunSseStatus
+    streamHasEnded: boolean
+    streamPhase: 'idle' | 'provisioning' | 'thinking'
+    threadItems: ThreadItem[]
+    toolInvocations: Map<string, ToolInvocation>
+    traceId: string | null
+    turnComplete: boolean
+    turnSuggestion: TurnSuggestion | null
+    turnSuggestionAcceptedHere: number | null
+    turnSuggestionExpandedHere: number | null
+    turnSuggestionLedger: TurnSuggestionLedger | null
+    turnSuggestionOutcomesHere: Record<number, string>
+    turnSuggestionsMuted: boolean
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface runStreamLogicActions {
+    markContextLinesSeen: (
+        taskId: string,
+        lines: string[]
+    ) => {
+        lines: string[]
+        taskId: string
+    } // attachedContextLogic
+    emitRunLifecycleEvent: (event: RunLifecycleEvent) => {
+        event: RunLifecycleEvent
+    } // toolStreamEventsLogic
+    emitToolEvent: (event: ToolStreamEvent) => {
+        event: ToolStreamEvent
+    } // toolStreamEventsLogic
+    emitTurnCompleteEvent: (event: TurnCompleteEvent) => {
+        event: TurnCompleteEvent
+    } // toolStreamEventsLogic
+    appendEntries: (entries: StoredEntry[]) => {
+        entries: StoredEntry[]
+    }
+    appendResumeBoundary: () => {
+        value: true
+    }
+    attachOptimisticResume: (
+        taskId: string,
+        run: TaskRunDetailDTOApi
+    ) => {
+        run: TaskRunDetailDTOApi
+        taskId: string
+    }
+    autoApprovePermissionRequest: (
+        record: PermissionRequestRecord,
+        optionId: string
+    ) => {
+        optionId: string
+        record: PermissionRequestRecord
+    }
+    bootstrapLogReady: () => {
+        value: true
+    }
+    bootstrapReplayComplete: () => {
+        value: true
+    }
+    bootstrapRun: (payload: {
+        justCreatedRun?: boolean
+        /** Read the latest turns first and load older turns in pages, for a thread that can show them. */
+        pagedHistory?: boolean
+        retainedMessage?: string
+        runId: string
+        taskId: string
+        taskRuntime?: string | null
+        traceId?: string
+    }) => {
+        justCreatedRun?: boolean | undefined
+        pagedHistory?: boolean | undefined
+        retainedMessage?: string | undefined
+        runId: string
+        taskId: string
+        taskRuntime?: string | null | undefined
+        traceId?: string | undefined
+    }
+    cancelPermissionDelivery: () => {
+        value: true
+    }
+    cancelRun: (run?: { runId: string; taskId: string }) => {
+        run:
+            | {
+                  runId: string
+                  taskId: string
+              }
+            | undefined
+    }
+    clearPermissionRequest: () => {
+        value: true
+    }
+    closeSse: () => {
+        value: true
+    }
+    deliverPermission: (
+        record: PermissionRequestRecord,
+        optionId: string,
+        customInput?: string,
+        answers?: Record<string, string>,
+        automatic?: boolean
+    ) => {
+        answers: Record<string, string> | undefined
+        automatic: boolean
+        customInput: string | undefined
+        optionId: string
+        record: PermissionRequestRecord
+    }
+    handleStreamError: (envelope: StreamErrorEnvelope) => StreamErrorEnvelope
+    handleTerminalStatus: (status: {
+        errorMessage?: string | null
+        replayedFromHistory?: boolean
+        status: RunStatus
+    }) => {
+        errorMessage?: string | null | undefined
+        replayedFromHistory?: boolean | undefined
+        status: RunStatus
+    }
+    ingestAcpFrame: (
+        entry: StoredLogEntry,
+        source?: FrameSource
+    ) => {
+        entry: StoredLogEntry
+        source: FrameSource
+    }
+    ingestPermissionRequest: (
+        record: PermissionRequestRecord,
+        replayedFromHistory?: boolean
+    ) => {
+        record: PermissionRequestRecord
+        replayedFromHistory: boolean
+    }
+    loadOlderHistory: () => {
+        value: true
+    }
+    loadTurnSuggestionLedger: (
+        taskId: string,
+        attempt?: number
+    ) => {
+        attempt: number
+        taskId: string
+    }
+    markBootstrapResumeRun: (value: boolean) => {
+        value: boolean
+    }
+    markPermissionRequestResolved: (requestId: string) => {
+        requestId: string
+    }
+    markPermissionRequestSeen: (requestId: string) => {
+        requestId: string
+    }
+    markRunStarted: () => {
+        value: true
+    }
+    markTurnComplete: (isReplay?: boolean) => {
+        isReplay: boolean
+    }
+    markTurnStarted: () => {
+        value: true
+    }
+    markTurnSuggestionAccepted: (turnIndex: number) => {
+        turnIndex: number
+    }
+    markTurnSuggestionExpanded: (turnIndex: number) => {
+        turnIndex: number
+    }
+    mergeRunArtifacts: (partial: Partial<RunArtifacts>) => {
+        partial: Partial<RunArtifacts>
+    }
+    openSseForRun: (payload: { runId: string; startLatest?: boolean; taskId: string; traceId?: string }) => {
+        runId: string
+        startLatest?: boolean | undefined
+        taskId: string
+        traceId?: string | undefined
+    }
+    permissionResponseFailed: (requestId: string) => {
+        requestId: string
+    }
+    permissionRunChanged: () => {
+        value: true
+    }
+    prepareResumeRun: () => {
+        value: true
+    }
+    pushConversationCleared: () => {
+        value: true
+    }
+    pushErrorItem: (
+        errorMessage: string,
+        variant?: 'crash' | 'error'
+    ) => {
+        errorMessage: string
+        variant: 'crash' | 'error'
+    }
+    pushHumanMessage: (
+        content: string,
+        stagedAttachments?: StagedAttachment[]
+    ) => {
+        content: string
+        stagedAttachments: StagedAttachment[] | undefined
+    }
+    recordTurnSuggestionOutcome: (
+        turnIndex: number,
+        outcome: string
+    ) => {
+        outcome: string
+        turnIndex: number
+    }
+    recoveryProgress: (
+        phase: RecoveryPhase,
+        attempt: number,
+        maxAttempts: number
+    ) => {
+        attempt: number
+        maxAttempts: number
+        phase: RecoveryPhase
+    }
+    recoveryRunChanged: () => {
+        value: true
+    }
+    replaceLog: (log: RunLog) => {
+        log: RunLog
+    }
+    reset: () => {
+        value: true
+    }
+    resetRecoveryBudget: () => {
+        value: true
+    }
+    respondToPermission: (payload: {
+        answers?: Record<string, string>
+        customInput?: string
+        optionId: string
+        requestId: string
+    }) => {
+        answers?: Record<string, string> | undefined
+        customInput?: string | undefined
+        optionId: string
+        requestId: string
+    }
+    retryConnection: () => {
+        value: true
+    }
+    rollbackOptimisticResume: () => {
+        value: true
+    }
+    routePermissionRequest: (
+        record: PermissionRequestRecord,
+        replayedFromHistory?: boolean
+    ) => {
+        record: PermissionRequestRecord
+        replayedFromHistory: boolean
+    }
+    setAvailableCommands: (commands: AgentCommand[]) => {
+        commands: AgentCommand[]
+    }
+    setContextUsage: (usage: ContextUsage) => {
+        usage: ContextUsage
+    }
+    setConversationClearSupported: (supported: boolean) => {
+        supported: boolean
+    }
+    setCurrentMode: (mode: string) => {
+        mode: string
+    }
+    setCurrentProgress: (progress: string | null) => {
+        progress: string | null
+    }
+    setCurrentStage: (stage: string | null) => {
+        stage: string | null
+    }
+    setHistoryComplete: (complete: boolean) => {
+        complete: boolean
+    }
+    setHistoryTurnBase: (base: number) => {
+        base: number
+    }
+    setOlderHistoryState: (state: OlderHistoryState) => {
+        state: OlderHistoryState
+    }
+    setPendingRunMessage: (message: PendingRunMessage | null) => {
+        message: PendingRunMessage | null
+    }
+    setReplySuggestions: (replySuggestions: ReplySuggestions | null) => {
+        replySuggestions: ReplySuggestions | null
+    }
+    setRunOpening: (opening: boolean) => {
+        opening: boolean
+    }
+    setSdkSession: (session: SdkSession) => {
+        session: SdkSession
+    }
+    setStreamHasEnded: (ended: boolean) => {
+        ended: boolean
+    }
+    setTurnSuggestionLedger: (ledger: TurnSuggestionLedger) => {
+        ledger: TurnSuggestionLedger
+    }
+    sseConnecting: () => {
+        value: true
+    }
+    sseDropped: () => {
+        value: true
+    }
+    sseOpened: () => {
+        value: true
+    }
+    sseReconnecting: (attempt: number) => {
+        attempt: number
+    }
+    startOptimisticResume: (
+        message: string,
+        stagedAttachments?: StagedAttachment[]
+    ) => {
+        message: string
+        stagedAttachments: StagedAttachment[] | undefined
+    }
+    startOptimisticRun: (
+        message?: string,
+        stagedAttachments?: StagedAttachment[]
+    ) => {
+        message: string | undefined
+        stagedAttachments: StagedAttachment[] | undefined
+    }
+    streamEnded: () => {
+        value: true
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface runStreamLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        respondingToPermission: (
+            permissionResponseRequestIds: Set<string>,
+            pendingPermissionRequest: PermissionRequestRecord | null
+        ) => boolean
+        foldedThread: (
+            log: RunLog,
+            isBootstrapResumeRun: boolean,
+            pendingRunMessage: PendingRunMessage | null,
+            bootstrappedTaskId: string | null
+        ) => FoldedThread
+        errorTraceIds: (threadItems: ThreadItem[]) => Map<string, string>
+        turnSuggestionsMuted: (
+            foldedThread: FoldedThread,
+            turnSuggestionLedger: TurnSuggestionLedger | null,
+            turnSuggestionOutcomesHere: Record<number, string>
+        ) => boolean
+        turnSuggestion: (
+            foldedThread: FoldedThread,
+            threadItems: ThreadItem[],
+            turnSuggestionLedger: TurnSuggestionLedger | null,
+            turnSuggestionOutcomesHere: Record<number, string>,
+            turnSuggestionAcceptedHere: number | null,
+            turnSuggestionsMuted: boolean,
+            bootstrappedTaskId: string | null,
+            historyTurnBase: number
+        ) => TurnSuggestion | null
+        replySuggestions: (
+            replySuggestionsFrame: ReplySuggestions | null,
+            threadItems: ThreadItem[],
+            historyTurnBase: number
+        ) => ReplySuggestions | null
+        latestTurnTraceId: (threadItems: ThreadItem[]) => string | null
+        threadItems: (foldedThread: FoldedThread, showDebugLogs: boolean) => ThreadItem[]
+        hasThreadItems: (threadItems: ThreadItem[]) => boolean
+        toolInvocations: (foldedThread: FoldedThread) => Map<string, ToolInvocation>
+        isThinking: (
+            runStarted: boolean,
+            turnComplete: boolean,
+            currentRunStatus: RunStatus | null,
+            sseStatus: RunSseStatus,
+            arg: boolean | undefined,
+            streamHasEnded: boolean
+        ) => boolean
+        streamPhase: (
+            runStarted: boolean,
+            isThinking: boolean,
+            currentRunStatus: RunStatus | null,
+            sseStatus: RunSseStatus,
+            runOpening: boolean,
+            arg: boolean | undefined
+        ) => 'idle' | 'provisioning' | 'thinking'
+        showThinkingIndicator: (
+            streamPhase: 'idle' | 'provisioning' | 'thinking',
+            threadItems: ThreadItem[],
+            toolInvocations: Map<string, ToolInvocation>
+        ) => boolean
+        hasGitArtifacts: (runArtifacts: RunArtifacts) => boolean
+        runConnectionState: (
+            sseStatus: RunSseStatus,
+            reconnectAttempt: number,
+            bootstrapError: StreamErrorEnvelope | null,
+            recoveryState: {
+                attempt: number
+                maxAttempts: number
+                phase: RecoveryPhase
+            } | null
+        ) => RunConnectionState | null
+    }
+}
+
+export type runStreamLogicType = MakeLogicType<
+    runStreamLogicValues,
+    runStreamLogicActions,
+    RunStreamLogicProps,
+    runStreamLogicMeta
+>
+
+/**
+ * Owns the SSE connection to the products/tasks stream endpoint (a `fetch` reader driven by
+ * `eventsource-parser`, so a reconnect can resume via a Last-Event-ID header), parses the ACP wire
+ * format, and produces thread-shaped state the renderer consumes. Coexistence sibling to
+ * `maxThreadLogic`'s streaming loop — the sandbox path never enters the LangGraph stream loop.
+ *
+ * Covers open/close, `data.type === 'notification'` → `ingestAcpFrame` dispatch, terminal status,
+ * and stream-error capture, plus the reconnect/backoff loop on SSE drops, the ordered append-only
+ * log the projection folds, HTTP-status error mapping, and the `bootstrapRun`
+ * connect-first/buffer/snapshot/drain helper.
+ *
+ * Keyed by `streamKey` (the conversation id for PostHog AI, the task id for a generic task viewer)
+ * so concurrent streams keep independent stream state and connections.
+ */
+export const runStreamLogic = kea<runStreamLogicType>([
+    // `replayOnly` needs a default so selectors can depend on it as a prop (kea throws on a missing prop).
+    props({ replayOnly: false } as RunStreamLogicProps),
+    // A read-only viewer keys under a `replay:` namespace so it never shares an instance with a live
+    // stream of the same run — streaming can't bleed into a read-only thread.
+    key((props) => (props.replayOnly ? `replay:${props.streamKey}` : props.streamKey)),
+    path((key) => ['products', 'posthog_ai', 'frontend', 'logics', 'runStreamLogic', key]),
+    connect(() => ({
+        values: [
+            projectLogic,
+            ['currentProjectId'],
+            preflightLogic,
+            ['isDev'],
+            userLogic,
+            ['user'],
+            debugLogsLogic,
+            ['showDebugLogs'],
+            toolStreamEventsLogic,
+            ['toolListeners'],
+            foregroundStreamLogic,
+            ['foregroundStreamKeys'],
+        ],
+        actions: [
+            toolStreamEventsLogic,
+            ['emitToolEvent', 'emitTurnCompleteEvent', 'emitRunLifecycleEvent'],
+            attachedContextLogic,
+            ['markContextLinesSeen'],
+        ],
+    })),
+    actions({
+        retryConnection: true,
+        resetRecoveryBudget: true,
+        recoveryRunChanged: true,
+        setHistoryComplete: (complete: boolean) => ({ complete }),
+        setOlderHistoryState: (state: OlderHistoryState) => ({ state }),
+        setHistoryTurnBase: (base: number) => ({ base }),
+        loadOlderHistory: true,
+        setStreamHasEnded: (ended: boolean) => ({ ended }),
+        recoveryProgress: (phase: RecoveryPhase, attempt: number, maxAttempts: number) => ({
+            phase,
+            attempt,
+            maxAttempts,
+        }),
+        /**
+         * Bootstrap an existing run on conversation open. Terminal run: replay the `logs/` history
+         * and stay read-only (no SSE). In-progress run: connect the SSE *first* (buffering live
+         * frames), then read the `logs/` snapshot, then drain the buffered tail against it
+         * (`dedupeBufferedAgainstHistory`) so the seam neither duplicates nor gaps. `justCreatedRun`
+         * skips the `logs/` round-trip (fresh-run fast path — nothing historical to assemble).
+         */
+        bootstrapRun: (payload: {
+            taskId: string
+            runId: string
+            justCreatedRun?: boolean
+            traceId?: string
+            retainedMessage?: string
+            taskRuntime?: string | null
+            /** Read the latest turns first and load older turns in pages, for a thread that can show them. */
+            pagedHistory?: boolean
+        }) => payload,
+        openSseForRun: (payload: { taskId: string; runId: string; startLatest?: boolean; traceId?: string }) => payload,
+        /**
+         * Internal: a replay snapshot finished loading and no stream will follow — clears the bootstrap
+         * spinner. Covers the read-only viewer and a live instance that bootstrapped an already-terminal
+         * run, which never opens SSE and so never gets `sseOpened` to clear the spinner for it.
+         */
+        bootstrapReplayComplete: true,
+        /** Internal: the live run history snapshot finished loading or was intentionally skipped. */
+        bootstrapLogReady: true,
+        closeSse: true,
+        /**
+         * The conversations/open POST is in flight — drives the optimistic "spinning up" indicator
+         * before any SSE state exists. The caller (maxThreadLogic) flips it on before the POST and off
+         * on the no-handle/failure paths; the success path lets `openSseForRun` clear it via the reducer.
+         */
+        setRunOpening: (opening: boolean) => ({ opening }),
+        sseConnecting: true,
+        sseOpened: true,
+        sseReconnecting: (attempt: number) => ({ attempt }),
+        /** Internal: an SSE drop initiates the refetch + backoff loop. */
+        sseDropped: true,
+        /**
+         * Internal: the in-band `stream-end` sentinel landed — the run's event stream is finished.
+         * Tears the connection down without reconnecting and finalizes the run status (a safety net
+         * for a stream that ended without a preceding terminal `task_run_state` frame).
+         */
+        streamEnded: true,
+        /**
+         * Frame ingestion — appends one frame to the log and runs its one-shot side effects
+         * (telemetry, permission routing, value folds). Called by the live SSE listener
+         * (`source: 'live'`), the products/tasks `logs/` replay (`source: 'replay'`), and the
+         * bootstrap drain (the deduped live tail). Telemetry is suppressed for replay; the
+         * permission/run-started/tool-completion guards keep the side effects fired-once without a
+         * per-frame key. The recovery session commits resume cursors only after retaining their frames.
+         */
+        ingestAcpFrame: (entry: StoredLogEntry, source: FrameSource = 'live') => ({ entry, source }),
+        /** Append frames to the ordered log (the single source of truth). */
+        appendEntries: (entries: StoredEntry[]) => ({ entries }),
+        replaceLog: (log: RunLog) => ({ log }),
+        /** Records whether the bootstrapped run is a resume run, so the projection can drop its synthetic resume prompt. */
+        markBootstrapResumeRun: (value: boolean) => ({ value }),
+        /**
+         * Surface a permission request. `replayedFromHistory` marks requests re-derived from the
+         * `logs/` bootstrap — they restore card state but don't re-fire telemetry (the event
+         * already fired when the request was live).
+         */
+        ingestPermissionRequest: (record: PermissionRequestRecord, replayedFromHistory: boolean = false) => ({
+            record,
+            replayedFromHistory,
+        }),
+        /**
+         * Entry point for every parsed permission request. Applies the default tool policy
+         * (`toolPolicy`): auto-approve built-in tools and PostHog exec in the task's project, but
+         * prompt for connected-project calls and other MCP. Replayed-from-history requests are
+         * never auto-approved because the run may already be terminal.
+         */
+        routePermissionRequest: (record: PermissionRequestRecord, replayedFromHistory: boolean = false) => ({
+            record,
+            replayedFromHistory,
+        }),
+        /** Silently POST `allow` for a request the default policy auto-approves (no card shown). */
+        autoApprovePermissionRequest: (record: PermissionRequestRecord, optionId: string) => ({ record, optionId }),
+        deliverPermission: (
+            record: PermissionRequestRecord,
+            optionId: string,
+            customInput?: string,
+            answers?: Record<string, string>,
+            automatic: boolean = false
+        ) => ({ record, optionId, customInput, answers, automatic }),
+        cancelPermissionDelivery: true,
+        permissionRunChanged: true,
+        /** Pin a requestId as seen without surfacing a card, so a reconnect replay can't re-process it. */
+        markPermissionRequestSeen: (requestId: string) => ({ requestId }),
+        /**
+         * The request was answered — by this client (successful POST), another tab/client, or a
+         * `_posthog/permission_resolved` log entry. Clears the matching card and pins the id so
+         * reconnect/bootstrap replays cannot re-surface it.
+         */
+        markPermissionRequestResolved: (requestId: string) => ({ requestId }),
+        /**
+         * User picked an option on the approval card. POSTs the reply to the sandbox `permission/`
+         * endpoint (which routes to the products/tasks `permission_response` command); the pending
+         * request clears only once the POST succeeds, so a failure keeps the card for retry.
+         * `customInput` carries `reject_with_feedback` text. `answers` carries `AskUserQuestion`
+         * selections (keyed by question text) — the agent reads `_meta.answers` to resolve the question.
+         */
+        respondToPermission: (payload: {
+            requestId: string
+            optionId: string
+            customInput?: string
+            answers?: Record<string, string>
+        }) => payload,
+        clearPermissionRequest: true,
+        /**
+         * Cancel a run via the generic tasks relay. With no argument, cancels the streamed run
+         * (`cache.activeRun`); pass an explicit run to cancel a warm Run the renderer isn't streaming.
+         */
+        cancelRun: (run?: { taskId: string; runId: string }) => ({ run }),
+        /**
+         * Internal: the reply POST failed. Resets the in-flight flag (so the surviving card's
+         * buttons re-enable for retry) without coupling that reset to unrelated stream errors.
+         */
+        permissionResponseFailed: (requestId: string) => ({ requestId }),
+        handleTerminalStatus: (status: {
+            status: RunStatus
+            errorMessage?: string | null
+            replayedFromHistory?: boolean
+        }) => status,
+        handleStreamError: (envelope: StreamErrorEnvelope) => envelope,
+        // Value-fold side effects emitted by ingestAcpFrame (thread items are derived in the projection).
+        setCurrentMode: (mode: string) => ({ mode }),
+        setCurrentProgress: (progress: string | null) => ({ progress }),
+        /** Optional `task_run_state.stage` — wired for a future richer status surface (G6). */
+        setCurrentStage: (stage: string | null) => ({ stage }),
+        markRunStarted: true,
+        /** Records the agent's `/clear` capability, read off each `_posthog/run_started` frame. */
+        setConversationClearSupported: (supported: boolean) => ({ supported }),
+        markTurnComplete: (isReplay: boolean = false) => ({ isReplay }),
+        setTurnSuggestionLedger: (ledger: TurnSuggestionLedger) => ({ ledger }),
+        loadTurnSuggestionLedger: (taskId: string, attempt: number = 0) => ({ taskId, attempt }),
+        /** Records an outcome this tab sent to the server, so the card closes before the frame echoes back. */
+        recordTurnSuggestionOutcome: (turnIndex: number, outcome: string) => ({ turnIndex, outcome }),
+        markTurnSuggestionAccepted: (turnIndex: number) => ({ turnIndex }),
+        setReplySuggestions: (replySuggestions: ReplySuggestions | null) => ({ replySuggestions }),
+        markTurnSuggestionExpanded: (turnIndex: number) => ({ turnIndex }),
+        /**
+         * Reopens the turn for a follow-up that started outside this composer, such as one sent from Slack
+         * or from another tab. Dispatched from a user turn seen on the wire, and from the agent's first
+         * output of a turn, which is the only marker the live stream carries.
+         */
+        markTurnStarted: true,
+        /** Echoes the user's own message into the thread as a `client`-sourced log entry (the wire never replays a live turn). */
+        pushHumanMessage: (content: string, stagedAttachments?: StagedAttachment[]) => ({
+            content,
+            stagedAttachments,
+        }),
+        /**
+         * Open a run optimistically before its real id exists: flips the thread to the provisioning
+         * indicator and, when a first message is given, renders it immediately as the human bubble. The
+         * composable seam for an optimistic-create UI — mount a surface keyed by a client `streamKey`,
+         * call this on send, then attach the real run (`bootstrapRun({ justCreatedRun: true })`) once
+         * created; the live SSE echo dedups the seeded message. Pure composition of `setRunOpening` +
+         * `pushHumanMessage`.
+         */
+        startOptimisticRun: (message?: string, stagedAttachments?: StagedAttachment[]) => ({
+            message,
+            stagedAttachments,
+        }),
+        setPendingRunMessage: (message: PendingRunMessage | null) => ({ message }),
+        startOptimisticResume: (message: string, stagedAttachments?: StagedAttachment[]) => ({
+            message,
+            stagedAttachments,
+        }),
+        appendResumeBoundary: true,
+        rollbackOptimisticResume: true,
+        attachOptimisticResume: (taskId: string, run: TaskRunDetailDTOApi) => ({ taskId, run }),
+        prepareResumeRun: true,
+        /** Injects a client-side error (terminal failure / stream disconnect) into the log as a `client`-sourced entry. */
+        pushErrorItem: (errorMessage: string, variant: 'error' | 'crash' = 'error') => ({ errorMessage, variant }),
+        /** Echoes a `/clear` boundary the backend just recorded against a finished run, which has no stream to send it back. */
+        pushConversationCleared: true,
+        /** Latest-wins merge of git artifacts (PR url / branch / base / repo) a run exposes. */
+        mergeRunArtifacts: (partial: Partial<RunArtifacts>) => ({ partial }),
+        /** Latest-wins context-usage snapshot fold (token/cost/breakdown or numeric aggregate). */
+        setContextUsage: (usage: ContextUsage) => ({ usage }),
+        /** Latest-wins agent slash-command list from `available_commands_update`. */
+        setAvailableCommands: (commands: AgentCommand[]) => ({ commands }),
+        /** Diagnostic `_posthog/sdk_session` plumbing — no UI. */
+        setSdkSession: (session: SdkSession) => ({ session }),
+        reset: true,
+    }),
+    reducers({
+        historyComplete: [
+            false,
+            {
+                setHistoryComplete: (_, { complete }) => complete,
+                reset: () => false,
+            },
+        ],
+        historyTurnBase: [
+            0,
+            {
+                setHistoryTurnBase: (_, { base }) => base,
+                reset: () => 0,
+            },
+        ],
+        olderHistoryState: [
+            'none' as OlderHistoryState,
+            {
+                setOlderHistoryState: (_, { state }) => state,
+                reset: () => 'none' as OlderHistoryState,
+            },
+        ],
+        pagedHistory: [
+            false,
+            {
+                bootstrapRun: (state, { pagedHistory }) => pagedHistory ?? state,
+                reset: () => false,
+            },
+        ],
+        streamHasEnded: [
+            false,
+            {
+                setStreamHasEnded: (_, { ended }) => ended,
+                streamEnded: () => true,
+                recoveryRunChanged: () => false,
+                reset: () => false,
+            },
+        ],
+        recoveryState: [
+            null as { phase: RecoveryPhase; attempt: number; maxAttempts: number } | null,
+            {
+                recoveryProgress: (_, state) => state,
+                sseReconnecting: (_, { attempt }) => ({
+                    phase: 'stream' as RecoveryPhase,
+                    attempt,
+                    maxAttempts: MAX_SSE_RECONNECT_ATTEMPTS,
+                }),
+                bootstrapReplayComplete: () => null,
+                bootstrapLogReady: () => null,
+                reset: () => null,
+            },
+        ],
+        // True while the conversations/open POST is in flight, before any SSE state exists. Folds into
+        // `streamPhase` as provisioning so the thread shows the optimistic "spinning up" indicator
+        // immediately on send. Cleared once a real stream lifecycle takes over (or ends/errors).
+        runOpening: [
+            false,
+            {
+                setRunOpening: (_, { opening }) => opening,
+                rollbackOptimisticResume: () => false,
+                openSseForRun: () => false,
+                sseOpened: () => false,
+                handleStreamError: () => false,
+                handleTerminalStatus: (state, { replayedFromHistory }) => (replayedFromHistory ? state : false),
+                pushErrorItem: () => false,
+                reset: () => false,
+            },
+        ],
+        sseStatus: [
+            'idle' as RunSseStatus,
+            {
+                sseConnecting: () => 'connecting',
+                bootstrapRun: () => 'connecting',
+                recoveryProgress: () => 'reconnecting',
+                bootstrapReplayComplete: () => 'closed',
+                sseOpened: () => 'open',
+                sseReconnecting: () => 'reconnecting',
+                closeSse: () => 'closed',
+                // The sentinel tears the connection down without reconnecting, so the stream is no
+                // longer open — say so, rather than leaving a dead connection reading as healthy.
+                streamEnded: () => 'closed',
+                handleStreamError: () => 'error',
+                reset: () => 'idle',
+            },
+        ],
+        reconnectAttempt: [
+            0,
+            {
+                sseReconnecting: (_, { attempt }) => attempt,
+                // Successful connections reset the consecutive budget; the cumulative cap still applies.
+                sseOpened: () => 0,
+                bootstrapRun: () => 0,
+                resetRecoveryBudget: () => 0,
+                reset: () => 0,
+            },
+        ],
+        // Counts every drop in the run regardless of the per-drop counter (healthy-connection drops
+        // don't bump `reconnectAttempt`, and a clean-EOF reopen loop keeps resetting it). Bounds
+        // runaway loops via MAX_CUMULATIVE_RECONNECT_ATTEMPTS. Cleared only on a fresh bootstrap.
+        cumulativeReconnectAttempt: [
+            0,
+            {
+                sseReconnecting: (state) => state + 1,
+                bootstrapRun: () => 0,
+                resetRecoveryBudget: () => 0,
+                reset: () => 0,
+            },
+        ],
+        pendingRunMessage: [
+            null as PendingRunMessage | null,
+            {
+                setPendingRunMessage: (_, { message }) => message,
+                reset: () => null,
+                startOptimisticResume: () => null,
+            },
+        ],
+        currentRunStatus: [
+            null as RunStatus | null,
+            {
+                // A reconnect reopens the same in-flight run — keep its known status rather than
+                // flickering back to queued; only a fresh open (no/terminal status) resets.
+                openSseForRun: (state) => state ?? 'queued',
+                recoveryRunChanged: () => null,
+                handleTerminalStatus: (_, { status }) => status,
+                // The boundary drops the status of the run being left behind, which is always a terminal
+                // one. The successor's own seed can already be here — `openSseForRun` runs before the
+                // history this reconciles — and wiping it hides the composer for the rest of the run.
+                prepareResumeRun: (state) => (state && !isTerminalRunStatus(state) ? state : null),
+                reset: () => null,
+            },
+        ],
+        // Trace correlation for the telemetry inventory. The SSE bypasses Django, so the frontend
+        // supplies the trace_id it minted for POST /sandbox/ when it opened the run; conversation_id
+        // is this keyed logic's own props.conversationId. Undefined for history-loaded runs — a
+        // reload can't recover the trace_id the original run was sent under.
+        traceId: [
+            null as string | null,
+            {
+                bootstrapRun: (state, { traceId }) => traceId ?? state,
+                openSseForRun: (state, { traceId }) => traceId ?? state,
+                reset: () => null,
+            },
+        ],
+        // The single source of truth: an ordered log of every ingested frame (plus client-injected
+        // synthetic entries). `threadItems` and `toolInvocations` are pure projections of it (see
+        // the selectors). The bootstrap seam is reconciled once before its live tail is appended
+        // (see `bootstrapRun` / `dedupeBufferedAgainstHistory`), and steady-state live frames
+        // resume exclusively after the last-seen Redis id, so a plain append never doubles the
+        // thread. Superseded `tool_call_update` snapshots are the one exception to append-only —
+        // `appendToRunLog` merges them per toolCallId (see the `RunLog` doc for why).
+        log: [
+            emptyRunLog(),
+            {
+                appendEntries: (state, { entries }) => appendToRunLog(state, entries),
+                replaceLog: (_, { log }) => log,
+                reset: () => emptyRunLog(),
+            },
+        ],
+        // True while a bootstrap is in flight before the thread has anything to show. Cleared once the
+        // live stream opens, the read-only replay snapshot finishes, or an error surfaces. Drives the
+        // read-only viewer's initial spinner.
+        bootstrapLoading: [
+            false,
+            {
+                bootstrapRun: () => true,
+                sseOpened: () => false,
+                bootstrapReplayComplete: () => false,
+                handleStreamError: () => false,
+                reset: () => false,
+            },
+        ],
+        // The run id this instance last bootstrapped, so the surface can adopt an already-bootstrapped
+        // instance (the optimistic-create handoff) instead of resetting and re-bootstrapping it. Logic-
+        // resident (not a per-component ref) so the decision survives the create-thread → detail swap.
+        bootstrappedRunId: [
+            null as string | null,
+            {
+                bootstrapRun: (_, { runId }) => runId,
+                reset: () => null,
+            },
+        ],
+        piRuntime: [
+            false,
+            {
+                bootstrapRun: (state, { taskRuntime }) =>
+                    taskRuntime === undefined ? state : taskRuntime === TaskRuntimeEnumApi.Pi,
+                reset: () => false,
+            },
+        ],
+        // The task id this instance last bootstrapped, so the `ingestAcpFrame` history-derived context
+        // bookkeeping can attribute seen context blocks to the task. Null for an unattached optimistic
+        // stream — those record nothing (their send path marks sent keys directly).
+        bootstrappedTaskId: [
+            null as string | null,
+            {
+                bootstrapRun: (_, { taskId }) => taskId,
+                openSseForRun: (_, { taskId }) => taskId,
+                reset: () => null,
+            },
+        ],
+        // True between an optimistic seed (`startOptimisticRun`) and its attach (`bootstrapRun`): the
+        // surface uses it to take the seed-preserving fast path when the real run id arrives.
+        awaitingOptimisticAttach: [
+            false,
+            {
+                startOptimisticRun: () => true,
+                startOptimisticResume: () => true,
+                rollbackOptimisticResume: () => false,
+                bootstrapRun: () => false,
+                reset: () => false,
+            },
+        ],
+        // Live-mode bootstrapping remains true after the SSE opens and only clears once the
+        // historical log snapshot has been replayed. Fresh runs explicitly skip history.
+        logBootstrapLoading: [
+            false,
+            {
+                bootstrapRun: () => true,
+                bootstrapLogReady: () => false,
+                bootstrapReplayComplete: () => false,
+                handleStreamError: () => false,
+                reset: () => false,
+            },
+        ],
+        bootstrapError: [
+            null as StreamErrorEnvelope | null,
+            {
+                bootstrapRun: () => null,
+                recoveryProgress: () => null,
+                bootstrapLogReady: () => null,
+                bootstrapReplayComplete: () => null,
+                handleStreamError: (_, envelope) => envelope,
+                reset: () => null,
+            },
+        ],
+        // Whether the bootstrapped run is a resume run — drives the §6 resume-prompt filter in the
+        // projection. Set from `run.state.resume_from_run_id` when bootstrap fetches the run.
+        isBootstrapResumeRun: [
+            false,
+            {
+                markBootstrapResumeRun: (_, { value }) => value,
+                reset: () => false,
+            },
+        ],
+        pendingPermissionRequest: [
+            null as PermissionRequestRecord | null,
+            {
+                ingestPermissionRequest: (_, { record }) => record,
+                // Cleared on resolution (successful POST or a permission_resolved entry), NOT on
+                // respondToPermission dispatch — a failed POST keeps the card so the user can retry.
+                markPermissionRequestResolved: (state, { requestId }) =>
+                    state?.requestId === requestId ? null : state,
+                clearPermissionRequest: () => null,
+                permissionRunChanged: () => null,
+                // A terminal run can't accept approvals — drop a card re-derived from its history.
+                handleTerminalStatus: (state, { status }) => (isTerminalRunStatus(status) ? null : state),
+                reset: () => null,
+            },
+        ],
+        // requestIds ever surfaced, so a reconnect's full replay can't double-fire telemetry or
+        // re-ingest a request this client already knows about.
+        seenPermissionRequestIds: [
+            new Set<string>(),
+            {
+                ingestPermissionRequest: (state, { record }) => {
+                    const next = new Set(state)
+                    next.add(record.requestId)
+                    return next
+                },
+                markPermissionRequestSeen: (state, { requestId }) => {
+                    const next = new Set(state)
+                    next.add(requestId)
+                    return next
+                },
+                permissionRunChanged: () => new Set<string>(),
+                reset: () => new Set<string>(),
+            },
+        ],
+        // requestIds answered (locally or observed via permission_resolved) — replayed requests
+        // with these ids must never re-surface as pending.
+        resolvedPermissionRequestIds: [
+            new Set<string>(),
+            {
+                markPermissionRequestResolved: (state, { requestId }) => {
+                    const next = new Set(state)
+                    next.add(requestId)
+                    return next
+                },
+                permissionRunChanged: () => new Set<string>(),
+                reset: () => new Set<string>(),
+            },
+        ],
+        // In-flight state for the approval reply POST — drives the input card's loading/disabled
+        // props. Cleared on resolution (success) and on the POST's own failure (the card stays
+        // pending, so the buttons must re-enable for retry).
+        permissionResponseRequestIds: [
+            new Set<string>(),
+            {
+                deliverPermission: (state, { record }) => new Set([...state, record.requestId]),
+                markPermissionRequestResolved: (state, { requestId }) =>
+                    new Set([...state].filter((id) => id !== requestId)),
+                clearPermissionRequest: () => new Set<string>(),
+                permissionResponseFailed: (state, { requestId }) =>
+                    new Set([...state].filter((id) => id !== requestId)),
+                cancelPermissionDelivery: () => new Set<string>(),
+                reset: () => new Set<string>(),
+            },
+        ],
+        currentMode: [
+            null as string | null,
+            {
+                setCurrentMode: (_, { mode }) => mode,
+                prepareResumeRun: () => null,
+                reset: () => null,
+            },
+        ],
+        currentProgress: [
+            null as string | null,
+            {
+                setCurrentProgress: (_, { progress }) => progress,
+                markTurnComplete: () => null,
+                prepareResumeRun: () => null,
+                reset: () => null,
+            },
+        ],
+        // Optional `task_run_state.stage` — generally unset for PHAI runs, but cheap to track so a
+        // future richer status surface (G6) can render "research / plan / build" without re-touching
+        // this logic. No render consumes it yet.
+        currentStage: [
+            null as string | null,
+            {
+                setCurrentStage: (_, { stage }) => stage,
+                prepareResumeRun: () => null,
+                reset: () => null,
+            },
+        ],
+        runStarted: [
+            false,
+            {
+                markRunStarted: () => true,
+                prepareResumeRun: () => false,
+                reset: () => false,
+            },
+        ],
+        // The latest run_started in the resume chain wins, matching the desktop client: the gate
+        // predicts the next run's agent, and after an agent rollback an earlier capable run must
+        // not authorize recording a boundary the current agent would ignore on resume (the UI
+        // would claim a clear that never happens). `reset` is deliberately not handled: a
+        // re-bootstrap replays the chain's run_started frames and re-derives it.
+        conversationClearSupported: [
+            false,
+            {
+                setConversationClearSupported: (_, { supported }) => supported,
+            },
+        ],
+        turnSuggestionLedger: [
+            null as TurnSuggestionLedger | null,
+            {
+                setTurnSuggestionLedger: (_, { ledger }) => ledger,
+                reset: () => null,
+            },
+        ],
+        // Kept apart from the ledger because the ledger read can land after this tab resolved a card,
+        // and replacing the ledger then must not drop the outcome.
+        turnSuggestionOutcomesHere: [
+            {} as Record<number, string>,
+            {
+                recordTurnSuggestionOutcome: (state, { turnIndex, outcome }) => ({ ...state, [turnIndex]: outcome }),
+                reset: () => ({}),
+            },
+        ],
+        // The turn whose card this tab accepted. That card stays up to show what it created, while
+        // every other tab hides it so a second accept cannot create a duplicate.
+        replySuggestionsFrame: [
+            null as ReplySuggestions | null,
+            {
+                setReplySuggestions: (state, { replySuggestions }) =>
+                    state && replySuggestions && replySuggestions.turnIndex < state.turnIndex
+                        ? state
+                        : replySuggestions,
+                pushHumanMessage: () => null,
+                reset: () => null,
+            },
+        ],
+        turnSuggestionAcceptedHere: [
+            null as number | null,
+            {
+                markTurnSuggestionAccepted: (_, { turnIndex }) => turnIndex,
+                reset: () => null,
+            },
+        ],
+        // The card's own logic unmounts when the virtualized thread recycles its row, so the open state lives here
+        // to keep an opened card open after the reader scrolls away and back.
+        turnSuggestionExpandedHere: [
+            null as number | null,
+            {
+                markTurnSuggestionExpanded: (_, { turnIndex }) => turnIndex,
+                reset: () => null,
+            },
+        ],
+        turnComplete: [
+            false,
+            {
+                markTurnComplete: () => true,
+                // A run emits `_posthog/run_started` once; a follow-up message on the same run starts
+                // a fresh turn with no new run_started frame, so a human message also reopens the
+                // turn — otherwise the thinking indicator would stay off for the whole follow-up.
+                // `pushHumanMessage` covers a send from this composer, `markTurnStarted` a turn that
+                // started some other way (Slack, another tab, a replayed history tail).
+                markRunStarted: () => false,
+                pushHumanMessage: () => false,
+                markTurnStarted: () => false,
+                prepareResumeRun: () => false,
+                reset: () => false,
+            },
+        ],
+        // Git artifacts a coding run exposes (PR url, working branch, base branch, repo), accumulated
+        // latest-wins from the bootstrap run fetch and live task_run_state frames. The pre/post-turn
+        // coding UI reads this and self-hides while empty, so a pure-analytics conversation shows
+        // nothing. NOT cleared on markTurnComplete — only a reset clears it.
+        runArtifacts: [
+            {} as RunArtifacts,
+            {
+                mergeRunArtifacts: (state, { partial }) => mergeRunArtifacts(state, partial),
+                reset: () => ({}),
+            },
+        ],
+        // Latest-wins context-usage snapshot for the footer ring. The setContextUsage payload is the
+        // already-folded snapshot (the listener merges onto the prior value).
+        contextUsage: [
+            null as ContextUsage | null,
+            {
+                setContextUsage: (_, { usage }) => usage,
+                reset: () => null,
+            },
+        ],
+        // Kept across a resume: the successor run re-advertises its list, and until then the old one holds.
+        availableCommands: [
+            [] as AgentCommand[],
+            {
+                setAvailableCommands: (_, { commands }) => commands,
+                reset: () => [],
+            },
+        ],
+        // Diagnostic resume plumbing — adapter/session identity for telemetry. No UI.
+        sdkSession: [
+            null as SdkSession | null,
+            {
+                setSdkSession: (_, { session }) => session,
+                prepareResumeRun: () => null,
+                reset: () => null,
+            },
+        ],
+    }),
+    selectors(({ cache }) => ({
+        respondingToPermission: [
+            (s) => [s.permissionResponseRequestIds, s.pendingPermissionRequest],
+            (ids: Set<string>, record: PermissionRequestRecord | null): boolean =>
+                record ? ids.has(record.requestId) : ids.size > 0,
+        ],
+        /**
+         * Pure projection of the ordered log into the rendered thread plus the tool-invocation map.
+         * Memoized on `log` identity, so it recomputes only when a frame is actually appended.
+         */
+        foldedThread: [
+            (s) => [s.log, s.isBootstrapResumeRun, s.pendingRunMessage, s.bootstrappedTaskId],
+            (
+                log: RunLog,
+                isResumeRun: boolean,
+                pendingMessage: PendingRunMessage | null,
+                taskId: string | null
+            ): FoldedThread => {
+                const previousCheckpoint: FoldCheckpoint | null = cache.foldCheckpoint ?? null
+                const { folded, checkpoint } = foldLogFromCheckpoint(
+                    log.entries,
+                    { isResumeRun, pendingMessage, taskId },
+                    previousCheckpoint
+                )
+                const previous: FoldedThread | undefined = cache.previousFoldedThread
+                const reconciled: FoldedThread = {
+                    threadItems: reconcileThreadItems(previous?.threadItems, folded.threadItems),
+                    toolInvocations: reconcileToolInvocations(previous?.toolInvocations, folded.toolInvocations),
+                    turnSuggestions: folded.turnSuggestions,
+                }
+                if (checkpoint && checkpoint !== previousCheckpoint) {
+                    checkpoint.items = reconcileThreadItems(reconciled.threadItems, checkpoint.items)
+                    checkpoint.invocations = reconcileToolInvocations(
+                        reconciled.toolInvocations,
+                        checkpoint.invocations
+                    )
+                }
+                cache.foldCheckpoint = checkpoint
+                cache.previousFoldedThread = reconciled
+                return reconciled
+            },
+        ],
+        errorTraceIds: [
+            (s) => [s.threadItems],
+            (threadItems: ThreadItem[]): Map<string, string> => {
+                // An error belongs to the turn that completes after it. A turn that never completes
+                // (a failed follow-up, a run that stopped) has no trace id, so the error gets none.
+                const result = new Map<string, string>()
+                threadItems.forEach((item, index) => {
+                    if (item.type !== 'error') {
+                        return
+                    }
+                    for (let j = index + 1; j < threadItems.length; j++) {
+                        const later = threadItems[j]
+                        if (later.type === 'human_message') {
+                            break
+                        }
+                        if (later.type === 'turn_separator') {
+                            if (later.traceId) {
+                                result.set(item.id, later.traceId)
+                            }
+                            break
+                        }
+                    }
+                })
+                return result
+            },
+        ],
+        turnSuggestionsMuted: [
+            (s) => [s.foldedThread, s.turnSuggestionLedger, s.turnSuggestionOutcomesHere],
+            (
+                foldedThread: FoldedThread,
+                ledger: TurnSuggestionLedger | null,
+                outcomesHere: Record<number, string>
+            ): boolean =>
+                !!ledger?.muted ||
+                [...foldedThread.turnSuggestions.outcomes.values(), ...Object.values(outcomesHere)].includes(
+                    'dismissed'
+                ),
+        ],
+        turnSuggestion: [
+            (s) => [
+                s.foldedThread,
+                s.threadItems,
+                s.turnSuggestionLedger,
+                s.turnSuggestionOutcomesHere,
+                s.turnSuggestionAcceptedHere,
+                s.turnSuggestionsMuted,
+                s.bootstrappedTaskId,
+                s.historyTurnBase,
+            ],
+            (
+                foldedThread: FoldedThread,
+                threadItems: ThreadItem[],
+                ledger: TurnSuggestionLedger | null,
+                outcomesHere: Record<number, string>,
+                acceptedHere: number | null,
+                muted: boolean,
+                taskId: string | null,
+                historyTurnBase: number
+            ): TurnSuggestion | null => {
+                const offer = foldedThread.turnSuggestions.latest
+                // The classifier runs after the answer, so an offer can land once the user already sent
+                // the next message; it belongs to the answer above it and closes when the thread moves on.
+                const latestPromptIndex =
+                    historyTurnBase + threadItems.filter((item) => item.type === 'human_message').length - 1
+                if (!offer || offer.turnIndex !== latestPromptIndex) {
+                    return null
+                }
+                if (acceptedHere === offer.turnIndex) {
+                    return offer
+                }
+                // Resolutions reach the log only while a tab is open, so a replayed offer waits for the ledger.
+                if (!ledger || (taskId !== null && ledger.taskId !== taskId)) {
+                    return null
+                }
+                const resolved =
+                    foldedThread.turnSuggestions.outcomes.has(offer.turnIndex) ||
+                    offer.turnIndex in outcomesHere ||
+                    ledger.resolvedTurns.includes(offer.turnIndex)
+                return muted || resolved ? null : offer
+            },
+        ],
+        replySuggestions: [
+            (s) => [s.replySuggestionsFrame, s.threadItems, s.historyTurnBase],
+            (
+                frame: ReplySuggestions | null,
+                threadItems: ThreadItem[],
+                historyTurnBase: number
+            ): ReplySuggestions | null => {
+                if (!frame) {
+                    return null
+                }
+                const latestPromptIndex =
+                    historyTurnBase + threadItems.filter((item) => item.type === 'human_message').length - 1
+                return frame.turnIndex === latestPromptIndex ? frame : null
+            },
+        ],
+        latestTurnTraceId: [
+            (s) => [s.threadItems],
+            (threadItems: ThreadItem[]): string | null => {
+                // Trailer-derived, not the raw last separator: synthetic trailing separators
+                // (idle-resume/error frames) carry no trace id and are not turns.
+                const trailers = computeTurnTrailers(threadItems)
+                const lastTurn = [...trailers.values()].find((trailer) => trailer.isLastTurn)
+                return lastTurn?.traceId ?? null
+            },
+        ],
+        threadItems: [
+            (s) => [s.foldedThread, s.showDebugLogs],
+            (foldedThread: FoldedThread, showDebugLogs: boolean): ThreadItem[] =>
+                // Filtering lives here, not in the renderer: a row the renderer would return `null` for
+                // (a content-less item, or a debug row a non-privileged user can't see) still reserves an
+                // empty, gap-padded slot in the virtualized thread. Drop them before they become rows.
+                // Debug rows are gated by `debugLogsLogic.showDebugLogs` (staff/dev toggle, force-on when
+                // impersonating).
+                foldedThread.threadItems.filter(
+                    (item: ThreadItem) => (item.type !== 'debug' || showDebugLogs) && rendersThreadItemContent(item)
+                ),
+        ],
+        hasThreadItems: [(s) => [s.threadItems], (threadItems: ThreadItem[]): boolean => threadItems.length > 0],
+        toolInvocations: [
+            (s) => [s.foldedThread],
+            (foldedThread: FoldedThread): Map<string, ToolInvocation> => foldedThread.toolInvocations,
+        ],
+        /**
+         * Whether the agent is actively working a turn — drives the thread's thinking indicator.
+         * Off once the turn completes, the run reaches a terminal status (a failed or cancelled
+         * run may never emit `_posthog/turn_complete`), or the stream errors out.
+         *
+         * A run is "in flight" from the moment it is `queued` — keying off `currentRunStatus` as
+         * well as `runStarted` lights the indicator during the multi-second cold-boot window before
+         * the first `_posthog/run_started` frame, which `runStarted` alone misses.
+         */
+        isThinking: [
+            // `replayOnly` always resolves (default in `props`); `!` drops the optional-prop `undefined`.
+            (s, p) => [s.runStarted, s.turnComplete, s.currentRunStatus, s.sseStatus, p.replayOnly!, s.streamHasEnded],
+            (
+                runStarted: boolean,
+                turnComplete: boolean,
+                currentRunStatus: RunStatus | null,
+                sseStatus: RunSseStatus,
+                replayOnly: boolean | undefined,
+                streamHasEnded: boolean
+            ): boolean => {
+                // A read-only snapshot is never "thinking" — it's a static replay, so the indicator
+                // must never spin (an in-progress run replayed read-only has no live turn to await).
+                if (replayOnly) {
+                    return false
+                }
+                if (streamHasEnded || sseStatus === 'error' || isTerminalRunStatus(currentRunStatus)) {
+                    return false
+                }
+                const runInFlight = runStarted || currentRunStatus === 'queued' || currentRunStatus === 'in_progress'
+                return runInFlight && !turnComplete
+            },
+        ],
+        /**
+         * Stream lifecycle phase gating the bottom-of-thread thinking indicator. `provisioning` = the
+         * cold-boot window — the conversations/open POST is in flight (`runOpening`), or the stream is
+         * opening/open but the agent hasn't started yet (the workflow is still setting up the sandbox).
+         * `ThreadView` uses setup progress as the startup indicator, with a fixed fallback before steps arrive.
+         * The playful gerund loader waits for `run_started` to flip the phase to `thinking`.
+         * `thinking` = the agent is working a turn (mirrors `isThinking`), and is
+         * what `ThreadView` gates the gerund loader on; `idle` otherwise (terminal, errored, or
+         * not yet connecting). A read-only viewer is always `idle` — it never streams.
+         */
+        streamPhase: [
+            (s, p) => [s.runStarted, s.isThinking, s.currentRunStatus, s.sseStatus, s.runOpening, p.replayOnly!],
+            (
+                runStarted: boolean,
+                isThinking: boolean,
+                currentRunStatus: RunStatus | null,
+                sseStatus: RunSseStatus,
+                runOpening: boolean,
+                replayOnly: boolean | undefined
+            ): 'provisioning' | 'thinking' | 'idle' => {
+                // A read-only snapshot never provisions or thinks — there is no live stream behind it.
+                if (replayOnly) {
+                    return 'idle'
+                }
+                if (runOpening && isTerminalRunStatus(currentRunStatus)) {
+                    return 'provisioning'
+                }
+                const connecting = sseStatus === 'connecting' || sseStatus === 'open' || sseStatus === 'reconnecting'
+                // `runOpening` covers the conversations/open POST window, before any SSE state exists.
+                if ((connecting || runOpening) && !runStarted && !isTerminalRunStatus(currentRunStatus)) {
+                    return 'provisioning'
+                }
+                if (isThinking) {
+                    return 'thinking'
+                }
+                return 'idle'
+            },
+        ],
+        /**
+         * Whether the bottom-of-thread gerund loader ("Thinking…", "Pondering…") should show. The
+         * loader is a *gap filler*: it stands in only while the agent is working a turn but nothing
+         * visible is streaming at the tail — i.e. it is genuinely "thinking". It hides the moment the
+         * tail produces visible output: a streaming assistant message, an in-flight tool call, or a
+         * running structured-progress activity (each already conveys "the agent is busy"). Reasoning is
+         * deliberately NOT a hide condition — the gerund is what fills the thinking/reasoning period
+         * (and the explicit `agent_thought_chunk` thinking signal arrives during exactly these gaps).
+         */
+        showThinkingIndicator: [
+            (s) => [s.streamPhase, s.threadItems, s.toolInvocations],
+            (
+                streamPhase: 'idle' | 'provisioning' | 'thinking',
+                threadItems: ThreadItem[],
+                toolInvocations: Map<string, ToolInvocation>
+            ): boolean => {
+                if (streamPhase === 'idle') {
+                    return false
+                }
+                // Scan the current turn only (items after the last separator).
+                const turnStart = threadItems.findLastIndex((item) => item.type === 'turn_separator') + 1
+                for (let i = turnStart; i < threadItems.length; i++) {
+                    const item = threadItems[i]
+                    if (streamPhase === 'provisioning' && (item.type === 'progress' || item.type === 'error')) {
+                        return false
+                    }
+                    // A running structured-progress activity owns the "busy" line.
+                    if (item.type === 'progress' && item.progressSteps?.some((step) => step.status === 'in_progress')) {
+                        return false
+                    }
+                    // A tool actively running already shows its own spinner.
+                    if (
+                        item.type === 'tool_invocation' &&
+                        item.toolCallId &&
+                        ['pending', 'in_progress'].includes(toolInvocations.get(item.toolCallId)?.status ?? '')
+                    ) {
+                        return false
+                    }
+                }
+                // The visible tail is streaming answer text — that's writing, not thinking.
+                const tail = threadItems[threadItems.length - 1]
+                if (tail?.type === 'assistant_message' && tail.complete !== true) {
+                    return false
+                }
+                return true
+            },
+        ],
+        /** Whether the run exposes any git artifact worth surfacing — gates the pre/post-turn coding UI. */
+        hasGitArtifacts: [
+            (s) => [s.runArtifacts],
+            (runArtifacts: RunArtifacts): boolean => !!runArtifacts.prUrl || !!runArtifacts.branch,
+        ],
+        /**
+         * The live connection banner view-model (footer `RunAlertActivity`), or null when the connection is
+         * healthy. `reconnecting` drives the attempt-counter card during the backoff loop; `connection_failed`
+         * is its terminal state (retries/cumulative exhausted, a non-retryable open, or a bootstrap-fetch
+         * failure — including read-only replay, which surfaces via `sseStatus='error'`). A terminal run's own
+         * failure/crash is an inline `error` item. History failures remain visible after termination.
+         */
+        runConnectionState: [
+            (s) => [s.sseStatus, s.reconnectAttempt, s.bootstrapError, s.recoveryState],
+            (
+                sseStatus: RunSseStatus,
+                reconnectAttempt: number,
+                bootstrapError: StreamErrorEnvelope | null,
+                recoveryState: { phase: RecoveryPhase; attempt: number; maxAttempts: number } | null
+            ): RunConnectionState | null => {
+                if (sseStatus === 'error') {
+                    const detail = bootstrapError
+                        ? [bootstrapError.errorTitle, bootstrapError.errorMessage].filter(Boolean).join('. ')
+                        : undefined
+                    return {
+                        kind: 'connection_failed',
+                        message: detail || undefined,
+                        retryable: bootstrapError?.retryable ?? false,
+                    }
+                }
+                if (sseStatus === 'reconnecting') {
+                    return {
+                        kind: 'reconnecting',
+                        attempt: recoveryState?.attempt ?? reconnectAttempt,
+                        maxAttempts: recoveryState?.maxAttempts ?? MAX_SSE_RECONNECT_ATTEMPTS,
+                        retryable: false,
+                    }
+                }
+                return null
+            },
+        ],
+    })),
+    listeners(({ values, actions, cache, props }) => {
+        const sessionNow = (): RunStreamRecovery | undefined => cache.recoverySession
+        const endedKey = (projectId: number, taskId: string, runId: string): string => `${projectId}:${taskId}:${runId}`
+        const hasEnded = (session: RunStreamRecovery): boolean =>
+            cache.endedRuns?.has(endedKey(session.projectId, session.taskId, session.runId)) === true
+        const beginSession = (taskId: string, runId: string): RunStreamRecovery | undefined => {
+            const projectId = values.currentProjectId
+            if (projectId === null) {
+                actions.handleStreamError({ errorTitle: 'No current project', retryable: false })
+                return
+            }
+            const previous = sessionNow()
+            const sameRun = previous?.projectId === projectId && previous.taskId === taskId && previous.runId === runId
+            cache.disposables.dispose('event-source')
+            const context = getContext()
+            const session = new RunStreamRecovery(
+                projectId,
+                taskId,
+                runId,
+                (cache.recoveryGeneration = (cache.recoveryGeneration ?? 0) + 1),
+                cache.disposables,
+                () =>
+                    getContext() === context &&
+                    cache.recoverySession === session &&
+                    values.currentProjectId === projectId
+            )
+            if (sameRun) {
+                session.committedCursor = previous.committedCursor
+                session.committedBacklogRunId = previous.committedBacklogRunId
+                if (previous.buffering) {
+                    session.buffer = [...previous.buffer]
+                    session.buffering = true
+                }
+            } else {
+                actions.cancelPermissionDelivery()
+                actions.permissionRunChanged()
+                cache.eventCoverage = undefined
+                actions.recoveryRunChanged()
+                actions.handleTerminalStatus({ status: 'queued' })
+            }
+            cache.recoverySession = session
+            cache.pausedError = undefined
+            cache.activeRun = session
+            cache.permissionRunId = runId
+            cache.streamTokenRefreshes = 0
+            actions.setStreamHasEnded(hasEnded(session))
+            return session
+        }
+        const dropHistoryPrefetch = (): void => {
+            cache.historyPrefetch = undefined
+            cache.disposables.dispose('history-prefetch')
+        }
+        const failRecovery = (session: RunStreamRecovery, error: unknown): void => {
+            if (!session.owns() || session.paused) {
+                return
+            }
+            cache.bootstrapStartedAt = undefined
+            dropHistoryPrefetch()
+            const envelope =
+                isRecord(error) && typeof error.errorTitle === 'string'
+                    ? (error as unknown as StreamErrorEnvelope)
+                    : mapHttpStatusToStreamError((error as { status?: number })?.status)
+            session.paused = true
+            cache.pausedError = envelope
+            session.buffer = []
+            session.receivedCursor = session.committedCursor
+            session.receivedBacklogRunId = session.committedBacklogRunId
+            if (session.phase !== 'finalization') {
+                actions.setHistoryComplete(false)
+            }
+            cache.disposables.dispose('event-source')
+            actions.handleStreamError(envelope)
+            session.controller.abort()
+        }
+        const readWithRetry = async <T>(session: RunStreamRecovery, read: () => Promise<T>): Promise<T> => {
+            for (let attempt = 1; ; attempt++) {
+                try {
+                    const result = await read()
+                    session.check()
+                    return result
+                } catch (error) {
+                    session.check()
+                    if (
+                        attempt >= MAX_HISTORY_FETCH_ATTEMPTS ||
+                        !isTransientStreamError(error as StreamErrorEnvelope)
+                    ) {
+                        throw error
+                    }
+                    cache.recoveryStartedAt ??= Date.now()
+                    actions.recoveryProgress(session.phase, attempt, MAX_HISTORY_FETCH_ATTEMPTS)
+                    await session.wait(reconnectDelayMs(attempt))
+                }
+            }
+        }
+        const readRun = (session: RunStreamRecovery): Promise<TaskRunDetailDTOApi> =>
+            session.request(STREAM_REQUEST_TIMEOUT_MS, (signal) =>
+                tasksRunsRetrieve(String(session.projectId), session.taskId, session.runId, { signal })
+            )
+        const applyRun = (session: RunStreamRecovery, run: TaskRunDetailDTOApi): void => {
+            session.check()
+            actions.markBootstrapResumeRun(isResumeRun(run))
+            actions.mergeRunArtifacts(extractRunArtifacts(run))
+            actions.setPendingRunMessage(readPendingRunMessage(run.state, session.runId))
+            if (!isTerminalRunStatus(run.status) && !hasEnded(session)) {
+                actions.handleTerminalStatus({ status: run.status as RunStatus })
+            }
+        }
+        const recordRecovery = (session: RunStreamRecovery): void => {
+            if (cache.recoveryStartedAt !== undefined) {
+                posthog.capture('sandbox_stream_recovered', {
+                    conversation_id: props.conversationId,
+                    trace_id: values.traceId,
+                    task_id: session.taskId,
+                    run_id: session.runId,
+                    recovery_phase: session.phase,
+                    run_status: values.currentRunStatus,
+                    reconnect_attempts: values.reconnectAttempt,
+                    cumulative_reconnect_attempts: values.cumulativeReconnectAttempt,
+                    duration_ms: Date.now() - cache.recoveryStartedAt,
+                    execution_type: 'sandbox',
+                })
+                cache.recoveryStartedAt = undefined
+            }
+        }
+        /** The latest turns of a paged log, or every entry from `start` on; the full log when the log is not paged. */
+        const readHistory = (session: RunStreamRecovery, signal: AbortSignal, start?: number): Promise<HistoryPage> =>
+            api.tasks.runs.getLogPage(session.taskId, session.runId, {
+                signal,
+                projectId: session.projectId,
+                view: 'thread',
+                ...(values.pagedHistory ? { tailBytes: HISTORY_TAIL_BYTES, start } : {}),
+            })
+        const stopHistoryPaging = (): void => {
+            cache.disposables.dispose('older-history-request')
+            cache.disposables.dispose('older-history-retry')
+            cache.disposables.dispose('older-history-preload')
+            cache.olderHistoryRequest = undefined
+            cache.olderHistoryFailures = 0
+        }
+        const setHistoryCursor = (cursor: HistoryCursor | undefined): void => {
+            stopHistoryPaging()
+            cache.historyCursor = cursor
+            actions.setHistoryTurnBase(cursor?.turnsBefore ?? 0)
+            actions.setOlderHistoryState(cursor && cursor.offset > 0 ? 'idle' : 'none')
+        }
+        const startHistoryPrefetch = (session: RunStreamRecovery): void => {
+            dropHistoryPrefetch()
+            const controller = new AbortController()
+            const entries = readHistory(session, controller.signal)
+            entries.catch(() => {})
+            cache.disposables.add(() => () => controller.abort(), 'history-prefetch', { pauseOnPageHidden: false })
+            cache.historyPrefetch = {
+                projectId: session.projectId,
+                taskId: session.taskId,
+                runId: session.runId,
+                entries,
+            }
+        }
+        const takeHistoryPrefetch = (session: RunStreamRecovery): Promise<HistoryPage> | undefined => {
+            const prefetch = cache.historyPrefetch as
+                | { projectId: number; taskId: string; runId: string; entries: Promise<HistoryPage> }
+                | undefined
+            cache.historyPrefetch = undefined
+            if (
+                !prefetch ||
+                session.phase === 'finalization' ||
+                session.committedCursor ||
+                prefetch.projectId !== session.projectId ||
+                prefetch.taskId !== session.taskId ||
+                prefetch.runId !== session.runId
+            ) {
+                cache.disposables.dispose('history-prefetch')
+                return undefined
+            }
+            return prefetch.entries
+        }
+        const replayRunLog = (log: RunLog, runId: string, isLiveFrame: (stored: StoredEntry) => boolean): void => {
+            // Rebuild state without publishing a partial transcript or repeating live reactions.
+            cache.rebuildingHistory = true
+            cache.coalesceReplay = true
+            cache.rebuildingLog = log
+            cache.trackedToolInvocations = undefined
+            try {
+                let reachedSuccessor = false
+                for (const stored of log.entries) {
+                    if (cache.retainedMessage && !reachedSuccessor && stored.entry.source_run_id === runId) {
+                        actions.prepareResumeRun()
+                        reachedSuccessor = true
+                    }
+                    if (stored.entry.notification.method === '_client/human_message') {
+                        actions.markTurnStarted()
+                    } else if (isLiveFrame(stored)) {
+                        actions.ingestAcpFrame(stored.entry, 'live')
+                    } else if (stored.source !== 'client') {
+                        ingestFrame(stored.entry, 'replay')
+                    }
+                }
+                if (cache.retainedMessage && !reachedSuccessor) {
+                    actions.prepareResumeRun()
+                }
+            } finally {
+                cache.rebuildingHistory = false
+                cache.coalesceReplay = false
+                cache.rebuildingLog = undefined
+                const replayContextUsage = cache.replayContextUsage as ContextUsage | undefined
+                cache.replayContextUsage = undefined
+                if (replayContextUsage) {
+                    actions.setContextUsage(replayContextUsage)
+                }
+            }
+        }
+        const rememberLegacyBacklog = (session: RunStreamRecovery, entries: unknown[], offset: number): void => {
+            // Django log-N cursors index the same object entries, including non-notification records.
+            entries.filter(isRecord).forEach((raw, index) => {
+                const entry = normalizeNotificationEntry(raw)
+                if (entry && !entry.event_id) {
+                    session.legacyBacklog.set(`log-${offset + index}`, entry)
+                }
+            })
+        }
+        const reconcileHistory = async (session: RunStreamRecovery): Promise<void> => {
+            const turnCompleteBeforeReconcile = values.turnComplete
+            const recoveringLiveTurn = session.phase === 'history' || session.phase === 'stream'
+            if (session.phase !== 'finalization') {
+                session.phase = 'history'
+            }
+            // A log this run already loaded needs only the entries after it, so the pages above the reader stay.
+            const cursor = cache.historyCursor as HistoryCursor | undefined
+            const loadedEnd =
+                values.pagedHistory && cursor?.runId === session.runId
+                    ? (cache.historyEnd as number | undefined)
+                    : undefined
+            let prefetched = loadedEnd === undefined ? takeHistoryPrefetch(session) : undefined
+            if (loadedEnd !== undefined) {
+                dropHistoryPrefetch()
+            }
+            const read = (start?: number): Promise<HistoryPage> =>
+                readWithRetry(session, () =>
+                    session.request(STREAM_HISTORY_TIMEOUT_MS, (signal) => {
+                        const pending = prefetched
+                        prefetched = undefined
+                        if (pending) {
+                            signal.addEventListener('abort', () => cache.disposables.dispose('history-prefetch'), {
+                                once: true,
+                            })
+                            return pending
+                        }
+                        return readHistory(session, signal, start)
+                    })
+                )
+            let page = await read(loadedEnd)
+            session.check()
+            if (loadedEnd !== undefined && page.indexed && page.origin !== cursor?.origin) {
+                // The chain dropped its oldest run, so the loaded indexes no longer match: read the latest turns again.
+                page = await read()
+                session.check()
+            }
+            const continues =
+                loadedEnd !== undefined && page.indexed && page.origin === cursor?.origin && page.offset === loadedEnd
+            rememberLegacyBacklog(session, page.entries.slice(page.preamble), page.offset)
+            if (page.indexed) {
+                // A stream backlog replays the run log from its start; the read already holds everything before its end.
+                session.buffer = session.buffer.filter((entry) => !isLoadedBacklog(entry, page.count))
+            }
+            const kept = continues ? values.log.entries.filter(({ source }) => source === 'replay') : []
+            const history = normalizeHistory(
+                page.entries,
+                session.runId,
+                values.isBootstrapResumeRun,
+                page.preamble,
+                kept[kept.length - 1]?.entry.source_run_id
+            )
+            const echo = cache.retainedMessage
+                ? values.log.entries.findLast(
+                      ({ entry }) =>
+                          entry.notification.method === '_client/human_message' &&
+                          entry.notification.params?.content === cache.retainedMessage
+                  )
+                : undefined
+            const echoPersisted =
+                !!echo &&
+                history.some(
+                    (entry) =>
+                        entry.source_run_id === session.runId && persistedHumanText(entry) === cache.retainedMessage
+                )
+            // A paged log keeps its saved entries apart: only live and client entries meet the new read.
+            const tail = values.pagedHistory
+                ? values.log.entries.filter(({ source }) => source !== 'replay')
+                : values.log.entries
+            const retained = echoPersisted ? tail.filter((stored) => stored !== echo) : tail
+            // The kept entries take part, so a frame the stream sends again after the read is a duplicate of them too.
+            const saved = [...kept.map(({ entry }) => entry), ...history]
+            const log = reconcileRunLog(saved, retained, session.buffer, echoPersisted ? undefined : echo)
+            if (values.pagedHistory && page.indexed) {
+                cache.historyEnd = page.count
+                if (!continues) {
+                    setHistoryCursor({
+                        runId: session.runId,
+                        origin: page.origin,
+                        offset: page.offset,
+                        turnsBefore: page.turnsBefore,
+                    })
+                }
+            } else {
+                cache.historyEnd = undefined
+                setHistoryCursor(undefined)
+            }
+            const bufferedEntries = new Set(session.buffer)
+            const bufferedIds = new Set(session.buffer.flatMap((entry) => (entry.event_id ? [entry.event_id] : [])))
+            replayRunLog(
+                log,
+                session.runId,
+                (stored) =>
+                    stored.source === 'live' &&
+                    (bufferedEntries.has(stored.entry) ||
+                        (!!stored.entry.event_id && bufferedIds.has(stored.entry.event_id)))
+            )
+            actions.replaceLog(log)
+            cache.eventCoverage = new RunEventCoverage([
+                ...saved,
+                ...retained.map(({ entry }) => entry),
+                ...session.buffer,
+            ])
+            if (
+                cache.retainedMessage &&
+                !foldLogToThread(log.entries, { isResumeRun: true }).threadItems.some(
+                    (item) => item.type === 'human_message' && item.text === cache.retainedMessage
+                )
+            ) {
+                actions.pushHumanMessage(cache.retainedMessage)
+            }
+            cache.retainedMessage = undefined
+            if (
+                recoveringLiveTurn &&
+                !turnCompleteBeforeReconcile &&
+                values.turnComplete &&
+                !windowShowsToolCallInFlight(dedupeBufferedAgainstHistory(session.buffer, saved))
+            ) {
+                actions.markTurnComplete()
+            }
+            session.buffer = []
+            session.buffering = false
+            if (session.receivedCursor) {
+                session.committedCursor = session.receivedCursor
+                session.committedBacklogRunId = session.receivedBacklogRunId
+            }
+            if (session.committedCursor && !hasEnded(session)) {
+                writeStreamResumeId(session.runId, session.committedCursor)
+            }
+            actions.setHistoryComplete(true)
+            actions.bootstrapLogReady()
+            if (cache.bootstrapStartedAt !== undefined) {
+                posthog.capture('sandbox_run_history_loaded', {
+                    conversation_id: props.conversationId,
+                    task_id: session.taskId,
+                    run_id: session.runId,
+                    run_status: values.currentRunStatus,
+                    entry_count: page.count || history.length,
+                    loaded_entry_count: page.entries.length - page.preamble,
+                    partial: page.indexed && page.offset > 0,
+                    duration_ms: Math.round(performance.now() - cache.bootstrapStartedAt),
+                    execution_type: 'sandbox',
+                })
+                cache.bootstrapStartedAt = undefined
+            }
+            if (session.phase !== 'finalization') {
+                recordRecovery(session)
+            }
+            const loaded = cache.historyCursor as HistoryCursor | undefined
+            if (!continues && loaded && loaded.offset > 0) {
+                cache.disposables.add(() => {
+                    const timer = setTimeout(() => {
+                        // Fired once: a tab that hides and shows again must not load another page on its own.
+                        cache.disposables.dispose('older-history-preload')
+                        actions.loadOlderHistory()
+                    }, OLDER_HISTORY_PRELOAD_DELAY_MS)
+                    return () => clearTimeout(timer)
+                }, 'older-history-preload')
+            }
+        }
+
+        const finalize = async (session: RunStreamRecovery): Promise<void> => {
+            session.phase = 'finalization'
+            actions.setHistoryComplete(false)
+            actions.recoveryProgress('finalization', 0, MAX_HISTORY_FETCH_ATTEMPTS)
+            // Status and history have independent budgets; a failed status read must not hide saved output.
+            const results = await Promise.allSettled([
+                isTerminalRunStatus(values.currentRunStatus)
+                    ? Promise.resolve()
+                    : readWithRetry(session, async () => {
+                          const run = await readRun(session)
+                          applyRun(session, run)
+                          if (!isTerminalRunStatus(run.status)) {
+                              throw {
+                                  errorTitle: "Couldn't confirm the run's final status",
+                                  errorMessage: 'Retry to check again',
+                                  retryable: true,
+                              }
+                          }
+                          actions.handleTerminalStatus({ status: run.status as RunStatus })
+                      }),
+                reconcileHistory(session),
+            ])
+            if (!session.owns()) {
+                return
+            }
+            const failed = results.find((result) => result.status === 'rejected')
+            if (failed?.status === 'rejected') {
+                failRecovery(session, failed.reason)
+            } else {
+                recordRecovery(session)
+                actions.bootstrapReplayComplete()
+            }
+        }
+        const foldContextUsage = (fold: (usage: ContextUsage | null) => ContextUsage): void => {
+            if (cache.coalesceReplay) {
+                cache.replayContextUsage = fold(
+                    (cache.replayContextUsage as ContextUsage | undefined) ?? values.contextUsage
+                )
+                return
+            }
+            actions.setContextUsage(fold(values.contextUsage))
+        }
+        const ingestFrame = (entry: StoredLogEntry, source: FrameSource): void => {
+            const notification = entry?.notification
+            if (!notification) {
+                return
+            }
+            const method = notification.method
+            const isReplay = source === 'replay'
+
+            // Tool-stream events go out for every live frame; on replay only when a subscriber opted in
+            // (so history replay doesn't pay per-frame resolution for nobody).
+            const emitToolStream = !isReplay || (!cache.rebuildingHistory && hasReplayListener(values.toolListeners))
+
+            // Per-frame tool-invocation tracker: the same fold the projection applies, maintained
+            // O(1) per tool frame so the telemetry and tool-stream emits below never read the
+            // `toolInvocations` projection (each such read re-folds the entire log, which turns a
+            // long tool-heavy history replay quadratic). Maintained for every source so a live update
+            // whose `tool_call` arrived during replay still sees the right prior status.
+            // `preToolStatus` is the status BEFORE this frame folds in; it gates the
+            // once-per-transition `tool_call_completed` telemetry and the tool-stream phase.
+            const trackedInvocations: Map<string, ToolInvocation> = (cache.trackedToolInvocations ??= new Map())
+            let preToolStatus: ToolInvocationStatus | undefined
+            if (method === 'session/update') {
+                const u = notification.params?.update
+                if (isRecord(u) && u.sessionUpdate === 'tool_call') {
+                    const invocation = invocationFromToolCall(u)
+                    if (invocation) {
+                        trackedInvocations.set(invocation.toolCallId, invocation)
+                    }
+                } else if (isRecord(u) && u.sessionUpdate === 'tool_call_update') {
+                    const existing = trackedInvocations.get(String(u.toolCallId ?? ''))
+                    preToolStatus = existing?.status
+                    const invocation = invocationFromToolCallUpdate(existing, u, notification)
+                    if (invocation) {
+                        trackedInvocations.set(invocation.toolCallId, invocation)
+                    }
+                }
+            }
+
+            // Append to the ordered log — the single source of truth. The bootstrap seam was already
+            // deduped (see `bootstrapRun`) and steady-state live frames resume exclusively, so the
+            // side effects below run exactly once per frame without a per-frame key; the
+            // run-started/permission/tool-completion guards enforce fire-once on their own.
+            if (!cache.rebuildingHistory) {
+                actions.appendEntries([{ entry, source }])
+            }
+
+            // Custom `_posthog/*` notification namespace emitted by the agent-server. Thread items
+            // (errors, status, compaction, task notifications, progress, human turns) are derived by
+            // the projection straight from the log — handled here only for their value-fold side
+            // effects (telemetry, usage/resources/mode folds, permission routing).
+            if (method === '_posthog/run_started') {
+                // TASK_RUN_STARTED telemetry — emit once per run on the first `_posthog/run_started`
+                // frame. Suppressed while replaying history (the run started in a prior session);
+                // `markRunStarted` still runs so started/thinking state stays correct.
+                if (!values.runStarted && !isReplay) {
+                    const activeRun = cache.activeRun as { taskId: string; runId: string } | undefined
+                    cache.turnStartedAtMs = Date.now()
+                    posthog.capture('task_run_started', {
+                        conversation_id: props.conversationId,
+                        trace_id: values.traceId,
+                        run_id: activeRun?.runId,
+                        task_id: activeRun?.taskId,
+                        execution_type: 'sandbox',
+                        task_runtime: values.piRuntime ? TaskRuntimeEnumApi.Pi : TaskRuntimeEnumApi.Acp,
+                        // The run-started frame carries no warmth signal and pre-warming isn't wired
+                        // yet, so every run is a cold start. A later pre-warm hook flips this.
+                        cold_start: true,
+                    })
+                }
+                actions.setConversationClearSupported(
+                    (notification.params as { conversationClear?: unknown } | undefined)?.conversationClear === true
+                )
+                cache.isBootstrapping = false
+                actions.markRunStarted()
+                return
+            }
+            if (method === '_posthog/reply_suggestions') {
+                actions.setReplySuggestions(parseReplySuggestionsParams(notification.params))
+                return
+            }
+            if (method === '_posthog/turn_suggestion') {
+                // The log holds only outcomes this tab saw live; the ledger adds the ones sent while
+                // no tab of this conversation was open. Read once per task, when it first has an offer.
+                const taskId = values.bootstrappedTaskId
+                if (taskId && cache.turnSuggestionLedgerTaskId !== taskId) {
+                    cache.turnSuggestionLedgerTaskId = taskId
+                    actions.loadTurnSuggestionLedger(taskId)
+                    // Another tab's resolution reaches this one only as a live frame, which can be
+                    // lost, so a returning tab rereads the ledger while it shows a card.
+                    cache.disposables.add(
+                        () => {
+                            const onVisibilityChange = (): void => {
+                                if (
+                                    document.visibilityState === 'visible' &&
+                                    values.turnSuggestion &&
+                                    values.bootstrappedTaskId === taskId
+                                ) {
+                                    actions.loadTurnSuggestionLedger(taskId)
+                                }
+                            }
+                            document.addEventListener('visibilitychange', onVisibilityChange)
+                            return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+                        },
+                        'turnSuggestionLedgerRefresh',
+                        { pauseOnPageHidden: false }
+                    )
+                }
+                return
+            }
+            if (method === '_posthog/turn_complete') {
+                if (!isReplay) {
+                    actions.emitTurnCompleteEvent({ streamKey: props.streamKey })
+                }
+                actions.markTurnComplete(isReplay)
+                return
+            }
+            if (method === '_posthog/progress') {
+                const progress = (notification.params ?? {}) as PosthogProgressParams
+                const status = normalizeProgressStatus(progress.status)
+                // A finished step is a milestone (the thread's progress card keeps it), not the current
+                // activity — clear it so the thinking line falls back to the rotating message instead of
+                // sticking on e.g. "Started agent" for the rest of the turn.
+                if (status === 'completed' || status === 'failed') {
+                    actions.setCurrentProgress(null)
+                } else {
+                    actions.setCurrentProgress(
+                        stringifyOptional(progress.label) ?? stringifyOptional(progress.detail) ?? ''
+                    )
+                }
+                return
+            }
+            // The agent-server persists the permission lifecycle to the run log — pending approvals
+            // are re-derived on bootstrap (a reload mid-approval would otherwise lose the card while
+            // the agent stays blocked), and a resolution observed here clears the local card.
+            if (isPosthogNotification(notification, '_posthog/permission_request')) {
+                const record = parsePermissionRequestFrame(notification.params ?? {}, entry.source_run_id)
+                if (
+                    record &&
+                    !values.seenPermissionRequestIds.has(record.requestId) &&
+                    !values.resolvedPermissionRequestIds.has(record.requestId) &&
+                    !permissionEndedByLaterTurn(
+                        entry.event_id ?? notification.params?.event_id,
+                        entry.source_run_id,
+                        (cache.rebuildingLog as RunLog | undefined) ?? values.log
+                    )
+                ) {
+                    actions.routePermissionRequest(record, isReplay)
+                }
+                return
+            }
+            if (isPosthogNotification(notification, '_posthog/permission_resolved')) {
+                const requestId = notification.params?.requestId
+                if (
+                    typeof requestId === 'string' &&
+                    requestId &&
+                    entry.source_run_id === cache.activeRun?.runId &&
+                    entry.source_run_id
+                ) {
+                    actions.markPermissionRequestResolved(requestId)
+                }
+                return
+            }
+            // Token usage + cost + context-window breakdown. The numeric used/size aggregate that
+            // drives the percentage ring arrives separately on a session/update (handled below).
+            if (isPosthogNotification(notification, '_posthog/usage_update')) {
+                foldContextUsage((usage) => foldUsageNotification(usage, notification.params ?? {}))
+                return
+            }
+            // Diagnostic only — no UI; kept for resume telemetry / crash-affordance work.
+            if (isPosthogNotification(notification, '_posthog/sdk_session')) {
+                const params = notification.params
+                actions.setSdkSession({ sessionId: params?.sessionId, adapter: params?.adapter })
+                return
+            }
+            // History-derived context dedupe: a persisted or echoed user message still carries the
+            // context blocks its send was wrapped with; record their rendered lines under the
+            // bootstrapped task (the `logs/` replay spans the task's full resume chain), so
+            // `pendingContextItems` prunes items the chain already carries even after the in-memory
+            // sent-keys bookkeeping is lost (a reload, another tab, a teammate's session). An
+            // unattached optimistic stream has no task id and records nothing — its send path marks
+            // sent keys directly.
+            if (method === CONTEXT_HISTORY_METHOD) {
+                const lines = contextHistoryLines(notification.params)
+                if (values.bootstrappedTaskId && lines.length > 0) {
+                    actions.markContextLinesSeen(values.bootstrappedTaskId, lines)
+                }
+                return
+            }
+            if (isPosthogNotification(notification, '_posthog/user_message')) {
+                const content = notification.params?.content
+                if (Array.isArray(content) && content.length > 0 && content.every(isHiddenUserContent)) {
+                    return
+                }
+                actions.markTurnStarted()
+                if (values.bootstrappedTaskId) {
+                    const lines = contextBlockLinesFromUserMessage(extractUserMessageText(notification.params?.content))
+                    if (lines.length > 0) {
+                        actions.markContextLinesSeen(values.bootstrappedTaskId, lines)
+                    }
+                }
+                return
+            }
+            if (method?.startsWith('_posthog/')) {
+                // _posthog/error, _posthog/status, _posthog/compact_boundary, _posthog/task_notification
+                // → rendered by the projection. _posthog/console, _posthog/sandbox_output,
+                // other internal events → no UI. No side effect either way.
+                return
+            }
+            // The session/new request carries the run's starting permission mode in its meta. Seed the
+            // mode fold from it so mode-aware permission routing (full-auto answering in
+            // `bypassPermissions`) works before any `current_mode_update` arrives — the adapter only
+            // emits those on changes.
+            if (method === 'session/new') {
+                const meta = (notification.params as { _meta?: { permissionMode?: unknown } } | undefined)?._meta
+                if (typeof meta?.permissionMode === 'string' && meta.permissionMode) {
+                    actions.setCurrentMode(meta.permissionMode)
+                }
+                return
+            }
+            // session/prompt never renders and the resume-context filter is handled in the projection.
+            if (method === 'session/prompt') {
+                return
+            }
+            if (!isSessionUpdateNotification(notification)) {
+                return
+            }
+            const update = notification.params?.update
+            // The numeric used/size usage aggregate is session/update-framed — fold it into the ring.
+            if (isSessionUpdateUsage(update)) {
+                foldContextUsage((usage) => foldUsageAggregate(usage, update))
+                return
+            }
+            // Wire user turns render only on replay (the projection branches on source). Their one side
+            // effect is the same context-line recording as `_posthog/user_message` above — resume
+            // chains persist a turn in both wire forms, and the seen-lines reducer dedupes the overlap.
+            // Chunked frames are skipped: a partial text could truncate a block mid-line.
+            if (isSessionUpdateUserMessage(update)) {
+                if (isHiddenUserContent(update.content)) {
+                    return
+                }
+                actions.markTurnStarted()
+                if (values.bootstrappedTaskId && update.sessionUpdate === 'user_message') {
+                    const lines = contextBlockLinesFromUserMessage(String(update.content?.text ?? update.text ?? ''))
+                    if (lines.length > 0) {
+                        actions.markContextLinesSeen(values.bootstrappedTaskId, lines)
+                    }
+                }
+                return
+            }
+            if (isSessionUpdateAvailableCommands(update)) {
+                actions.setAvailableCommands(parseAvailableCommands(update.availableCommands))
+                return
+            }
+            if (!isKnownSessionUpdate(update)) {
+                return
+            }
+            // The agent producing output is the only marker of a new turn this client can rely on when the
+            // turn was started from outside its own composer. Such a follow-up is queued on the run, which
+            // emits no second `run_started`, and neither wire form of the user turn fills the gap: the live
+            // stream never carries one, and the persisted one is written when the message is received, so a
+            // message sent mid-turn is replayed *before* the previous turn's `turn_complete`. Guarded on
+            // `turnComplete` so this costs one dispatch per turn rather than one per streamed chunk.
+            if (values.turnComplete && opensAgentTurn(update)) {
+                actions.markTurnStarted()
+            }
+            if (update.sessionUpdate === 'current_mode_update') {
+                actions.setCurrentMode(String(update.currentModeId ?? update.mode ?? ''))
+                return
+            }
+            if (update.sessionUpdate === 'tool_call') {
+                // A fresh tool call — the tracker folded it in above, so resolve its name off the
+                // merged invocation and publish a `started` event on the bus.
+                if (emitToolStream) {
+                    const toolCallId = String(update.toolCallId ?? '')
+                    const invocation = toolCallId ? trackedInvocations.get(toolCallId) : undefined
+                    if (invocation) {
+                        actions.emitToolEvent({
+                            streamKey: props.streamKey,
+                            toolCallId,
+                            toolName: resolveToolCall(invocation).resolvedKey,
+                            rawToolName: invocation.rawToolName,
+                            phase: 'started',
+                            invocation,
+                            source,
+                        })
+                    }
+                }
+                return
+            }
+            if (update.sessionUpdate === 'tool_call_update') {
+                // TOOL_CALL_COMPLETED telemetry — emit once when a tool call first transitions to a
+                // terminal status. `preToolStatus` (read before the upsert) gates the once-only fire;
+                // the resolved key comes from the tracked merged invocation. Suppressed on replay,
+                // and skipped when the creating `tool_call` was lost (no pre-status).
+                const toolCallId = String(update.toolCallId ?? '')
+                if (!toolCallId) {
+                    return
+                }
+                const status = mapAcpStatus(update.status ?? preToolStatus)
+                if (
+                    !isReplay &&
+                    preToolStatus !== undefined &&
+                    preToolStatus !== 'completed' &&
+                    preToolStatus !== 'failed' &&
+                    (status === 'completed' || status === 'failed')
+                ) {
+                    const invocation = trackedInvocations.get(toolCallId)
+                    const startedAt = cache.turnStartedAtMs as number | undefined
+                    posthog.capture('tool_call_completed', {
+                        conversation_id: props.conversationId,
+                        trace_id: values.traceId,
+                        tool_call_id: toolCallId,
+                        tool_qualified_name: invocation ? resolveToolCall(invocation).resolvedKey : undefined,
+                        status,
+                        duration_ms: startedAt !== undefined ? Date.now() - startedAt : undefined,
+                        execution_type: 'sandbox',
+                    })
+                }
+                // Tool-stream event: phase from the pre-fold status → new status transition. A crossing
+                // into a terminal status is `completed`/`failed`; any other update is `updated`.
+                if (emitToolStream) {
+                    const invocation = trackedInvocations.get(toolCallId)
+                    if (invocation) {
+                        const wasTerminal = preToolStatus === 'completed' || preToolStatus === 'failed'
+                        const phase: ToolStreamPhase =
+                            !wasTerminal && status === 'completed'
+                                ? 'completed'
+                                : !wasTerminal && status === 'failed'
+                                  ? 'failed'
+                                  : 'updated'
+                        actions.emitToolEvent({
+                            streamKey: props.streamKey,
+                            toolCallId,
+                            toolName: resolveToolCall(invocation).resolvedKey,
+                            rawToolName: invocation.rawToolName,
+                            phase,
+                            invocation,
+                            source,
+                        })
+                    }
+                }
+                return
+            }
+            // agent_message_chunk / agent_message / agent_thought_chunk → projection only.
+        }
+        return {
+            [projectLogic.actionTypes.loadCurrentProjectSuccess]: () => {
+                const session = sessionNow()
+                if (session && session.projectId !== values.currentProjectId) {
+                    actions.reset()
+                }
+            },
+            bootstrapRun: async ({ taskId, runId, justCreatedRun, retainedMessage }) => {
+                if (!props.replayOnly) {
+                    liveRunStreams().set(props.streamKey, runId)
+                }
+                dropHistoryPrefetch()
+                const previous = sessionNow()
+                if (
+                    previous?.paused &&
+                    previous.projectId === values.currentProjectId &&
+                    previous.taskId === taskId &&
+                    previous.runId === runId
+                ) {
+                    actions.handleStreamError(cache.pausedError)
+                    return
+                }
+                const session = beginSession(taskId, runId)
+                if (!session) {
+                    return
+                }
+                cache.retainedMessage = retainedMessage
+                cache.isBootstrapping = true
+                cache.bootstrapStartedAt = justCreatedRun ? undefined : performance.now()
+                actions.setHistoryComplete(false)
+                try {
+                    if (hasEnded(session)) {
+                        await finalize(session)
+                        return
+                    }
+                    if (justCreatedRun && !props.replayOnly) {
+                        cache.skipInitialHistory = true
+                        session.buffering = false
+                        actions.setHistoryComplete(true)
+                        actions.bootstrapLogReady()
+                        actions.openSseForRun({ taskId, runId, startLatest: false })
+                        return
+                    }
+                    const run = await readWithRetry(session, () => readRun(session))
+                    applyRun(session, run)
+                    if (isTerminalRunStatus(run.status) || props.replayOnly) {
+                        if (isTerminalRunStatus(run.status)) {
+                            actions.handleTerminalStatus({ status: run.status as RunStatus, replayedFromHistory: true })
+                        }
+                        await reconcileHistory(session)
+                        session.check()
+                        actions.setRunOpening(false)
+                        actions.bootstrapReplayComplete()
+                    } else {
+                        if (!session.committedCursor) {
+                            startHistoryPrefetch(session)
+                        }
+                        actions.openSseForRun({ taskId, runId, startLatest: false })
+                    }
+                } catch (error) {
+                    failRecovery(session, error)
+                }
+            },
+            retryConnection: () => {
+                const previous = sessionNow()
+                if (
+                    !previous?.paused ||
+                    !values.bootstrapError?.retryable ||
+                    values.currentProjectId !== previous.projectId
+                ) {
+                    return
+                }
+                previous.paused = false
+                actions.resetRecoveryBudget()
+                cache.recoveryStartedAt = Date.now()
+                actions.bootstrapRun({ taskId: previous.taskId, runId: previous.runId })
+            },
+            loadTurnSuggestionLedger: async ({ taskId, attempt }) => {
+                const projectId = values.currentProjectId
+                if (!projectId || values.bootstrappedTaskId !== taskId) {
+                    return
+                }
+                // The first read and a visibility refresh can overlap, and an older snapshot that lands
+                // last would bring back a card the newer one resolved.
+                const request = (cache.turnSuggestionLedgerRequest = (cache.turnSuggestionLedgerRequest ?? 0) + 1)
+                try {
+                    const state = await turnSuggestionsStateRetrieve(String(projectId), { task_id: taskId })
+                    if (request !== cache.turnSuggestionLedgerRequest) {
+                        return
+                    }
+                    if (values.bootstrappedTaskId === taskId) {
+                        actions.setTurnSuggestionLedger({
+                            taskId,
+                            muted: state.muted,
+                            resolvedTurns: state.resolved_turns,
+                        })
+                    }
+                } catch {
+                    // The card stays hidden while the ledger is unknown, so a failed read retries a few times.
+                    if (attempt + 1 < TURN_SUGGESTION_LEDGER_ATTEMPTS && values.bootstrappedTaskId === taskId) {
+                        cache.disposables.add(() => {
+                            const timer = setTimeout(
+                                () => actions.loadTurnSuggestionLedger(taskId, attempt + 1),
+                                TURN_SUGGESTION_LEDGER_RETRY_MS * 2 ** attempt
+                            )
+                            return () => clearTimeout(timer)
+                        }, 'turnSuggestionLedgerRetry')
+                    }
+                }
+            },
+            openSseForRun: ({ taskId, runId }) => {
+                if (props.replayOnly) {
+                    return
+                }
+                if (liveRunStreams().get(props.streamKey) !== runId) {
+                    liveRunStreams().delete(props.streamKey)
+                }
+                const previous = sessionNow()
+                if (
+                    (previous?.paused &&
+                        previous.runId === runId &&
+                        previous.taskId === taskId &&
+                        previous.projectId === values.currentProjectId) ||
+                    (previous && hasEnded(previous) && previous.runId === runId && previous.taskId === taskId)
+                ) {
+                    return
+                }
+                const skipHistory = cache.skipInitialHistory === true || !previous
+                cache.skipInitialHistory = false
+                const session = beginSession(taskId, runId)
+                if (!session || hasEnded(session)) {
+                    return
+                }
+                session.phase = 'stream'
+                cache.eventCoverage ??= new RunEventCoverage(values.log.entries.map(({ entry }) => entry))
+                session.buffering = !skipHistory
+                actions.sseConnecting()
+                const controller = new AbortController()
+                let backlogRunId = session.committedBacklogRunId ?? (values.isBootstrapResumeRun ? undefined : runId)
+                const ownsStream = (): boolean => session.owns() && !controller.signal.aborted && !hasEnded(session)
+                const drop = (error?: StreamErrorEnvelope): void => {
+                    if (!ownsStream()) {
+                        return
+                    }
+                    if (error && !isTransientStreamError(error)) {
+                        failRecovery(session, error)
+                    } else {
+                        actions.sseDropped()
+                    }
+                }
+                const handleSseEvent = ({ id, event, data }: EventSourceMessage): void => {
+                    if (!ownsStream()) {
+                        return
+                    }
+                    if (event === STREAM_END_EVENT) {
+                        actions.streamEnded()
+                        return
+                    }
+                    if (event === 'error') {
+                        try {
+                            const envelope: SseErrorFrameData = JSON.parse(data)
+                            drop({
+                                errorTitle: envelope.errorTitle ?? 'Cloud stream failed',
+                                errorMessage: envelope.errorMessage,
+                                retryable: envelope.retryable ?? true,
+                            })
+                        } catch {
+                            drop({ errorTitle: 'Cloud stream failed', retryable: true })
+                        }
+                        return
+                    }
+                    if (event === 'end') {
+                        let control: unknown
+                        try {
+                            control = JSON.parse(data)
+                        } catch {
+                            return
+                        }
+                        if (isRecord(control) && control.type === 'resync') {
+                            session.committedCursor = undefined
+                            session.receivedCursor = undefined
+                            session.committedBacklogRunId = undefined
+                            session.receivedBacklogRunId = undefined
+                            clearStreamResumeId(runId)
+                        }
+                        return
+                    }
+                    if (event && event !== 'message') {
+                        return
+                    }
+                    let parsed: unknown
+                    try {
+                        parsed = JSON.parse(data)
+                    } catch {
+                        return
+                    }
+                    if (isLegacyPiEntry(parsed)) {
+                        parsed = readLegacyPiEntry(parsed)
+                    }
+                    if (isNotificationFrame(parsed)) {
+                        const marker =
+                            parsed.notification.method === '_posthog/run_started'
+                                ? parsed.notification.params?.runId
+                                : parsed.notification.method === '_posthog/sdk_session'
+                                  ? parsed.notification.params?.taskRunId
+                                  : undefined
+                        if (id?.startsWith('log-') && typeof marker === 'string') {
+                            backlogRunId = marker
+                        }
+                        const entry = {
+                            ...parsed,
+                            source_run_id: parsed.source_run_id ?? (id?.startsWith('log-') ? backlogRunId : runId),
+                        }
+                        reduceToolResponseCopy(entry)
+                        const backlogIndex = id?.startsWith('log-') ? Number(id.slice('log-'.length)) : NaN
+                        if (Number.isSafeInteger(backlogIndex)) {
+                            backlogIndexes.set(entry, backlogIndex)
+                        }
+                        // An entry the loaded log already holds is not ingested, but it still moves the resume cursor below.
+                        const fresh = !isLoadedBacklog(entry, cache.historyEnd as number | undefined)
+                        const savedBacklog = !entry.event_id && id ? session.legacyBacklog.get(id) : undefined
+                        const matchesSavedBacklog =
+                            savedBacklog &&
+                            savedBacklog.timestamp === entry.timestamp &&
+                            JSON.stringify(savedBacklog.notification) === JSON.stringify(entry.notification)
+                        if (fresh && session.buffering) {
+                            session.buffer.push(entry)
+                        } else if (
+                            fresh &&
+                            !session.buffering &&
+                            !matchesSavedBacklog &&
+                            !(cache.eventCoverage as RunEventCoverage).covers(entry)
+                        ) {
+                            ;(cache.eventCoverage as RunEventCoverage).add(entry)
+                            if (entry.first_event_id) {
+                                const log = mergeCoalescedRunLog(values.log, entry)
+                                cache.rebuildingHistory = true
+                                try {
+                                    actions.ingestAcpFrame(entry, 'live')
+                                } finally {
+                                    cache.rebuildingHistory = false
+                                }
+                                actions.replaceLog(log)
+                            } else {
+                                actions.ingestAcpFrame(entry, 'live')
+                            }
+                        }
+                    } else if (isPermissionRequestFrame(parsed)) {
+                        if (session.buffering) {
+                            session.buffer.push({
+                                type: 'notification',
+                                source_run_id: runId,
+                                notification: {
+                                    method: '_posthog/permission_request',
+                                    params: parsed as unknown as Record<string, unknown>,
+                                },
+                            })
+                            return
+                        }
+                        const record = parsePermissionRequestFrame(parsed, runId)
+                        if (
+                            record &&
+                            !values.seenPermissionRequestIds.has(record.requestId) &&
+                            !values.resolvedPermissionRequestIds.has(record.requestId) &&
+                            !permissionEndedByLaterTurn(parsed.event_id, runId, values.log)
+                        ) {
+                            actions.routePermissionRequest(record)
+                        }
+                    } else if (isTaskRunStateFrame(parsed)) {
+                        if (parsed.stage !== undefined) {
+                            actions.setCurrentStage(parsed.stage ?? null)
+                        }
+                        actions.mergeRunArtifacts(extractRunArtifacts(parsed))
+                        actions.handleTerminalStatus({
+                            status: parsed.status as RunStatus,
+                            errorMessage: parsed.error_message ?? null,
+                        })
+                    }
+                    if (id && ownsStream()) {
+                        session.receivedCursor = id
+                        session.receivedBacklogRunId = backlogRunId
+                        if (!session.buffering) {
+                            session.committedCursor = id
+                            session.committedBacklogRunId = backlogRunId
+                            writeStreamResumeId(runId, id)
+                        }
+                    }
+                }
+                const streamRun = async (): Promise<void> => {
+                    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+                    try {
+                        let response: Response
+                        for (;;) {
+                            const proxyTarget = await session.request(
+                                STREAM_REQUEST_TIMEOUT_MS,
+                                (signal) => resolveStreamTarget(String(session.projectId), taskId, runId, signal),
+                                controller.signal
+                            )
+                            if (!ownsStream()) {
+                                return
+                            }
+                            try {
+                                response = await session.request(
+                                    STREAM_REQUEST_TIMEOUT_MS,
+                                    () =>
+                                        api.tasks.runs.openStream(taskId, runId, {
+                                            projectId: session.projectId,
+                                            signal: controller.signal,
+                                            lastEventId: session.committedCursor,
+                                            startLatest: false,
+                                            ...(proxyTarget ? { proxyTarget } : {}),
+                                        }),
+                                    controller.signal
+                                )
+                                break
+                            } catch (error) {
+                                if (!ownsStream()) {
+                                    return
+                                }
+                                const status = (error as { status?: number })?.status
+                                if (
+                                    status === 401 &&
+                                    proxyTarget &&
+                                    (cache.streamTokenRefreshes ?? 0) < MAX_STREAM_TOKEN_REMINTS
+                                ) {
+                                    cache.streamTokenRefreshes = (cache.streamTokenRefreshes ?? 0) + 1
+                                    continue
+                                }
+                                throw error
+                            }
+                        }
+                        if (!ownsStream()) {
+                            return
+                        }
+                        reader = response.body?.getReader()
+                        if (!reader) {
+                            drop()
+                            return
+                        }
+                        const streamReader = reader
+                        cache.disposables.add(
+                            () => () => {
+                                void streamReader.cancel?.().catch(() => {})
+                            },
+                            'stream-reader',
+                            { pauseOnPageHidden: false }
+                        )
+                        actions.sseOpened()
+                        if (session.buffering) {
+                            void reconcileHistory(session)
+                                .then(() => {
+                                    if (ownsStream()) {
+                                        actions.sseOpened()
+                                    }
+                                })
+                                .catch((error) => failRecovery(session, error))
+                        }
+                        const decoder = new TextDecoder()
+                        const parser = createParser({ onEvent: handleSseEvent })
+                        while (ownsStream()) {
+                            const { done, value } = await session.request(
+                                STREAM_IDLE_TIMEOUT_MS,
+                                () => streamReader.read(),
+                                controller.signal
+                            )
+                            if (!ownsStream()) {
+                                return
+                            }
+                            if (value) {
+                                parser.feed(decoder.decode(value, { stream: true }))
+                            }
+                            if (done) {
+                                drop()
+                                return
+                            }
+                        }
+                    } catch (error) {
+                        if (ownsStream()) {
+                            drop(mapHttpStatusToStreamError((error as { status?: number })?.status))
+                        }
+                    }
+                }
+                cache.disposables.add(
+                    () => {
+                        const entry: LiveStreamEntry = {
+                            controller,
+                            reopen: () => {
+                                if (session.owns() && !session.paused) {
+                                    actions.openSseForRun({ taskId, runId })
+                                }
+                            },
+                        }
+                        liveStreamControllers.add(entry)
+                        void streamRun()
+                        return () => {
+                            liveStreamControllers.delete(entry)
+                            controller.abort()
+                            cache.disposables.dispose('stream-reader')
+                        }
+                    },
+                    'event-source',
+                    { pauseOnPageHidden: false }
+                )
+            },
+            sseOpened: () => {
+                cache.sseConnectedAtMs = Date.now()
+                cache.streamTokenRefreshes = 0
+            },
+            sseDropped: async () => {
+                dropHistoryPrefetch()
+                const previous = sessionNow()
+                if (!previous?.owns() || previous.paused || hasEnded(previous)) {
+                    return
+                }
+                const connectedAtMs = cache.sseConnectedAtMs as number | undefined
+                const wasHealthy =
+                    connectedAtMs !== undefined && Date.now() - connectedAtMs >= SSE_HEALTHY_CONNECTION_MS
+                const attempt = wasHealthy ? values.reconnectAttempt : values.reconnectAttempt + 1
+                const session = beginSession(previous.taskId, previous.runId)
+                if (!session) {
+                    return
+                }
+                session.phase = 'stream'
+                cache.sseConnectedAtMs = undefined
+                cache.recoveryStartedAt ??= Date.now()
+                actions.setHistoryComplete(false)
+                if (
+                    attempt > MAX_SSE_RECONNECT_ATTEMPTS ||
+                    values.cumulativeReconnectAttempt >= MAX_CUMULATIVE_RECONNECT_ATTEMPTS
+                ) {
+                    failRecovery(session, {
+                        errorTitle: 'Cloud stream failed',
+                        errorMessage: 'Retry to restore the conversation.',
+                        retryable: true,
+                    })
+                    return
+                }
+                actions.sseReconnecting(attempt)
+                try {
+                    try {
+                        const run = await readRun(session)
+                        applyRun(session, run)
+                        if (isTerminalRunStatus(run.status)) {
+                            actions.handleTerminalStatus({ status: run.status as RunStatus })
+                            return
+                        }
+                    } catch (error) {
+                        session.check()
+                        if (!isTransientStreamError(error as StreamErrorEnvelope)) {
+                            throw error
+                        }
+                    }
+                    await session.wait(reconnectDelayMs(Math.max(attempt, 1)))
+                    session.check()
+                    actions.openSseForRun({ taskId: session.taskId, runId: session.runId })
+                } catch (error) {
+                    failRecovery(session, error)
+                }
+            },
+            streamEnded: () => {
+                dropHistoryPrefetch()
+                const previous = sessionNow()
+                if (!previous?.owns() || previous.phase === 'finalization') {
+                    return
+                }
+                ;(cache.endedRuns ??= new Set<string>()).add(
+                    endedKey(previous.projectId, previous.taskId, previous.runId)
+                )
+                const session = beginSession(previous.taskId, previous.runId)
+                if (!session) {
+                    return
+                }
+                session.buffer = previous.buffer
+                session.receivedCursor = previous.receivedCursor
+                clearStreamResumeId(session.runId)
+                void finalize(session)
+            },
+            routePermissionRequest: ({ record, replayedFromHistory }) => {
+                if (
+                    props.replayOnly ||
+                    !record.sourceRunId ||
+                    record.sourceRunId !== cache.activeRun?.runId ||
+                    isTerminalRunStatus(values.currentRunStatus)
+                ) {
+                    return
+                }
+                // Replayed history is a read-only restore — never auto-approve (the run may be terminal).
+                // Full-auto covers the task's selected project. Questions, plan approvals, and calls into
+                // connected projects still surface because the task did not authorize them.
+                const fullAuto =
+                    isFullAutoMode(values.currentMode) &&
+                    !record.questions?.length &&
+                    !isPlanPermissionRequest(record) &&
+                    !isConnectedProjectTool(record)
+                const decision = fullAuto ? 'auto_allow' : defaultPermissionDecision(record)
+                if (!replayedFromHistory && decision === 'auto_allow') {
+                    const optionId = findAllowOptionId(record)
+                    if (optionId) {
+                        actions.autoApprovePermissionRequest(record, optionId)
+                        return
+                    }
+                }
+                actions.ingestPermissionRequest(record, replayedFromHistory)
+            },
+            autoApprovePermissionRequest: async ({ record, optionId }) => {
+                // Pin it seen up front so a reconnect replay can't re-process the same request mid-POST.
+                actions.markPermissionRequestSeen(record.requestId)
+                const activeRun = cache.activeRun as { taskId: string; runId: string } | undefined
+                const resolvedToolCall = resolveToolCall(record.rawToolCall)
+                posthog.capture('permission_auto_approved', {
+                    conversation_id: props.conversationId,
+                    trace_id: values.traceId,
+                    request_id: record.requestId,
+                    tool_call_name: resolvedToolCall.resolvedKey,
+                    tool_call_id: record.toolCallId,
+                    run_id: activeRun?.runId,
+                    task_id: activeRun?.taskId,
+                    execution_type: 'sandbox',
+                })
+                if (!activeRun || values.currentProjectId == null) {
+                    // No active run to command yet — fall back to the manual card so the user can respond.
+                    actions.ingestPermissionRequest(record)
+                    return
+                }
+                actions.deliverPermission(record, optionId, undefined, undefined, true)
+            },
+            ingestPermissionRequest: ({ record, replayedFromHistory }) => {
+                if (replayedFromHistory) {
+                    return
+                }
+                // conversation_id / trace_id are correlated by the caller (the SSE bypasses Django);
+                // emit what this logic knows.
+                const activeRun = cache.activeRun as { taskId: string; runId: string } | undefined
+                const resolvedToolCall = resolveToolCall(record.rawToolCall)
+                posthog.capture('permission_requested', {
+                    conversation_id: props.conversationId,
+                    trace_id: values.traceId,
+                    request_id: record.requestId,
+                    tool_call_name: resolvedToolCall.resolvedKey,
+                    tool_call_id: record.toolCallId,
+                    run_id: activeRun?.runId,
+                    task_id: activeRun?.taskId,
+                    execution_type: 'sandbox',
+                })
+            },
+            respondToPermission: ({ requestId, optionId, customInput, answers }) => {
+                const record = values.pendingPermissionRequest
+                if (record?.requestId === requestId) {
+                    actions.deliverPermission(record, optionId, customInput, answers)
+                }
+            },
+            deliverPermission: async ({ record, optionId, customInput, answers, automatic }) => {
+                const activeRun = cache.activeRun as { taskId: string; runId: string } | undefined
+                const projectId = values.currentProjectId
+                if (
+                    !activeRun ||
+                    projectId == null ||
+                    record.sourceRunId !== activeRun.runId ||
+                    isTerminalRunStatus(values.currentRunStatus) ||
+                    props.replayOnly
+                ) {
+                    actions.permissionResponseFailed(record.requestId)
+                    return
+                }
+                const deliveries = (cache.permissionDeliveries ??= new Map<string, AbortController>()) as Map<
+                    string,
+                    AbortController
+                >
+                const key = `permission-delivery:${activeRun.runId}:${record.requestId}`
+                if (deliveries.has(key)) {
+                    return
+                }
+                if (values.resolvedPermissionRequestIds.has(record.requestId)) {
+                    actions.permissionResponseFailed(record.requestId)
+                    return
+                }
+                const controller = new AbortController()
+                const disposables = cache.disposables
+                deliveries.set(key, controller)
+                disposables.add(
+                    () => () => {
+                        controller.abort()
+                        deliveries.delete(key)
+                    },
+                    key,
+                    { pauseOnPageHidden: false }
+                )
+                const body: TaskRunCommandRequestApi = {
+                    jsonrpc: '2.0',
+                    method: 'permission_response',
+                    params: {
+                        requestId: record.requestId,
+                        optionId,
+                        customInput,
+                        answers: answers ? { ...answers } : undefined,
+                    },
+                }
+                try {
+                    await deliverPermissionResponse(
+                        (signal) =>
+                            tasksRunsCommandCreate(String(projectId), activeRun.taskId, activeRun.runId, body, {
+                                signal,
+                            }),
+                        controller.signal
+                    )
+                    if (!controller.signal.aborted && !disposables.isDisposed) {
+                        actions.markPermissionRequestResolved(record.requestId)
+                    }
+                } catch (error) {
+                    if (controller.signal.aborted || disposables.isDisposed) {
+                        return
+                    }
+                    posthog.captureException(error)
+                    // The run ended before the approval arrived, so every further attempt gets the same
+                    // rejection. Drop the card instead of asking for a retry that cannot succeed.
+                    if (isPermissionTargetEnded(error)) {
+                        actions.clearPermissionRequest()
+                        lemonToast.error(
+                            "This run has ended, so the approval wasn't sent. Send a new message to continue."
+                        )
+                        return
+                    }
+                    if (automatic) {
+                        actions.ingestPermissionRequest(record)
+                    }
+                    actions.permissionResponseFailed(record.requestId)
+                    lemonToast.error('Failed to send approval. Please try again.')
+                } finally {
+                    disposables.dispose(key)
+                }
+            },
+            cancelPermissionDelivery: () => {
+                const deliveries = cache.permissionDeliveries as Map<string, AbortController> | undefined
+                for (const key of deliveries?.keys() ?? []) {
+                    cache.disposables.dispose(key)
+                }
+            },
+            markPermissionRequestResolved: ({ requestId }) => {
+                cache.disposables.dispose(`permission-delivery:${cache.activeRun?.runId}:${requestId}`)
+            },
+            clearPermissionRequest: () => {
+                actions.cancelPermissionDelivery()
+            },
+            cancelRun: async ({ run }) => {
+                // Cancel a run through the generic tasks relay — the same command PostHog Desktop issues. The
+                // SSE then receives a terminal task_run_state; cancellation telemetry is emitted server-side
+                // by the relay. `run` defaults to the streamed run; a warm Run (not streamed) is passed in.
+                // Fire-and-forget: a failure leaves the run alive for a retry.
+                const target = run ?? (cache.activeRun as { taskId: string; runId: string } | undefined)
+                if (!target || values.currentProjectId == null) {
+                    return
+                }
+                // An approval waiting on agent startup outlives this command — the terminal frame that stops
+                // it is a round trip away, so the agent can still accept work the user just canceled. Drop
+                // the delivery here. A warm Run is not the streamed run, so its deliveries are not ours.
+                if (target.runId === (cache.activeRun as { runId: string } | undefined)?.runId) {
+                    actions.cancelPermissionDelivery()
+                }
+                try {
+                    await tasksRunsCommandCreate(String(values.currentProjectId), target.taskId, target.runId, {
+                        jsonrpc: '2.0',
+                        method: 'cancel',
+                    })
+                } catch (error) {
+                    posthog.captureException(error)
+                }
+            },
+            handleTerminalStatus: ({ status, errorMessage, replayedFromHistory }) => {
+                // The wire emits task_run_state for non-terminal transitions too (e.g. queued →
+                // in_progress) — only an actually-terminal run has no more frames to stream.
+                if (!isTerminalRunStatus(status)) {
+                    return
+                }
+                actions.cancelPermissionDelivery()
+                const session = sessionNow()
+                if (session) {
+                    ;(cache.endedRuns ??= new Set<string>()).add(
+                        endedKey(session.projectId, session.taskId, session.runId)
+                    )
+                    actions.setStreamHasEnded(true)
+                    clearStreamResumeId(session.runId)
+                    if (session.phase !== 'finalization' && !replayedFromHistory) {
+                        actions.streamEnded()
+                    }
+                }
+
+                // A run that already terminated in a prior session is surfaced read-only on reopen —
+                // the reducers still record the terminal status, but re-emitting telemetry on every
+                // page load would inflate termination counts.
+                if (replayedFromHistory) {
+                    return
+                }
+
+                // Run-lifecycle signal for apply-back consumers: publish once per run when a live run
+                // reaches a terminal status. `handleTerminalStatus` can fire more than once for the same
+                // run (a task_run_state frame, then a post-drop refetch), so guard on the run id — a
+                // reconnect double-transition must not re-fire the reaction. Replay is already excluded
+                // by the early return above.
+                const lifecycleRun = cache.activeRun as { taskId: string; runId: string } | undefined
+                const emittedRunIds = (cache.emittedTerminalRunIds ??= new Set<string>()) as Set<string>
+                if (lifecycleRun && emittedRunIds.has(lifecycleRun.runId)) {
+                    return
+                }
+                if (lifecycleRun) {
+                    emittedRunIds.add(lifecycleRun.runId)
+                    actions.emitRunLifecycleEvent({ streamKey: props.streamKey, status: status as RunTerminalStatus })
+                }
+
+                // Crash/failure affordance: a failed run carrying an error_message otherwise just blanks
+                // the thinking indicator. Push a visible error item so the user sees why it stopped. The
+                // in-sandbox agent server writes "Agent server crashed: …" on a fatal exception — render
+                // that as a friendlier, retry-oriented `crash` variant; other failures show the raw line.
+                if (status === 'failed' && errorMessage) {
+                    actions.pushErrorItem(errorMessage, errorMessage.startsWith(AGENT_CRASH_PREFIX) ? 'crash' : 'error')
+                }
+
+                // TASK_RUN_TERMINATED telemetry. `duration_ms` is measured from the current turn's start
+                // (run start for the first turn, the latest human message for a follow-up); absent if the
+                // run terminated before either was seen.
+                const activeRun = cache.activeRun as { taskId: string; runId: string } | undefined
+                const startedAt = cache.turnStartedAtMs as number | undefined
+                posthog.capture('task_run_terminated', {
+                    conversation_id: props.conversationId,
+                    trace_id: values.traceId,
+                    run_id: activeRun?.runId,
+                    task_id: activeRun?.taskId,
+                    status,
+                    error_message: errorMessage ?? undefined,
+                    execution_type: 'sandbox',
+                    duration_ms: startedAt !== undefined ? Date.now() - startedAt : undefined,
+                })
+            },
+            handleStreamError: ({ errorTitle, retryable }) => {
+                const session = sessionNow()
+                if (session && cache.disconnectedGeneration === session.generation) {
+                    return
+                }
+                cache.disconnectedGeneration = session?.generation
+                // A stream/connection failure no longer appends an inline error item (which stacked up as
+                // spam on a flapping stream). It sets `sseStatus='error'` + the error envelope via the reducers,
+                // which the `runConnectionState` selector projects into the single footer `RunAlertActivity`
+                // card. Here we only capture the disconnect telemetry that mirrors the cloud client's
+                // CLOUD_STREAM_DISCONNECTED (the relay can't see a client-side reconnect-budget exhaustion).
+                const activeRun = cache.activeRun as { taskId: string; runId: string } | undefined
+                posthog.capture('sandbox_stream_disconnected', {
+                    conversation_id: props.conversationId,
+                    trace_id: values.traceId,
+                    run_id: activeRun?.runId,
+                    task_id: activeRun?.taskId,
+                    error_title: errorTitle,
+                    retryable,
+                    reconnect_attempts: values.reconnectAttempt,
+                    stream_error_attempts: 0,
+                    cumulative_reconnect_attempts: values.cumulativeReconnectAttempt,
+                    was_bootstrapping: cache.isBootstrapping === true,
+                    execution_type: 'sandbox',
+                    recovery_phase: sessionNow()?.phase,
+                    run_status: values.currentRunStatus,
+                    http_status: values.bootstrapError?.status,
+                })
+            },
+            closeSse: () => {
+                dropHistoryPrefetch()
+                cache.disposables.dispose('stream-session')
+                if (sessionNow()) {
+                    sessionNow()!.paused = false
+                }
+                actions.cancelPermissionDelivery()
+                cache.activeRun = undefined
+                // Aborts the in-flight fetch reader (its signal); the reader loop sees `aborted` and
+                // exits without scheduling a reconnect.
+                cache.disposables.dispose('event-source')
+            },
+            reset: () => {
+                stopHistoryPaging()
+                cache.historyCursor = undefined
+                cache.historyEnd = undefined
+                if (!props.replayOnly) {
+                    liveRunStreams().delete(props.streamKey)
+                }
+                cache.disposables.dispose('stream-session')
+                cache.bootstrapStartedAt = undefined
+                dropHistoryPrefetch()
+                cache.recoverySession = undefined
+                cache.eventCoverage = undefined
+                cache.retainedMessage = undefined
+                cache.recoveryStartedAt = undefined
+                actions.cancelPermissionDelivery()
+                cache.optimisticResume = undefined
+                // `log` clears via its own reducer on `reset`, so the projection empties with it. The
+                // per-frame invocation tracker mirrors the log, so it must clear alongside it.
+                cache.trackedToolInvocations = undefined
+                cache.turnSuggestionLedgerTaskId = null
+                cache.disposables.dispose('turnSuggestionLedgerRetry')
+                cache.disposables.dispose('turnSuggestionLedgerRefresh')
+                cache.permissionRunId = undefined
+                cache.activeRun = undefined
+                cache.turnStartedAtMs = undefined
+                cache.isBootstrapping = false
+                cache.sseConnectedAtMs = undefined
+                cache.streamTokenRefreshes = 0
+                cache.disposables.dispose('event-source')
+            },
+            startOptimisticRun: ({ message, stagedAttachments }) => {
+                actions.setRunOpening(true)
+                if (message) {
+                    actions.pushHumanMessage(message, stagedAttachments)
+                }
+            },
+            appendResumeBoundary: () => {
+                // A killed run can end without a turn_complete frame. Close that turn before inserting
+                // the successor's message, or the projection moves it ahead of the previous answer.
+                if (!values.turnComplete && values.log.entries.length > 0) {
+                    actions.appendEntries([
+                        {
+                            entry: {
+                                type: 'notification',
+                                notification: { method: '_posthog/turn_complete', params: {} },
+                            },
+                            source: 'client',
+                        },
+                    ])
+                }
+            },
+            startOptimisticResume: ({ message, stagedAttachments }) => {
+                const historyComplete = values.historyComplete
+                const turnComplete = values.turnComplete
+                const previousEntryCount = values.log.entries.length
+                actions.appendResumeBoundary()
+                actions.setRunOpening(true)
+                actions.pushHumanMessage(message, stagedAttachments)
+                cache.optimisticResume = {
+                    entries: values.log.entries.slice(previousEntryCount),
+                    message,
+                    historyComplete,
+                    turnComplete,
+                } satisfies OptimisticResume
+            },
+            rollbackOptimisticResume: () => {
+                const resume = cache.optimisticResume as OptimisticResume | undefined
+                if (!resume) {
+                    return
+                }
+                cache.optimisticResume = undefined
+                actions.replaceLog(
+                    appendToRunLog(
+                        emptyRunLog(),
+                        values.log.entries.filter((entry) => !resume.entries.includes(entry))
+                    )
+                )
+                if (resume.turnComplete) {
+                    actions.markTurnComplete()
+                }
+            },
+            attachOptimisticResume: ({ taskId, run }) => {
+                const resume = cache.optimisticResume as OptimisticResume | undefined
+                if (!resume) {
+                    return
+                }
+                cache.optimisticResume = undefined
+                const cursor = cache.historyCursor as HistoryCursor | undefined
+                if (cursor) {
+                    // The successor's chain holds this run's chain at the same indexes, so the loaded log stays valid.
+                    cache.historyCursor = { ...cursor, runId: run.id }
+                }
+                actions.closeSse()
+                actions.prepareResumeRun()
+                actions.permissionRunChanged()
+                cache.trackedToolInvocations = undefined
+                actions.markBootstrapResumeRun(true)
+                actions.mergeRunArtifacts(extractRunArtifacts(run))
+                actions.bootstrapRun({
+                    taskId,
+                    runId: run.id,
+                    justCreatedRun: resume.historyComplete,
+                    ...(!resume.historyComplete ? { retainedMessage: resume.message } : {}),
+                })
+            },
+            pushHumanMessage: ({ content, stagedAttachments }) => {
+                // The echo is always a live turn (replayed human turns render straight from the log), so
+                // stamp the turn start for per-turn duration metrics and append it as a `client`-sourced
+                // log entry the projection renders in order.
+                cache.turnStartedAtMs = Date.now()
+                // A send does NOT revive a dead stream, and reviving one is harder than it looks:
+                // `sseStatus: 'error'` covers a failed history bootstrap as well as an exhausted
+                // reconnect budget, and the bootstrap case has already dropped buffered frames whose
+                // ids advanced the resume cursor, so reopening from it silently skips them; a reopen
+                // also inherits the spent reconnect budgets, so the next drop gives up at once. A
+                // stream the durable sentinel closed cannot be revived at all — its Redis stream holds
+                // a completion entry the server stops at and refuses to write past.
+                actions.appendEntries([
+                    {
+                        entry: {
+                            type: 'notification',
+                            // The wire echo of this send is deduped against this entry, so the send time can only come from here.
+                            timestamp: new Date().toISOString(),
+                            notification: {
+                                method: '_client/human_message',
+                                params: {
+                                    // Keeps the row's id when older history loads in front of it.
+                                    clientId: uuid(),
+                                    content,
+                                    ...(stagedAttachments?.length ? { attachments: stagedAttachments } : {}),
+                                },
+                            },
+                        },
+                        source: 'client',
+                    },
+                ])
+            },
+            pushConversationCleared: () => {
+                actions.appendEntries([
+                    {
+                        entry: {
+                            type: 'notification',
+                            notification: { method: '_posthog/conversation_cleared', params: {} },
+                        },
+                        source: 'client',
+                    },
+                ])
+            },
+            pushErrorItem: ({ errorMessage, variant }) => {
+                // Client-side errors (terminal failure, stream disconnect) aren't wire frames — append
+                // them as `client`-sourced log entries so the projection renders them in thread order.
+                actions.appendEntries([
+                    {
+                        entry: {
+                            type: 'notification',
+                            notification: { method: '_client/error', params: { message: errorMessage, variant } },
+                        },
+                        source: 'client',
+                    },
+                ])
+            },
+            ingestAcpFrame: ({ entry, source }) => ingestFrame(entry, source),
+            loadOlderHistory: async () => {
+                const cursor = cache.historyCursor as HistoryCursor | undefined
+                const projectId = values.currentProjectId
+                const taskId = values.bootstrappedTaskId
+                if (
+                    !cursor ||
+                    cursor.offset === 0 ||
+                    values.olderHistoryState !== 'idle' ||
+                    projectId === null ||
+                    !taskId
+                ) {
+                    return
+                }
+                cache.disposables.dispose('older-history-preload')
+                actions.setOlderHistoryState('loading')
+                // Paging owns its request, so a stream that reconnects, fails or moves to a successor run leaves it
+                // running. A new cursor, a reset or an unmount cancels it.
+                const request = {}
+                cache.olderHistoryRequest = request
+                const controller = new AbortController()
+                cache.disposables.add(
+                    () => {
+                        const timer = setTimeout(() => controller.abort(), STREAM_HISTORY_TIMEOUT_MS)
+                        return () => {
+                            clearTimeout(timer)
+                            controller.abort()
+                        }
+                    },
+                    'older-history-request',
+                    { pauseOnPageHidden: false }
+                )
+                const startedAt = performance.now()
+                const owned = (): HistoryCursor | undefined => {
+                    const current = cache.historyCursor as HistoryCursor | undefined
+                    return !cache.disposables.isDisposed &&
+                        cache.olderHistoryRequest === request &&
+                        current?.offset === cursor.offset
+                        ? current
+                        : undefined
+                }
+                const capture = (outcome: 'loaded' | 'failed', fields: Record<string, unknown>): void => {
+                    posthog.capture('sandbox_run_older_history_loaded', {
+                        conversation_id: props.conversationId,
+                        task_id: taskId,
+                        run_id: cursor.runId,
+                        outcome,
+                        duration_ms: Math.round(performance.now() - startedAt),
+                        execution_type: 'sandbox',
+                        ...fields,
+                    })
+                }
+                try {
+                    const page = await api.tasks.runs.getLogPage(taskId, cursor.runId, {
+                        signal: controller.signal,
+                        projectId,
+                        tailBytes: HISTORY_PAGE_BYTES,
+                        before: cursor.offset,
+                        view: 'thread',
+                    })
+                    const current = owned()
+                    if (!current) {
+                        return
+                    }
+                    cache.olderHistoryRequest = undefined
+                    cache.disposables.dispose('older-history-request')
+                    // A page from a chain that dropped its oldest run counts from another run. The next history read
+                    // finds the same change and reads the latest turns again, with a new cursor.
+                    if (!page.indexed || page.origin !== current.origin || page.offset >= cursor.offset) {
+                        actions.setOlderHistoryState('none')
+                        return
+                    }
+                    const entries = normalizeHistory(
+                        page.entries.slice(0, page.preamble + cursor.offset - page.offset),
+                        current.runId,
+                        values.isBootstrapResumeRun,
+                        page.preamble
+                    )
+                    const lines = historyContextLines(entries)
+                    if (lines.length > 0) {
+                        actions.markContextLinesSeen(taskId, lines)
+                    }
+                    cache.historyCursor = { ...current, offset: page.offset, turnsBefore: page.turnsBefore }
+                    cache.olderHistoryFailures = 0
+                    actions.replaceLog(prependHistoryPage(values.log, entries))
+                    actions.setHistoryTurnBase(page.turnsBefore)
+                    actions.setOlderHistoryState(page.offset > 0 ? 'idle' : 'none')
+                    capture('loaded', { entry_count: entries.length - page.preamble, remaining: page.offset > 0 })
+                } catch (error) {
+                    if (!owned()) {
+                        return
+                    }
+                    cache.olderHistoryRequest = undefined
+                    cache.disposables.dispose('older-history-request')
+                    const failures = ((cache.olderHistoryFailures as number | undefined) ?? 0) + 1
+                    cache.olderHistoryFailures = failures
+                    const status = (error as { status?: number } | null)?.status
+                    capture('failed', { http_status: status, failures })
+                    // A refused or missing log never loads, so it stops at once.
+                    if (status === 403 || status === 404 || failures >= OLDER_HISTORY_MAX_FAILURES) {
+                        actions.setOlderHistoryState('none')
+                        return
+                    }
+                    // Every failure waits before the state rearms, so a short thread's automatic load cannot loop.
+                    cache.disposables.add(() => {
+                        const timer = setTimeout(
+                            () => {
+                                cache.disposables.dispose('older-history-retry')
+                                actions.setOlderHistoryState('idle')
+                            },
+                            OLDER_HISTORY_RETRY_DELAY_MS * 2 ** (failures - 1)
+                        )
+                        return () => clearTimeout(timer)
+                    }, 'older-history-retry')
+                }
+            },
+        }
+    }),
+    beforeUnmount(({ props }) => {
+        if (!props.replayOnly) {
+            liveRunStreams().delete(props.streamKey)
+        }
+    }),
+])

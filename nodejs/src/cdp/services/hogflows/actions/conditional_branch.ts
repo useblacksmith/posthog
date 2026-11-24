@@ -1,0 +1,387 @@
+import { DateTime } from 'luxon'
+import { Counter } from 'prom-client'
+
+import { HogFlowAction } from '~/cdp/schema/hogflow'
+import { CohortMembershipRepository } from '~/cdp/services/cohorts/cohort-membership-repository'
+import { CyclotronJobInvocationHogFlow, CyclotronJobInvocationResult, HogFunctionFilters } from '~/cdp/types'
+import { filterFunctionInstrumented } from '~/cdp/utils/hog-function-filtering'
+
+import { loadMissingPersonProperties, personPropertiesInBytecode } from '../hogflow-person-property-usage'
+import { findContinueAction, findNextAction, isEvaluableCondition } from '../hogflow-utils'
+import { ActionHandler, ActionHandlerOptions, ActionHandlerResult } from './action.interface'
+import { calculatedScheduledAt } from './delay'
+
+// A wait parks for its whole max_wait_duration: the subscription matcher wakes it when a matching
+// event, person update or internal event arrives, so nothing has to re-check it on a timer.
+//
+// Increments when a wait's condition only matched once that ceiling arrived. The condition was
+// therefore true earlier and no stream woke the run, so this counts wakes the matcher lost. A
+// condition turning true in the same second as the ceiling is a coincidence, so a sustained
+// non-zero reading names a workflow whose wakes are going missing.
+export const counterHogflowWaitAdvancedAtMaxWait = new Counter({
+    name: 'cdp_hogflow_wait_advanced_at_max_wait',
+    help: 'wait_until_condition that only matched once max_wait_duration elapsed — a wake the streams missed.',
+    labelNames: ['team_id', 'hog_flow_id'],
+})
+
+// A person re-read that failed, so the wait evaluated against the person the dequeue read. Kept as
+// a counter because swallowing the failure is what stops it from ending the wait early, and a
+// sustained non-zero reading means waits are routing on person data that is older than they expect.
+export const counterHogflowWaitPersonRefreshFailed = new Counter({
+    name: 'cdp_hogflow_wait_person_refresh_failed',
+    help: 'wait_until_condition evaluations whose person re-read failed, falling back to the dequeue read.',
+})
+
+// Outcome of a wait_until_condition re-check that ran because a person merge re-keyed the parked job
+// onto the survivor and woke it (scheduled=now). 'advanced' = the merge made the condition match;
+// 'reparked' = it didn't, so waking was wasted churn. A high reparked:advanced ratio means the wake
+// is firing on merges that don't satisfy the wait — signal to narrow when the matcher wakes.
+export const counterHogflowRekeyWake = new Counter({
+    name: 'cdp_hogflow_matcher_rekey_wake_total',
+    help: 'wait_until_condition re-checks triggered by a merge re-key wake, by outcome.',
+    labelNames: ['outcome'],
+})
+
+// Outcome of a wait re-check that ran because the matcher woke a job it could not decide itself.
+// 'advanced' = the worker's fuller globals made the condition match; 'reparked' = they did not, so
+// the wake was wasted. A high reparked:advanced ratio means this path costs more than it recovers.
+export const counterHogflowRecheckWake = new Counter({
+    name: 'cdp_hogflow_matcher_recheck_wake_total',
+    help: 'wait_until_condition re-checks triggered by a wake the matcher could not decide, by outcome.',
+    labelNames: ['outcome'],
+})
+
+// Outcome of a failed cohort membership lookup. 'retried' re-runs the step after a backoff;
+// 'aborted' means every attempt failed and the run stopped. Sustained 'aborted' readings mean the
+// behavioral cohorts DB is unreachable from the workers, and every cohort branch is stopping runs.
+// 'exit_check_skipped' is a cohort trigger's exit check that could not run, so the run carried on.
+export const counterHogflowCohortLookupFailure = new Counter({
+    name: 'cdp_hogflow_cohort_lookup_failure_total',
+    help: 'Cohort membership lookups that failed in a conditional_branch, a wait or a cohort trigger exit check, by outcome.',
+    labelNames: ['outcome'],
+})
+
+// Seconds to wait before each retry. One more attempt than there are delays: the first try runs inline.
+export const COHORT_LOOKUP_RETRY_DELAYS_SECONDS = [10, 60]
+
+export class CohortMembershipLookupFailedError extends Error {
+    constructor(cause: unknown) {
+        super(`Cohort membership lookup failed: ${String(cause)}`, { cause })
+        this.name = 'CohortMembershipLookupFailedError'
+    }
+}
+
+export class ConditionalBranchHandler implements ActionHandler {
+    constructor(private cohortMembershipRepository: CohortMembershipRepository) {}
+
+    async execute({
+        invocation,
+        action,
+        result,
+    }: ActionHandlerOptions<
+        Extract<HogFlowAction, { type: 'conditional_branch' | 'wait_until_condition' }>
+    >): Promise<ActionHandlerResult> {
+        // The subscription matcher sets rekeyWake when it re-keyed this parked wait onto a merge
+        // survivor and woke it (scheduled=now). Consume it here (one-shot) and attribute this
+        // re-check's outcome to the re-key below, so the wasted-re-park churn from waking is observable.
+        const rekeyWoken = action.type === 'wait_until_condition' && invocation.state?.currentAction?.rekeyWake === true
+        if (rekeyWoken && invocation.state.currentAction) {
+            invocation.state.currentAction.rekeyWake = false
+        }
+
+        // Same for a first-mapping anchor fill: a matcher wake that also carries no eventMatched.
+        const anchorWoken =
+            action.type === 'wait_until_condition' && invocation.state?.currentAction?.anchorWake === true
+        if (anchorWoken && invocation.state.currentAction) {
+            invocation.state.currentAction.anchorWake = false
+        }
+
+        // Same again for a wake the matcher could not decide: the evaluation below is the decision.
+        const recheckWoken =
+            action.type === 'wait_until_condition' && invocation.state?.currentAction?.recheckWake === true
+        if (recheckWoken && invocation.state.currentAction) {
+            invocation.state.currentAction.recheckWake = false
+        }
+
+        // The subscription matcher sets eventMatched when an incoming event matched this
+        // step's wait condition. Honor it as a forced match and advance immediately,
+        // rather than re-evaluating the stored condition against the original event.
+        if (action.type === 'wait_until_condition' && invocation.state?.currentAction?.eventMatched === true) {
+            invocation.state.currentAction.eventMatched = false
+            invocation.state.currentAction.eventMatchedEvent = undefined
+            invocation.state.currentAction.eventMatchedEventUuid = undefined
+            return {
+                nextAction: findNextAction(invocation.hogFlow, action.id, 0),
+                result: { eventMatched: true },
+            }
+        }
+
+        // The person the worker read at dequeue can predate a write this wait is waiting for, and a
+        // wait that parks on that read is stuck: the write already happened, so no person message
+        // follows to wake it. Re-read before every evaluation of a wait: on entry, and on each
+        // matcher wake, where the person the wake refers to is the point of the re-check.
+        if (action.type === 'wait_until_condition') {
+            const refreshed = await invocation.refreshPerson?.().catch(() => {
+                // A read that throws keeps the dequeue's person as well. Letting it reach the
+                // executor's error handling would follow the continue edge, which for a wait is the
+                // timeout edge, so one failed read would end a multi-day wait early.
+                counterHogflowWaitPersonRefreshFailed.inc()
+                return undefined
+            })
+            // A refresh that finds no person keeps the dequeue's read. The refresh exists to make a
+            // just-written property visible, not to drop a person: a lookup that comes back empty
+            // (replica lag, a transient miss) would otherwise evaluate the condition against nothing.
+            if (refreshed?.person) {
+                invocation.person = refreshed.person
+                invocation.filterGlobals = refreshed.filterGlobals
+                // The result carries a shallow clone, so rebinding only `invocation` would leave it
+                // pointing at the pre-refresh globals for anything that reads it later.
+                result.invocation.person = refreshed.person
+                result.invocation.filterGlobals = refreshed.filterGlobals
+            }
+        }
+
+        if (action.type === 'conditional_branch') {
+            await loadMissingPersonProperties(invocation, result, () =>
+                action.config.conditions.flatMap((condition) =>
+                    personPropertiesInBytecode((condition.filters as HogFunctionFilters | null | undefined)?.bytecode)
+                )
+            )
+        }
+
+        const conditionalAction: Extract<HogFlowAction, { type: 'conditional_branch' }> =
+            action.type === 'conditional_branch'
+                ? action
+                : {
+                      ...action,
+                      type: 'conditional_branch',
+                      config: {
+                          // An empty condition compiles to always-true bytecode, which would match on
+                          // entry and fire the wait immediately. Only honor a condition with a real
+                          // compiled filter; otherwise the wait relies on its events / the timeout.
+                          conditions: isEvaluableCondition(action.config.condition) ? [action.config.condition] : [],
+                      },
+                  }
+
+        let conditionResult: Awaited<ReturnType<typeof checkConditions>>
+        try {
+            conditionResult = await checkConditions(
+                invocation,
+                conditionalAction,
+                this.createMemberCohortIdsLoader(invocation),
+                action.type === 'wait_until_condition' && action.config.max_wait_duration
+                    ? { maxWaitDuration: action.config.max_wait_duration }
+                    : undefined
+            )
+        } catch (error) {
+            if (error instanceof CohortMembershipLookupFailedError) {
+                return retryOrFailCohortLookup(invocation, result, error)
+            }
+            throw error
+        }
+        if (invocation.state.currentAction) {
+            delete invocation.state.currentAction.cohortLookupAttempts
+            delete invocation.state.currentAction.cohortLookupFailed
+        }
+
+        const isWait = action.type === 'wait_until_condition'
+
+        if (conditionResult.scheduledAt) {
+            if (rekeyWoken) {
+                counterHogflowRekeyWake.labels('reparked').inc()
+            }
+            if (recheckWoken) {
+                counterHogflowRecheckWake.labels('reparked').inc()
+            }
+            return { scheduledAt: conditionResult.scheduledAt, result: toStepResult(conditionResult) }
+        } else if (conditionResult.nextAction) {
+            if (isWait && !rekeyWoken && !anchorWoken && !recheckWoken && matchedAtMaxWait(invocation, action)) {
+                counterHogflowWaitAdvancedAtMaxWait
+                    .labels({ team_id: invocation.hogFlow.team_id, hog_flow_id: invocation.hogFlow.id })
+                    .inc()
+            }
+            if (rekeyWoken) {
+                counterHogflowRekeyWake.labels('advanced').inc()
+            }
+            if (recheckWoken) {
+                counterHogflowRecheckWake.labels('advanced').inc()
+            }
+            return { nextAction: conditionResult.nextAction, result: toStepResult(conditionResult) }
+        }
+
+        return { nextAction: findContinueAction(invocation), result: toStepResult(conditionResult) }
+    }
+
+    /**
+     * Memoized so one lookup covers every cohort condition in the action. Person-less
+     * invocations (warehouse rows, account audiences) are non-members of everything.
+     */
+    private createMemberCohortIdsLoader(invocation: CyclotronJobInvocationHogFlow): () => Promise<number[]> {
+        let loaded: Promise<number[]> | undefined
+        return () => {
+            if (!loaded) {
+                const personUuid = invocation.person?.id ?? invocation.state.personId
+                loaded = personUuid
+                    ? this.cohortMembershipRepository
+                          .getMemberCohortIds(invocation.hogFlow.team_id, personUuid)
+                          .catch((error) => {
+                              throw new CohortMembershipLookupFailedError(error)
+                          })
+                    : Promise.resolve([])
+            }
+            return loaded
+        }
+    }
+}
+
+// A failed lookup must not route the person: no answer is not the same as "not a member". The step
+// re-runs after a backoff, and once the attempts run out it marks cohortLookupFailed and rethrows, so
+// the executor aborts the run instead of following on_error's default continue edge.
+function retryOrFailCohortLookup(
+    invocation: CyclotronJobInvocationHogFlow,
+    result: CyclotronJobInvocationResult<CyclotronJobInvocationHogFlow>,
+    error: CohortMembershipLookupFailedError
+): ActionHandlerResult {
+    const currentAction = invocation.state.currentAction
+    const failedAttempts = (currentAction?.cohortLookupAttempts ?? 0) + 1
+    const retryDelaySeconds = COHORT_LOOKUP_RETRY_DELAYS_SECONDS[failedAttempts - 1]
+
+    if (currentAction && retryDelaySeconds !== undefined) {
+        currentAction.cohortLookupAttempts = failedAttempts
+        counterHogflowCohortLookupFailure.labels('retried').inc()
+        result.logs.push({
+            level: 'warn',
+            timestamp: DateTime.now(),
+            message: `Could not look up cohort membership (${String(error.cause)}). Retrying in ${retryDelaySeconds}s`,
+        })
+        return { scheduledAt: DateTime.now().plus({ seconds: retryDelaySeconds }) }
+    }
+
+    if (currentAction) {
+        currentAction.cohortLookupFailed = true
+    }
+    counterHogflowCohortLookupFailure.labels('aborted').inc()
+    throw error
+}
+
+// Operation.CALL_GLOBAL from @posthog/hogvm, which is a const enum and can't be imported
+// under isolatedModules
+const CALL_GLOBAL = 2
+
+// Scans the compiled bytecode so expression-authored inCohort(...) calls count too. Matches the
+// call encoding [CALL_GLOBAL, name, argCount] rather than the bare name: string constants and
+// property chains put their text in the same flat array, and a stray match here would couple an
+// unrelated condition's run to the behavioral cohorts DB.
+function conditionReferencesCohorts(condition: { filters?: unknown }): boolean {
+    const bytecode = (condition.filters as HogFunctionFilters | null | undefined)?.bytecode
+    if (!Array.isArray(bytecode)) {
+        return false
+    }
+    return bytecode.some(
+        (op, index) =>
+            (op === 'inCohort' || op === 'notInCohort') &&
+            bytecode[index - 1] === CALL_GLOBAL &&
+            typeof bytecode[index + 1] === 'number'
+    )
+}
+
+// True when this wait is being evaluated at or past the max_wait_duration it parked against.
+// calculatedScheduledAt returns null once that instant has passed, which is the same test the
+// timeout path uses. A wait that never parked, or that parked against a ceiling the flow has since
+// changed, reads false: neither is a wake the streams missed.
+function matchedAtMaxWait(
+    invocation: CyclotronJobInvocationHogFlow,
+    action: Extract<HogFlowAction, { type: 'conditional_branch' | 'wait_until_condition' }>
+): boolean {
+    const startedAtTimestamp = invocation.state.currentAction?.startedAtTimestamp
+    const maxWait = action.type === 'wait_until_condition' ? action.config.max_wait_duration : undefined
+    if (!startedAtTimestamp || !maxWait) {
+        return false
+    }
+    if (invocation.state.currentAction?.parkedMaxWaitDuration !== maxWait) {
+        return false
+    }
+    try {
+        return calculatedScheduledAt(maxWait, startedAtTimestamp) === null
+    } catch {
+        // An unreadable duration is the timeout path's problem, not this counter's.
+        return false
+    }
+}
+
+// The step result reaches the test run's `execResult` and output variables. The next action carries decrypted
+// secret inputs, so the result keeps only its id, at the path that existing output variable mappings read.
+function toStepResult(conditionResult: Awaited<ReturnType<typeof checkConditions>>): {
+    conditionResult: { nextAction?: { id: string }; scheduledAt?: DateTime }
+} {
+    const { nextAction, scheduledAt } = conditionResult
+    return {
+        conditionResult: {
+            nextAction: nextAction ? { id: nextAction.id } : undefined,
+            scheduledAt,
+        },
+    }
+}
+
+export async function checkConditions(
+    invocation: CyclotronJobInvocationHogFlow,
+    action: Extract<HogFlowAction, { type: 'conditional_branch' }>,
+    loadMemberCohortIds?: () => Promise<number[]>,
+    // Only a wait re-parks, for its whole ceiling; a conditional_branch routes on the spot. A wait is
+    // normalised into a branch before it gets here, so the caller passes its ceiling rather than the
+    // type carrying it.
+    repark?: { maxWaitDuration: string }
+): Promise<{
+    scheduledAt?: DateTime
+    nextAction?: HogFlowAction
+}> {
+    // the index is used to find the right edge
+    for (const [index, condition] of action.config.conditions.entries()) {
+        // Loaded only when evaluation actually reaches a cohort condition, so a run whose earlier
+        // condition matches never touches the behavioral cohorts DB. A lookup failure throws here
+        // on purpose, and the handler retries and then aborts instead of guessing non-membership; the
+        // inCohort/notInCohort STL functions read the resulting cohort_ids global. The matcher does
+        // not watch cohort membership, so a wait gated on a cohort advances at its deadline.
+        const cohortGlobals =
+            loadMemberCohortIds && conditionReferencesCohorts(condition)
+                ? { cohort_ids: await loadMemberCohortIds() }
+                : {}
+
+        // TODO(team-workflows): Figure out error handling here - do we throw or just move on to other conditions?
+        const filterResults = await filterFunctionInstrumented({
+            caller: 'hogflow_conditional_branch',
+            fn: invocation.hogFlow,
+            filters: condition.filters,
+            filterGlobals: {
+                ...invocation.filterGlobals,
+                variables: invocation.state.variables,
+                ...cohortGlobals,
+            },
+        })
+
+        if (filterResults.match) {
+            return {
+                nextAction: findNextAction(invocation.hogFlow, action.id, index),
+            }
+        }
+    }
+
+    if (repark) {
+        // Park to the ceiling rather than a re-check interval: the matcher wakes the job when
+        // something relevant changes, so the deadline is the only timer left.
+        const scheduledAt = calculatedScheduledAt(
+            repark.maxWaitDuration,
+            invocation.state.currentAction?.startedAtTimestamp
+        )
+
+        if (scheduledAt) {
+            if (invocation.state.currentAction) {
+                invocation.state.currentAction.parkedMaxWaitDuration = repark.maxWaitDuration
+            }
+            return {
+                scheduledAt,
+            }
+        }
+    }
+    return {}
+}

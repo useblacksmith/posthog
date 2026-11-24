@@ -1,0 +1,580 @@
+# MCP tool definitions. Tools are opt-in: an operation is exposed only when it has an entry here.
+# List operations without an entry: pnpm --filter=@posthog/mcp run scaffold-yaml -- --candidates --product logs
+# Add one: pnpm --filter=@posthog/mcp run scaffold-yaml -- --add <operationId> --product logs
+# To keep an operation off on purpose, set enabled: false and give a disabled_reason.
+category: Logs
+feature: logs
+url_prefix: /logs
+ui_apps: {}
+tools:
+    logs-alerts-create:
+        operation: logs_alerts_create
+        enabled: true
+        scopes:
+            - logs:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: false
+        title: Create log alert
+        description: >
+            Create a threshold-based alert on log streams. The alert periodically counts log entries matching the given
+            filters and fires when the count crosses the threshold. Maximum 20 alerts per project.
+        exclude_params:
+            - id
+            - state
+            - check_interval_minutes
+            - next_check_at
+            - last_notified_at
+            - last_checked_at
+            - consecutive_failures
+            - created_at
+            - created_by
+            - updated_at
+        response:
+            include:
+                - id
+                - name
+                - enabled
+                - state
+                - filters
+                - threshold_count
+                - threshold_operator
+                - window_minutes
+                - check_interval_minutes
+                - evaluation_periods
+                - datapoints_to_alarm
+                - cooldown_minutes
+                - schedule_restriction
+                - snooze_until
+                - grouping
+                - labels
+                - annotations
+                - platform_owned
+                - next_check_at
+                - last_notified_at
+                - last_checked_at
+                - consecutive_failures
+                - last_error_message
+                - created_at
+                - updated_at
+    logs-alerts-destinations-create:
+        operation: logs_alerts_destinations_create
+        enabled: true
+        scopes:
+            - logs:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: false
+        title: Attach alert destination
+        description: >
+            Attach a Slack, webhook, Microsoft Teams, or PagerDuty notification destination to a log alert. Without a
+            destination an alert evaluates silently and never notifies. One HogFunction is created per event kind
+            (firing, resolved, broken, errored) atomically. A PagerDuty destination gets the incident opened and
+            incident closed kinds instead. They follow every start and end of a firing, cooldown included, so each
+            incident it opens is resolved. The returned id identifies the destination; pass it to
+            logs-alerts-destinations-delete-create to remove it. When id is null, use hog_function_ids instead.
+        param_overrides:
+            type:
+                description: >
+                    Destination type. Use slack, webhook, teams, or pagerduty. Slack requires slack_workspace_id and
+                    slack_channel_id. Webhook and teams require webhook_url. PagerDuty requires pagerduty_routing_key.
+            slack_workspace_id:
+                description: Slack workspace integration ID. Required when type is slack.
+            slack_channel_id:
+                description: Slack channel ID. Required when type is slack.
+            slack_channel_name:
+                description: Optional Slack channel name used for display.
+            webhook_url:
+                description: Required when type is webhook or teams.
+            pagerduty_routing_key:
+                description: >
+                    The 32-character integration key of an Events API v2 integration on the PagerDuty service. Required
+                    when type is pagerduty.
+            pagerduty_severity:
+                description: Incident severity for PagerDuty. One of critical, error, warning, info. Defaults to critical.
+            pagerduty_region:
+                description: PagerDuty service region, us or eu. Defaults to us.
+        response:
+            include:
+                - id
+                - hog_function_ids
+    logs-alerts-destinations-delete-create:
+        operation: logs_alerts_destinations_delete_create
+        enabled: true
+        scopes:
+            - logs:write
+        annotations:
+            readOnly: false
+            destructive: true
+            idempotent: true
+        title: Detach alert destination
+        description: >
+            Remove a notification destination from a log alert. Pass the id that logs-alerts-destinations-create
+            returned, or the destination's id from the alert's destinations list, in destination_ids. When that id is
+            null, pass the destination's hog_function_ids instead. A destination is deleted as one atomic group —
+            partial deletion fails the call.
+    logs-alerts-destroy:
+        operation: logs_alerts_destroy
+        enabled: true
+        scopes:
+            - logs:write
+        annotations:
+            readOnly: false
+            destructive: true
+            idempotent: true
+        title: Delete log alert
+        description: |
+            Permanently delete a log alert configuration by ID.
+    logs-alerts-events-list:
+        operation: logs_alerts_events_list
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        list: true
+        title: List alert events
+        description: >
+            List historical events for a log alert — fires, resolves, errors, enable/disable toggles, threshold changes.
+            Use to evaluate how an existing alert has behaved (firing cadence, error rate, flap pattern) before tuning
+            thresholds. Quiet no-op check rows are filtered out server-side. Optional `kind` query param narrows to a
+            single event kind.
+        response:
+            include:
+                - id
+                - created_at
+                - kind
+                - state_before
+                - state_after
+                - threshold_breached
+                - result_count
+                - error_message
+                - query_duration_ms
+    logs-alerts-list:
+        operation: logs_alerts_list
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        list: true
+        title: List log alerts
+        description: >
+            List log alert configurations in the current project, newest first. Returns alert name, state, threshold,
+            filters, and scheduling details. Use this to review existing alerts before creating or modifying them.
+        response:
+            include:
+                - id
+                - name
+                - enabled
+                - state
+                - threshold_count
+                - threshold_operator
+                - window_minutes
+                - schedule_restriction
+                - grouping
+                - labels
+                - annotations
+                - platform_owned
+                - created_at
+                - updated_at
+    logs-alerts-partial-update:
+        operation: logs_alerts_partial_update
+        enabled: true
+        scopes:
+            - logs:write
+        annotations:
+            readOnly: false
+            destructive: false
+            idempotent: true
+        title: Update log alert
+        description: >
+            Update a log alert configuration by ID. Only the fields you provide are changed. Use this to adjust
+            thresholds, filters, quiet hours, enable/disable alerts, or snooze them.
+        exclude_params:
+            - id
+            - state
+            - check_interval_minutes
+            - next_check_at
+            - last_notified_at
+            - last_checked_at
+            - consecutive_failures
+            - created_at
+            - created_by
+            - updated_at
+        response:
+            include:
+                - id
+                - name
+                - enabled
+                - state
+                - filters
+                - threshold_count
+                - threshold_operator
+                - window_minutes
+                - check_interval_minutes
+                - evaluation_periods
+                - datapoints_to_alarm
+                - cooldown_minutes
+                - schedule_restriction
+                - snooze_until
+                - grouping
+                - labels
+                - annotations
+                - platform_owned
+                - next_check_at
+                - last_notified_at
+                - last_checked_at
+                - consecutive_failures
+                - last_error_message
+                - created_at
+                - updated_at
+    logs-alerts-retrieve:
+        operation: logs_alerts_retrieve
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Get log alert
+        description: >
+            Get a log alert configuration by ID. Returns full details including current state, threshold settings,
+            filters, and scheduling information.
+        response:
+            include:
+                - id
+                - name
+                - enabled
+                - state
+                - filters
+                - threshold_count
+                - threshold_operator
+                - window_minutes
+                - check_interval_minutes
+                - evaluation_periods
+                - datapoints_to_alarm
+                - cooldown_minutes
+                - schedule_restriction
+                - snooze_until
+                - grouping
+                - labels
+                - annotations
+                - platform_owned
+                - next_check_at
+                - last_notified_at
+                - last_checked_at
+                - consecutive_failures
+                - last_error_message
+                - created_at
+                - updated_at
+    logs-alerts-simulate-create:
+        operation: logs_alerts_simulate_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Simulate log alert
+        description: >
+            Run a draft alert configuration against historical logs and return per-bucket results from the full state
+            machine — count, threshold_breached, state, notification (none/fire/resolve), reason. Use to validate
+            threshold + N-of-M settings before creating an alert. Read-only; no alert records are written. Aim for
+            fire_count between 0 and 3 over a `-7d` lookback for a healthy threshold.
+        response:
+            include:
+                - buckets
+                - fire_count
+                - resolve_count
+                - total_buckets
+                - threshold_count
+                - threshold_operator
+    logs-anomalies-scan:
+        operation: logs_anomalies_scan_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Scan a service's logs for volume anomalies
+        description: >
+            Run anomaly detection on demand over one service's log volume for a time window of up to 7 days. Learns
+            per-severity baselines from up to 6 weeks of history and returns spike, drop, and silence issues plus
+            per-severity learning status. Requires a serviceName (use logs-services-create or the resource attribute
+            values tool to discover services). Experimental; synchronous and read only, so prefer windows of a few hours
+            to a day. Per-bucket band evidence is omitted from the tool response to save tokens; the API endpoint
+            returns it for charts.
+        feature_flag: logs-anomalies
+        response:
+            exclude:
+                - series.*.buckets
+    logs-anomalies-series-bands:
+        operation: logs_anomalies_series_bands_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Per-series log volume with expected bands
+        description: >
+            Return log volume for every (namespace, environment, severity) series of one service, each with an expected
+            band learned from the same time of week over the previous weeks of the volume rollup. This is the data
+            behind the Anomalies tab in the logs UI. A bucket whose observed count sits above upper or below lower fell
+            outside the expected range. Ranges target 99% coverage of individual buckets, so an out-of-range bucket is a
+            reason to investigate, not a confirmed incident. lower and upper are null while a series is still learning.
+            band_ready_at gives the earliest end of a rolling window of the same length with enough earlier history.
+            Waiting does not add earlier history to a fixed historical window; select a more recent window instead. Omit
+            intervalMinutes and the grain is picked from the window (7 days gives 60 minutes, 1 day gives 15); pass 5,
+            15, 30 or 60 to choose. A series too sparse or too quiet for the requested grain comes back coarser, with
+            its own interval_minutes and a coarsened_reason. Requires a serviceName (use logs-services-create or the
+            resource attribute values tool to discover services). The window defaults to the last 7 days, may span at
+            most 7 days, and may start at most 35 days ago. Synchronous and read only.
+        feature_flag: logs-anomalies
+    logs-attribute-values-list:
+        operation: logs_values_retrieve
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: List log attribute values
+        description: >
+            List values for a specific log attribute key. Use to discover what values exist before building filters.
+            Defaults to attribute_type "log" (log-level attributes). To get values for resource-level attributes (e.g.
+            service.name, k8s.pod.name), you MUST explicitly pass attribute_type: "resource". Accepts optional
+            serviceNames, dateRange, and filterGroup to narrow which logs are scanned. Pass the dateRange of the window
+            you are investigating, because the default is the last hour. To match part of a value, pass it in `value`.
+            The tool ignores other keys, such as `search`.
+        hooks: logs/redactCredentialsHooks
+        response:
+            include:
+                - results
+    logs-attributes-list:
+        operation: logs_attributes_retrieve
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: List log attributes
+        description: >
+            List available log attribute names for filtering. Defaults to attribute_type "log" (log-level attributes).
+            To search resource-level attributes (e.g. k8s.pod.name, k8s.namespace.name), you MUST explicitly pass
+            attribute_type: "resource" — it will NOT return resource attributes unless you do. Accepts optional
+            serviceNames, dateRange, and filterGroup to narrow which logs are scanned.
+        exclude_params:
+            - date_from
+            - date_to
+        response:
+            include:
+                - results
+                - count
+    logs-context:
+        operation: logs_context_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Logs around a log line, trace or run
+        description_file: ./prompts/logs-context.md
+        hooks: logs/redactCredentialsHooks
+        feature_flag: logs-agent-tools
+    logs-count:
+        operation: logs_count_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Count logs
+        description_file: ./prompts/logs-count.md
+        response:
+            include:
+                - count
+    logs-count-ranges:
+        operation: logs_count_ranges_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Count logs by time bucket
+        description_file: ./prompts/logs-count-ranges.md
+        response:
+            include:
+                - ranges
+                - interval
+    logs-facet-values-create:
+        operation: logs_facet_values_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Facet log counts
+        description_file: ./prompts/logs-facet-values.md
+        hooks: logs/redactCredentialsHooks
+        response:
+            include:
+                - results
+    logs-group-by:
+        operation: logs_group_by_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Group logs by attributes
+        description_file: ./prompts/logs-group-by.md
+        hooks: logs/groupByRedactionHooks
+        response:
+            exclude:
+                - groups.*.value
+    logs-impact:
+        operation: logs_impact_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Count sessions and users affected by logs
+        description: >
+            Estimate how many sessions and users the logs matching a filter set touch. Use it when the user asks who an
+            error or log pattern affects, or how widespread it is.
+
+
+            Takes the same filters as `logs-count`, inside `query`, and defaults to the last hour:
+
+
+            ```json
+
+            { "query": { "serviceNames": ["api"], "dateRange": { "date_from": "-1h" } } }
+
+            ```
+
+
+            Returns the matching log total, unique `sessions` and `users` (HyperLogLog estimates), how many logs carry
+            each ID, and the top 5 session IDs and distinct IDs by log count. `sessionGroupKey` and `personGroupKey`
+            name the attribute that holds each ID: pass it to `logs-group-by` for the full breakdown.
+
+
+            Low `logsWithSessionId` or `logsWithDistinctId` means the service does not log those IDs, not that no one is
+            affected.
+        hooks: logs/redactCredentialsHooks
+    logs-patterns:
+        operation: logs_patterns_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Mine log patterns
+        description_file: ./prompts/logs-patterns.md
+        hooks: logs/redactCredentialsHooks
+        response:
+            exclude:
+                - patterns.*.examples
+                - patterns.*.sparkline
+                - patterns.*.count
+                - patterns.*.error_count
+                - sparkline_buckets
+    logs-patterns-diff:
+        operation: logs_patterns_diff_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Diff log patterns between two windows
+        description_file: ./prompts/logs-patterns-diff.md
+        hooks: logs/redactCredentialsHooks
+        response:
+            exclude:
+                - entries.*.pattern.pattern
+                - entries.*.pattern.services
+                - entries.*.pattern.examples
+                - entries.*.pattern.sparkline
+                - entries.*.pattern.count
+                - entries.*.pattern.error_count
+    logs-services-create:
+        operation: logs_services_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: List services with health status
+        description_file: ./prompts/logs-services.md
+        response:
+            include:
+                - services
+                - sparkline
+                - window
+                - summary
+                - next
+    logs-sparkline-query:
+        operation: logs_sparkline_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Query logs sparkline
+        description_file: ./prompts/logs-sparkline.md
+    query-logs:
+        operation: logs_query_create
+        enabled: true
+        scopes:
+            - logs:read
+        annotations:
+            readOnly: true
+            destructive: false
+            idempotent: true
+        title: Query logs
+        description_file: ./prompts/query-logs.md
+        system_prompt_hint: Log filtering by severity/service/attribute
+        exclude_params:
+            - trigger
+        hooks: logs/redactCredentialsHooks
+        response:
+            include:
+                - results
+                - columns

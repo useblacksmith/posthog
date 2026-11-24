@@ -1,0 +1,371 @@
+import time
+import datetime as dt
+
+import pytest
+import time_machine
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from django.conf import settings
+
+from temporalio.worker import ExecuteActivityInput, ExecuteWorkflowInput, StartActivityInput, WorkflowInboundInterceptor
+
+from posthog.temporal.common.interceptor import is_task_queue_supported
+from posthog.temporal.common.liveness_tracker import (
+    LivenessInterceptor,
+    LivenessTracker,
+    RunningActivity,
+    _LivenessActivityInboundInterceptor,
+    _LivenessWorkflowInterceptor,
+    _LivenessWorkflowOutboundInterceptor,
+    get_liveness_tracker,
+)
+
+
+class TestLivenessTracker:
+    def test_initialization(self):
+        """Test that tracker initializes with current time."""
+
+        tracker = LivenessTracker()
+        current_time = time.time()
+
+        # Should be initialized to approximately now
+        assert abs(tracker.get_last_execution_time() - current_time) < 1.0
+
+    def test_record_activity_execution(self):
+        """Test recording activity execution updates timestamp."""
+
+        with time_machine.travel(dt.datetime(2026, 1, 1, tzinfo=dt.UTC), tick=False) as traveller:
+            tracker = LivenessTracker()
+            initial_time = tracker.get_last_execution_time()
+
+            traveller.shift(1)
+            tracker.record_activity_execution()
+
+        assert tracker.get_last_execution_time() > initial_time
+
+    def test_record_workflow_execution(self):
+        """Test recording workflow execution updates timestamp."""
+
+        with time_machine.travel(dt.datetime(2026, 1, 1, tzinfo=dt.UTC), tick=False) as traveller:
+            tracker = LivenessTracker()
+            initial_time = tracker.get_last_execution_time()
+
+            traveller.shift(1)
+            tracker.record_workflow_execution()
+
+        assert tracker.get_last_execution_time() > initial_time
+
+    def test_record_heartbeat(self):
+        """Test recording heartbeat updates timestamp."""
+
+        with time_machine.travel(dt.datetime(2026, 1, 1, tzinfo=dt.UTC), tick=False) as traveller:
+            tracker = LivenessTracker()
+            initial_time = tracker.get_last_execution_time()
+
+            traveller.shift(1)
+            tracker.record_heartbeat()
+
+        assert tracker.get_last_execution_time() > initial_time
+
+    def test_get_last_execution_time_returns_most_recent(self):
+        """Test that get_last_execution_time returns the most recent timestamp."""
+
+        tracker = LivenessTracker()
+
+        # Set activity to 2 seconds ago
+        tracker._last_activity_time = time.time() - 2.0
+        # Set workflow to 1 second ago
+        tracker._last_workflow_time = time.time() - 1.0
+
+        # Should return workflow time (most recent)
+        last_time = tracker.get_last_execution_time()
+        idle = time.time() - last_time
+        assert 0.9 <= idle <= 1.1  # Should be about 1 second ago
+
+    def test_is_healthy_when_within_threshold(self):
+        """Test that tracker is healthy when execution is recent."""
+
+        tracker = LivenessTracker()
+        tracker.record_activity_execution()
+
+        assert tracker.is_healthy(max_idle_seconds=10.0) is True
+
+    def test_is_unhealthy_when_exceeds_threshold(self):
+        """Test that tracker is unhealthy when idle exceeds threshold."""
+
+        tracker = LivenessTracker()
+        tracker._last_activity_time = time.time() - 11.0
+        tracker._last_workflow_time = time.time() - 11.0
+
+        assert tracker.is_healthy(max_idle_seconds=10.0) is False
+
+    def test_get_idle_time(self):
+        """Test that idle time is calculated correctly."""
+
+        tracker = LivenessTracker()
+        tracker._last_activity_time = time.time() - 5.0
+        tracker._last_workflow_time = time.time() - 5.0
+
+        idle_time = tracker.get_idle_time()
+        assert 4.9 <= idle_time <= 5.1  # Should be about 5 seconds
+
+    def test_thread_safety(self):
+        """Test that tracker is thread-safe under concurrent access."""
+
+        import threading
+
+        tracker = LivenessTracker()
+        results = []
+
+        def record_activity():
+            for _ in range(100):
+                tracker.record_activity_execution()
+
+        def record_workflow():
+            for _ in range(100):
+                tracker.record_workflow_execution()
+
+        def record_heartbeat():
+            for _ in range(100):
+                tracker.record_heartbeat()
+
+        def check_health():
+            for _ in range(100):
+                results.append(tracker.is_healthy(10.0))
+
+        # Run multiple threads concurrently
+        threads = [
+            threading.Thread(target=record_activity),
+            threading.Thread(target=record_workflow),
+            threading.Thread(target=record_heartbeat),
+            threading.Thread(target=check_health),
+        ]
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Should not crash and should have recorded something
+        assert tracker.get_idle_time() < 1.0
+        assert len(results) == 100
+
+    def test_get_liveness_tracker_returns_singleton(self):
+        """Test that get_liveness_tracker returns the same instance."""
+
+        tracker1 = get_liveness_tracker()
+        tracker2 = get_liveness_tracker()
+
+        assert tracker1 is tracker2
+
+
+@pytest.mark.parametrize(
+    "task_queue",
+    (
+        settings.DATA_WAREHOUSE_TASK_QUEUE,
+        settings.MAX_AI_TASK_QUEUE,
+        settings.TASKS_TASK_QUEUE,
+        settings.SESSION_REPLAY_TASK_QUEUE,
+        settings.BATCH_EXPORTS_TASK_QUEUE,
+        settings.GENERAL_PURPOSE_TASK_QUEUE,
+        "a-queue-that-does-not-exist-yet",
+    ),
+)
+def test_liveness_interceptor_covers_every_task_queue(task_queue):
+    # Narrowing this back to an allowlist leaves the omitted queue's tracker unfed, so
+    # /healthz reports process uptime and k8s reaps every replica at max_idle_seconds.
+    assert is_task_queue_supported(task_queue, LivenessInterceptor) is True
+
+
+@pytest.mark.asyncio
+class TestLivenessActivityInboundInterceptor:
+    async def test_records_execution_on_success(self):
+        """Test that activity execution is recorded on success."""
+
+        tracker = LivenessTracker()
+        tracker._last_activity_time = time.time() - 10.0
+
+        # Create mock next interceptor
+        next_interceptor = AsyncMock()
+        next_interceptor.execute_activity.return_value = "result"
+
+        interceptor = _LivenessActivityInboundInterceptor(next_interceptor)
+        interceptor._tracker = tracker
+
+        # Create mock input
+        mock_input = MagicMock(spec=ExecuteActivityInput)
+
+        # Execute
+        result = await interceptor.execute_activity(mock_input)
+
+        # Should have called next interceptor
+        next_interceptor.execute_activity.assert_called_once_with(mock_input)
+
+        # Should have recorded execution
+        assert tracker.get_idle_time() < 1.0
+
+        # Should return result
+        assert result == "result"
+
+    async def test_records_execution_on_failure(self):
+        """Test that activity execution is recorded even on failure."""
+
+        tracker = LivenessTracker()
+        tracker._last_activity_time = time.time() - 10.0
+
+        # Create mock next interceptor that raises
+        next_interceptor = AsyncMock()
+        next_interceptor.execute_activity.side_effect = ValueError("test error")
+
+        interceptor = _LivenessActivityInboundInterceptor(next_interceptor)
+        interceptor._tracker = tracker
+
+        # Create mock input
+        mock_input = MagicMock(spec=ExecuteActivityInput)
+
+        # Execute and expect exception
+        with pytest.raises(ValueError, match="test error"):
+            await interceptor.execute_activity(mock_input)
+
+        # Should still have recorded execution
+        assert tracker.get_idle_time() < 1.0
+
+    @pytest.mark.parametrize("fails", [False, True])
+    async def test_lists_activity_only_while_it_runs(self, fails):
+        tracker = LivenessTracker()
+        seen_while_running: list[list[RunningActivity]] = []
+
+        async def execute(_input):
+            seen_while_running.append(tracker.get_running_activities())
+            if fails:
+                raise ValueError("test error")
+            return "result"
+
+        next_interceptor = AsyncMock()
+        next_interceptor.execute_activity.side_effect = execute
+        interceptor = _LivenessActivityInboundInterceptor(next_interceptor)
+        interceptor._tracker = tracker
+
+        info = MagicMock(activity_type="import_data_activity_sync", workflow_type="external-data-job")
+        info.workflow_id = "wf-1"
+        info.attempt = 3
+        with (
+            patch("posthog.temporal.common.liveness_tracker.activity.in_activity", return_value=True),
+            patch("posthog.temporal.common.liveness_tracker.activity.info", return_value=info),
+        ):
+            if fails:
+                with pytest.raises(ValueError):
+                    await interceptor.execute_activity(MagicMock(spec=ExecuteActivityInput))
+            else:
+                await interceptor.execute_activity(MagicMock(spec=ExecuteActivityInput))
+
+        [running] = seen_while_running[0]
+        assert (running.activity_type, running.workflow_type, running.workflow_id, running.attempt) == (
+            "import_data_activity_sync",
+            "external-data-job",
+            "wf-1",
+            3,
+        )
+        assert tracker.get_running_activities() == []
+
+    async def test_records_each_heartbeat_of_the_running_activity(self):
+        tracker = LivenessTracker()
+        heartbeats_seen: list[tuple[float | None, float]] = []
+        outbound = MagicMock()
+        next_interceptor = AsyncMock()
+        next_interceptor.init = MagicMock(side_effect=lambda wrapped: setattr(next_interceptor, "outbound", wrapped))
+
+        async def execute(_input):
+            with time_machine.travel(dt.datetime(2026, 1, 1, 0, 5, tzinfo=dt.UTC), tick=False):
+                next_interceptor.outbound.heartbeat("details")
+                [running] = tracker.get_running_activities()
+                heartbeats_seen.append((running.last_heartbeat_at, running.max_heartbeat_gap))
+
+        next_interceptor.execute_activity.side_effect = execute
+        interceptor = _LivenessActivityInboundInterceptor(next_interceptor)
+        interceptor._tracker = tracker
+        interceptor.init(outbound)
+
+        info = MagicMock(activity_type="cdc_extract_activity", workflow_type="cdc-extraction", is_local=False)
+        info.heartbeat_timeout = dt.timedelta(minutes=10)
+        with (
+            time_machine.travel(dt.datetime(2026, 1, 1, tzinfo=dt.UTC), tick=False),
+            patch("posthog.temporal.common.liveness_tracker.activity.in_activity", return_value=True),
+            patch("posthog.temporal.common.liveness_tracker.activity.info", return_value=info),
+        ):
+            await interceptor.execute_activity(MagicMock(spec=ExecuteActivityInput))
+
+        outbound.heartbeat.assert_called_once_with("details")
+        assert heartbeats_seen == [(dt.datetime(2026, 1, 1, 0, 5, tzinfo=dt.UTC).timestamp(), 300.0)]
+
+
+@pytest.mark.asyncio
+class TestLivenessWorkflowInterceptor:
+    async def test_records_execution_on_success(self):
+        """Test that workflow execution is recorded on success."""
+
+        tracker = LivenessTracker()
+        tracker._last_workflow_time = time.time() - 10.0
+
+        # Create mock next interceptor
+        next_interceptor = AsyncMock()
+        next_interceptor.execute_workflow.return_value = "result"
+
+        interceptor = _LivenessWorkflowInterceptor(next_interceptor)
+        interceptor._tracker = tracker
+
+        # Create mock input
+        mock_input = MagicMock(spec=ExecuteWorkflowInput)
+
+        # Execute
+        result = await interceptor.execute_workflow(mock_input)
+
+        # Should have called next interceptor
+        next_interceptor.execute_workflow.assert_called_once_with(mock_input)
+
+        # Should have recorded execution
+        assert tracker.get_idle_time() < 1.0
+
+        # Should return result
+        assert result == "result"
+
+    async def test_records_execution_on_failure(self):
+        """Test that workflow execution is recorded even on failure."""
+
+        tracker = LivenessTracker()
+        tracker._last_workflow_time = time.time() - 10.0
+
+        # Create mock next interceptor that raises
+        next_interceptor = AsyncMock()
+        next_interceptor.execute_workflow.side_effect = ValueError("test error")
+
+        interceptor = _LivenessWorkflowInterceptor(next_interceptor)
+        interceptor._tracker = tracker
+
+        # Create mock input
+        mock_input = MagicMock(spec=ExecuteWorkflowInput)
+
+        # Execute and expect exception
+        with pytest.raises(ValueError, match="test error"):
+            await interceptor.execute_workflow(mock_input)
+
+        # Should still have recorded execution
+        assert tracker.get_idle_time() < 1.0
+
+    async def test_records_progress_when_a_running_workflow_schedules_an_activity(self):
+        tracker = LivenessTracker()
+        tracker._last_activity_time = time.time() - 10.0
+        tracker._last_workflow_time = time.time() - 10.0
+        handle = MagicMock()
+        next_outbound = MagicMock()
+        next_outbound.start_activity.return_value = handle
+
+        interceptor = _LivenessWorkflowInterceptor(AsyncMock())
+        interceptor._tracker = tracker
+        with patch.object(WorkflowInboundInterceptor, "init") as inbound_init:
+            interceptor.init(next_outbound)
+        outbound = inbound_init.call_args.args[0]
+
+        assert isinstance(outbound, _LivenessWorkflowOutboundInterceptor)
+        assert outbound.start_activity(MagicMock(spec=StartActivityInput)) is handle
+        assert tracker.get_idle_time() < 1.0

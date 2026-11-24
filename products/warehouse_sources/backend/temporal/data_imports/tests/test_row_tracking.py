@@ -1,0 +1,616 @@
+import uuid
+import contextlib
+from datetime import datetime
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+import pytest
+import time_machine
+from posthog.test.base import BaseTest
+from unittest import mock
+
+from django.db.utils import InternalError, OperationalError
+from django.test import override_settings
+
+import requests
+from asgiref.sync import sync_to_async
+from parameterized import parameterized
+from redis import exceptions as redis_exceptions
+from structlog.types import FilteringBoundLogger
+
+from posthog.models import Team
+from posthog.redis import get_async_client, get_client
+from posthog.sync import database_sync_to_async
+
+from products.warehouse_sources.backend.models.external_data_job import ExternalDataJob
+from products.warehouse_sources.backend.models.external_data_schema import ExternalDataSchema
+from products.warehouse_sources.backend.models.external_data_source import ExternalDataSource
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.common.extract import (
+    setup_row_tracking_with_billing_check,
+)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.arrow_utils import (
+    BillingLimitsWillBeReachedException,
+)
+from products.warehouse_sources.backend.temporal.data_imports.row_tracking import (
+    _get_redis,
+    decrement_rows,
+    finish_row_tracking,
+    get_all_rows_for_team,
+    get_rows,
+    increment_rows,
+    setup_row_tracking,
+    will_hit_billing_limit,
+)
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
+
+_READ_ONLY_REPLICA_ERROR = redis_exceptions.ReadOnlyError("You can't write against a read only replica.")
+_MISCONF_ERROR = redis_exceptions.ResponseError(
+    "MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk. "
+    "Commands that may modify the data set are disabled, because this instance is configured to report "
+    "errors during writes if RDB snapshotting fails (stop-writes-on-bgsave-error option). Please check "
+    "the Redis logs for details about the RDB error."
+)
+
+# Every row-tracking entry point the import calls, with the value it must return when Redis refuses
+# every command.
+_ENTRY_POINTS = [
+    ("setup_row_tracking", lambda team_id, schema_id: setup_row_tracking(team_id, schema_id), None),
+    ("increment_rows", lambda team_id, schema_id: increment_rows(team_id, schema_id, 10), None),
+    ("decrement_rows", lambda team_id, schema_id: decrement_rows(team_id, schema_id, 10), None),
+    ("finish_row_tracking", lambda team_id, schema_id: finish_row_tracking(team_id, schema_id), None),
+    ("get_rows", lambda team_id, schema_id: get_rows(team_id, schema_id), 0),
+    ("get_all_rows_for_team", lambda team_id, _schema_id: get_all_rows_for_team(team_id), 0),
+]
+
+_FAIL_OPEN_CASES = [
+    (f"{entry_point_name}_{error_name}", call, fallback, error)
+    for entry_point_name, call, fallback in _ENTRY_POINTS
+    for error_name, error in [("read_only_replica", _READ_ONLY_REPLICA_ERROR), ("misconf", _MISCONF_ERROR)]
+]
+
+
+class _CacheReadFailsClient:
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get(self, *args, **kwargs):
+        raise redis_exceptions.ConnectionError("Error connecting to redis:6379.")
+
+
+class _FirstIncrementFailsClient:
+    def __init__(self, inner):
+        self._inner = inner
+        self._remaining_failures = 1
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def hincrby(self, *args, **kwargs):
+        if self._remaining_failures:
+            self._remaining_failures -= 1
+            raise redis_exceptions.ConnectionError("Error connecting to redis:6379.")
+
+        return await self._inner.hincrby(*args, **kwargs)
+
+
+class TestRowTrackingRedisUnavailable(BaseTest):
+    @parameterized.expand(
+        [
+            (
+                "connection_error",
+                redis_exceptions.ConnectionError(
+                    "Error connecting to redis:6379. Temporary failure in name resolution."
+                ),
+            ),
+            (
+                "misconf_error",
+                redis_exceptions.ResponseError(
+                    "MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to "
+                    "disk. Commands that may modify the data set are disabled, because this instance is configured "
+                    "to report errors during writes if RDB snapshotting fails (stop-writes-on-bgsave-error option). "
+                    "Please check the Redis logs for details about the RDB error."
+                ),
+            ),
+        ]
+    )
+    @pytest.mark.asyncio
+    async def test_setup_row_tracking_does_not_raise_when_redis_is_unreachable(self, _name, exception):
+        # get_async_client only builds a lazy client - the ping is the first real
+        # connection attempt. If it fails, the client must not be used again, or the
+        # next command (hset) raises the same connection error, this time uncaught.
+        # Row tracking already fails open when redis is unavailable, so a Redis-side
+        # error (unreachable, or refusing writes because RDB snapshotting failed) is a
+        # transient infra blip, not a bug, and must not be reported to error tracking.
+        unreachable_client = mock.AsyncMock()
+        unreachable_client.ping.side_effect = exception
+
+        with (
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.get_async_client",
+                return_value=unreachable_client,
+            ),
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.capture_exception"
+            ) as mock_capture_exception,
+            override_settings(DATA_WAREHOUSE_REDIS_HOST="localhost", DATA_WAREHOUSE_REDIS_PORT="6379"),
+        ):
+            await setup_row_tracking(self.team.pk, str(uuid.uuid4()))
+
+        unreachable_client.hset.assert_not_called()
+        mock_capture_exception.assert_not_called()
+
+    @parameterized.expand(_FAIL_OPEN_CASES)
+    @pytest.mark.asyncio
+    async def test_row_tracking_fails_open_when_redis_refuses_every_command(self, _name, call, fallback, exception):
+        # A successful ping doesn't guarantee the following command succeeds: Redis can refuse a
+        # write because it can't persist an RDB snapshot, and a failover can point the client at a
+        # read only replica. Row tracking is bookkeeping for the import that calls it, so no
+        # command may raise into that import, and a transient infra blip is not worth an
+        # error-tracking issue.
+        refusing_client = mock.AsyncMock()
+        refusing_client.ping.return_value = True
+        for command in ("hset", "expire", "hincrby", "hdel", "hexists", "hget", "hgetall"):
+            getattr(refusing_client, command).side_effect = exception
+
+        with (
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.get_async_client",
+                return_value=refusing_client,
+            ),
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.capture_exception"
+            ) as mock_capture_exception,
+            override_settings(DATA_WAREHOUSE_REDIS_HOST="localhost", DATA_WAREHOUSE_REDIS_PORT="6379"),
+        ):
+            assert await call(self.team.pk, str(uuid.uuid4())) == fallback
+
+        mock_capture_exception.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_increment_rows_keeps_the_count_through_a_transient_failure(self):
+        # A single connection blip used to drop the increment, which makes the billing limit read
+        # a count that is short by one batch for the rest of the sync.
+        schema_id = str(uuid.uuid4())
+
+        with override_settings(DATA_WAREHOUSE_REDIS_HOST="localhost", DATA_WAREHOUSE_REDIS_PORT="6379"):
+            await setup_row_tracking(self.team.pk, schema_id)
+
+            with mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.get_async_client",
+                side_effect=lambda url: _FirstIncrementFailsClient(get_async_client(url)),
+            ):
+                await increment_rows(self.team.pk, schema_id, 10)
+
+            assert await get_rows(self.team.pk, schema_id) == 10
+
+            await finish_row_tracking(self.team.pk, schema_id)
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_uses_the_shared_redis_when_no_dedicated_host_is_configured(self):
+        # An unset host used to fall back to localhost:6379, where nothing listens in a deployed
+        # environment, so every row-tracking call raised a connection error.
+        with (
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.get_async_client",
+                return_value=mock.AsyncMock(),
+            ) as mock_get_async_client,
+            override_settings(
+                DATA_WAREHOUSE_REDIS_HOST=None,
+                DATA_WAREHOUSE_REDIS_PORT=None,
+                REDIS_URL="redis://shared-redis.example.com:6379/",
+            ),
+        ):
+            await setup_row_tracking(self.team.pk, str(uuid.uuid4()))
+
+        mock_get_async_client.assert_called_once_with("redis://shared-redis.example.com:6379/")
+
+
+@pytest.mark.timeout(600)
+@mock.patch(
+    "products.warehouse_sources.backend.temporal.data_imports.row_tracking.database_sync_to_async_pool",
+    database_sync_to_async,
+)
+class TestRowTracking(BaseTest):
+    def _logger(self) -> FilteringBoundLogger:
+        return mock.AsyncMock()
+
+    @contextlib.contextmanager
+    def _setup_limits(self, limit: int):
+        from ee.api.test.test_billing import create_billing_customer
+
+        with mock.patch("ee.billing.billing_manager.http_session.get") as mock_billing_request:
+            mock_res = create_billing_customer()
+            usage_summary = mock_res.get("usage_summary") or {}
+            mock_billing_request.return_value.status_code = 200
+            mock_billing_request.return_value.json.return_value = {
+                "license": {
+                    "type": "scale",
+                },
+                "customer": {
+                    **mock_res,
+                    "usage_summary": {**usage_summary, "rows_synced": {"limit": limit, "usage": 0}},
+                },
+            }
+
+            yield
+
+    @contextlib.asynccontextmanager
+    async def _setup_redis_rows(self, rows: int, team_id: Optional[int] = None):
+        with override_settings(DATA_WAREHOUSE_REDIS_HOST="localhost", DATA_WAREHOUSE_REDIS_PORT="6379"):
+            t_id = team_id or self.team.pk
+
+            schema_id = str(uuid.uuid4())
+            await setup_row_tracking(t_id, schema_id)
+            await increment_rows(t_id, schema_id, rows)
+
+            yield
+
+            await finish_row_tracking(t_id, schema_id)
+
+    async def _clear_billing_period_rows_cache(self) -> None:
+        # The organization is created once per test class and Redis is not rolled back between
+        # tests, so a cached sum would otherwise leak into the next test.
+        with override_settings(DATA_WAREHOUSE_REDIS_HOST="localhost", DATA_WAREHOUSE_REDIS_PORT="6379"):
+            async with _get_redis() as redis:
+                if not redis:
+                    return
+
+                keys = await redis.keys(f"posthog:data_warehouse_billing_period_rows:{self.organization.id}:*")
+                if keys:
+                    await redis.delete(*keys)
+
+    @contextlib.asynccontextmanager
+    async def _billing_check_environment(self, limit: int, clear_cache: bool = True):
+        from ee.models.license import License
+
+        if clear_cache:
+            await self._clear_billing_period_rows_cache()
+
+        await sync_to_async(License.objects.get_or_create)(
+            key="12345::67890",
+            defaults={
+                "plan": "enterprise",
+                "valid_until": datetime(2038, 1, 19, 3, 14, 7, tzinfo=ZoneInfo("UTC")),
+            },
+        )
+
+        with (
+            override_settings(DATA_WAREHOUSE_REDIS_HOST="localhost", DATA_WAREHOUSE_REDIS_PORT="6379"),
+            self._setup_limits(limit),
+            time_machine.travel("2024-01-01 12:00:00", tick=False),
+        ):
+            yield
+
+    async def _run(self, source: ExternalDataSource, limit: int, clear_cache: bool = True) -> bool:
+        async with self._billing_check_environment(limit, clear_cache):
+            return await will_hit_billing_limit(team_id=self.team.pk, source=source, logger=self._logger())
+
+    @sync_to_async
+    def _create_source(self, created_at: datetime = datetime(2023, 12, 1)) -> ExternalDataSource:
+        with time_machine.travel(created_at, tick=False):
+            return ExternalDataSource.objects.create(team=self.team)
+
+    @sync_to_async
+    def _create_schema(self, source: ExternalDataSource) -> ExternalDataSchema:
+        return ExternalDataSchema.objects.create(team=self.team, source=source, name=str(uuid.uuid4()))
+
+    async def _start_sync(self, schema: ExternalDataSchema, rows_to_sync: int, billable: bool = True) -> None:
+        await setup_row_tracking_with_billing_check(
+            self.team.pk,
+            schema,
+            SourceResponse(name=schema.name, items=lambda: [], primary_keys=None, rows_to_sync=rows_to_sync),
+            schema.source,
+            self._logger(),
+            billable=billable,
+        )
+
+    @pytest.mark.asyncio
+    async def test_row_tracking(self):
+        source = await self._create_source()
+        assert await self._run(source, 10) is False
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_with_previous_jobs(self):
+        source = await self._create_source()
+        await sync_to_async(ExternalDataJob.objects.create)(
+            team=self.team,
+            rows_synced=11,
+            pipeline=source,
+            finished_at=datetime.now(),
+            billable=True,
+            status=ExternalDataJob.Status.COMPLETED,
+        )
+
+        assert await self._run(source, 10) is True
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_with_free_rows(self):
+        source = await self._create_source()
+        await sync_to_async(ExternalDataJob.objects.create)(
+            team=self.team,
+            rows_synced=11,
+            pipeline=source,
+            finished_at=datetime(2023, 12, 2),
+            billable=True,
+            status=ExternalDataJob.Status.COMPLETED,
+        )
+
+        # 11 rows were during the free sync period and so we've not hit the 10 row limit yet
+
+        assert await self._run(source, 10) is False
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_with_previous_incomplete_jobs(self):
+        source = await self._create_source()
+        await sync_to_async(ExternalDataJob.objects.create)(
+            team=self.team,
+            rows_synced=11,
+            pipeline=source,
+            finished_at=datetime.now(),
+            billable=True,
+            status=ExternalDataJob.Status.RUNNING,
+        )
+
+        assert await self._run(source, 10) is False
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_with_previous_no_finished_at_jobs(self):
+        source = await self._create_source()
+        await sync_to_async(ExternalDataJob.objects.create)(
+            team=self.team,
+            rows_synced=11,
+            pipeline=source,
+            finished_at=None,
+            billable=True,
+            status=ExternalDataJob.Status.COMPLETED,
+        )
+
+        assert await self._run(source, 10) is False
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_with_previous_unbillable_jobs(self):
+        source = await self._create_source()
+        await sync_to_async(ExternalDataJob.objects.create)(
+            team=self.team,
+            rows_synced=11,
+            pipeline=source,
+            finished_at=datetime.now(),
+            billable=False,
+            status=ExternalDataJob.Status.COMPLETED,
+        )
+
+        assert await self._run(source, 10) is False
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_with_in_progress_rows(self):
+        source = await self._create_source()
+        async with self._setup_redis_rows(20):
+            assert await self._run(source, 10) is True
+
+    @parameterized.expand(
+        [
+            ("non_billable_run", False, datetime(2023, 12, 1), False),
+            ("run_of_a_source_in_its_free_week", True, datetime(2023, 12, 30), False),
+            ("billable_run", True, datetime(2023, 12, 1), True),
+        ]
+    )
+    @pytest.mark.asyncio
+    async def test_in_flight_rows_count_toward_the_limit_only_when_they_will_bill(
+        self, _name, in_flight_billable, in_flight_source_created_at, blocks_the_next_sync
+    ):
+        in_flight_schema = await self._create_schema(await self._create_source(in_flight_source_created_at))
+        next_schema = await self._create_schema(await self._create_source())
+
+        async with self._billing_check_environment(limit=25):
+            try:
+                await self._start_sync(in_flight_schema, rows_to_sync=20, billable=in_flight_billable)
+
+                if blocks_the_next_sync:
+                    with pytest.raises(BillingLimitsWillBeReachedException):
+                        await self._start_sync(next_schema, rows_to_sync=10)
+                else:
+                    await self._start_sync(next_schema, rows_to_sync=10)
+            finally:
+                await finish_row_tracking(self.team.pk, in_flight_schema.id)
+                await finish_row_tracking(self.team.pk, next_schema.id)
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_with_previous_rows_from_other_team_in_org(self):
+        another_team = await sync_to_async(Team.objects.create)(organization=self.organization)
+        source = await self._create_source()
+        await sync_to_async(ExternalDataJob.objects.create)(
+            team=another_team,
+            rows_synced=11,
+            pipeline=source,
+            finished_at=datetime.now(),
+            billable=True,
+            status=ExternalDataJob.Status.COMPLETED,
+        )
+
+        assert await self._run(source, 10) is True
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_with_in_progress_rows_from_other_team_in_org(self):
+        another_team = await sync_to_async(Team.objects.create)(organization=self.organization)
+        source = await self._create_source()
+
+        async with self._setup_redis_rows(20, team_id=another_team.pk):
+            assert await self._run(source, 10) is True
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_serves_the_billing_period_sum_from_cache(self):
+        source = await self._create_source()
+
+        assert await self._run(source, 10) is False
+
+        await sync_to_async(ExternalDataJob.objects.create)(
+            team=self.team,
+            rows_synced=11,
+            pipeline=source,
+            finished_at=datetime.now(),
+            billable=True,
+            status=ExternalDataJob.Status.COMPLETED,
+        )
+
+        assert await self._run(source, 10, clear_cache=False) is False
+        assert await self._run(source, 10) is True
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_queries_postgres_when_the_cache_read_fails(self):
+        # A Redis failure must fall through to the query. The caller treats a RedisError as
+        # "fail open", so letting one escape would skip the billing check for this run.
+        source = await self._create_source()
+        await sync_to_async(ExternalDataJob.objects.create)(
+            team=self.team,
+            rows_synced=11,
+            pipeline=source,
+            finished_at=datetime.now(),
+            billable=True,
+            status=ExternalDataJob.Status.COMPLETED,
+        )
+
+        with mock.patch(
+            "products.warehouse_sources.backend.temporal.data_imports.row_tracking.get_client",
+            side_effect=lambda url: _CacheReadFailsClient(get_client(url)),
+        ):
+            assert await self._run(source, 10) is True
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_fails_open_on_redis_error_without_capturing_exception(self):
+        # A transient Redis connectivity blip while fetching billing data (e.g. a DNS
+        # resolution failure reaching the quota-limiting cache) must fail open like any
+        # other billing-check error, but shouldn't be reported to error tracking since
+        # the check already tolerates it.
+        source = await self._create_source()
+
+        with (
+            mock.patch("ee.billing.billing_manager.BillingManager.get_billing") as mock_get_billing,
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.capture_exception"
+            ) as mock_capture_exception,
+        ):
+            mock_get_billing.side_effect = redis_exceptions.ConnectionError(
+                "Error -3 connecting to redis:6379. Temporary failure in name resolution."
+            )
+
+            assert await self._run(source, 10) is False
+
+        mock_capture_exception.assert_not_called()
+
+    @parameterized.expand(
+        [
+            (
+                "operational_error",
+                OperationalError(
+                    'connection failed: connection to server at "127.0.0.1", port 5432 failed: '
+                    "server closed the connection unexpectedly"
+                ),
+            ),
+            (
+                "internal_error",
+                InternalError("cannot execute UPDATE in a read-only transaction"),
+            ),
+        ]
+    )
+    @pytest.mark.asyncio
+    async def test_row_tracking_fails_open_on_database_error_without_capturing_exception(self, _name, exception):
+        # A dropped Postgres connection, or hitting a read-only replica/failover blip,
+        # while fetching billing data is a transient infra issue, not a bug, and must
+        # fail open like any other billing-check error without being reported to error
+        # tracking.
+        source = await self._create_source()
+
+        with (
+            mock.patch("ee.billing.billing_manager.BillingManager.get_billing") as mock_get_billing,
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.capture_exception"
+            ) as mock_capture_exception,
+        ):
+            mock_get_billing.side_effect = exception
+
+            assert await self._run(source, 10) is False
+
+        mock_capture_exception.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_retries_and_tolerates_a_transient_billing_refusal(self):
+        # Billing answers a request it could not finish in time with a 408 and an empty body.
+        # That must be retried, and once the retries are spent it must fail open quietly: the
+        # check already tolerates a missing answer, so it is not worth an error-tracking issue.
+        #
+        # The refusal is raised through `handle_billing_service_error` itself, on a response with
+        # no body, rather than by constructing `BillingServiceResponseError` directly: that is the
+        # only way to prove the real response-handling path is what attaches the `status_code`
+        # that `_is_transient_billing_error` reads.
+        from ee.billing.billing_manager import handle_billing_service_error
+
+        source = await self._create_source()
+
+        def _raise_billing_timeout(*args, **kwargs):
+            response = requests.Response()
+            response.status_code = 408
+            handle_billing_service_error(response)
+
+        with (
+            mock.patch("ee.billing.billing_manager.BillingManager.get_billing") as mock_get_billing,
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.capture_exception"
+            ) as mock_capture_exception,
+        ):
+            mock_get_billing.side_effect = _raise_billing_timeout
+
+            assert await self._run(source, 10) is False
+
+        assert mock_get_billing.call_count == 3
+        mock_capture_exception.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_does_not_retry_a_rate_limited_billing_check(self):
+        from ee.billing.billing_manager import handle_billing_service_error
+
+        source = await self._create_source()
+
+        def _raise_billing_rate_limited(*args, **kwargs):
+            response = requests.Response()
+            response.status_code = 429
+            response.raw = mock.MagicMock()
+            handle_billing_service_error(response)
+
+        with (
+            mock.patch("ee.billing.billing_manager.BillingManager.get_billing") as mock_get_billing,
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.capture_exception"
+            ) as mock_capture_exception,
+        ):
+            mock_get_billing.side_effect = _raise_billing_rate_limited
+
+            assert await self._run(source, 10) is False
+
+        assert mock_get_billing.call_count == 1
+        mock_capture_exception.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_row_tracking_fails_open_on_request_error_without_capturing_exception(self):
+        # A network blip (e.g. a proxy timeout) reaching the billing service is a transient
+        # infra issue, not a bug, and must fail open like any other billing-check error
+        # without being reported to error tracking.
+        source = await self._create_source()
+
+        with (
+            mock.patch("ee.billing.billing_manager.BillingManager.get_billing") as mock_get_billing,
+            mock.patch(
+                "products.warehouse_sources.backend.temporal.data_imports.row_tracking.capture_exception"
+            ) as mock_capture_exception,
+        ):
+            mock_get_billing.side_effect = requests.exceptions.ProxyError(
+                "HTTPSConnectionPool(host='billing.posthog.com', port=443): Max retries exceeded "
+                "with url: /api/billing (Caused by ProxyError('Cannot connect to proxy.', "
+                "OSError('Tunnel connection failed: 504 Gateway timeout')))"
+            )
+
+            assert await self._run(source, 10) is False
+
+        mock_capture_exception.assert_not_called()

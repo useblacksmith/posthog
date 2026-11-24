@@ -1,0 +1,1056 @@
+import uuid
+from datetime import datetime, timedelta
+
+import pytest
+from posthog.test.base import (
+    APIBaseTest,
+    ClickhouseTestMixin,
+    _create_event,
+    _create_person,
+    snapshot_clickhouse_queries,
+)
+from unittest.mock import patch
+
+from parameterized import parameterized
+
+from posthog.schema import FilterLogicalOperator, HogQLQueryModifiers, SessionTableVersion
+
+from posthog.hogql import ast
+from posthog.hogql.database.database import Database
+from posthog.hogql.database.schema.sessions_v3 import (
+    get_lazy_session_table_properties_v3,
+    get_lazy_session_table_values_v3,
+)
+from posthog.hogql.parser import parse_select
+from posthog.hogql.query import execute_hogql_query
+
+from posthog.session_recordings.queries.test.session_replay_sql import produce_replay_summary
+from posthog.uuidt import uuid7
+
+from products.event_definitions.backend.models.property_definition import PropertyType
+
+
+@snapshot_clickhouse_queries
+class TestSessionsV3(ClickhouseTestMixin, APIBaseTest):
+    allow_dual_schema_snapshots = True
+    snapshot_replace_all_numbers = True
+
+    def __execute(
+        self,
+        query,
+        bounce_rate_duration=None,
+    ):
+        modifiers = HogQLQueryModifiers(
+            sessionTableVersion=SessionTableVersion.V3, bounceRateDurationSeconds=bounce_rate_duration
+        )
+        return execute_hogql_query(
+            query=query,
+            team=self.team,
+            modifiers=modifiers,
+        )
+
+    def test_select_star_from_raw_sessions(self):
+        session_id = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={"$current_url": "https://example.com", "$session_id": session_id},
+        )
+
+        response = self.__execute(
+            parse_select(
+                "select * from raw_sessions_v3",
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        self.assertEqual(
+            len(response.results or []),
+            1,
+        )
+
+    def test_select_star_from_sessions(self):
+        session_id = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={"$current_url": "https://example.com", "$session_id": session_id},
+        )
+
+        response = self.__execute(
+            parse_select(
+                "select * from sessions where session_id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        self.assertEqual(
+            len(response.results or []),
+            1,
+        )
+
+    @pytest.mark.skip(reason="doesn't work, didn't in V1 either so not a regression but should still be fixed")
+    def test_select_event_sessions_star(self):
+        session_id = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={"$current_url": "https://example.com", "$session_id": session_id},
+        )
+
+        response = self.__execute(
+            parse_select(
+                "select session.* from events where session_id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        self.assertEqual(
+            len(response.results or []),
+            1,
+        )
+
+    def test_select_session_replay_session_duration(self):
+        session_id = str(uuid7())
+
+        response = self.__execute(
+            parse_select(
+                "select raw_session_replay_events.session.duration from raw_session_replay_events",
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        self.assertEqual(
+            len(response.results or []),
+            0,  # just making sure the query runs
+        )
+
+    @parameterized.expand(
+        [
+            ("gad_source", {"gad_source": "1"}, "Paid Search"),
+            ("gclid_from_google", {"gclid": "abc", "$referring_domain": "www.google.com"}, "Paid Search"),
+            ("empty_gclid_is_not_a_click", {"gclid": "", "$referring_domain": "www.google.com"}, "Organic Search"),
+            ("gad_source_without_referrer", {"gad_source": "1", "$referring_domain": "$direct"}, "Paid Search"),
+            ("fbclid_without_referrer", {"fbclid": "xyz", "$referring_domain": "$direct"}, "Organic Social"),
+            (
+                "unknown_source_stripped_referrer",
+                {"utm_source": "newsletter-2026", "$referring_domain": "$direct"},
+                "Direct",
+            ),
+            ("unknown_referrer", {"$referring_domain": "blog.example.org"}, "Referral"),
+            (
+                "self_referral_with_paid_utms",
+                {"$referring_domain": "example.com", "utm_source": "google", "utm_medium": "cpc"},
+                "Paid Search",
+            ),
+            (
+                "self_referral_with_unknown_source",
+                {"$referring_domain": "example.com", "utm_source": "newsletter-2026"},
+                "Referral",
+            ),
+            (
+                "msclkid_only_in_url",
+                {"$current_url": "https://example.com/?msclkid=m1", "$referring_domain": "$direct"},
+                "Direct",
+            ),
+        ]
+    )
+    def test_channel_type(self, _name, properties, expected_channel_type):
+        session_id = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={**properties, "$session_id": session_id},
+        )
+
+        response = self.__execute(
+            parse_select(
+                "select $channel_type from sessions where session_id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        result = (response.results or [])[0]
+        self.assertEqual(
+            result[0],
+            expected_channel_type,
+        )
+
+    @parameterized.expand(
+        [
+            ("property", "msclkid", {"msclkid": "m1"}, ("m1", True)),
+            ("url_only", "irclickid", {"$current_url": "https://example.com/?irclickid=ic1"}, ("ic1", True)),
+            ("missing", "msclkid", {"gclid": "g1"}, (None, False)),
+        ]
+    )
+    def test_entry_ad_id_value(self, _name, ad_id, properties, expected):
+        session_id = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={**properties, "$session_id": session_id},
+        )
+
+        response = self.__execute(
+            parse_select(
+                f"select $entry_{ad_id}, $entry_{ad_id} IS NOT NULL from sessions where session_id = {{session_id}}",
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        self.assertEqual((response.results or [])[0], expected)
+
+    @parameterized.expand(
+        [
+            (
+                "utm_only_in_url",
+                [("$pageview", 0, {"$current_url": "https://example.com/?utm_source=newsletter&utm_campaign=fall"})],
+                (None, None, "Direct"),
+            ),
+            (
+                "first_event_is_not_a_pageview",
+                [
+                    ("$feature_flag_called", 0, {}),
+                    ("$pageview", 2, {"utm_source": "google", "utm_campaign": "spring"}),
+                ],
+                ("google", "spring", "Organic Search"),
+            ),
+            (
+                # entry_utm_* skip a NULL on the landing page view and take a later value, while the channel type
+                # tuple keeps the landing page view's empty values, so the two disagree for this session
+                "utm_added_on_second_pageview",
+                [
+                    ("$pageview", 0, {}),
+                    ("$pageview", 1, {"utm_source": "google", "utm_medium": "cpc", "utm_campaign": "spring"}),
+                ],
+                ("google", "spring", "Direct"),
+            ),
+            (
+                "two_campaigns_keep_the_first",
+                [
+                    ("$pageview", 0, {"utm_source": "newsletter", "utm_campaign": "A"}),
+                    ("$pageview", 30, {"utm_source": "newsletter", "utm_campaign": "B"}),
+                ],
+                ("newsletter", "A", "Direct"),
+            ),
+            (
+                "sdk_session_entry_properties_are_not_read",
+                [("$pageview", 0, {"$session_entry_utm_source": "email"})],
+                (None, None, "Direct"),
+            ),
+        ]
+    )
+    def test_entry_utm_and_channel_type_across_events(self, _name, events, expected):
+        session_id = str(uuid7("2024-03-08T00:00:00+00:00"))
+        start = datetime.fromisoformat("2024-03-08T00:00:00+00:00")
+        for event, offset_seconds, properties in events:
+            _create_event(
+                event=event,
+                team=self.team,
+                distinct_id="d1",
+                properties={"$referring_domain": "$direct", **properties, "$session_id": session_id},
+                timestamp=start + timedelta(seconds=offset_seconds),
+            )
+
+        response = self.__execute(
+            parse_select(
+                "select $entry_utm_source, $entry_utm_campaign, $channel_type from sessions where session_id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        self.assertEqual((response.results or [])[0], expected)
+
+    @parameterized.expand([("replay_starts_before_first_pageview", True), ("replay_only", False)])
+    def test_replay_rows_shape_the_session(self, _name, with_pageview):
+        session_id = str(uuid7("2024-03-08T00:00:00+00:00"))
+        produce_replay_summary(
+            team_id=self.team.pk,
+            distinct_id="d1",
+            session_id=session_id,
+            first_timestamp="2024-03-08T00:00:00",
+            last_timestamp="2024-03-08T00:00:00",
+            ensure_analytics_event_in_session=False,
+        )
+        if with_pageview:
+            _create_event(
+                event="$pageview",
+                team=self.team,
+                distinct_id="d1",
+                properties={"$session_id": session_id, "$current_url": "https://example.com/"},
+                timestamp="2024-03-08T00:00:05",
+            )
+
+        response = self.__execute(
+            parse_select(
+                "select $start_timestamp, $session_duration, $pageview_count, $is_bounce, $has_replay_events from sessions where session_id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        start_timestamp, duration, pageview_count, is_bounce, has_replay_events = (response.results or [])[0]
+        self.assertEqual(start_timestamp.isoformat()[:19], "2024-03-08T00:00:00")
+        self.assertTrue(has_replay_events)
+        if with_pageview:
+            self.assertEqual((duration, pageview_count, is_bounce), (5, 1, True))
+        else:
+            self.assertEqual((duration, pageview_count, is_bounce), (0, 0, None))
+
+    def test_session_dot_channel_type(self):
+        session_id = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={"gad_source": "1", "$session_id": session_id},
+        )
+
+        response = self.__execute(
+            parse_select(
+                "select session.$channel_type from events where $session_id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        result = (response.results or [])[0]
+        self.assertEqual(
+            result[0],
+            "Paid Search",
+        )
+
+    def test_persons_and_sessions_on_events(self):
+        p1 = _create_person(distinct_ids=["d1"], team=self.team)
+        p2 = _create_person(distinct_ids=["d2"], team=self.team)
+
+        s1 = str(uuid7())
+        s2 = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={"$session_id": s1, "utm_source": "source1"},
+        )
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d2",
+            properties={"$session_id": s2, "utm_source": "source2"},
+        )
+
+        response = self.__execute(
+            parse_select(
+                "select events.person_id, session.$entry_utm_source from events where $session_id = {session_id} or $session_id = {session_id2} order by 2 asc",
+                placeholders={"session_id": ast.Constant(value=s1), "session_id2": ast.Constant(value=s2)},
+            ),
+        )
+
+        [row1, row2] = response.results or []
+        self.assertEqual(row1, (p1.uuid, "source1"))
+        self.assertEqual(row2, (p2.uuid, "source2"))
+
+    def test_empty_counts(self):
+        s1 = str(uuid7("2024-07-17"))
+        d1 = "d1"
+        _create_event(
+            event="other_event",
+            team=self.team,
+            distinct_id=d1,
+            properties={"$session_id": s1},
+            timestamp="2024-07-17",
+        )
+
+        response = self.__execute(
+            parse_select(
+                "select $pageview_count, $autocapture_count, $screen_count from sessions where id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=s1)},
+            ),
+        )
+        self.assertEqual(response.results or [], [(0, 0, 0)])
+
+    def test_counts(self):
+        s1 = str(uuid7("2023-12-02T00:00:00+00:00"))
+        d1 = "d1"
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id=d1,
+            properties={"$session_id": s1},
+            timestamp="2023-12-02",
+        )
+        for _ in range(2):
+            _create_event(
+                event="$autocapture",
+                team=self.team,
+                distinct_id=d1,
+                properties={"$session_id": s1},
+                timestamp="2023-12-02",
+            )
+        for _ in range(3):
+            _create_event(
+                event="$screen",
+                team=self.team,
+                distinct_id=d1,
+                properties={"$session_id": s1},
+                timestamp="2023-12-02",
+            )
+        response = self.__execute(
+            parse_select(
+                "select $pageview_count, $autocapture_count, $screen_count from sessions where id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=s1)},
+            ),
+        )
+        self.assertEqual(response.results or [], [(1, 2, 3)])
+
+    def test_idempotent_event_counts(self):
+        s1 = str(uuid7("2023-12-02T00:00:00+00:00"))
+        d1 = "d1"
+        pageview_uuid = str(uuid.uuid4())
+        autocapture_uuid = str(uuid.uuid4())
+        screen_uuid = str(uuid.uuid4())
+
+        # simulate inserting the same event multiple times
+        for _ in range(5):
+            _create_event(
+                event="$pageview",
+                team=self.team,
+                distinct_id=d1,
+                properties={"$session_id": s1},
+                timestamp="2023-12-02",
+                event_uuid=pageview_uuid,
+            )
+            _create_event(
+                event="$autocapture",
+                team=self.team,
+                distinct_id=d1,
+                properties={"$session_id": s1},
+                timestamp="2023-12-02",
+                event_uuid=autocapture_uuid,
+            )
+            _create_event(
+                event="$screen",
+                team=self.team,
+                distinct_id=d1,
+                properties={"$session_id": s1},
+                timestamp="2023-12-02",
+                event_uuid=screen_uuid,
+            )
+
+        response = self.__execute(
+            parse_select(
+                "select $pageview_count, $autocapture_count, $screen_count from sessions where id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=s1)},
+            ),
+        )
+        self.assertEqual(response.results or [], [(1, 1, 1)])
+
+    def test_page_screen_autocapture_count_up_to(self):
+        time = int(datetime.fromisoformat("2023-12-02T00:00:00+00:00").timestamp() * 1000)
+
+        # two pageviews
+        s1 = str(uuid7(time))
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s1},
+            timestamp="2023-12-02",
+        )
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s1},
+            timestamp="2023-12-03",
+        )
+        # one pageview and one autocapture
+        s2 = str(uuid7(time + 2))
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s2},
+            timestamp="2023-12-02",
+        )
+        _create_event(
+            event="$autocapture",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s2},
+            timestamp="2023-12-03",
+        )
+        # one pageview
+        s3 = str(uuid7(time + 3))
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s3},
+            timestamp="2023-12-02",
+        )
+        # >2 pageviews (should still count as 2)
+        s4 = str(uuid7(time + 4))
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s4},
+            timestamp="2023-12-02",
+        )
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s4},
+            timestamp="2023-12-02",
+        )
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s4},
+            timestamp="2023-12-02",
+        )
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s4},
+            timestamp="2023-12-02",
+        )
+        # one screen
+        s5 = str(uuid7(time + 5))
+        _create_event(
+            event="$screen",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s5},
+            timestamp="2023-12-02",
+        )
+        # one autocapture
+        s6 = str(uuid7(time + 6))
+        _create_event(
+            event="$autocapture",
+            team=self.team,
+            distinct_id=s1,
+            properties={"$session_id": s6},
+            timestamp="2023-12-02",
+        )
+
+        results = (
+            self.__execute(
+                parse_select(
+                    "select $page_screen_count_up_to, $has_autocapture from sessions ORDER BY session_id",
+                    placeholders={"session_id": ast.Constant(value=s1)},
+                ),
+            ).results
+            or []
+        )
+        assert results == [(2, False), (1, True), (1, False), (2, False), (1, False), (0, True)]
+
+    def test_bounce_rate(self):
+        time = int(datetime.fromisoformat("2023-12-02T00:00:00+00:00").timestamp() * 1000)
+        # ensure the sessions ids are sortable by giving them different time components
+        s1a = str(uuid7(time))
+        s1b = str(uuid7(time + 1))
+        s2 = str(uuid7(time + 2))
+        s3 = str(uuid7(time + 3))
+        s4 = str(uuid7(time + 4))
+        s5 = str(uuid7(time + 5))
+        s6 = str(uuid7(time + 6))
+
+        # person with 2 different sessions
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={"$session_id": s1a, "$current_url": "https://example.com/1"},
+            timestamp="2023-12-02",
+        )
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={"$session_id": s1a, "$current_url": "https://example.com/2"},
+            timestamp="2023-12-03",
+        )
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={"$session_id": s1b, "$current_url": "https://example.com/3"},
+            timestamp="2023-12-12",
+        )
+        # session with 1 pageview
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d2",
+            properties={"$session_id": s2, "$current_url": "https://example.com/4"},
+            timestamp="2023-12-11",
+        )
+        # session with 1 pageview and 1 autocapture
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d3",
+            properties={"$session_id": s3, "$current_url": "https://example.com/5"},
+            timestamp="2023-12-11",
+        )
+        _create_event(
+            event="$autocapture",
+            team=self.team,
+            distinct_id="d3",
+            properties={"$session_id": s3, "$current_url": "https://example.com/5"},
+            timestamp="2023-12-11",
+        )
+        # short session with a pageleave
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d4",
+            properties={"$session_id": s4, "$current_url": "https://example.com/6"},
+            timestamp="2023-12-11T12:00:00",
+        )
+        _create_event(
+            event="$pageleave",
+            team=self.team,
+            distinct_id="d4",
+            properties={"$session_id": s4, "$current_url": "https://example.com/6"},
+            timestamp="2023-12-11T12:00:01",
+        )
+        # long session with a pageleave
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d5",
+            properties={"$session_id": s5, "$current_url": "https://example.com/7"},
+            timestamp="2023-12-11T12:00:00",
+        )
+        _create_event(
+            event="$pageleave",
+            team=self.team,
+            distinct_id="d5",
+            properties={"$session_id": s5, "$current_url": "https://example.com/7"},
+            timestamp="2023-12-11T12:00:11",
+        )
+        # session with 1 autocapture
+        _create_event(
+            event="autocapture",
+            team=self.team,
+            distinct_id="d6",
+            properties={"$session_id": s6, "$current_url": "https://example.com/7"},
+            timestamp="2023-12-11T12:00:00",
+        )
+
+        response = self.__execute(
+            parse_select(
+                "select $is_bounce, session_id from sessions ORDER BY session_id",
+            ),
+        )
+        assert (response.results or []) == [
+            (0, s1a),
+            (1, s1b),
+            (1, s2),
+            (0, s3),
+            (1, s4),
+            (0, s5),
+            (None, s6),
+        ]
+
+    def test_custom_bounce_rate_duration(self):
+        time = int(datetime.fromisoformat("2023-12-11T00:00:00+00:00").timestamp() * 1000)
+        # ensure the sessions ids are sortable by giving them different time components
+        s = str(uuid7(time))
+
+        # 15 second session with a pageleave
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d4",
+            properties={"$session_id": s, "$current_url": "https://example.com/6"},
+            timestamp="2023-12-11T12:00:00",
+        )
+        _create_event(
+            event="$pageleave",
+            team=self.team,
+            distinct_id="d4",
+            properties={"$session_id": s, "$current_url": "https://example.com/6"},
+            timestamp="2023-12-11T12:00:15",
+        )
+
+        # with default settings this should not be a bounce
+        assert (
+            self.__execute(
+                parse_select(
+                    "select $is_bounce, session_id from sessions ORDER BY session_id",
+                ),
+            )
+        ).results == [(0, s)]
+
+        # with a custom 10 second duration this should not be a bounce
+        assert (
+            self.__execute(
+                parse_select(
+                    "select $is_bounce, session_id from sessions ORDER BY session_id",
+                ),
+                bounce_rate_duration=10,
+            )
+        ).results == [(0, s)]
+
+        # with a custom 30 second duration this should be a bounce
+        assert (
+            self.__execute(
+                parse_select(
+                    "select $is_bounce, session_id from sessions ORDER BY session_id",
+                ),
+                bounce_rate_duration=30,
+            )
+        ).results == [(1, s)]
+
+    def test_last_external_click_url(self):
+        s1 = str(uuid7())
+
+        _create_event(
+            event="$autocapture",
+            team=self.team,
+            distinct_id="d1",
+            properties={"$session_id": s1, "$external_click_url": "https://example.com/1"},
+        )
+        _create_event(
+            event="$autocapture",
+            team=self.team,
+            distinct_id="d1",
+            properties={"$session_id": s1, "$external_click_url": "https://example.com/2"},
+        )
+
+        response = self.__execute(
+            parse_select(
+                "select $last_external_click_url from sessions where session_id = {session_id}",
+                placeholders={"session_id": ast.Constant(value=s1)},
+            ),
+        )
+
+        [row1] = response.results or []
+        self.assertEqual(row1, ("https://example.com/2",))
+
+    def test_can_use_v1_and_v2_fields(self):
+        session_id = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={
+                "$current_url": "https://example.com/pathname",
+                "$pathname": "/pathname",
+                "$session_id": session_id,
+            },
+        )
+
+        response = self.__execute(
+            parse_select(
+                """
+                select
+                    $session_duration,
+                    duration,
+                    $end_current_url,
+                    $exit_current_url,
+                    $end_pathname,
+                    $exit_pathname
+                from sessions
+                where session_id = {session_id}
+                """,
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        assert response.results == [
+            (0, 0, "https://example.com/pathname", "https://example.com/pathname", "/pathname", "/pathname")
+        ]
+
+    def test_event_sessions_where_event_timestamp(self):
+        session_id = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={
+                "$current_url": "https://example.com/pathname",
+                "$pathname": "/pathname",
+                "$session_id": session_id,
+            },
+        )
+
+        response = self.__execute(
+            parse_select(
+                """
+                select
+                    session.id as session_id,
+                from events
+                where session_id = {session_id} AND timestamp >= '1970-01-01'
+                """,
+                placeholders={"session_id": ast.Constant(value=session_id)},
+            ),
+        )
+
+        assert response.results == [(session_id,)]
+
+    def test_event_sessions_where(self):
+        session_id = str(uuid7())
+
+        _create_event(
+            event="$pageview",
+            team=self.team,
+            distinct_id="d1",
+            properties={
+                "$current_url": "https://example.com/pathname",
+                "$pathname": "/pathname",
+                "$session_id": session_id,
+            },
+        )
+
+        response = self.__execute(
+            parse_select(
+                """
+                select
+                    count() from events
+                where events.session.$entry_pathname = '/pathname'
+                """,
+            ),
+        )
+
+        assert response.results == [(1,)]
+
+
+class TestGetLazySessionProperties(ClickhouseTestMixin, APIBaseTest):
+    def test_all(self):
+        results = get_lazy_session_table_properties_v3(None)
+        self.assertEqual(
+            {r["id"] for r in results},
+            {
+                "$autocapture_count",
+                "$channel_type",
+                "$end_current_url",
+                "$end_hostname",
+                "$end_pathname",
+                "$end_timestamp",
+                "$entry__bhlid",
+                "$entry__kx",
+                "$entry_awc",
+                "$entry_bfcid",
+                "$entry_cjevent",
+                "$entry_current_url",
+                "$entry_dclid",
+                "$entry_dicbo",
+                "$entry_epik",
+                "$entry_fbclid",
+                "$entry_gad_campaignid",
+                "$entry_gad_source",
+                "$entry_gbraid",
+                "$entry_gclid",
+                "$entry_gclsrc",
+                "$entry_has__bhlid",
+                "$entry_has__kx",
+                "$entry_has_awc",
+                "$entry_has_bfcid",
+                "$entry_has_cjevent",
+                "$entry_has_dclid",
+                "$entry_has_dicbo",
+                "$entry_has_epik",
+                "$entry_has_fbclid",
+                "$entry_has_gad_campaignid",
+                "$entry_has_gbraid",
+                "$entry_has_gclid",
+                "$entry_has_gclsrc",
+                "$entry_has_igshid",
+                "$entry_has_irclickid",
+                "$entry_has_irclid",
+                "$entry_has_li_fat_id",
+                "$entry_has_mc_cid",
+                "$entry_has_msclkid",
+                "$entry_has_ndclid",
+                "$entry_has_oppref",
+                "$entry_has_qclid",
+                "$entry_has_rdt_cid",
+                "$entry_has_rtid",
+                "$entry_has_sccid",
+                "$entry_has_srsltid",
+                "$entry_has_syclid",
+                "$entry_has_tblci",
+                "$entry_has_ttclid",
+                "$entry_has_twclid",
+                "$entry_has_utm_creative_format",
+                "$entry_has_utm_id",
+                "$entry_has_utm_marketing_tactic",
+                "$entry_has_utm_source_platform",
+                "$entry_has_wbraid",
+                "$entry_has_yclid",
+                "$entry_hostname",
+                "$entry_igshid",
+                "$entry_irclickid",
+                "$entry_irclid",
+                "$entry_li_fat_id",
+                "$entry_mc_cid",
+                "$entry_msclkid",
+                "$entry_ndclid",
+                "$entry_oppref",
+                "$entry_pathname",
+                "$entry_qclid",
+                "$entry_rdt_cid",
+                "$entry_referring_domain",
+                "$entry_rtid",
+                "$entry_sccid",
+                "$entry_srsltid",
+                "$entry_syclid",
+                "$entry_tblci",
+                "$entry_ttclid",
+                "$entry_twclid",
+                "$entry_utm_campaign",
+                "$entry_utm_content",
+                "$entry_utm_creative_format",
+                "$entry_utm_id",
+                "$entry_utm_marketing_tactic",
+                "$entry_utm_medium",
+                "$entry_utm_source",
+                "$entry_utm_source_platform",
+                "$entry_utm_term",
+                "$entry_wbraid",
+                "$entry_yclid",
+                "$is_bounce",
+                "$last_external_click_url",
+                "$pageview_count",
+                "$screen_count",
+                "$session_duration",
+                "$start_timestamp",
+                "$hosts",
+                "$emails",
+                "$has_replay_events",
+            },
+        )
+        self.assertEqual(
+            results[0],
+            {
+                "id": "$start_timestamp",
+                "is_numerical": False,
+                "is_seen_on_filtered_events": None,
+                "name": "$start_timestamp",
+                "property_type": PropertyType.Datetime,
+                "tags": [],
+            },
+        )
+
+    def test_source(self):
+        results = get_lazy_session_table_properties_v3("source")
+        self.assertEqual(
+            [result["name"] for result in results],
+            [
+                "$entry_utm_source",
+                "$entry_gad_source",
+                "$entry_utm_source_platform",
+                "$entry_has_utm_source_platform",
+            ],
+        )
+        self.assertEqual(
+            results[0],
+            {
+                "id": "$entry_utm_source",
+                "is_numerical": False,
+                "is_seen_on_filtered_events": None,
+                "name": "$entry_utm_source",
+                "property_type": PropertyType.String,
+                "tags": [],
+            },
+        )
+
+    def test_entry_utm(self):
+        results = get_lazy_session_table_properties_v3("entry utm")
+        self.assertEqual(
+            [result["name"] for result in results],
+            [
+                "$entry_utm_source",
+                "$entry_utm_campaign",
+                "$entry_utm_medium",
+                "$entry_utm_term",
+                "$entry_utm_content",
+                "$entry_utm_id",
+                "$entry_has_utm_id",
+                "$entry_utm_source_platform",
+                "$entry_has_utm_source_platform",
+                "$entry_utm_creative_format",
+                "$entry_has_utm_creative_format",
+                "$entry_utm_marketing_tactic",
+                "$entry_has_utm_marketing_tactic",
+            ],
+        )
+
+    def test_can_get_values_for_all(self):
+        results = get_lazy_session_table_properties_v3(None)
+        for prop in results:
+            get_lazy_session_table_values_v3(key=prop["id"], team=self.team, search_term=None)
+
+    @parameterized.expand([(None,), ("tub",)])
+    def test_values_query_samples_raw_rows(self, search_term):
+        with (
+            patch.object(Database, "_fetch_sources", side_effect=AssertionError("full database build")),
+            self.capture_select_queries() as queries,
+        ):
+            get_lazy_session_table_values_v3(key="$entry_utm_source", team=self.team, search_term=search_term)
+
+        assert len(queries) == 1
+        sql = " ".join(queries[0].split())
+        assert "FROM raw_sessions_v3" in sql
+        assert "finalizeAggregation(raw_sessions_v3.entry_utm_source)" in sql
+        assert "ORDER BY raw_sessions_v3.session_id_v7 DESC" in sql
+        assert "LIMIT 100000" in sql
+        # The `sessions` lazy table would merge every row of the team first.
+        assert "argMinMerge" not in sql
+        assert sql.count("GROUP BY") == 1
+        assert ("ilike(" in sql) == (search_term is not None)
+
+    def test_custom_channel_types(self):
+        self.team.modifiers = {
+            "customChannelTypeRules": [
+                {"items": [], "combiner": FilterLogicalOperator.AND_, "channel_type": "Test Channel Type", "id": "1"},
+                {"items": [], "combiner": FilterLogicalOperator.AND_, "channel_type": "Paid Social", "id": "2"},
+                {"items": [], "combiner": FilterLogicalOperator.AND_, "channel_type": "Test Channel Type", "id": "3"},
+            ]
+        }
+        self.team.save()
+        results = get_lazy_session_table_values_v3(key="$channel_type", team=self.team, search_term=None)
+        # the custom channel types should be first, there's should be no duplicates, and any custom rules for existing
+        # channel types should be bumped to the top
+        assert results == [
+            ["Test Channel Type"],
+            ["Paid Social"],
+            ["Cross Network"],
+            ["Paid Search"],
+            ["Paid Video"],
+            ["Paid Shopping"],
+            ["Paid Unknown"],
+            ["Direct"],
+            ["Organic Search"],
+            ["Organic Social"],
+            ["Organic Video"],
+            ["Organic Shopping"],
+            ["AI"],
+            ["Push"],
+            ["SMS"],
+            ["Audio"],
+            ["Email"],
+            ["Referral"],
+            ["Affiliate"],
+            ["Unknown"],
+        ]

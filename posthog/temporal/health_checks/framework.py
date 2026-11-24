@@ -1,0 +1,422 @@
+from __future__ import annotations
+
+import inspect
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any
+
+from django.conf import settings
+
+from posthog.clickhouse.query_tagging import Product
+from posthog.job_owners import JobOwners
+from posthog.models.health_issue import HealthIssue
+from posthog.scopes.catalog import APIScopeObject
+from posthog.temporal.health_checks.detectors import DEFAULT_EXECUTION_POLICY, HealthExecutionPolicy
+from posthog.temporal.health_checks.models import (
+    DEFAULT_ACTIVE_SINCE_DAYS,
+    DEFAULT_EXECUTION_TIMEOUT,
+    HealthCheckResult,
+)
+from posthog.temporal.health_checks.registry import _DETECT_FNS, HEALTH_CHECKS, ensure_registry_loaded
+
+from products.signals.backend.facade.taxonomy import ReportPriority
+
+if TYPE_CHECKING:
+    from django.db.models import Model
+
+# Severity → signal weight. Critical issues hit weight 1.0, which triggers the
+# Signals summary pipeline; lower severities rank below in the inbox feed.
+_SEVERITY_WEIGHT: dict[str, float] = {
+    HealthIssue.Severity.CRITICAL: 1.0,
+    HealthIssue.Severity.WARNING: 0.7,
+    HealthIssue.Severity.INFO: 0.4,
+}
+
+# Severity → suggested report priority, carried on a signal's remediation. Kept beside
+# `_SEVERITY_WEIGHT` so the two severity mappings stay in sync.
+_SEVERITY_PRIORITY: dict[str, ReportPriority] = {
+    HealthIssue.Severity.CRITICAL: ReportPriority.P1,
+    HealthIssue.Severity.WARNING: ReportPriority.P2,
+    HealthIssue.Severity.INFO: ReportPriority.P3,
+}
+
+
+@dataclass(frozen=True)
+class AlertContent:
+    """User-facing description of a fired health-check alert.
+
+    Health checks override `HealthCheck.render_alert` to produce one of
+    these. The fields are embedded into `$health_check_issue_firing` and
+    `$health_check_issue_resolved` event properties, where HogFunction
+    templates pick them up as `event.properties.title`, etc.
+    """
+
+    title: str
+    summary: str
+    # Relative path inside the PostHog app (e.g. "/health/sdk-health").
+    # HogFunction templates concatenate this onto {project.url}.
+    link: str
+
+
+@dataclass(frozen=True)
+class Remediation:
+    """How to resolve issues of a given health-check kind.
+
+    Static per kind (not per issue), so it lives as a constant on the check.
+    `human` is the UI-oriented fix shown to people and sent to alert
+    destinations; `agent` is what an agent should do to investigate and — where
+    the fix lives in the user's codebase — apply it directly.
+
+    Both fields are run through `inspect.cleandoc` at construction, so checks
+    can write naturally-indented triple-quoted strings and every reader sees
+    clean, dedented prose.
+    """
+
+    human: str
+    agent: str
+
+    def __post_init__(self) -> None:
+        # Frozen dataclass — normalize in place via object.__setattr__.
+        object.__setattr__(self, "human", inspect.cleandoc(self.human))
+        object.__setattr__(self, "agent", inspect.cleandoc(self.agent))
+
+
+@dataclass(frozen=True)
+class SignalContent:
+    """An inbox signal rendered from a newly-firing health issue.
+
+    Checks opt into the Signals inbox by overriding `HealthCheck.render_signal`
+    to return one of these. `description` is what a reviewer reads in the feed;
+    `weight` ranks it (see `_SEVERITY_WEIGHT`); `extra` is product metadata that
+    must satisfy the `health_checks`/`health_issue` schema variant in
+    `frontend/src/queries/schema/schema-signals.ts`.
+
+    The signal's remediation is not carried here — it's the check's static
+    `Remediation` (human/agent), which the signal emitter reads directly and
+    maps onto the signal's top-level `remediation` field.
+    """
+
+    description: str
+    weight: float
+    extra: dict[str, Any]
+
+
+# Bounds on `issue.payload` before it lands in a signal's `extra`, which the Signals pipeline
+# renders verbatim into LLM context — an unbounded check payload must not blow up the prompt.
+_MAX_PAYLOAD_LIST_ITEMS = 20
+_MAX_PAYLOAD_STR_LEN = 500
+_MAX_PAYLOAD_DEPTH = 3
+
+
+def _bounded_payload_value(value: Any, depth: int = 0) -> Any:
+    """Recursively cap list length, string length, and nesting depth of a payload value."""
+    if isinstance(value, str):
+        if len(value) <= _MAX_PAYLOAD_STR_LEN:
+            return value
+        return f"{value[:_MAX_PAYLOAD_STR_LEN]}… (truncated)"
+    if isinstance(value, list):
+        if depth >= _MAX_PAYLOAD_DEPTH:
+            return f"[{len(value)} items]"
+        bounded = [_bounded_payload_value(item, depth + 1) for item in value[:_MAX_PAYLOAD_LIST_ITEMS]]
+        if len(value) > _MAX_PAYLOAD_LIST_ITEMS:
+            bounded.append(f"… (+{len(value) - _MAX_PAYLOAD_LIST_ITEMS} more)")
+        return bounded
+    if isinstance(value, dict):
+        if depth >= _MAX_PAYLOAD_DEPTH:
+            return f"{{{len(value)} keys}}"
+        return {key: _bounded_payload_value(item, depth + 1) for key, item in value.items()}
+    return value
+
+
+def build_signal_extra(issue: HealthIssue, *, title: str, summary: str, link: str) -> dict[str, Any]:
+    """Assemble the `extra` envelope for a health-check signal.
+
+    Shape must match the `health_checks`/`health_issue` variant in
+    `frontend/src/queries/schema/schema-signals.ts`. `render_signal` overrides
+    call this so the envelope stays consistent across checks.
+    """
+    return {
+        "kind": issue.kind,
+        "severity": issue.severity,
+        "issue_id": str(issue.id),
+        "title": title,
+        "summary": summary,
+        "link": link,
+        "url": f"{settings.SITE_URL}{link}",
+        "payload": _bounded_payload_value(issue.payload),
+    }
+
+
+@dataclass(frozen=True)
+class HealthCheckRegistration:
+    name: str
+    kind: str
+    owner: JobOwners
+    schedule: str | None
+    batch_size: int
+    max_concurrent: int
+    rollout_percentage: float
+    not_processed_threshold: float
+    execution_timeout: timedelta
+    dry_run: bool
+    active_since_days: int | None
+    product: Product | None
+    remediation: Remediation | None
+    access_controlled_resource: APIScopeObject | None
+    access_controlled_object_key: str | None
+    access_controlled_object_model: type[Model] | None
+
+    def __post_init__(self) -> None:
+        # A fraction, not a percent: 50 here would silently skip the rollout filter and hit every team.
+        if not (0.0 <= self.rollout_percentage <= 1.0):
+            raise ValueError(
+                f"HealthCheckRegistration rollout_percentage must be between 0 and 1, got {self.rollout_percentage}"
+            )
+        if not (0.0 <= self.not_processed_threshold <= 1.0):
+            raise ValueError(
+                f"HealthCheckRegistration not_processed_threshold must be between 0 and 1, "
+                f"got {self.not_processed_threshold}"
+            )
+        # Temporal reads a zero timeout as no timeout, which would let a broken run block the schedule again.
+        if self.execution_timeout <= timedelta(0):
+            raise ValueError(
+                f"HealthCheckRegistration execution_timeout must be positive, got {self.execution_timeout}"
+            )
+        # The denied ids are looked up under the resource, so a key alone would gate nobody.
+        if self.access_controlled_object_key is not None and self.access_controlled_resource is None:
+            raise ValueError(
+                f"HealthCheckRegistration access_controlled_object_key={self.access_controlled_object_key!r} "
+                "requires access_controlled_resource"
+            )
+        # The creator exemption only lifts an object-level deny, so it means nothing without one.
+        if self.access_controlled_object_model is not None and self.access_controlled_object_key is None:
+            raise ValueError(
+                f"HealthCheckRegistration access_controlled_object_model={self.access_controlled_object_model!r} "
+                "requires access_controlled_object_key"
+            )
+
+
+def _register_health_check(cls: type[HealthCheck]) -> None:
+    existing = HEALTH_CHECKS.get(cls.kind)
+    if existing is not None and existing.name != cls.name:
+        raise ValueError(f"Health check kind '{cls.kind}' already registered by '{existing.name}'")
+
+    registration = HealthCheckRegistration(
+        name=cls.name,
+        kind=cls.kind,
+        owner=cls.owner,
+        schedule=cls.schedule,
+        batch_size=cls.policy.batch_size,
+        max_concurrent=cls.policy.max_concurrent,
+        rollout_percentage=cls.rollout_percentage,
+        not_processed_threshold=cls.not_processed_threshold,
+        execution_timeout=cls.execution_timeout,
+        dry_run=cls.dry_run,
+        active_since_days=cls.active_since_days,
+        product=cls.product,
+        remediation=cls.remediation,
+        access_controlled_resource=cls.access_controlled_resource,
+        access_controlled_object_key=cls.access_controlled_object_key,
+        access_controlled_object_model=cls.access_controlled_object_model,
+    )
+
+    HEALTH_CHECKS[cls.kind] = registration
+    _DETECT_FNS[cls.kind] = cls().detect
+
+
+class HealthCheck:
+    name: str
+    kind: str
+    owner: JobOwners
+    product: Product | None = None
+    policy: HealthExecutionPolicy = DEFAULT_EXECUTION_POLICY
+    schedule: str | None = None
+    rollout_percentage: float = 1.0
+    not_processed_threshold: float = 0.1
+    execution_timeout: timedelta = DEFAULT_EXECUTION_TIMEOUT
+    dry_run: bool = False
+    active_since_days: int | None = DEFAULT_ACTIVE_SINCE_DAYS
+    # False stops the `$health_check_issue_firing` and `$health_check_issue_resolved` events for
+    # this kind. Issues are still written, served by the Health API, and sent to the Signals inbox
+    # when the check overrides `render_signal`. Use it for a check that writes many issues per
+    # team, because the stock health-alert destination does not filter on kind and sends one
+    # notification per issue. The alert emitter also ignores the access-control fields below, so
+    # this is the only way to keep a gated payload out of destinations.
+    emits_alerts: bool = True
+
+    # Static, kind-level guidance on how to resolve issues of this kind. Unlike
+    # `render_alert` (which describes a *specific* issue), this is the same for
+    # every issue of the kind, so it lives as a constant — easy to find and
+    # update in one place. Surfaced on the health-issue detail view; the `human`
+    # half is also emitted with alerts.
+    #
+    # Set it to a Remediation with two naturally-indented triple-quoted strings
+    # (the Remediation constructor normalises the indentation):
+    #   - human: how to fix it in the PostHog UI (no need to repeat the
+    #     "what's wrong" — title/summary already cover that).
+    #   - agent: how an agent should investigate (which MCP tools to call) and,
+    #     where the fix lives in the user's codebase, how to apply it directly
+    #     (edit config, bump a dependency, add a route, etc.).
+    # Be descriptive — each half doubles as a prompt for its audience.
+    remediation: Remediation | None = None
+
+    # The access-controlled resource this check's issue payloads describe (an
+    # `ACCESS_CONTROL_RESOURCES` entry, e.g. "external_data_source"). Set it when
+    # payloads embed metadata about that resource — names, keys, errors — so the
+    # Health API hides the check's issues from members whose access to the
+    # resource is restricted. None means every team member sees the issues.
+    #
+    # Two limits. On its own the gate is resource-level only: an `AccessControl`
+    # deny scoped to one object's `resource_id` is not consulted, so a member
+    # barred from a single source or view still sees its issues. Set
+    # `access_controlled_object_key` as well to close that. And only the Health
+    # API reads these fields. The alert emitter does not, so set `emits_alerts`
+    # to False to keep the payload out of destinations. The Signals inbox emitter
+    # does not either, so a check that also overrides `render_signal` still
+    # publishes its payload there.
+    access_controlled_resource: APIScopeObject | None = None
+
+    # The payload key that holds the id of the one object an issue describes, for
+    # example "flag_id" under the "feature_flag" resource. When set, the Health API
+    # also hides an issue from a member whose access to that object resolves to
+    # "none", even though they can view the resource in general. The payload value
+    # and the `AccessControl.resource_id` are compared as strings, so an integer id
+    # in the payload matches. Requires `access_controlled_resource`.
+    access_controlled_object_key: str | None = None
+
+    # The model the object ids belong to. When set, the Health API reads its
+    # `created_by_id` and still shows a creator the issues about objects they are
+    # denied, to match the creator exemption on the resource's own endpoints,
+    # where a creator can always open what they made. Requires
+    # `access_controlled_object_key`.
+    access_controlled_object_model: type[Model] | None = None
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        if not hasattr(cls, "name") or not hasattr(cls, "kind"):
+            return
+        _register_health_check(cls)
+
+    def detect(self, team_ids: list[int]) -> dict[int, list[HealthCheckResult]]:
+        raise NotImplementedError
+
+    @classmethod
+    def eligible_team_ids(cls, team_ids: list[int]) -> list[int]:
+        """Narrow a batch before detection runs. The default keeps every team.
+
+        A team left out here is never considered by the run, so it keeps whatever issues it
+        already holds. That is the difference between this and returning nothing from `detect`:
+        the framework reads a team missing from a detector's result as healthy and resolves its
+        issues, while a team removed here is simply not part of the run.
+
+        Use it to gate a check on something the framework cannot know, such as a feature flag.
+        Keep it cheap and side-effect free, because it runs once per batch.
+        """
+        return team_ids
+
+    @classmethod
+    def render_alert(cls, issue: HealthIssue) -> AlertContent:
+        """Build the alert content surfaced to HogFunction destinations.
+
+        The default produces a generic title/summary keyed off `kind` and
+        `severity` with a link to /health. Concrete checks override this to
+        produce a human-readable message that names the affected resource.
+        """
+        return AlertContent(
+            title=cls.name,
+            summary=f"{cls.kind} ({issue.severity})",
+            link="/health",
+        )
+
+    @classmethod
+    def render_signal(cls, issue: HealthIssue) -> SignalContent | None:
+        """Build the inbox signal for a newly-firing issue, or None to skip.
+
+        The base default returns None — a check surfaces in the Signals inbox
+        only by overriding this and writing its own description / weight / extra.
+        Overrides build their own prose rather than reusing `render_alert`: the
+        alert phrasing (a destination notification) and the inbox phrasing (a
+        reviewer-facing finding) are deliberately separate. Use `_SEVERITY_WEIGHT`
+        for the standard severity → weight mapping. The remediation is not set
+        here — it comes from the check's static `remediation` constant.
+        """
+        return None
+
+
+def health_check_class_for_kind(kind: str) -> type[HealthCheck] | None:
+    """Resolve the HealthCheck subclass that produces issues of `kind`.
+
+    The registry only stores instance-bound detect callables, but every
+    HealthCheck subclass binds `cls()` so the underlying class is reachable
+    via the bound method's `__self__`.
+    """
+    ensure_registry_loaded()
+    fn = _DETECT_FNS.get(kind)
+    if fn is None:
+        return None
+    instance = getattr(fn, "__self__", None)
+    return type(instance) if instance is not None else None
+
+
+def render_alert_for_issue(issue: HealthIssue) -> AlertContent:
+    """Render the per-issue envelope (title/summary/link) for an issue.
+
+    Falls back to a generic envelope when the issue's kind has no registered
+    check (e.g. a check that was removed after issues were persisted).
+    """
+    check_cls = health_check_class_for_kind(issue.kind)
+    if check_cls is None:
+        return AlertContent(title=issue.kind, summary=f"{issue.kind} ({issue.severity})", link="/health")
+    return check_cls.render_alert(issue)
+
+
+def access_controlled_resources_by_kind() -> dict[str, APIScopeObject]:
+    """Map check kind → the access-controlled resource its payloads describe.
+
+    Only kinds that declare `access_controlled_resource` appear; every other
+    kind is visible to all team members.
+    """
+    ensure_registry_loaded()
+    return {
+        kind: registration.access_controlled_resource
+        for kind, registration in HEALTH_CHECKS.items()
+        if registration.access_controlled_resource is not None
+    }
+
+
+@dataclass(frozen=True)
+class ObjectAccessGate:
+    resource: APIScopeObject
+    object_key: str
+    model: type[Model] | None
+
+
+def object_access_gates_by_kind() -> dict[str, ObjectAccessGate]:
+    """Map check kind → how its issues are gated on the one object each describes.
+
+    Only kinds that declare both `access_controlled_resource` and
+    `access_controlled_object_key` appear.
+    """
+    ensure_registry_loaded()
+    return {
+        kind: ObjectAccessGate(
+            resource=registration.access_controlled_resource,
+            object_key=registration.access_controlled_object_key,
+            model=registration.access_controlled_object_model,
+        )
+        for kind, registration in HEALTH_CHECKS.items()
+        if registration.access_controlled_resource is not None and registration.access_controlled_object_key is not None
+    }
+
+
+def remediation_for_kind(kind: str) -> Remediation | None:
+    """Return the static, kind-level remediation guide, or None if there isn't one.
+
+    Read straight from the registry so callers don't need to resolve the check
+    class. Unknown kinds (and kinds that never set `remediation`) return None.
+    """
+    ensure_registry_loaded()
+    registration = HEALTH_CHECKS.get(kind)
+    if registration is None:
+        return None
+    return registration.remediation

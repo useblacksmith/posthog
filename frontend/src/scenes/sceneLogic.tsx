@@ -1,0 +1,1342 @@
+import { deepEqual as equal } from 'fast-equals'
+import {
+    MakeLogicType,
+    BuiltLogic,
+    actions,
+    afterMount,
+    connect,
+    kea,
+    listeners,
+    path,
+    props,
+    reducers,
+    selectors,
+} from 'kea'
+import { combineUrl, router, urlToAction } from 'kea-router'
+import posthog from 'posthog-js'
+import { useEffect, useState } from 'react'
+
+import api from 'lib/api'
+import type { SupportTicketExceptionEvent } from 'lib/components/Support/supportLogic'
+import { FEATURE_FLAGS, TeamMembershipLevel } from 'lib/constants'
+import { listenForGoldRingsKeys } from 'lib/holidayGoldRings'
+import { trackFileSystemLogView } from 'lib/hooks/useFileSystemLogView'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { Spinner } from 'lib/lemon-ui/Spinner'
+import { FeatureFlagsSet, featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { inviteLogic } from 'lib/logic/inviteLogic'
+import { preflightLogic } from 'lib/logic/preflightLogic'
+import { markBootPhase } from 'lib/utils/bootTiming'
+import { getAppContext } from 'lib/utils/getAppContext'
+import { isChunkLoadError } from 'lib/utils/isChunkLoadError'
+import { addProjectIdIfMissing, getProjectIdentifierInPath, removeProjectIdIfPresent } from 'lib/utils/kea-router'
+import { handleLoginRedirect } from 'lib/utils/loginRedirect'
+import { retryImport } from 'lib/utils/retryImport'
+import { isStableChunkBuild, reloadAfterChunkLoadError } from 'lib/utils/stableChunks'
+import { identifierToHuman } from 'lib/utils/strings'
+import { getRelativeNextPath } from 'lib/utils/url'
+import {
+    emptySceneParams,
+    forwardedRedirectQueryParams,
+    preloadedScenes,
+    redirects,
+    routes,
+    sceneConfigurations,
+} from 'scenes/scenes'
+import {
+    LoadedScene,
+    Params,
+    Scene,
+    SceneConfig,
+    SceneExport,
+    SceneParams,
+    SceneTab,
+    sceneToAccessControlResourceType,
+} from 'scenes/sceneTypes'
+import { urls } from 'scenes/urls'
+
+import { isSharedView } from '~/exporter/exporterViewLogic'
+import { FileSystemIconType, ProductKey } from '~/queries/schema/schema-general'
+import { loadCoreFilterDefinitions } from '~/taxonomy/loadCoreFilterDefinitions'
+import { AccessControlLevel, UserType } from '~/types'
+
+import { parseCouponCampaign } from './coupons/utils'
+import { isOnboardingRedirectSuppressed } from './onboarding/onboardingDelegationState'
+import { organizationLogic } from './organizationLogic'
+import { isPathOpenWhileProjectPendingDeletion, projectLogic } from './projectLogic'
+import type { SceneProps } from './sceneTypes'
+import { teamLogic } from './teamLogic'
+import { userLogic } from './userLogic'
+
+interface MountedSceneLogic {
+    logic: SceneExport['logic']
+    logicProps: Record<string, any>
+    sceneId: string
+    sceneKey?: string
+    unmount: () => void
+}
+
+function unmountSceneLogic(cache: Record<string, any>): void {
+    const mountedLogic: MountedSceneLogic | null = cache.mountedSceneLogic
+    if (!mountedLogic) {
+        return
+    }
+    try {
+        mountedLogic.unmount()
+    } catch (error) {
+        console.error('Error unmounting previous scene logic:', error)
+    }
+    cache.mountedSceneLogic = null
+}
+
+// A failed load must fail the scene, because code that builds queries from an empty taxonomy returns wrong results.
+function loadCoreFilterDefinitionsFor(sceneId: string, loggedIn: boolean): Promise<void> {
+    const sceneConfig = sceneConfigurations[sceneId]
+    if (sceneConfig?.onlyUnauthenticated || (sceneConfig?.allowUnauthenticated && !loggedIn)) {
+        return Promise.resolve()
+    }
+    return retryImport(loadCoreFilterDefinitions)
+}
+
+const generateTabId = (): string => crypto?.randomUUID?.()?.split('-')?.pop() || `${Date.now()}-${Math.random()}`
+
+/**
+ * Homepage snapshot for JSON persistence: strips `sceneParams` (deep/cyclic routing state) and
+ * ensures an id. Every other `SceneTab` field is kept so new fields aren't forgotten; if a future
+ * field holds non-plain data, omit it here explicitly.
+ */
+const tabToPersistableSnapshot = (tab: SceneTab): SceneTab => {
+    const { sceneParams: _omitSceneParams, ...rest } = tab
+    return {
+        ...rest,
+        id: tab.id || generateTabId(),
+    }
+}
+
+/**
+ * Moves a member of a blocked organization off a path the block closes. Returns true when it navigated.
+ */
+function leaveBlockedOrganizationPath(): boolean {
+    const { currentOrganizationBlockPage, isPathInAnotherOrganization, isPathOpenWhileBlocked } =
+        organizationLogic.values
+    if (!currentOrganizationBlockPage) {
+        return false
+    }
+    const { pathname, search, hash } = router.values.location
+    if (isPathInAnotherOrganization(pathname)) {
+        // The client keeps the blocked organization's project whatever the URL says, so the scene would
+        // read that project's data. A page load lets the server switch the member into the project's
+        // organization, or send them to the block page.
+        window.location.href = pathname + search + hash
+        return true
+    }
+    if (isPathOpenWhileBlocked(pathname)) {
+        return false
+    }
+    router.actions.replace(currentOrganizationBlockPage)
+    return true
+}
+
+// `/` and `/home` both resolve the configured homepage through this, so anything asking whether a
+// location is the homepage has to derive it the same way.
+export const homepageTargetPathname = (homepage: SceneTab): string => {
+    const targetPathname = addProjectIdIfMissing(homepage.pathname || urls.projectHomepage())
+    return removeProjectIdIfPresent(targetPathname) === '/'
+        ? addProjectIdIfMissing(urls.projectHomepage())
+        : targetPathname
+}
+
+// Bootstrapped by Django into APP_CONTEXT so the configured homepage is known on first paint,
+// before any async fetch — otherwise urlToAction runs with a null homepage and /home can't redirect.
+export const getBootstrappedHomepage = (): SceneTab | null => {
+    const homepage = getAppContext()?.homepage
+    if (!homepage) {
+        return null
+    }
+    // A homepage saved against a scene that no longer ships would send `/` to a dead route on
+    // every visit, with no way back except reconfiguring it. Fall back to the project default.
+    if (homepage.sceneId && !sceneConfigurations[homepage.sceneId]) {
+        return null
+    }
+    return tabToPersistableSnapshot(homepage)
+}
+
+const pathPrefixesOnboardingNotRequiredFor = [
+    urls.onboarding(),
+    '/settings',
+    urls.organizationBilling(),
+    urls.billingAuthorizationStatus(),
+    '/instance',
+    urls.moveToPostHogCloud(),
+    urls.unsubscribe(),
+    urls.debugHog(),
+    urls.debugQuery(),
+    urls.activity(),
+    // /integrations/* — OAuth + third-party round-trips: must complete (callback/landing effects)
+    // even when onboarding is incomplete, else /onboarding swallows the response. E.g.
+    // /integrations/<kind>/callback (urls.integrationsRedirect), stripe confirm-install, vercel link-error.
+    '/integrations',
+    // /account-connected/<kind> — return after linking GitHub etc.; /complete/github-link/ redirects here.
+    '/account-connected',
+    // /account/* — credential/passkey round-trips (e.g. /account/credential-review) must complete
+    // even when onboarding is incomplete, else finishing security setup bounces straight back to
+    // /onboarding and the user is stuck in a redirect loop.
+    '/account',
+    // /oauth/authorize and any /oauth/* callback path.
+    '/oauth',
+    // /connect/vercel/link (urls.vercelConnect) and other connect round-trips.
+    '/connect',
+    // /agentic/authorize, /agentic/account-mismatch.
+    '/agentic',
+    // /cli/authorize, /cli/live (CLI auth round-trip).
+    '/cli',
+    // /device, where a person approves an OAuth device login (urls.oauthDeviceAuthorize).
+    '/device',
+    // /stamphog/install/callback — GitHub App install round-trip carrying a one-time OAuth code;
+    // if /onboarding swallows it the installation completes on GitHub but no repos ever connect.
+    '/stamphog/install/callback',
+    // /verify_email/<uuid>/<token> — email verification/change confirmation must run its
+    // urlToAction (POST /api/users/verify_email/) even when onboarding is incomplete, else
+    // /onboarding swallows the click and the email is never updated.
+    urls.verifyEmail(),
+    '/startups',
+    '/coupons',
+    '/legal',
+]
+
+// The server refused the project this address names and served the user's own one.
+function isRefusedProjectPath(pathname: string): boolean {
+    const refusedProject = getAppContext()?.project_access_denied
+    return !!refusedProject && getProjectIdentifierInPath(pathname) === refusedProject
+}
+
+function isAccountSettingsPath(pathname: string): boolean {
+    return /^\/settings\/(user|organization)/.test(removeProjectIdIfPresent(pathname))
+}
+
+function isProjectAccessDenied(sceneId: string, pathname: string, isCurrentProjectAccessDenied: boolean): boolean {
+    if (!sceneConfigurations[sceneId]?.projectBased) {
+        return false
+    }
+    // The server refused the project this address names and served the user's own one, so the page
+    // cannot load. Once the address bar names a project we do serve, the scene loads as usual.
+    if (isRefusedProjectPath(pathname)) {
+        return true
+    }
+    return isCurrentProjectAccessDenied && !isAccountSettingsPath(pathname)
+}
+
+// `isHobby` is true until preflight loads, so a cloud user must not be redirected before it loads
+function isCloudOnlySceneOnSelfHosted(sceneId: string | null): boolean {
+    const { preflight, isHobby } = preflightLogic.values
+    return !!sceneId && !!sceneConfigurations[sceneId]?.cloudOnly && !!preflight && isHobby
+}
+
+function isFirstProjectWithoutData(user: UserType): boolean {
+    const { currentTeam, hasOnboardedAnyProduct } = teamLogic.values
+    return (
+        !user.is_impersonated &&
+        user.organization?.teams.length === 1 &&
+        !!currentTeam &&
+        !currentTeam.is_demo &&
+        !hasOnboardedAnyProduct &&
+        !currentTeam.ingested_event &&
+        // The access denied page must show, else the link silently opens the onboarding of the user's own project.
+        !isRefusedProjectPath(router.values.location.pathname)
+    )
+}
+
+export function isOnboardingNotRequiredForPath(pathname: string): boolean {
+    const path = removeProjectIdIfPresent(pathname)
+    return pathPrefixesOnboardingNotRequiredFor.some((prefix) => path.startsWith(prefix))
+}
+
+export function getOnboardingRedirectNextPath(nextParam: string | null | undefined, location: Location): string {
+    return (
+        getRelativeNextPath(nextParam, location) ?? `${removeProjectIdIfPresent(location.pathname)}${location.search}`
+    )
+}
+
+const DelayedLoadingSpinner = (): JSX.Element => {
+    const [show, setShow] = useState(false)
+    useEffect(() => {
+        const timeout = window.setTimeout(() => setShow(true), 500)
+        return () => window.clearTimeout(timeout)
+    }, [])
+    return <>{show ? <Spinner /> : null}</>
+}
+
+const captureSceneLoadFailure = (
+    error: unknown,
+    sceneId: string,
+    stage: 'import' | 'logic_mount',
+    extra: Record<string, unknown> = {}
+): SupportTicketExceptionEvent | undefined => posthog.captureException(error, { extra: { sceneId, stage, ...extra } })
+
+const scrollMainContentToTop = (): void => {
+    const element = document.getElementById('main-content')
+    if (!element) {
+        return
+    }
+    window.requestAnimationFrame(() => {
+        element.scrollTo({ top: 0 })
+    })
+}
+
+/**
+ * Forwards whitelisted query parameters from the current URL to the redirect URL.
+ * Only forwards params that exist in the current URL and don't already exist in the redirect URL.
+ * This is specifically used for scene redirects to maintain important query parameters across redirects.
+ */
+export function withForwardedSearchParams(
+    redirectUrl: string,
+    currentSearchParams: Params,
+    forwardedQueryParams: string[]
+): string {
+    // If no params to forward, return the original URL
+    if (!forwardedQueryParams?.length) {
+        return redirectUrl
+    }
+
+    const redirectUrlObj = new URL(redirectUrl, window.location.origin)
+    const redirectSearchParams = new URLSearchParams(redirectUrlObj.search)
+    let paramsWereForwarded = false
+
+    // For each whitelisted param that exists in current URL
+    forwardedQueryParams.forEach((param) => {
+        if (currentSearchParams[param] !== undefined && !redirectSearchParams.has(param)) {
+            redirectSearchParams.set(param, currentSearchParams[param])
+            paramsWereForwarded = true
+        }
+    })
+
+    // Only modify the URL if we actually forwarded any params
+    if (!paramsWereForwarded) {
+        return redirectUrl
+    }
+
+    // Reconstruct the URL with the forwarded params
+    redirectUrlObj.search = redirectSearchParams.toString()
+    // Return just the pathname and search to avoid origin being included
+    return redirectUrlObj.pathname + redirectUrlObj.search + redirectUrlObj.hash
+}
+
+/**
+ * Builds a redirect URL that carries the incoming hash (e.g. #panel=max:<prompt>, merged over any
+ * hash the target already has) plus the allow-listed query params, so URL-driven side panel prompts
+ * survive scene redirects like `/` → the homepage.
+ */
+function withForwardedHashAndSearchParams(
+    redirectUrl: string,
+    currentSearchParams: Params,
+    hashParams: Params,
+    forwardedQueryParams: string[]
+): string {
+    return withForwardedSearchParams(
+        combineUrl(redirectUrl, {}, hashParams).url,
+        currentSearchParams,
+        forwardedQueryParams
+    )
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sceneLogicValues {
+    featureFlags: FeatureFlagsSet // featureFlagLogic
+    organizationBeingDeleted: string | null // organizationLogic
+    activeExportedScene: SceneExport<SceneProps> | null
+    activeLoadedScene: LoadedScene | null
+    activeSceneComponentParams: Record<string, any>
+    activeSceneId: string | null
+    activeSceneLogic: BuiltLogic | null
+    activeSceneLogicProps: Record<string, any>
+    activeSceneProductKey: ProductKey | null
+    exportedScenes: Record<string, SceneExport<SceneProps>>
+    hashParams: Record<string, any>
+    homepage: SceneTab | null
+    homepageSaving: boolean
+    lastReloadAt: number | null
+    lastSetScenePayload: Record<string, any>
+    loadingScene: string | null
+    sceneConfig: SceneConfig | null
+    sceneId: string | null
+    sceneKey: string | null
+    sceneLoadExceptionEvent: SupportTicketExceptionEvent | null
+    sceneParams: SceneParams
+    searchParams: Record<string, any>
+    titleAndIcon: {
+        iconType: FileSystemIconType | 'blank' | 'loading'
+        title: string
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sceneLogicActions {
+    hideInviteModal: () => {
+        value: true
+    } // inviteLogic
+    homepageSaved: (tab: SceneTab | null) => {
+        tab: SceneTab | null
+    }
+    loadScene: (
+        sceneId: string,
+        sceneKey: string | undefined,
+        params: SceneParams,
+        method: string
+    ) => {
+        method: string
+        params: SceneParams
+        sceneId: string
+        sceneKey: string | undefined
+    }
+    openScene: (
+        sceneId: string,
+        sceneKey: string | undefined,
+        params: SceneParams,
+        method: string
+    ) => {
+        method: string
+        params: SceneParams
+        sceneId: string
+        sceneKey: string | undefined
+    }
+    reloadBrowserDueToImportError: (error: unknown) => {
+        error: unknown
+    }
+    resetUnavailableHomepage: (pathname: string) => {
+        pathname: string
+    }
+    setExportedScene: (
+        exportedScene: SceneExport,
+        sceneId: string,
+        sceneKey: string | undefined,
+        params: SceneParams
+    ) => {
+        exportedScene: SceneExport<SceneProps>
+        params: SceneParams
+        sceneId: string
+        sceneKey: string | undefined
+    }
+    setHomepage: (
+        tab: SceneTab | null,
+        homepageSource?: 'dashboards list'
+    ) => {
+        homepageSource: 'dashboards list' | undefined
+        tab: SceneTab | null
+    }
+    setHomepageSaving: (saving: boolean) => {
+        saving: boolean
+    }
+    setScene: (
+        sceneId: string,
+        sceneKey: string | undefined,
+        params: SceneParams,
+        scrollToTop?: boolean,
+        exportedScene?: SceneExport
+    ) => {
+        exportedScene: SceneExport<SceneProps> | undefined
+        params: SceneParams
+        sceneId: string
+        sceneKey: string | undefined
+        scrollToTop: boolean
+    }
+    setSceneLoadExceptionEvent: (exceptionEvent: SupportTicketExceptionEvent | undefined) => {
+        exceptionEvent: SupportTicketExceptionEvent | undefined
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sceneLogicProps {
+    scenes?: Record<string, () => any>
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface sceneLogicMeta {
+    __keaTypeGenInternalSelectorTypes: {
+        sceneConfig: (sceneId: string | null) => SceneConfig | null
+        activeSceneId: (
+            sceneId: string | null,
+            isCurrentTeamUnavailable: boolean,
+            isCurrentProjectAccessDenied: boolean,
+            location: {
+                hash: string
+                pathname: string
+                search: string
+            }
+        ) => string | null
+        activeExportedScene: (
+            activeSceneId: string | null,
+            exportedScenes: Record<string, SceneExport<SceneProps>>
+        ) => SceneExport<SceneProps> | null
+        activeLoadedScene: (
+            activeSceneId: string | null,
+            activeExportedScene: SceneExport<SceneProps> | null,
+            sceneParams: SceneParams
+        ) => LoadedScene | null
+        activeSceneComponentParams: (sceneParams: SceneParams) => Record<string, any>
+        activeSceneLogicProps: (
+            activeExportedScene: SceneExport<SceneProps> | null,
+            sceneParams: SceneParams
+        ) => Record<string, any>
+        activeSceneLogic: (
+            activeExportedScene: SceneExport<SceneProps> | null,
+            activeSceneLogicProps: Record<string, any>
+        ) => BuiltLogic | null
+        searchParams: (sceneParams: SceneParams) => Record<string, any>
+        hashParams: (sceneParams: SceneParams) => Record<string, any>
+        titleAndIcon: (arg: { iconType: FileSystemIconType | 'blank' | 'loading'; title: string }) => {
+            iconType: FileSystemIconType | 'blank' | 'loading'
+            title: string
+        }
+        activeSceneProductKey: (activeExportedScene: SceneExport<SceneProps> | null) => ProductKey | null
+    }
+}
+
+export type sceneLogicType = MakeLogicType<sceneLogicValues, sceneLogicActions, sceneLogicProps, sceneLogicMeta>
+
+export const sceneLogic = kea<sceneLogicType>([
+    props(
+        {} as {
+            scenes?: Record<string, () => any>
+        }
+    ),
+    path(['scenes', 'sceneLogic']),
+
+    connect(() => ({
+        logic: [router, userLogic, preflightLogic, teamLogic],
+        actions: [inviteLogic, ['hideInviteModal']],
+        values: [organizationLogic, ['organizationBeingDeleted'], featureFlagLogic, ['featureFlags']],
+    })),
+    afterMount(({ cache }) => {
+        cache.mountedSceneLogic = null as MountedSceneLogic | null
+        cache.lastTrackedScene = null as { sceneId?: string; sceneKey?: string } | null
+        cache.homepageSave = Promise.resolve()
+        cache.homepageRequest = 0
+        cache.disposables.add(() =>
+            listenForGoldRingsKeys(
+                () => featureFlagLogic.values.featureFlags[FEATURE_FLAGS.CHRISTMAS_GOLD_RINGS] === true
+            )
+        )
+    }),
+    actions({
+        /* 1. Prepares to open the scene, as the listener may override and do something
+        else (e.g. redirecting if unauthenticated), then calls (2) `loadScene`*/
+        openScene: (sceneId: string, sceneKey: string | undefined, params: SceneParams, method: string) => ({
+            sceneId,
+            sceneKey,
+            params,
+            method,
+        }),
+        // 2. Start loading the scene's Javascript and mount any logic, then calls (3) `setScene`
+        loadScene: (sceneId: string, sceneKey: string | undefined, params: SceneParams, method: string) => ({
+            sceneId,
+            sceneKey,
+            params,
+            method,
+        }),
+        // 3. Set the `scene` reducer
+        setScene: (
+            sceneId: string,
+            sceneKey: string | undefined,
+            params: SceneParams,
+            scrollToTop: boolean = false,
+            exportedScene?: SceneExport
+        ) => ({
+            sceneId,
+            sceneKey,
+            params,
+            scrollToTop,
+            exportedScene,
+        }),
+        setExportedScene: (
+            exportedScene: SceneExport,
+            sceneId: string,
+            sceneKey: string | undefined,
+            params: SceneParams
+        ) => ({
+            exportedScene,
+            sceneId,
+            sceneKey,
+            params,
+        }),
+        reloadBrowserDueToImportError: (error: unknown) => ({ error }),
+
+        setHomepage: (tab: SceneTab | null, homepageSource?: 'dashboards list') => ({ tab, homepageSource }),
+        homepageSaved: (tab: SceneTab | null) => ({ tab }),
+        setHomepageSaving: (saving: boolean) => ({ saving }),
+        resetUnavailableHomepage: (pathname: string) => ({ pathname }),
+        setSceneLoadExceptionEvent: (exceptionEvent: SupportTicketExceptionEvent | undefined) => ({ exceptionEvent }),
+    }),
+    reducers({
+        sceneId: [
+            null as string | null,
+            {
+                setScene: (_, { sceneId }) => sceneId,
+                setExportedScene: (_, { sceneId }) => sceneId,
+            },
+        ],
+        sceneKey: [
+            null as string | null,
+            {
+                setScene: (_, { sceneKey }) => sceneKey ?? null,
+                setExportedScene: (_, { sceneKey }) => sceneKey ?? null,
+            },
+        ],
+        sceneParams: [
+            emptySceneParams as SceneParams,
+            {
+                setScene: (_, { params }) => params,
+                setExportedScene: (_, { params }) => params,
+            },
+        ],
+        exportedScenes: [
+            preloadedScenes,
+            {
+                setExportedScene: (state, { exportedScene, sceneId }) => ({
+                    ...state,
+                    [sceneId]: { ...exportedScene },
+                }),
+            },
+        ],
+        loadingScene: [
+            null as string | null,
+            {
+                loadScene: (_, { sceneId }) => sceneId,
+                setScene: () => null,
+            },
+        ],
+        lastReloadAt: [
+            null as number | null,
+            { persist: true },
+            {
+                reloadBrowserDueToImportError: () => new Date().valueOf(),
+            },
+        ],
+        lastSetScenePayload: [
+            {} as Record<string, any>,
+            {
+                setScene: (_, { sceneId, sceneKey, params }) => ({
+                    sceneId,
+                    sceneKey,
+                    params,
+                }),
+            },
+        ],
+    }),
+    // Function form so the bootstrapped default is read at build time (per kea context),
+    // not once at module import — production sets APP_CONTEXT before the bundle loads either way.
+    reducers(() => ({
+        homepage: [
+            getBootstrappedHomepage(),
+            {
+                setHomepage: (state, { tab, homepageSource }) => {
+                    if (homepageSource) {
+                        return state
+                    }
+                    return tab ? tabToPersistableSnapshot(tab) : null
+                },
+                homepageSaved: (_, { tab }) => (tab ? tabToPersistableSnapshot(tab) : null),
+            },
+        ],
+        homepageSaving: [false, { setHomepageSaving: (_, { saving }) => saving }],
+        sceneLoadExceptionEvent: [
+            null as SupportTicketExceptionEvent | null,
+            { setSceneLoadExceptionEvent: (_, { exceptionEvent }) => exceptionEvent ?? null },
+        ],
+    })),
+    selectors({
+        sceneConfig: [
+            (s) => [s.sceneId],
+            (sceneId: Scene): SceneConfig | null => {
+                const config = sceneConfigurations[sceneId] || null
+                return config
+            },
+            { resultEqualityCheck: equal },
+        ],
+        activeSceneId: [
+            (s) => [
+                s.sceneId,
+                teamLogic.selectors.isCurrentTeamUnavailable,
+                teamLogic.selectors.isCurrentProjectAccessDenied,
+                router.selectors.location,
+            ],
+            (
+                sceneId: string | null,
+                isCurrentTeamUnavailable: boolean,
+                isCurrentProjectAccessDenied: boolean,
+                location: { pathname: string }
+            ) => {
+                const appContext = getAppContext()
+                const effectiveResourceAccessControl = appContext?.effective_resource_access_control
+
+                if (sceneId && isProjectAccessDenied(sceneId, location.pathname, isCurrentProjectAccessDenied)) {
+                    return Scene.ErrorProjectAccessDenied
+                }
+
+                // Get the access control resource type for the current scene
+                const sceneAccessControlResource = sceneId ? sceneToAccessControlResourceType[sceneId as Scene] : null
+
+                // Check if the user has effective access to this resource (includes specific object access)
+                if (
+                    sceneAccessControlResource &&
+                    effectiveResourceAccessControl &&
+                    (Array.isArray(sceneAccessControlResource)
+                        ? sceneAccessControlResource
+                        : [sceneAccessControlResource]
+                    ).every((resource) => effectiveResourceAccessControl[resource] === AccessControlLevel.None)
+                ) {
+                    return Scene.ErrorAccessDenied
+                }
+
+                // Check if the current team is unavailable for project-based scenes
+                // Allow settings and danger zone to be opened
+                if (
+                    isCurrentTeamUnavailable &&
+                    sceneId &&
+                    sceneConfigurations[sceneId]?.projectBased &&
+                    !location.pathname.startsWith('/settings')
+                ) {
+                    return Scene.ErrorProjectUnavailable
+                }
+
+                return sceneId
+            },
+        ],
+        activeExportedScene: [
+            (s) => [s.activeSceneId, s.exportedScenes],
+            (
+                activeSceneId: string | null,
+                exportedScenes: Record<string, SceneExport<import('scenes/sceneTypes').SceneProps>>
+            ) => {
+                return activeSceneId ? exportedScenes[activeSceneId] : null
+            },
+            { resultEqualityCheck: (a, b) => a === b },
+        ],
+        activeLoadedScene: [
+            (s) => [s.activeSceneId, s.activeExportedScene, s.sceneParams],
+            (
+                activeSceneId: string | null,
+                activeExportedScene: SceneExport<import('scenes/sceneTypes').SceneProps> | null,
+                sceneParams: SceneParams
+            ): LoadedScene | null => {
+                return {
+                    ...(activeExportedScene ?? { component: DelayedLoadingSpinner }),
+                    id: activeSceneId ?? Scene.Error404,
+                    sceneParams: sceneParams,
+                }
+            },
+        ],
+        activeSceneComponentParams: [
+            (s) => [s.sceneParams],
+            (sceneParams: SceneParams): Record<string, any> => {
+                return {
+                    ...sceneParams.params,
+                }
+            },
+            { resultEqualityCheck: equal },
+        ],
+        activeSceneLogicProps: [
+            (s) => [s.activeExportedScene, s.sceneParams],
+            (
+                activeExportedScene: SceneExport<import('scenes/sceneTypes').SceneProps> | null,
+                sceneParams: SceneParams
+            ): Record<string, any> => {
+                return {
+                    ...activeExportedScene?.paramsToProps?.(sceneParams),
+                }
+            },
+            { resultEqualityCheck: equal },
+        ],
+        activeSceneLogic: [
+            (s) => [s.activeExportedScene, s.activeSceneLogicProps],
+            (
+                activeExportedScene: SceneExport<import('scenes/sceneTypes').SceneProps> | null,
+                activeSceneLogicProps: Record<string, any>
+            ): BuiltLogic | null => {
+                if (activeExportedScene?.logic) {
+                    try {
+                        return activeExportedScene.logic.build(activeSceneLogicProps)
+                    } catch (e) {
+                        // Building a keyed logic with undefined key (e.g. during a scene
+                        // transition before paramsToProps has resolved) throws
+                        // "Undefined key for logic". Swallow only that case so the scene
+                        // doesn't hard-crash; the next render with resolved params will
+                        // rebuild. Re-throw anything else so genuine build bugs (wrong
+                        // prop shape, missing reducer, etc.) still surface loudly.
+                        if (e instanceof Error && e.message.includes('Undefined key for logic')) {
+                            posthog.captureException(e, { source: 'sceneLogic.activeSceneLogic' })
+                            return null
+                        }
+                        throw e
+                    }
+                }
+
+                return null
+            },
+        ],
+        searchParams: [
+            (s) => [s.sceneParams],
+            (sceneParams: SceneParams): Record<string, any> => sceneParams.searchParams || {},
+        ],
+        hashParams: [
+            (s) => [s.sceneParams],
+            (sceneParams: SceneParams): Record<string, any> => sceneParams.hashParams || {},
+        ],
+
+        titleAndIcon: [
+            (s) => [
+                // We're effectively passing the selector through to the scene logic, and "recalculating"
+                // this every time it's rendered. Caching will happen within the scene's breadcrumb selector.
+                (state, props): { title: string; iconType: FileSystemIconType | 'loading' | 'blank' } => {
+                    const activeSceneLogic = sceneLogic.selectors.activeSceneLogic(state, props)
+                    const activeExportedScene = sceneLogic.selectors.activeExportedScene(state, props)
+                    if (activeSceneLogic && 'breadcrumbs' in activeSceneLogic.selectors) {
+                        try {
+                            const sceneParams = sceneLogic.selectors.sceneParams(state, props)
+                            const bc = activeSceneLogic.selectors.breadcrumbs(
+                                state,
+                                activeExportedScene?.paramsToProps?.(sceneParams) || props
+                            )
+                            return {
+                                title: bc.length > 0 ? bc[bc.length - 1].name : '...',
+                                iconType: bc.length > 0 ? bc[bc.length - 1].iconType : 'blank',
+                            }
+                        } catch {
+                            // If the breadcrumb selector fails, we'll just ignore it and return a placeholder value below
+                        }
+                    }
+
+                    const activeSceneId = s.activeSceneId(state, props)
+                    if (activeSceneId) {
+                        const sceneConfig = s.sceneConfig(state, props)
+                        return {
+                            title: sceneConfig?.name ?? identifierToHuman(activeSceneId),
+                            iconType: sceneConfig?.iconType ?? (activeExportedScene ? 'notebook' : 'loading'),
+                        }
+                    }
+                    return { title: '...', iconType: 'loading' }
+                },
+            ],
+            (titleAndIcon: { iconType: FileSystemIconType | 'blank' | 'loading'; title: string }) =>
+                titleAndIcon as { title: string; iconType: FileSystemIconType | 'loading' | 'blank' },
+            { resultEqualityCheck: equal },
+        ],
+        activeSceneProductKey: [
+            (s) => [s.activeExportedScene],
+            (activeExportedScene: SceneExport | null): ProductKey | null => {
+                return activeExportedScene?.productKey ?? null
+            },
+        ],
+    }),
+    listeners(({ values, actions, cache, props, selectors }) => ({
+        [preflightLogic.actionTypes.loadPreflightSuccess]: () => {
+            if (isCloudOnlySceneOnSelfHosted(values.loadingScene ?? values.sceneId)) {
+                router.actions.replace(urls.moveToPostHogCloud())
+            }
+        },
+        [teamLogic.actionTypes.currentProjectAccessDenied]: () => {
+            if (values.activeSceneId === Scene.ErrorProjectAccessDenied) {
+                unmountSceneLogic(cache)
+            }
+        },
+        // A homepage pointing at a deleted object answers every `/` and Home with a not-found screen,
+        // and the picker that would change it sits behind that screen. Drop the setting instead.
+        resetUnavailableHomepage: ({ pathname }) => {
+            const target = addProjectIdIfMissing(pathname)
+            if (!values.homepage || homepageTargetPathname(values.homepage) !== target) {
+                return
+            }
+            actions.setHomepage(null)
+            lemonToast.info('Your home pointed to something that no longer exists, so we reset it.')
+            const location = router.values.currentLocation
+            if (addProjectIdIfMissing(location.pathname) === target) {
+                // Carry the hash and allow-listed params over, as the `/` → homepage redirect does,
+                // so a modal bound to `?modal=` does not close on the way out.
+                router.actions.replace(
+                    withForwardedHashAndSearchParams(
+                        urls.projectHomepage(),
+                        location.searchParams,
+                        location.hashParams,
+                        forwardedRedirectQueryParams
+                    )
+                )
+            }
+        },
+        setHomepage: async ({ tab, homepageSource }) => {
+            if (isSharedView() || (homepageSource && values.homepageSaving)) {
+                return
+            }
+            if (homepageSource) {
+                actions.setHomepageSaving(true)
+            }
+            const requestId = ++cache.homepageRequest
+            const previousSave = cache.homepageSave
+            cache.homepageSave = (async () => {
+                await previousSave
+                try {
+                    // nosemgrep: prefer-codegen-api -- Legacy raw API call with a hand-written URL and an unchecked response type. Use userHomeSettingsPartialUpdate() from 'products/platform_features/frontend/generated/api' instead.
+                    await api.update('api/user_home_settings/@me/', {
+                        homepage: tab ? tabToPersistableSnapshot(tab) : null,
+                    })
+                    if (homepageSource && requestId === cache.homepageRequest) {
+                        actions.homepageSaved(tab)
+                        lemonToast.success('Homepage updated')
+                        posthog.capture('dashboard set as homepage', { source: homepageSource })
+                    }
+                } catch (error) {
+                    console.error('Failed to persist homepage', error)
+                    if (homepageSource && requestId === cache.homepageRequest) {
+                        lemonToast.error('Could not save your homepage. Please try again.')
+                    }
+                } finally {
+                    if (homepageSource) {
+                        actions.setHomepageSaving(false)
+                    }
+                }
+            })()
+            await cache.homepageSave
+        },
+        setScene: ({ sceneKey, sceneId, exportedScene, params, scrollToTop }, _, __, previousState) => {
+            if (exportedScene) {
+                markBootPhase('scene_loaded', { scene: sceneId })
+            }
+
+            const {
+                sceneId: lastSceneId,
+                sceneKey: lastSceneKey,
+                params: lastParams,
+            } = selectors.lastSetScenePayload(previousState)
+
+            // Do not trigger a new pageview event when only the hashParams change
+            if (
+                lastSceneId !== sceneId ||
+                lastSceneKey !== sceneKey ||
+                !equal(lastParams.params, params.params) ||
+                JSON.stringify(lastParams.searchParams) !== JSON.stringify(params.searchParams) // `equal` crashes here
+            ) {
+                const productKey = values.activeSceneProductKey
+                posthog.capture('$pageview', productKey ? { product_key: productKey } : undefined)
+            }
+
+            const previousScene = selectors.sceneId(previousState)
+            if (scrollToTop && sceneId !== previousScene) {
+                // Forward navigation (link click) scrolls to top. There is no back/forward scroll
+                // restoration: #main-content is an inner scroll container the browser won't restore.
+                scrollMainContentToTop()
+            }
+
+            let newLogicErrored = false
+            // A scene behind the access denied screen would keep loading and polling the refused project.
+            if (exportedScene?.logic && values.activeSceneId !== Scene.ErrorProjectAccessDenied) {
+                try {
+                    const builtLogicProps = { ...exportedScene?.paramsToProps?.(params) }
+                    const mountedLogic = cache.mountedSceneLogic
+                    // Re-applying the same scene should not remount its logic.
+                    // Child logics attach to this scene root to keep draft state alive.
+                    const canKeepMountedLogic =
+                        mountedLogic?.logic === exportedScene.logic &&
+                        mountedLogic?.sceneId === sceneId &&
+                        mountedLogic.sceneKey === sceneKey &&
+                        equal(mountedLogic.logicProps, builtLogicProps)
+
+                    if (!canKeepMountedLogic) {
+                        const builtLogic = exportedScene.logic(builtLogicProps)
+
+                        if (mountedLogic) {
+                            try {
+                                mountedLogic.unmount()
+                            } catch (error) {
+                                console.error('Error unmounting previous scene logic:', error)
+                            }
+                        }
+
+                        cache.mountedSceneLogic = {
+                            logic: exportedScene.logic,
+                            logicProps: builtLogicProps,
+                            sceneId,
+                            sceneKey,
+                            unmount: builtLogic.mount(),
+                        }
+                    }
+                } catch (error) {
+                    actions.setSceneLoadExceptionEvent(
+                        captureSceneLoadFailure(error, sceneId, 'logic_mount', { sceneKey })
+                    )
+                    newLogicErrored = true
+                }
+            } else {
+                unmountSceneLogic(cache)
+            }
+
+            if (newLogicErrored) {
+                // Not a 404: the route exists and the person is allowed on it, so saying the page
+                // is missing sends them looking for a URL mistake that isn't there. `setScene`
+                // rather than `loadScene`, because the error scenes are preloaded and so are
+                // absent from `props.scenes`.
+                actions.setScene(Scene.ErrorSceneLoad, undefined, emptySceneParams, false)
+                return
+            }
+
+            const lastTracked = cache.lastTrackedScene
+            if (!lastTracked || lastTracked.sceneId !== sceneId || lastTracked.sceneKey !== sceneKey) {
+                trackFileSystemLogView({ type: 'scene', ref: sceneId })
+                cache.lastTrackedScene = { sceneId, sceneKey }
+            }
+        },
+        openScene: ({ sceneId, sceneKey, params, method }) => {
+            const sceneConfig = sceneConfigurations[sceneId] || {}
+            const { user } = userLogic.values
+            const { preflight } = preflightLogic.values
+
+            if (sceneId === Scene.Signup && preflight && !preflight.can_create_org) {
+                // If user is on an already initiated self-hosted instance, redirect away from signup
+                router.actions.replace(urls.login())
+                return
+            }
+            if (sceneId === Scene.Login && preflight?.demo) {
+                // In the demo environment, there's only passwordless "login" via the signup scene
+                router.actions.replace(urls.signup())
+                return
+            }
+            if (sceneId === Scene.MoveToPostHogCloud && preflight?.cloud) {
+                router.actions.replace(urls.projectRoot())
+                return
+            }
+            if (isCloudOnlySceneOnSelfHosted(sceneId)) {
+                router.actions.replace(urls.moveToPostHogCloud())
+                return
+            }
+
+            if (user) {
+                // If user is already logged in, redirect away from unauthenticated-only routes (e.g. /signup)
+                if (sceneConfig.onlyUnauthenticated) {
+                    // `next` is where the person needs to end up, whichever screen they landed on:
+                    // an OAuth partner sends them to /signup?next=/oauth/authorize?... just as
+                    // `login_required` sends them to /login?next=... . With no `next` this lands on
+                    // the app root, so it covers the plain case too.
+                    handleLoginRedirect()
+                    return
+                }
+
+                if (organizationLogic.values.currentOrganizationBlockPage) {
+                    // Decide the block here. A redirect from a `locationChanged` listener does not hold,
+                    // because this route handler still opens the scene of the original URL after that
+                    // listener runs. The onboarding and project-creation redirects below stay off: they
+                    // only lead to pages that are closed while blocked, so they loop against the block page.
+                    if (!leaveBlockedOrganizationPath()) {
+                        actions.loadScene(sceneId, sceneKey, params, method)
+                    }
+                    return
+                }
+
+                if (projectLogic.findMounted()?.values.currentProject?.is_pending_deletion) {
+                    // Same reasons as the organization block above, including skipping the onboarding redirects.
+                    if (isPathOpenWhileProjectPendingDeletion(router.values.location.pathname)) {
+                        actions.loadScene(sceneId, sceneKey, params, method)
+                    } else {
+                        router.actions.replace(urls.projectPendingDeletion())
+                    }
+                    return
+                }
+
+                if (sceneId === Scene.OrganizationDeactivated || sceneId === Scene.OrganizationPendingDeletion) {
+                    // The organization is open again, so let the member back in, as the server does. The server
+                    // only matches the bare block path, and the router writes it with a `/project/<id>` prefix.
+                    router.actions.replace(urls.projectRoot())
+                    return
+                }
+
+                if (sceneId !== Scene.InviteSignup) {
+                    // The agentic and OAuth consent pages pick or create the organization and project
+                    // they use, so approving there must not require either first.
+                    const isConsentPage =
+                        location.pathname.startsWith(urls.agenticAuthorize()) ||
+                        location.pathname.startsWith(urls.oauthAuthorize())
+                    // Redirect to org/project creation if there's no org/project respectively, unless using invite
+                    if (organizationLogic.values.isCurrentOrganizationUnavailable) {
+                        if (
+                            location.pathname !== urls.organizationCreateFirst() &&
+                            !location.pathname.startsWith(urls.settings('user')) &&
+                            !isConsentPage
+                        ) {
+                            console.warn('Organization not available, redirecting to organization creation')
+                            router.actions.replace(urls.organizationCreateFirst())
+                            return
+                        }
+                    } else if (teamLogic.values.isCurrentTeamUnavailable) {
+                        if (
+                            user.organization?.teams.length === 0 &&
+                            user.organization.membership_level &&
+                            user.organization.membership_level >= TeamMembershipLevel.Admin
+                        ) {
+                            // Allow settings to be opened, otherwise route to project creation
+                            if (
+                                location.pathname !== urls.projectCreateFirst() &&
+                                !location.pathname.startsWith('/settings') &&
+                                !isConsentPage
+                            ) {
+                                console.warn(
+                                    'Project not available and no other projects, redirecting to project creation'
+                                )
+                                lemonToast.error('You do not have access to any projects in this organization', {
+                                    toastId: 'no-projects',
+                                })
+                                router.actions.replace(urls.projectCreateFirst())
+                                return
+                            }
+                        }
+                    } else if (
+                        // Or redirect to onboarding in case we detect people have to do onboarding for their first project
+                        isFirstProjectWithoutData(user) &&
+                        // Suppress the redirect when the user has explicitly exited onboarding
+                        // (skipped for later, or delegated to a teammate with a pending invite).
+                        // If the delegation invite is cancelled or expires, the backend clears
+                        // onboarding_delegated_to_invite and the redirect re-fires.
+                        !isOnboardingRedirectSuppressed(user) &&
+                        !isOnboardingNotRequiredForPath(location.pathname)
+                    ) {
+                        const nextUrl = getOnboardingRedirectNextPath(params.searchParams.next, location)
+
+                        // Check if user is coming from a coupon campaign link
+                        const couponCampaign = nextUrl ? parseCouponCampaign(nextUrl) : null
+                        if (couponCampaign) {
+                            router.actions.replace(urls.onboarding({ campaign: couponCampaign }), { next: nextUrl })
+                            return
+                        }
+
+                        router.actions.replace(urls.onboarding(), nextUrl ? { next: nextUrl } : undefined)
+                        return
+                    } else if (
+                        isFirstProjectWithoutData(user) &&
+                        (user.onboarding_skipped_reason === 'connector' ||
+                            user.onboarding_skipped_reason === 'device_login') &&
+                        user.onboarding_skipped_organization_id === user.organization?.id &&
+                        // Only the homepage redirects, so a deep link the connecting assistant hands out still opens.
+                        removeProjectIdIfPresent(router.values.location.pathname) === urls.projectHomepage()
+                    ) {
+                        router.actions.replace(
+                            withForwardedHashAndSearchParams(
+                                urls.onboardingWelcome(),
+                                params.searchParams,
+                                params.hashParams,
+                                forwardedRedirectQueryParams
+                            )
+                        )
+                        return
+                    }
+                }
+            }
+
+            actions.loadScene(sceneId, sceneKey, params, method)
+        },
+        loadScene: async ({ sceneId, sceneKey, params, method }, breakpoint) => {
+            const clickedLink = method === 'PUSH'
+            if (values.sceneId === sceneId && values.exportedScenes[sceneId]) {
+                actions.setScene(sceneId, sceneKey, params, clickedLink, values.exportedScenes[sceneId])
+                return
+            }
+
+            if (!props.scenes?.[sceneId]) {
+                actions.setScene(
+                    Scene.Error404,
+                    undefined,
+                    emptySceneParams,
+                    clickedLink,
+                    values.exportedScenes[sceneId]
+                )
+                return
+            }
+
+            let exportedScene = values.exportedScenes[sceneId]
+            const wasNotLoaded = !exportedScene
+
+            if (!exportedScene) {
+                // if we can't load the scene in a second, show a spinner
+                const timeout = window.setTimeout(() => actions.setScene(sceneId, sceneKey, params, true), 500)
+                let importedScene
+                try {
+                    window.ESBUILD_LOAD_CHUNKS?.(sceneId)
+                    // Capture the importer in the narrowed scope; the early guard above ensures it's
+                    // defined, but that narrowing wouldn't flow into the retryImport closure.
+                    const importScene = props.scenes[sceneId]
+                    ;[importedScene] = await Promise.all([
+                        retryImport(() => importScene()),
+                        loadCoreFilterDefinitionsFor(sceneId, !!userLogic.values.user),
+                    ])
+                } catch (error: any) {
+                    if (isChunkLoadError(error)) {
+                        // Reloaded once in the last 20 seconds and now reloading again? Show network error
+                        if (
+                            !isStableChunkBuild() &&
+                            values.lastReloadAt &&
+                            parseInt(String(values.lastReloadAt)) > new Date().valueOf() - 20000
+                        ) {
+                            console.error('App assets regenerated. Showing error page.')
+                            actions.setScene(Scene.ErrorNetwork, undefined, emptySceneParams, clickedLink)
+                        } else {
+                            console.error('App assets regenerated. Reloading this page.')
+                            actions.reloadBrowserDueToImportError(error)
+                        }
+                        return
+                    }
+                    // A slow import can reject after the person has already navigated somewhere
+                    // else, so break first: the error scene must not replace a newer one.
+                    breakpoint()
+                    // Rethrowing here escapes the listener unhandled: the address bar sits on the
+                    // scene that failed while the previous one stays rendered, and nothing reaches
+                    // error tracking. Report it, then render an error where the URL points.
+                    actions.setSceneLoadExceptionEvent(
+                        captureSceneLoadFailure(error, sceneId, 'import', { sceneKey, source: 'sceneLogic.loadScene' })
+                    )
+                    actions.setScene(Scene.ErrorSceneLoad, undefined, emptySceneParams, clickedLink)
+                    return
+                } finally {
+                    window.clearTimeout(timeout)
+                }
+                // Break before the `values` read below: the import can outlive this logic, and a
+                // detached path throws. The `sceneId` check this replaces read `values` itself.
+                breakpoint()
+                const { default: defaultExport, logic, scene: _scene, ...others } = importedScene
+
+                if (_scene) {
+                    exportedScene = _scene
+                } else if (defaultExport) {
+                    console.warn(`Scene ${sceneId} not yet converted to use SceneExport!`)
+                    exportedScene = {
+                        component: defaultExport,
+                        logic: logic,
+                    }
+                } else {
+                    console.warn(`Scene ${sceneId} not yet converted to use SceneExport!`)
+                    exportedScene = {
+                        component:
+                            Object.keys(others).length === 1
+                                ? others[Object.keys(others)[0]]
+                                : values.exportedScenes[Scene.Error404].component,
+                        logic: logic,
+                    }
+                    if (Object.keys(others).length > 1) {
+                        console.error('There are multiple exports for this scene. Showing 404 instead.')
+                    }
+                }
+                actions.setExportedScene(exportedScene, sceneId, sceneKey, params)
+            }
+            actions.setScene(sceneId, sceneKey, params, clickedLink || wasNotLoaded, exportedScene)
+        },
+        reloadBrowserDueToImportError: ({ error }) => {
+            reloadAfterChunkLoadError(error)
+        },
+    })),
+
+    urlToAction(({ actions, values }) => {
+        type RouteHandler = (
+            params: Params,
+            searchParams: Params,
+            hashParams: Params,
+            payload: {
+                method: string
+            }
+        ) => any
+        const mapping: Record<string, RouteHandler> = {}
+
+        // Malformed URLs (a stray `%`, embedded whitespace) can make redirect building or
+        // scene dispatch throw synchronously while kea-router matches the route. Nothing
+        // upstream catches it, so the whole app fails to render. Guard every route handler:
+        // capture the error and fall back to a 404 instead of crashing.
+        const guardRoute =
+            (handler: RouteHandler): RouteHandler =>
+            (params, searchParams, hashParams, payload) => {
+                try {
+                    return handler(params, searchParams, hashParams, payload)
+                } catch (error) {
+                    posthog.captureException(error, { extra: { source: 'sceneLogic.urlToAction' } })
+                    actions.loadScene(Scene.Error404, undefined, emptySceneParams, payload.method)
+                }
+            }
+
+        for (const path of Object.keys(redirects)) {
+            mapping[path] = guardRoute((params, searchParams, hashParams) => {
+                const redirect = redirects[path]
+                const redirectUrl =
+                    typeof redirect === 'function' ? redirect(params, searchParams, hashParams) : redirect
+
+                router.actions.replace(
+                    withForwardedSearchParams(redirectUrl, searchParams, forwardedRedirectQueryParams)
+                )
+            })
+        }
+        // The Home button (via `/`) and a direct visit to /home should both land on the user's
+        // configured homepage (set in the Configure home modal). Redirect there unless we're
+        // already at it, which also guards against loops when the homepage is the launchpad itself.
+        const redirectToConfiguredHomepage = (searchParams: Params, hashParams: Params): boolean => {
+            const homepage = values.homepage
+            // The rail nav makes /home the Today page and has no control to change the homepage,
+            // so a homepage saved before the rail would hide Today with no way back.
+            if (!homepage || values.featureFlags[FEATURE_FLAGS.TODAY_RAIL_NAV]) {
+                return false
+            }
+            const targetPathname = homepageTargetPathname(homepage)
+            // Forward the incoming hash and allow-listed params (e.g. modal) onto the homepage, and
+            // compare against that final target so a forwarded param can't loop.
+            const target = withForwardedHashAndSearchParams(
+                targetPathname + (homepage.search || '') + (homepage.hash || ''),
+                searchParams,
+                hashParams,
+                forwardedRedirectQueryParams
+            )
+            const loc = router.values.currentLocation
+            if (addProjectIdIfMissing(loc.pathname) + (loc.search || '') + (loc.hash || '') === target) {
+                return false
+            }
+            router.actions.replace(target)
+            return true
+        }
+
+        mapping['/'] = guardRoute((_params, searchParams, hashParams) => {
+            if (redirectToConfiguredHomepage(searchParams, hashParams)) {
+                return
+            }
+            router.actions.replace(
+                withForwardedHashAndSearchParams(
+                    urls.projectHomepage(),
+                    searchParams,
+                    hashParams,
+                    forwardedRedirectQueryParams
+                )
+            )
+        })
+
+        const projectHomepagePath = urls.projectHomepage()
+        for (const [path, [scene, sceneKey]] of Object.entries(routes)) {
+            mapping[path] = guardRoute((params, searchParams, hashParams, { method }) => {
+                // A direct visit to /home honors the configured homepage just like the Home button.
+                if (path === projectHomepagePath && redirectToConfiguredHomepage(searchParams, hashParams)) {
+                    return
+                }
+                actions.openScene(
+                    scene,
+                    sceneKey,
+                    {
+                        params,
+                        searchParams,
+                        hashParams,
+                    },
+                    method
+                )
+            })
+        }
+
+        mapping['/*'] = (_, __, { method }) => {
+            // This route skips `openScene`, so it applies the organization block and the project lockout itself.
+            if (leaveBlockedOrganizationPath()) {
+                return
+            }
+            if (projectLogic.findMounted()?.values.currentProject?.is_pending_deletion) {
+                router.actions.replace(urls.projectPendingDeletion())
+                return
+            }
+            return actions.loadScene(Scene.Error404, undefined, emptySceneParams, method)
+        }
+
+        return mapping
+    }),
+])

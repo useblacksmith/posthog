@@ -1,0 +1,292 @@
+import json
+import uuid
+from collections.abc import Callable
+
+from posthog.test.base import APIBaseTest, patch_clickhouse_client_execute
+from unittest.mock import patch
+
+from parameterized import parameterized
+from rest_framework import status
+
+from posthog.errors import ExposedCHQueryError
+from posthog.models.event.util import create_event
+from posthog.models.raw_sessions.sessions_v3 import SESSION_V3_LOWER_TIER_AD_IDS
+from posthog.models.utils import uuid7
+
+V2_EXPECTED_PROPERTIES = {
+    "$autocapture_count",
+    "$channel_type",
+    "$end_current_url",
+    "$end_hostname",
+    "$end_pathname",
+    "$end_timestamp",
+    "$entry__kx",
+    "$entry_current_url",
+    "$entry_dclid",
+    "$entry_fbclid",
+    "$entry_gad_source",
+    "$entry_gbraid",
+    "$entry_gclid",
+    "$entry_gclsrc",
+    "$entry_hostname",
+    "$entry_igshid",
+    "$entry_irclid",
+    "$entry_li_fat_id",
+    "$entry_mc_cid",
+    "$entry_msclkid",
+    "$entry_pathname",
+    "$entry_referring_domain",
+    "$entry_ttclid",
+    "$entry_twclid",
+    "$entry_utm_campaign",
+    "$entry_utm_content",
+    "$entry_utm_medium",
+    "$entry_utm_source",
+    "$entry_utm_term",
+    "$entry_wbraid",
+    "$is_bounce",
+    "$last_external_click_url",
+    "$pageview_count",
+    "$screen_count",
+    "$session_duration",
+    "$start_timestamp",
+    "$vitals_lcp",
+}
+
+V3_EXPECTED_PROPERTIES = {
+    "$autocapture_count",
+    "$channel_type",
+    "$emails",
+    "$end_current_url",
+    "$end_hostname",
+    "$end_pathname",
+    "$end_timestamp",
+    "$entry_current_url",
+    "$entry_fbclid",
+    "$entry_gad_source",
+    "$entry_gclid",
+    "$entry_has_fbclid",
+    "$entry_has_gclid",
+    "$entry_hostname",
+    "$entry_pathname",
+    "$entry_referring_domain",
+    "$entry_utm_campaign",
+    "$entry_utm_content",
+    "$entry_utm_medium",
+    "$entry_utm_source",
+    "$entry_utm_term",
+    "$has_replay_events",
+    "$hosts",
+    "$is_bounce",
+    "$last_external_click_url",
+    "$pageview_count",
+    "$screen_count",
+    "$session_duration",
+    "$start_timestamp",
+}
+
+for ad_id in SESSION_V3_LOWER_TIER_AD_IDS:
+    V3_EXPECTED_PROPERTIES.add(f"$entry_{ad_id}")
+    V3_EXPECTED_PROPERTIES.add(f"$entry_has_{ad_id}")
+
+
+def _set_session_table_version(team, version):
+    if version == "v3":
+        team.modifiers = {"sessionTableVersion": "v3"}
+        team.save()
+
+
+class TestSessionsAPI(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        # Two distinct sessions: a single session's two utm_sources collapse to the argMin entry value once raw_sessions parts merge.
+        create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="d1",
+            properties={"$session_id": str(uuid7()), "utm_source": "google"},
+            event_uuid=(uuid.uuid4()),
+        )
+        create_event(
+            team=self.team,
+            event="$pageview",
+            distinct_id="d1",
+            properties={"$session_id": str(uuid7()), "utm_source": "youtube"},
+            event_uuid=(uuid.uuid4()),
+        )
+
+    @parameterized.expand([("v2",), ("v3",)])
+    def test_expected_session_properties(self, version):
+        _set_session_table_version(self.team, version)
+        response = self.client.get(f"/api/projects/{self.team.pk}/sessions/property_definitions/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        actual_properties = {entry["name"] for entry in response.json()["results"]}
+        expected = V2_EXPECTED_PROPERTIES if version == "v2" else V3_EXPECTED_PROPERTIES
+        assert actual_properties == expected
+
+    @parameterized.expand([("v2",), ("v3",)])
+    def test_search_session_properties(self, version):
+        _set_session_table_version(self.team, version)
+        response = self.client.get(f"/api/projects/{self.team.pk}/sessions/property_definitions/?search=utm")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        actual_properties = {entry["name"] for entry in response.json()["results"]}
+        expected_properties = {
+            "$entry_utm_campaign",
+            "$entry_utm_content",
+            "$entry_utm_medium",
+            "$entry_utm_source",
+            "$entry_utm_term",
+        }
+        if version == "v3":
+            for ad_id in SESSION_V3_LOWER_TIER_AD_IDS:
+                if "utm" in ad_id:
+                    expected_properties.add(f"$entry_{ad_id}")
+                    expected_properties.add(f"$entry_has_{ad_id}")
+        assert actual_properties == expected_properties
+
+    def test_empty_search_session_properties(self):
+        response = self.client.get(f"/api/projects/{self.team.pk}/sessions/property_definitions/?search=doesnotexist")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        assert len(response.json()["results"]) == 0
+
+    @parameterized.expand([("v2",), ("v3",)])
+    def test_list_channel_type_values(self, version):
+        _set_session_table_version(self.team, version)
+        response = self.client.get(f"/api/projects/{self.team.pk}/sessions/values/?key=$channel_type")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        actual_values = {entry["name"] for entry in response.json()["results"]}
+        expected_values = {
+            "Affiliate",
+            "AI",
+            "Audio",
+            "Cross Network",
+            "Direct",
+            "Email",
+            "Organic Search",
+            "Organic Shopping",
+            "Organic Social",
+            "Organic Video",
+            "Unknown",
+            "Paid Unknown",
+            "Paid Search",
+            "Paid Shopping",
+            "Paid Social",
+            "Paid Video",
+            "Push",
+            "Referral",
+            "SMS",
+        }
+        assert actual_values == expected_values
+
+    @parameterized.expand([("v2",), ("v3",)])
+    def test_search_channel_type_values(self, version):
+        _set_session_table_version(self.team, version)
+        response = self.client.get(f"/api/projects/{self.team.pk}/sessions/values/?key=$channel_type&value=paid")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        actual_values = {entry["name"] for entry in response.json()["results"]}
+        expected_values = {
+            "Paid Unknown",
+            "Paid Search",
+            "Paid Shopping",
+            "Paid Social",
+            "Paid Video",
+        }
+        assert actual_values == expected_values
+
+    @parameterized.expand([("v2",), ("v3",)])
+    def test_list_session_property_values(self, version: str) -> None:
+        _set_session_table_version(self.team, version)
+        query_tags: list[tuple[str | None, str | None]] = []
+
+        def capture_tags(execute: Callable[..., object], query: str, *args: object, **kwargs: object) -> object:
+            settings = kwargs["settings"]
+            assert isinstance(settings, dict)
+            tags = json.loads(settings["log_comment"])
+            query_tags.append((tags.get("product"), tags.get("feature")))
+            return execute(query, *args, **kwargs)
+
+        with patch_clickhouse_client_execute(capture_tags):
+            response = self.client.get(f"/api/projects/{self.team.pk}/sessions/values/?key=$entry_utm_source")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        actual_values = {entry["name"] for entry in response.json()["results"]}
+        expected_values = {
+            "google",
+            "youtube",
+        }
+        assert actual_values == expected_values
+        assert query_tags
+        assert set(query_tags) == {("web_analytics", "sessions_values_api")}
+
+    @parameterized.expand([("v2",), ("v3",)])
+    def test_search_session_property_values(self, version):
+        _set_session_table_version(self.team, version)
+        response = self.client.get(f"/api/projects/{self.team.pk}/sessions/values/?key=$entry_utm_source&value=tub")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        actual_values = {entry["name"] for entry in response.json()["results"]}
+        expected_values = {
+            "youtube",
+        }
+        assert actual_values == expected_values
+
+    @parameterized.expand([("v2",), ("v3",)])
+    def test_search_session_property_no_matching_values(self, version):
+        _set_session_table_version(self.team, version)
+        response = self.client.get(
+            f"/api/projects/{self.team.pk}/sessions/values/?key=$entry_utm_source&value=doesnotexist"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        assert len(response.json()["results"]) == 0
+
+    def test_values_returns_400_on_user_safe_clickhouse_error(self):
+        _set_session_table_version(self.team, "v2")
+        with patch(
+            "posthog.hogql.query.sync_execute",
+            side_effect=ExposedCHQueryError("Estimated query execution time is too long", code_name="timeout"),
+        ):
+            response = self.client.get(f"/api/projects/{self.team.pk}/sessions/values/?key=$entry_utm_source")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        assert "Estimated query execution time" in response.json()["detail"]
+
+    @parameterized.expand([("v2",), ("v3",)])
+    def test_numerical_session_properties(self, version):
+        _set_session_table_version(self.team, version)
+        response = self.client.get(f"/api/projects/{self.team.pk}/sessions/property_definitions/?is_numerical=true")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.json()["results"]
+        for entry in results:
+            self.assertTrue(entry["is_numerical"], f"Expected {entry['name']} to be numerical")
+        actual_properties = {entry["name"] for entry in results}
+        expected_numerical = {
+            "$autocapture_count",
+            "$pageview_count",
+            "$screen_count",
+            "$session_duration",
+        }
+        if version == "v2":
+            expected_numerical.add("$vitals_lcp")
+        self.assertEqual(actual_properties, expected_numerical)
+
+    @parameterized.expand([("v2",), ("v3",)])
+    def test_non_numerical_session_properties(self, version):
+        _set_session_table_version(self.team, version)
+        response = self.client.get(f"/api/projects/{self.team.pk}/sessions/property_definitions/?is_numerical=false")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.json()["results"]
+        for entry in results:
+            self.assertFalse(entry["is_numerical"], f"Expected {entry['name']} to not be numerical")
+        numerical_properties = {
+            "$autocapture_count",
+            "$pageview_count",
+            "$screen_count",
+            "$session_duration",
+            "$vitals_lcp",
+        }
+        actual_properties = {entry["name"] for entry in results}
+        self.assertTrue(actual_properties.isdisjoint(numerical_properties))
+
+    def test_search_missing_session_property_values(self):
+        response = self.client.get(
+            f"/api/projects/{self.team.pk}/sessions/values/?key=$entry_utm_source&value=doesnotexist"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        assert len(response.json()["results"]) == 0

@@ -1,0 +1,422 @@
+"""Replay Vision workflow + activity metrics.
+
+Every metric is emitted twice from one `record_*` helper: a Prometheus instrument
+(auto-scraped by the worker's combined metrics server, feeds Grafana) and an OTLP twin
+with the same name and attributes pushed into the PostHog Metrics product via
+posthog/otel_metrics.py (no-op unless OTEL_METRICS_EXPORT_URL/TOKEN are configured).
+The twin derives its name and description from the prom instrument, and its recording
+is swallowed so telemetry can never fail an activity.
+"""
+
+import time
+
+from prometheus_client import Counter, Gauge, Histogram
+
+from posthog.metrics import pushed_metrics_registry
+from posthog.otel_metrics import OtelInstrumentFactory
+
+_otel = OtelInstrumentFactory("replay-vision")
+
+REPLAY_VISION_OBSERVATIONS = Counter(
+    "replay_vision_observations_total",
+    "Observations by terminal status",
+    ["status", "scanner_type"],
+)
+
+REPLAY_VISION_FAILURE_KINDS = Counter(
+    "replay_vision_failure_kinds_total",
+    "Failed observations broken down by FailureKind",
+    ["kind", "scanner_type"],
+)
+
+REPLAY_VISION_INELIGIBLE_KINDS = Counter(
+    "replay_vision_ineligible_kinds_total",
+    "Ineligible observations broken down by IneligibleSessionKind",
+    ["kind"],
+)
+
+# Extends past the default ceiling so multi-minute upload + provider-call activities don't all land in +Inf.
+# The top bucket matches the provider-call activity's 20-minute start-to-close timeout.
+_ACTIVITY_DURATION_BUCKETS = (0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 900, 1200)
+
+REPLAY_VISION_ACTIVITY_DURATION = Histogram(
+    "replay_vision_activity_duration_seconds",
+    "Per-activity wall time",
+    ["activity", "status"],
+    buckets=_ACTIVITY_DURATION_BUCKETS,
+)
+
+_PROVIDER_CALL_BUCKETS = (0.5, 1, 2.5, 5, 10, 30, 60, 120, 300)
+
+REPLAY_VISION_PROVIDER_CALL = Histogram(
+    "replay_vision_provider_call_seconds",
+    "Provider call latency",
+    ["provider", "model", "scanner_type", "outcome"],
+    buckets=_PROVIDER_CALL_BUCKETS,
+)
+
+REPLAY_VISION_MISSION_PASSES = Counter(
+    "replay_vision_mission_passes_total",
+    "Full mission passes sent to the provider; rate against observations shows how hard the retry layers multiply",
+    ["model", "path"],
+)
+
+# LLM analytics cannot answer this: the scanner runs with privacy mode on, so the lookup plan the model
+# writes never reaches the provider events.
+REPLAY_VISION_EVENTS_TOOL_CALLS = Counter(
+    "replay_vision_events_tool_calls_total",
+    "Analytics events lookups the scanner model asked for",
+    ["scanner_type", "model"],
+)
+
+REPLAY_VISION_NETWORK_TOOL_CALLS = Counter(
+    "replay_vision_network_tool_calls_total",
+    "Network request lookups the scanner model asked for",
+    ["scanner_type", "model"],
+)
+
+# A scan has one lookup round, so this is the size of the model's lookup plan when the plan asks for anything.
+_TOOL_CALLS_PER_ROUND_BUCKETS = (1, 2, 3, 4, 5, 6, 7, 8)
+
+REPLAY_VISION_TOOL_ROUNDS = Histogram(
+    "replay_vision_tool_calls_per_round",
+    "Lookups in the scan's lookup plan, recorded when the plan asks for any",
+    ["scanner_type", "model"],
+    buckets=_TOOL_CALLS_PER_ROUND_BUCKETS,
+)
+
+REPLAY_VISION_LOOKUP_PLANS = Counter(
+    "replay_vision_lookup_plans_total",
+    "Lookup round outcomes per scan: planned, empty, or failed (the step answered without lookups)",
+    ["scanner_type", "model", "outcome"],
+)
+
+REPLAY_VISION_NETWORK_STATE = Counter(
+    "replay_vision_network_state_total",
+    "How each scan described network data to the model: available, clean, or none",
+    ["scanner_type", "state"],
+)
+
+REPLAY_VISION_QUOTA_EXHAUSTED_SKIPS = Counter(
+    "replay_vision_quota_exhausted_skips_total",
+    "Observations skipped because the org's monthly credit quota was exhausted",
+    ["scanner_type"],
+)
+
+REPLAY_VISION_CREDITS_CONSUMED = Counter(
+    "replay_vision_credits_consumed_total",
+    "Credits billed onto usage receipts at observation success",
+    ["scanner_type", "model"],
+)
+
+REPLAY_VISION_BACKFILL_TICK_OUTCOMES = Counter(
+    "replay_vision_backfill_tick_outcomes_total",
+    "Backfill tick outcomes: dispatched, throttled, paused on quota, skipped, or completed",
+    ["outcome"],
+)
+
+REPLAY_VISION_SWEEP_OUTCOMES = Counter(
+    "replay_vision_sweep_outcomes_total",
+    "Sweep tick outcomes: throttled at an in-flight cap, capped by the scanner's own credit limit "
+    "(settled spend, which skips the window for good, or in-flight reservations, which preserve the "
+    "watermark), skipped because its experiment is paused, ended, or archived (experiment_over), disabled "
+    "because its experiment was deleted (experiment_deleted), kept on because the deleted experiment's "
+    "scout could not be paused (experiment_deleted_pause_failed), disabled because a free-only scanner used "
+    "the organization's free credits (free_credits_used), kept on because its scout could not be paused "
+    "(free_credits_used_pause_failed), skipped because an experiment scanner has "
+    "no creator to authorize as (no_principal), no candidates, or "
+    "candidates found",
+    ["outcome"],
+)
+
+# The admission lock gives up after a 2s lock_timeout, so waits are capped, not worth a histogram;
+# here instead, as attempts that found the row held and deferred to the activity's retry policy.
+REPLAY_VISION_SCANNER_ADMISSION_BUSY = Counter(
+    "replay_vision_scanner_admission_busy_total",
+    "Capped-scanner admissions that found the row lock held and were deferred to the activity retry",
+    ["scanner_type"],
+)
+
+REPLAY_VISION_SCANNER_LIMIT_REACHED = Counter(
+    "replay_vision_scanner_limit_reached_total",
+    "Requests refused because a per-scanner credit limit left no room, by the API surface that refused",
+    ["surface"],
+)
+
+REPLAY_VISION_DEEP_SWEEP_FAILURES = Counter(
+    "replay_vision_deep_sweep_failures_total",
+    "Deep catch-up passes that failed inside an otherwise successful sweep tick; separate from sweep "
+    "outcomes so a tick still counts exactly once there",
+)
+
+REPLAY_VISION_DEEP_CANDIDATES = Counter(
+    "replay_vision_deep_candidates_total",
+    "Sessions the catch-up pass found that the frequent sweep had missed. This is the pass's whole "
+    "justification, so it is the number to weigh against what its wide-lookback query costs",
+)
+
+REPLAY_VISION_SWEEP_CANDIDATE_PAGE_FULL = Counter(
+    "replay_vision_sweep_candidate_page_full_total",
+    "Sweep ticks whose candidate page filled, meaning the window held more sessions than one tick "
+    "could correlate; a scanner stuck at this is no longer keeping up with its own window",
+)
+
+REPLAY_VISION_SWEEP_CANDIDATES = Counter(
+    "replay_vision_sweep_candidates_total",
+    "Candidate sessions returned to sweeps for dispatch",
+)
+
+# Creation to success spans queueing, rasterization, upload, and the provider call.
+_E2E_BUCKETS = (30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0, 7200.0)
+
+REPLAY_VISION_OBSERVATION_E2E = Histogram(
+    "replay_vision_observation_e2e_seconds",
+    "Wall time from observation creation to success",
+    ["scanner_type"],
+    buckets=_E2E_BUCKETS,
+)
+
+REPLAY_VISION_SIDE_EFFECT_FAILURES = Counter(
+    "replay_vision_side_effect_failures_total",
+    "Failed attempts of fail-soft post-success side effects",
+    ["effect"],
+)
+
+REPLAY_VISION_CONSENT_SKIPS = Counter(
+    "replay_vision_consent_skips_total",
+    "Scans skipped because the organization has not approved AI data processing",
+    ["scanner_type"],
+)
+
+REPLAY_VISION_ENQUEUE_CLAIM_FAILURES = Counter(
+    "replay_vision_enqueue_claim_failures_total",
+    "Redis enqueue-claim operations that failed (claims fail open, so failures over-admit)",
+    ["operation"],
+)
+
+REPLAY_VISION_ESTIMATE_OUTCOMES = Counter(
+    "replay_vision_estimate_outcomes_total",
+    "Estimate outcomes, recorded by scanner saves and the hourly refresher: refreshed, or skipped "
+    "because the scanner's experiment targeting can't resolve an exposed population. Most skips "
+    "are drafts that heal at launch; a rising unresolved count means scanners are stuck with no "
+    "estimate. Failures of the scanner's own query stay on the error path and are not counted",
+    ["outcome"],
+)
+
+REPLAY_VISION_GEMINI_CLEANUP_FILES = Counter(
+    "replay_vision_gemini_cleanup_files_total",
+    "Tracked Gemini files the cleanup sweep looked at, by result",
+    ["result"],
+)
+
+
+REPLAY_VISION_SEARCH_RERANK = Counter(
+    "replay_vision_search_rerank_total",
+    "Observation searches by rerank outcome",
+    ["outcome"],
+)
+
+REPLAY_VISION_SEARCH_RERANK_LATENCY = Histogram(
+    "replay_vision_search_rerank_latency_seconds",
+    "Wall-clock time a search waited on the rerank model",
+    buckets=(0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5),
+)
+
+
+def record_observation(status: str, scanner_type: str) -> None:
+    labels = {"status": status, "scanner_type": scanner_type}
+    REPLAY_VISION_OBSERVATIONS.labels(**labels).inc()
+    _otel.record_counter_twin(REPLAY_VISION_OBSERVATIONS, 1, labels)
+
+
+def record_failure_kind(kind: str, scanner_type: str) -> None:
+    labels = {"kind": kind, "scanner_type": scanner_type}
+    REPLAY_VISION_FAILURE_KINDS.labels(**labels).inc()
+    _otel.record_counter_twin(REPLAY_VISION_FAILURE_KINDS, 1, labels)
+
+
+def record_ineligible_kind(kind: str) -> None:
+    REPLAY_VISION_INELIGIBLE_KINDS.labels(kind=kind).inc()
+    _otel.record_counter_twin(REPLAY_VISION_INELIGIBLE_KINDS, 1, {"kind": kind})
+
+
+def record_activity_duration(activity: str, status: str, seconds: float) -> None:
+    labels = {"activity": activity, "status": status}
+    REPLAY_VISION_ACTIVITY_DURATION.labels(**labels).observe(seconds)
+    _otel.record_histogram_twin(REPLAY_VISION_ACTIVITY_DURATION, seconds, labels)
+
+
+def record_provider_call(provider: str, model: str, scanner_type: str, outcome: str, seconds: float) -> None:
+    labels = {"provider": provider, "model": model, "scanner_type": scanner_type, "outcome": outcome}
+    REPLAY_VISION_PROVIDER_CALL.labels(**labels).observe(seconds)
+    _otel.record_histogram_twin(REPLAY_VISION_PROVIDER_CALL, seconds, labels)
+
+
+def record_events_tool_call(scanner_type: str, model: str) -> None:
+    labels = {"scanner_type": scanner_type, "model": model}
+    REPLAY_VISION_EVENTS_TOOL_CALLS.labels(**labels).inc()
+    _otel.record_counter_twin(REPLAY_VISION_EVENTS_TOOL_CALLS, 1, labels)
+
+
+def record_network_tool_call(scanner_type: str, model: str) -> None:
+    labels = {"scanner_type": scanner_type, "model": model}
+    REPLAY_VISION_NETWORK_TOOL_CALLS.labels(**labels).inc()
+    _otel.record_counter_twin(REPLAY_VISION_NETWORK_TOOL_CALLS, 1, labels)
+
+
+def record_tool_round(scanner_type: str, model: str, calls: int) -> None:
+    labels = {"scanner_type": scanner_type, "model": model}
+    REPLAY_VISION_TOOL_ROUNDS.labels(**labels).observe(calls)
+    _otel.record_histogram_twin(REPLAY_VISION_TOOL_ROUNDS, calls, labels)
+
+
+def record_lookup_plan(scanner_type: str, model: str, outcome: str) -> None:
+    labels = {"scanner_type": scanner_type, "model": model, "outcome": outcome}
+    REPLAY_VISION_LOOKUP_PLANS.labels(**labels).inc()
+    _otel.record_counter_twin(REPLAY_VISION_LOOKUP_PLANS, 1, labels)
+
+
+def record_network_state(scanner_type: str, state: str) -> None:
+    labels = {"scanner_type": scanner_type, "state": state}
+    REPLAY_VISION_NETWORK_STATE.labels(**labels).inc()
+    _otel.record_counter_twin(REPLAY_VISION_NETWORK_STATE, 1, labels)
+
+
+def record_mission_pass(model: str, path: str) -> None:
+    labels = {"model": model, "path": path}
+    REPLAY_VISION_MISSION_PASSES.labels(**labels).inc()
+    _otel.record_counter_twin(REPLAY_VISION_MISSION_PASSES, 1, labels)
+
+
+def record_quota_exhausted_skip(scanner_type: str) -> None:
+    REPLAY_VISION_QUOTA_EXHAUSTED_SKIPS.labels(scanner_type=scanner_type).inc()
+    _otel.record_counter_twin(REPLAY_VISION_QUOTA_EXHAUSTED_SKIPS, 1, {"scanner_type": scanner_type})
+
+
+def record_scanner_admission_busy(scanner_type: str) -> None:
+    REPLAY_VISION_SCANNER_ADMISSION_BUSY.labels(scanner_type=scanner_type).inc()
+    _otel.record_counter_twin(REPLAY_VISION_SCANNER_ADMISSION_BUSY, 1, {"scanner_type": scanner_type})
+
+
+def record_scanner_limit_reached(surface: str) -> None:
+    """`surface` is "on_demand", "bulk", "evaluation", "max_tool", or "admission": the path that refused the work."""
+    REPLAY_VISION_SCANNER_LIMIT_REACHED.labels(surface=surface).inc()
+    _otel.record_counter_twin(REPLAY_VISION_SCANNER_LIMIT_REACHED, 1, {"surface": surface})
+
+
+def record_credits_consumed(scanner_type: str, model: str, credits: int) -> None:
+    labels = {"scanner_type": scanner_type, "model": model}
+    REPLAY_VISION_CREDITS_CONSUMED.labels(**labels).inc(credits)
+    _otel.record_counter_twin(REPLAY_VISION_CREDITS_CONSUMED, credits, labels)
+
+
+def record_sweep_outcome(outcome: str, candidates: int = 0) -> None:
+    REPLAY_VISION_SWEEP_OUTCOMES.labels(outcome=outcome).inc()
+    _otel.record_counter_twin(REPLAY_VISION_SWEEP_OUTCOMES, 1, {"outcome": outcome})
+    if candidates > 0:
+        REPLAY_VISION_SWEEP_CANDIDATES.inc(candidates)
+        _otel.record_counter_twin(REPLAY_VISION_SWEEP_CANDIDATES, candidates, {})
+
+
+def record_estimate_outcome(outcome: str) -> None:
+    REPLAY_VISION_ESTIMATE_OUTCOMES.labels(outcome=outcome).inc()
+    _otel.record_counter_twin(REPLAY_VISION_ESTIMATE_OUTCOMES, 1, {"outcome": outcome})
+
+
+def record_deep_candidates(count: int) -> None:
+    REPLAY_VISION_DEEP_CANDIDATES.inc(count)
+    _otel.record_counter_twin(REPLAY_VISION_DEEP_CANDIDATES, count, {})
+
+
+def record_candidate_page_full() -> None:
+    REPLAY_VISION_SWEEP_CANDIDATE_PAGE_FULL.inc()
+    _otel.record_counter_twin(REPLAY_VISION_SWEEP_CANDIDATE_PAGE_FULL, 1, {})
+
+
+def record_deep_sweep_failure() -> None:
+    REPLAY_VISION_DEEP_SWEEP_FAILURES.inc()
+    _otel.record_counter_twin(REPLAY_VISION_DEEP_SWEEP_FAILURES, 1, {})
+
+
+def record_backfill_tick_outcome(outcome: str) -> None:
+    REPLAY_VISION_BACKFILL_TICK_OUTCOMES.labels(outcome=outcome).inc()
+    _otel.record_counter_twin(REPLAY_VISION_BACKFILL_TICK_OUTCOMES, 1, {"outcome": outcome})
+
+
+def record_observation_e2e(scanner_type: str, seconds: float) -> None:
+    labels = {"scanner_type": scanner_type}
+    REPLAY_VISION_OBSERVATION_E2E.labels(**labels).observe(seconds)
+    _otel.record_histogram_twin(REPLAY_VISION_OBSERVATION_E2E, seconds, labels)
+
+
+def record_side_effect_failure(effect: str) -> None:
+    REPLAY_VISION_SIDE_EFFECT_FAILURES.labels(effect=effect).inc()
+    _otel.record_counter_twin(REPLAY_VISION_SIDE_EFFECT_FAILURES, 1, {"effect": effect})
+
+
+def record_consent_skip(scanner_type: str) -> None:
+    REPLAY_VISION_CONSENT_SKIPS.labels(scanner_type=scanner_type).inc()
+    _otel.record_counter_twin(REPLAY_VISION_CONSENT_SKIPS, 1, {"scanner_type": scanner_type})
+
+
+def record_enqueue_claim_failure(operation: str) -> None:
+    REPLAY_VISION_ENQUEUE_CLAIM_FAILURES.labels(operation=operation).inc()
+    _otel.record_counter_twin(REPLAY_VISION_ENQUEUE_CLAIM_FAILURES, 1, {"operation": operation})
+
+
+def record_gemini_cleanup_files(result: str, count: int) -> None:
+    if count <= 0:
+        return
+    REPLAY_VISION_GEMINI_CLEANUP_FILES.labels(result=result).inc(count)
+    _otel.record_counter_twin(REPLAY_VISION_GEMINI_CLEANUP_FILES, count, {"result": result})
+
+
+# Singleton schedules push their gauges, so each region holds one series per gauge. A scraped gauge would keep
+# exporting, from every pod that ever ran the job, the value that pod last saw. The Pushgateway takes only
+# Prometheus metrics, so these gauges have no OTLP twin.
+
+
+def push_gemini_cleanup_gauges(tracked_files: int) -> None:
+    with pushed_metrics_registry("replay_vision_gemini_cleanup_sweep") as registry:
+        Gauge(
+            "replay_vision_gemini_cleanup_backlog",
+            "Tracked Gemini files awaiting cleanup (a growing backlog means the sweep is losing)",
+            registry=registry,
+        ).set(tracked_files)
+        Gauge(
+            "replay_vision_gemini_cleanup_last_run_timestamp_seconds",
+            "Unix time the Gemini cleanup sweep last finished",
+            registry=registry,
+        ).set(time.time())
+
+
+def push_in_flight_observation_gauges(by_status: dict[str, tuple[int, float]]) -> None:
+    """Takes `(count, oldest age in seconds)` per not-yet-terminal status."""
+    with pushed_metrics_registry("replay_vision_observation_backlog") as registry:
+        counts = Gauge(
+            "replay_vision_in_flight_observations",
+            "Observations not yet terminal, by status",
+            ["status"],
+            registry=registry,
+        )
+        ages = Gauge(
+            "replay_vision_oldest_in_flight_observation_age_seconds",
+            "Time since the oldest not-yet-terminal observation was created, by status; 0 when there is none",
+            ["status"],
+            registry=registry,
+        )
+        for status, (count, oldest_age_seconds) in by_status.items():
+            counts.labels(status=status).set(count)
+            ages.labels(status=status).set(oldest_age_seconds)
+        Gauge(
+            "replay_vision_observation_backlog_last_run_timestamp_seconds",
+            "Unix time the in-flight observation backlog was last measured",
+            registry=registry,
+        ).set(time.time())
+
+
+def record_search_rerank(outcome: str, seconds: float) -> None:
+    REPLAY_VISION_SEARCH_RERANK.labels(outcome=outcome).inc()
+    _otel.record_counter_twin(REPLAY_VISION_SEARCH_RERANK, 1, {"outcome": outcome})
+    REPLAY_VISION_SEARCH_RERANK_LATENCY.observe(seconds)
+    _otel.record_histogram_twin(REPLAY_VISION_SEARCH_RERANK_LATENCY, seconds, {})

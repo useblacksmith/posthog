@@ -1,0 +1,74 @@
+import type {
+  PiCommand,
+  PiNativeModelInfo,
+  PiQueueSnapshot,
+  PiSessionStatus,
+  PiThinkingLevel,
+  PiUsageStats,
+} from "@posthog/agent/pi/types";
+import type {
+  AgentConversationEvent,
+  GatewayLimitCause,
+  McpToolPermissionRequest,
+  PromptFailureKind,
+  SessionStatus,
+  TaskRunStatus,
+} from "@posthog/shared";
+import { createStore, type StoreApi } from "zustand/vanilla";
+
+export interface PiSessionError {
+  id: string;
+  scope: "connection" | "operation";
+  kind: PromptFailureKind;
+  title: string;
+  message: string;
+  retryable: boolean;
+  limitCause: GatewayLimitCause | null;
+  recoveryPrompt?: string;
+}
+
+export interface PiControllerSessionState {
+  connectionState: SessionStatus;
+  events: AgentConversationEvent[];
+  historyVersion: number;
+  models: Array<Pick<PiNativeModelInfo, "provider" | "id">>;
+  modelsLoaded: boolean;
+  thinkingLevels: PiThinkingLevel[];
+  thinkingLevelsLoaded: boolean;
+  commands: PiCommand[];
+  queue: PiQueueSnapshot;
+  status?: PiSessionStatus;
+  stats?: PiUsageStats;
+  cloudStatus?: TaskRunStatus;
+  error?: PiSessionError;
+  authRestoring: boolean;
+  isBashRunning: boolean;
+  mcpToolPermissionRequests: Map<string, McpToolPermissionRequest>;
+}
+
+export interface PiSessionState {
+  sessions: Record<string, PiControllerSessionState>;
+}
+
+export type PiSessionStore = StoreApi<PiSessionState>;
+
+export function createPiSessionStore(): PiSessionStore {
+  return createStore<PiSessionState>(() => ({ sessions: {} }));
+}
+
+export function createEmptyPiControllerSession(): PiControllerSessionState {
+  return {
+    connectionState: "connecting",
+    events: [],
+    historyVersion: 0,
+    models: [],
+    modelsLoaded: false,
+    thinkingLevels: [],
+    thinkingLevelsLoaded: false,
+    commands: [],
+    queue: { steering: [], followUp: [] },
+    mcpToolPermissionRequests: new Map(),
+    authRestoring: false,
+    isBashRunning: false,
+  };
+}

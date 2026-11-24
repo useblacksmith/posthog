@@ -1,0 +1,134 @@
+import { IconFilter } from '@posthog/icons'
+import { LemonSkeleton, Tooltip } from '@posthog/lemon-ui'
+import { Metric, MetricSubtitle, MetricTitle, MetricValue } from '@posthog/quill-components/metric'
+
+import { cn } from 'lib/utils/css-classes'
+import { humanFriendlyNumber } from 'lib/utils/numbers'
+
+export type StatTone = 'default' | 'danger' | 'warning' | 'success'
+
+export function HeroStat({
+    label,
+    value,
+    tone = 'default',
+    align = 'end',
+    loading = false,
+    onClick,
+    active = false,
+    filterHint,
+}: {
+    label: string
+    value: number | null | undefined
+    tone?: StatTone
+    align?: 'start' | 'end'
+    loading?: boolean
+    onClick?: () => void
+    active?: boolean
+    filterHint?: string
+}): JSX.Element {
+    const pressing = value != null && value > 0
+    const color =
+        pressing && tone === 'danger'
+            ? 'text-danger'
+            : pressing && tone === 'warning'
+              ? 'text-warning-dark'
+              : pressing && tone === 'success'
+                ? 'text-success'
+                : 'text-primary'
+    const alignCls = align === 'end' ? 'items-end' : 'items-start'
+    const body = (
+        <>
+            {loading ? (
+                <LemonSkeleton className="h-5 w-10" />
+            ) : (
+                <span className={cn('text-xl font-semibold leading-none tabular-nums', color)}>
+                    {value == null ? '—' : humanFriendlyNumber(value)}
+                </span>
+            )}
+            <span className={cn('mt-1 text-[11px] whitespace-nowrap', active ? 'text-accent' : 'text-tertiary')}>
+                {label}
+            </span>
+        </>
+    )
+    if (!onClick) {
+        return <div className={cn('flex flex-col', alignCls)}>{body}</div>
+    }
+    return (
+        <Tooltip title={active ? 'Showing this view' : filterHint} placement="bottom">
+            <button
+                type="button"
+                onClick={onClick}
+                aria-pressed={active}
+                className={cn(
+                    'flex cursor-pointer flex-col rounded px-2.5 py-1.5 transition-colors',
+                    alignCls,
+                    active ? 'bg-accent-highlight-secondary' : 'hover:bg-surface-secondary'
+                )}
+            >
+                {body}
+            </button>
+        </Tooltip>
+    )
+}
+
+export function StatCard({
+    label,
+    value,
+    caption,
+    loading,
+    onClick,
+    active = false,
+    filterHint,
+}: {
+    label: string
+    value: string
+    caption?: string
+    loading: boolean
+    /** Without it the card is a plain stat, not a filter toggle. */
+    onClick?: () => void
+    active?: boolean
+    filterHint?: string
+}): JSX.Element {
+    const body = loading ? (
+        <>
+            <div className={cn('text-sm font-medium', active ? 'text-accent' : 'text-secondary')}>{label}</div>
+            <LemonSkeleton className="h-9 w-20" />
+        </>
+    ) : (
+        <Metric value={0} subtitle={caption} className="px-0">
+            <MetricTitle className={active ? 'text-accent' : undefined}>{label}</MetricTitle>
+            <MetricValue className="mt-2">{value}</MetricValue>
+            <MetricSubtitle className="mt-1" />
+        </Metric>
+    )
+    if (!onClick) {
+        return (
+            <div className="relative flex flex-col gap-1 rounded-lg border border-primary bg-surface-primary p-4 text-left">
+                {body}
+            </div>
+        )
+    }
+    return (
+        <Tooltip title={active ? 'Showing this view' : filterHint} placement="bottom">
+            <button
+                type="button"
+                onClick={onClick}
+                aria-pressed={active}
+                className={cn(
+                    'group relative flex cursor-pointer flex-col gap-1 rounded-lg border p-4 text-left transition-colors',
+                    active
+                        ? 'border-accent bg-accent-highlight-secondary'
+                        : 'border-primary bg-surface-primary hover:border-accent/40 hover:bg-surface-secondary'
+                )}
+            >
+                <IconFilter
+                    className={cn(
+                        'absolute top-3 right-3 size-3.5 transition-opacity',
+                        active ? 'text-accent opacity-100' : 'text-tertiary opacity-0 group-hover:opacity-100'
+                    )}
+                />
+                {body}
+            </button>
+        </Tooltip>
+    )
+}

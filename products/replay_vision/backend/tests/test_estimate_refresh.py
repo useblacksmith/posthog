@@ -1,0 +1,601 @@
+import uuid
+import datetime as dt
+from typing import Any
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from django.utils import timezone
+
+from parameterized import parameterized
+from prometheus_client import REGISTRY
+from rest_framework.exceptions import (
+    PermissionDenied,
+    ValidationError as DRFValidationError,
+)
+from temporalio.exceptions import ApplicationError
+
+from posthog.schema import FilterLogicalOperator, RecordingsQuery
+
+from posthog.hogql.context import HogQLContext
+from posthog.hogql.printer import prepare_and_print_ast
+
+from posthog.errors import CHQueryErrorTooManyBytes
+from posthog.exceptions import ClickHouseQueryMemoryLimitExceeded, ClickHouseQueryTimeOut
+from posthog.models import Organization, Team, User
+from posthog.session_recordings.queries.session_recording_list_from_query import SessionRecordingListFromQuery
+
+from products.replay_vision.backend.models.replay_scanner import ReplayScanner, ScannerModel, ScannerType
+from products.replay_vision.backend.queries import (
+    DISABLED_ESTIMATE_STALE_AFTER,
+    ESTIMATE_STALE_AFTER,
+    SAVE_ESTIMATE_BUDGET,
+    ScannerVolumeEstimate,
+    project_monthly_observations,
+    refresh_scanner_estimate,
+)
+from products.replay_vision.backend.queries.scanner_volume_estimate import (
+    _ESTIMATE_EVENTS_SAMPLE_FACTOR,
+    BATCH_ESTIMATE_BUDGET,
+    EXACT_ESTIMATE_MAX_BYTES,
+    PREVIEW_ESTIMATE_BUDGET,
+    estimate_scanner_session_volume,
+)
+from products.replay_vision.backend.temporal.activities.list_stale_scanner_estimates import (
+    list_stale_scanner_estimates_activity,
+)
+from products.replay_vision.backend.temporal.activities.refresh_scanner_estimate import (
+    refresh_scanner_estimate_activity,
+)
+from products.replay_vision.backend.temporal.constants import ESTIMATES_SCHEDULE_ID
+from products.replay_vision.backend.temporal.estimates import (
+    RefreshScannerEstimatesWorkflow,
+    create_replay_vision_estimates_schedule,
+)
+from products.replay_vision.backend.temporal.estimates_types import (
+    RefreshScannerEstimateInputs,
+    RefreshScannerEstimatesInputs,
+    RefreshScannerEstimatesResult,
+)
+
+_STALE_HOURS = int(ESTIMATE_STALE_AFTER.total_seconds() // 3600) + 1
+_DISABLED_STALE_HOURS = int(DISABLED_ESTIMATE_STALE_AFTER.total_seconds() // 3600) + 1
+
+_ACTIVITY_HELPER = (
+    "products.replay_vision.backend.temporal.activities.refresh_scanner_estimate.refresh_scanner_estimate"
+)
+_ESTIMATE_QUERY = "products.replay_vision.backend.queries.scanner_volume_estimate.estimate_scanner_session_volume"
+# The classifier defers this import, so the patch target is the facade attribute it reads.
+_RESOLVE_LINKAGE = "products.experiments.backend.facade.replay.resolve_exposure_linkage"
+
+
+def _make_scanner(**overrides: Any) -> ReplayScanner:
+    org = Organization.objects.create(name="vision-estimate-test-org")
+    team = Team.objects.create(organization=org, name="vision-estimate-test-team")
+    defaults: dict[str, Any] = {
+        "team": team,
+        "name": "estimate-scanner",
+        "scanner_type": ScannerType.MONITOR,
+        "scanner_config": {"prompt": "p"},
+        "model": ScannerModel.GEMINI_3_8_FLASH,
+    }
+    defaults.update(overrides)
+    return ReplayScanner.objects.create(**defaults)
+
+
+def _set_estimate(scanner: ReplayScanner, value: int, hours_ago: float) -> None:
+    ReplayScanner.objects.filter(pk=scanner.pk).update(
+        estimated_monthly_observations=value,
+        estimated_at=timezone.now() - dt.timedelta(hours=hours_ago),
+    )
+
+
+def _set_attempt(scanner: ReplayScanner, hours_ago: float) -> None:
+    ReplayScanner.objects.filter(pk=scanner.pk).update(
+        estimate_attempted_at=timezone.now() - dt.timedelta(hours=hours_ago)
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "recordings_query, expect_sampled",
+    [
+        (RecordingsQuery(events=[{"id": "$pageview", "type": "events", "name": "$pageview"}]), True),
+        (RecordingsQuery(), False),
+        # Negative filters build only the exclusion blocklist, which must never sample: it would under-exclude.
+        (
+            RecordingsQuery(
+                properties=[{"type": "event", "key": "$host", "operator": "not_icontains", "value": "localhost"}]
+            ),
+            False,
+        ),
+    ],
+)
+def test_estimate_samples_only_positive_events_subqueries(
+    recordings_query: RecordingsQuery, expect_sampled: bool
+) -> None:
+    scanner = _make_scanner()
+    list_query = SessionRecordingListFromQuery(
+        team=scanner.team, query=recordings_query, events_sample_factor=_ESTIMATE_EVENTS_SAMPLE_FACTOR
+    )
+    built = list_query.get_query()
+
+    assert list_query.events_subqueries_sampled == expect_sampled
+    sql = prepare_and_print_ast(built, HogQLContext(team_id=scanner.team.pk, enable_select_queries=True), "clickhouse")[
+        0
+    ]
+    assert (sql.count(f"SAMPLE {_ESTIMATE_EVENTS_SAMPLE_FACTOR}") > 0) == expect_sampled
+
+
+_EVENT_FILTERED_AND_QUERY = RecordingsQuery(
+    events=[{"id": "$pageview", "type": "events", "name": "$pageview"}],
+    properties=[{"type": "person", "key": "email", "operator": "icontains", "value": "@"}],
+    operand=FilterLogicalOperator.AND_,
+)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "budget, execute_outcomes, expected_matched, expected_sampled, expected_budgets, expected_query_types",
+    [
+        (
+            BATCH_ESTIMATE_BUDGET,
+            [MagicMock(results=[[5, None]])],
+            5,
+            False,
+            [15],
+            ["ReplayVisionScannerEstimateExactQuery"],
+        ),
+        (
+            BATCH_ESTIMATE_BUDGET,
+            [ClickHouseQueryTimeOut(), MagicMock(results=[[5, None]])],
+            50,
+            True,
+            [15, 30],
+            ["ReplayVisionScannerEstimateExactQuery", "ReplayVisionScannerEstimateSampledQuery"],
+        ),
+        (
+            BATCH_ESTIMATE_BUDGET,
+            [CHQueryErrorTooManyBytes("too many bytes", code=307), MagicMock(results=[[5, None]])],
+            50,
+            True,
+            [15, 30],
+            ["ReplayVisionScannerEstimateExactQuery", "ReplayVisionScannerEstimateSampledQuery"],
+        ),
+        (
+            BATCH_ESTIMATE_BUDGET,
+            [ClickHouseQueryMemoryLimitExceeded(), MagicMock(results=[[5, None]])],
+            50,
+            True,
+            [15, 30],
+            ["ReplayVisionScannerEstimateExactQuery", "ReplayVisionScannerEstimateSampledQuery"],
+        ),
+        # A save blocks the request, so it skips the exact attempt and runs one sampled query.
+        (
+            SAVE_ESTIMATE_BUDGET,
+            [MagicMock(results=[[5, None]])],
+            50,
+            True,
+            [10],
+            ["ReplayVisionScannerEstimateSampledQuery"],
+        ),
+    ],
+)
+def test_estimate_falls_back_to_sampling_only_when_the_exact_count_times_out(
+    budget: Any,
+    execute_outcomes: list[Any],
+    expected_matched: int,
+    expected_sampled: bool,
+    expected_budgets: list[int],
+    expected_query_types: list[str],
+) -> None:
+    scanner = _make_scanner()
+    with patch(
+        "products.replay_vision.backend.queries.scanner_volume_estimate.execute_hogql_query",
+        side_effect=execute_outcomes,
+    ) as mock_execute:
+        estimate = estimate_scanner_session_volume(team=scanner.team, query=_EVENT_FILTERED_AND_QUERY, budget=budget)
+    assert estimate.matched_sessions == expected_matched
+    assert estimate.sampled == expected_sampled
+    settings = [call.kwargs["settings"] for call in mock_execute.call_args_list]
+    assert [s.max_execution_time for s in settings] == expected_budgets
+    assert all(s.timeout_overflow_mode == "throw" for s in settings)
+    assert [call.kwargs["query_type"] for call in mock_execute.call_args_list] == expected_query_types
+    # Only the exact count is capped: the sampled count is the answer of last resort.
+    assert [s.max_bytes_to_read for s in settings] == [
+        EXACT_ESTIMATE_MAX_BYTES if query_type.endswith("ExactQuery") else None for query_type in expected_query_types
+    ]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "exact_error, batch_query_type, batch_matched",
+    [
+        # A preview's timeout says nothing about the batch's longer budget, so the batch tries the exact count.
+        (ClickHouseQueryTimeOut(), "ReplayVisionScannerEstimateExactQuery", 7),
+        # The byte cap is the same under every budget, so the batch skips the exact count too.
+        (CHQueryErrorTooManyBytes("too many bytes", code=307), "ReplayVisionScannerEstimateSampledQuery", 70),
+    ],
+)
+def test_a_failed_exact_count_is_skipped_next_time_and_previews_reuse_their_result(
+    exact_error: Exception, batch_query_type: str, batch_matched: int
+) -> None:
+    scanner = _make_scanner()
+    with patch(
+        "products.replay_vision.backend.queries.scanner_volume_estimate.execute_hogql_query",
+        side_effect=[
+            exact_error,
+            MagicMock(results=[[5, None]]),
+            MagicMock(results=[[6, None]]),
+            MagicMock(results=[[7, None]]),
+        ],
+    ) as mock_execute:
+        for _ in range(2):
+            estimate_scanner_session_volume(
+                team=scanner.team, query=_EVENT_FILTERED_AND_QUERY, budget=PREVIEW_ESTIMATE_BUDGET
+            )
+        # Another user's preview misses the result cache but still skips the exact count that timed out.
+        estimate_scanner_session_volume(
+            team=scanner.team,
+            query=_EVENT_FILTERED_AND_QUERY,
+            user=User.objects.create(email="estimate-viewer@example.com"),
+            budget=PREVIEW_ESTIMATE_BUDGET,
+        )
+        batch = estimate_scanner_session_volume(team=scanner.team, query=_EVENT_FILTERED_AND_QUERY)
+
+    assert [call.kwargs["query_type"] for call in mock_execute.call_args_list] == [
+        "ReplayVisionScannerEstimateExactQuery",
+        "ReplayVisionScannerEstimateSampledQuery",
+        "ReplayVisionScannerEstimateSampledQuery",
+        batch_query_type,
+    ]
+    assert batch.matched_sessions == batch_matched
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "recordings_query, error",
+    [
+        (
+            RecordingsQuery(
+                events=[{"id": "$pageview", "type": "events", "name": "$pageview"}],
+                properties=[{"type": "person", "key": "email", "operator": "icontains", "value": "@"}],
+                operand=FilterLogicalOperator.OR_,
+            ),
+            ClickHouseQueryTimeOut(),
+        ),
+        (RecordingsQuery(), ClickHouseQueryTimeOut()),
+    ],
+)
+def test_estimate_propagates_errors_when_a_retry_would_not_help(
+    recordings_query: RecordingsQuery, error: Exception
+) -> None:
+    scanner = _make_scanner()
+    with patch(
+        "products.replay_vision.backend.queries.scanner_volume_estimate.execute_hogql_query",
+        side_effect=error,
+    ) as mock_execute:
+        with pytest.raises(type(error)):
+            estimate_scanner_session_volume(team=scanner.team, query=recordings_query)
+    assert mock_execute.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "matched, window_days, sampling_rate, expected",
+    [
+        (60, 30, 1.0, 60),
+        (14, 7, 1.0, 60),
+        (60, 30, 0.5, 30),
+        (0, 30, 1.0, 0),
+        (10, 1, 0.5, 150),
+        (45, 30, 0.2, 9),
+    ],
+)
+def test_project_monthly_observations(matched: int, window_days: int, sampling_rate: float, expected: int) -> None:
+    estimate = ScannerVolumeEstimate(matched_sessions=matched, effective_window_days=window_days)
+    assert project_monthly_observations(estimate, sampling_rate) == expected
+
+
+@pytest.mark.django_db(transaction=True)
+class TestRefreshScannerEstimate:
+    def test_persists_projection_and_timestamp(self) -> None:
+        scanner = _make_scanner(sampling_rate=0.5)
+        with patch(
+            _ESTIMATE_QUERY,
+            return_value=ScannerVolumeEstimate(matched_sessions=60, effective_window_days=30),
+        ):
+            refresh_scanner_estimate(scanner)
+
+        scanner.refresh_from_db()
+        assert scanner.estimated_monthly_observations == 30
+        assert scanner.estimated_at is not None
+        # The attempt is stamped when the query starts, so it never trails the success stamp.
+        assert scanner.estimate_attempted_at is not None
+        assert scanner.estimate_attempted_at <= scanner.estimated_at
+
+    def test_raises_and_stamps_only_the_attempt_when_the_estimate_query_errors(self) -> None:
+        scanner = _make_scanner()
+        with patch(_ESTIMATE_QUERY, side_effect=RuntimeError("clickhouse down")):
+            with pytest.raises(RuntimeError, match="clickhouse down"):
+                refresh_scanner_estimate(scanner)
+
+        scanner.refresh_from_db()
+        assert scanner.estimated_monthly_observations is None
+        assert scanner.estimated_at is None
+        assert scanner.estimate_attempted_at is not None
+
+    def test_does_not_bump_scanner_version(self) -> None:
+        scanner = _make_scanner()
+        original_version = scanner.scanner_version
+        with patch(
+            _ESTIMATE_QUERY,
+            return_value=ScannerVolumeEstimate(matched_sessions=1, effective_window_days=30),
+        ):
+            refresh_scanner_estimate(scanner)
+
+        scanner.refresh_from_db()
+        assert scanner.scanner_version == original_version
+
+    def test_discards_result_when_config_changed_mid_flight(self) -> None:
+        scanner = _make_scanner(sampling_rate=1.0)
+
+        def edit_then_estimate(**_: Any) -> ScannerVolumeEstimate:
+            ReplayScanner.objects.filter(pk=scanner.pk).update(sampling_rate=0.5)
+            return ScannerVolumeEstimate(matched_sessions=60, effective_window_days=30)
+
+        with patch(_ESTIMATE_QUERY, side_effect=edit_then_estimate):
+            refresh_scanner_estimate(scanner)
+
+        scanner.refresh_from_db()
+        # The estimate was computed against the pre-edit config, so the filtered write must not land.
+        assert scanner.estimated_monthly_observations is None
+        assert scanner.estimated_at is None
+
+
+@pytest.mark.django_db(transaction=True)
+class TestEstimateInvalidationOnSave:
+    @pytest.mark.parametrize(
+        "field, value, expect_stale",
+        [
+            ("sampling_rate", 0.25, True),
+            ("query", {"kind": "RecordingsQuery", "operand": "AND"}, True),
+            ("name", "renamed", False),
+            ("scanner_config", {"prompt": "new prompt"}, False),  # version-tracked but not a volume input
+        ],
+    )
+    def test_volume_input_changes_clear_estimated_at(self, field: str, value: Any, expect_stale: bool) -> None:
+        scanner = _make_scanner()
+        _set_estimate(scanner, 10, hours_ago=1)
+        scanner.refresh_from_db()
+
+        setattr(scanner, field, value)
+        scanner.save()
+
+        scanner.refresh_from_db()
+        assert (scanner.estimated_at is None) == expect_stale
+        # The last computed value sticks around until the refresher recomputes it.
+        assert scanner.estimated_monthly_observations == 10
+
+    @pytest.mark.parametrize(
+        "initial_enabled, new_enabled",
+        [
+            (False, True),  # the refresher keeps disabled scanners fresh, so re-enabling needs no invalidation
+            (True, False),
+            (True, True),
+        ],
+    )
+    def test_enabled_transitions_keep_the_estimate(self, initial_enabled: bool, new_enabled: bool) -> None:
+        scanner = _make_scanner(enabled=initial_enabled)
+        _set_estimate(scanner, 10, hours_ago=1)
+        scanner.refresh_from_db()
+
+        scanner.enabled = new_enabled
+        scanner.save(update_fields=["enabled"])
+
+        scanner.refresh_from_db()
+        assert scanner.estimated_at is not None
+
+
+@pytest.mark.django_db(transaction=True)
+class TestRefreshScannerEstimateActivity:
+    @pytest.mark.parametrize(
+        "enabled, estimated_hours_ago, expect_refresh",
+        [
+            (True, None, True),  # never computed → refresh
+            (True, _STALE_HOURS, True),  # stale → refresh
+            (True, 1, False),  # fresh → no-op
+            (False, _STALE_HOURS, True),  # disabled scanners refresh too, so re-enabling uses an accurate number
+            (False, 1, False),  # fresh → no-op regardless of enabled
+        ],
+    )
+    def test_gates_on_staleness(self, enabled: bool, estimated_hours_ago: int | None, expect_refresh: bool) -> None:
+        scanner = _make_scanner(enabled=enabled)
+        if estimated_hours_ago is not None:
+            _set_estimate(scanner, 10, hours_ago=estimated_hours_ago)
+
+        with patch(_ACTIVITY_HELPER) as mock_refresh:
+            refreshed = refresh_scanner_estimate_activity(
+                RefreshScannerEstimateInputs(scanner_id=scanner.id, team_id=scanner.team_id)
+            )
+
+        assert refreshed == expect_refresh
+        assert mock_refresh.called == expect_refresh
+
+    def test_noop_when_scanner_missing(self) -> None:
+        with patch(_ACTIVITY_HELPER) as mock_refresh:
+            refreshed = refresh_scanner_estimate_activity(
+                RefreshScannerEstimateInputs(scanner_id=uuid.uuid4(), team_id=999)
+            )
+        assert refreshed is False
+        mock_refresh.assert_not_called()
+
+    @parameterized.expand(
+        [
+            ("unexpected_error", RuntimeError("boom")),
+            # Without experiment targeting there is no linkage to resolve: a DRF ValidationError
+            # means the scanner's own query no longer builds, which must stay a failed activity.
+            ("query_unbuildable", DRFValidationError("Action ID 424242 does not exist!")),
+        ]
+    )
+    def test_propagates_helper_errors(self, _name: str, error: Exception) -> None:
+        scanner = _make_scanner()
+        with patch(_ACTIVITY_HELPER, side_effect=error):
+            with pytest.raises(type(error)):
+                refresh_scanner_estimate_activity(
+                    RefreshScannerEstimateInputs(scanner_id=scanner.id, team_id=scanner.team_id)
+                )
+
+    def test_propagates_query_errors_when_the_linkage_resolves(self) -> None:
+        # A targeted scanner can carry a broken query filter too. When the linkage itself
+        # resolves, the failure is the query, which no launch heals, so it stays loud.
+        scanner = _make_scanner(experiment_targeting={"experiment_id": 424242, "variant": None})
+        with (
+            patch(_ACTIVITY_HELPER, side_effect=DRFValidationError("Action ID 424242 does not exist!")),
+            patch(_RESOLVE_LINKAGE, return_value=MagicMock()),
+        ):
+            with pytest.raises(DRFValidationError):
+                refresh_scanner_estimate_activity(
+                    RefreshScannerEstimateInputs(scanner_id=scanner.id, team_id=scanner.team_id)
+                )
+
+    @parameterized.expand(
+        [
+            ("experiment_cannot_answer", DRFValidationError("This experiment hasn't launched")),
+            ("creator_lost_experiment_access", PermissionDenied("no access")),
+        ]
+    )
+    def test_reports_an_unresolvable_experiment_as_not_refreshed(self, _name: str, error: Exception) -> None:
+        # The nonexistent experiment id makes the classifier's re-resolution raise, which is the
+        # linkage-unresolved state.
+        scanner = _make_scanner(experiment_targeting={"experiment_id": 424242, "variant": None})
+        labels = {"outcome": "experiment_linkage_unresolved"}
+        before = REGISTRY.get_sample_value("replay_vision_estimate_outcomes_total", labels) or 0.0
+
+        with patch(_ACTIVITY_HELPER, side_effect=error):
+            refreshed = refresh_scanner_estimate_activity(
+                RefreshScannerEstimateInputs(scanner_id=scanner.id, team_id=scanner.team_id)
+            )
+
+        assert refreshed is False
+        # The workflow discards the return value, so this counter is the only thing that separates a
+        # skipped scanner from a refreshed one.
+        assert REGISTRY.get_sample_value("replay_vision_estimate_outcomes_total", labels) == before + 1
+
+
+@pytest.mark.django_db(transaction=True)
+class TestListStaleScannerEstimatesActivity:
+    def test_returns_stale_scanners_enabled_first_then_oldest(self) -> None:
+        never = _make_scanner(name="never-estimated")
+        stale = _make_scanner(name="stale")
+        _set_estimate(stale, 10, hours_ago=_STALE_HOURS)
+        very_stale = _make_scanner(name="very-stale")
+        _set_estimate(very_stale, 10, hours_ago=_STALE_HOURS + 24)
+        fresh = _make_scanner(name="fresh")
+        _set_estimate(fresh, 10, hours_ago=1)
+        disabled = _make_scanner(name="disabled", enabled=False)
+        _set_estimate(disabled, 10, hours_ago=_DISABLED_STALE_HOURS)
+        # Disabled scanners run on the slower clock: stale for an enabled scanner, not for a disabled one.
+        disabled_recent = _make_scanner(name="disabled-recent", enabled=False)
+        _set_estimate(disabled_recent, 10, hours_ago=_STALE_HOURS + 24)
+        # A failed attempt sorts a never-computed estimate by that attempt instead of at the head.
+        failed_earlier = _make_scanner(name="failed-earlier")
+        _set_attempt(failed_earlier, hours_ago=_STALE_HOURS + 12)
+        # A recent failed attempt is skipped until the backoff has passed.
+        failed_recently = _make_scanner(name="failed-recently")
+        _set_attempt(failed_recently, hours_ago=0.1)
+
+        entries = list_stale_scanner_estimates_activity()
+
+        # Disabled scanners are included but sort behind enabled ones even when staler.
+        assert [e.scanner_id for e in entries] == [never.id, very_stale.id, failed_earlier.id, stale.id, disabled.id]
+        assert entries[0].team_id == never.team_id
+
+    def test_caps_the_batch(self) -> None:
+        for i in range(3):
+            _make_scanner(name=f"stale-{i}")
+        with patch(
+            "products.replay_vision.backend.temporal.activities.list_stale_scanner_estimates.ESTIMATES_MAX_PER_RUN",
+            2,
+        ):
+            entries = list_stale_scanner_estimates_activity()
+        assert len(entries) == 2
+
+
+# RefreshScannerEstimatesWorkflow (mocked-Temporal)
+
+
+def _stale(*scanner_ids: uuid.UUID) -> list[RefreshScannerEstimateInputs]:
+    return [RefreshScannerEstimateInputs(scanner_id=sid, team_id=i + 1) for i, sid in enumerate(scanner_ids)]
+
+
+async def _run_estimates(
+    stale: list[RefreshScannerEstimateInputs], failing: set[uuid.UUID] | None = None
+) -> tuple[RefreshScannerEstimatesResult, list[uuid.UUID]]:
+    refreshed: list[uuid.UUID] = []
+
+    async def execute_activity(activity_fn: Any, activity_input: Any = None, **_: Any) -> Any:
+        if activity_fn is list_stale_scanner_estimates_activity:
+            return stale
+        assert activity_fn is refresh_scanner_estimate_activity
+        if activity_input.scanner_id in (failing or set()):
+            raise RuntimeError(f"refresh boom for {activity_input.scanner_id}")
+        refreshed.append(activity_input.scanner_id)
+        return True
+
+    with (
+        patch("temporalio.workflow.execute_activity", side_effect=execute_activity),
+        patch("temporalio.workflow.logger", MagicMock()),
+    ):
+        result = await RefreshScannerEstimatesWorkflow().run(RefreshScannerEstimatesInputs())
+    return result, refreshed
+
+
+@pytest.mark.asyncio
+async def test_workflow_skips_when_nothing_is_stale() -> None:
+    result, refreshed = await _run_estimates([])
+    assert result == RefreshScannerEstimatesResult()
+    assert refreshed == []
+
+
+@pytest.mark.asyncio
+async def test_workflow_refreshes_each_stale_scanner() -> None:
+    sid_a, sid_b = uuid.uuid4(), uuid.uuid4()
+    result, refreshed = await _run_estimates(_stale(sid_a, sid_b))
+    assert set(result.refreshed) == {sid_a, sid_b}
+    assert result.failed == []
+    assert set(refreshed) == {sid_a, sid_b}
+
+
+@pytest.mark.asyncio
+async def test_workflow_isolates_per_scanner_failures() -> None:
+    sid_ok, sid_fail = uuid.uuid4(), uuid.uuid4()
+    result, _ = await _run_estimates(_stale(sid_ok, sid_fail), failing={sid_fail})
+    assert result.refreshed == [sid_ok]
+    assert result.failed == [sid_fail]
+
+
+@pytest.mark.asyncio
+async def test_workflow_raises_when_all_refreshes_fail() -> None:
+    sid_a, sid_b = uuid.uuid4(), uuid.uuid4()
+    with pytest.raises(ApplicationError):
+        await _run_estimates(_stale(sid_a, sid_b), failing={sid_a, sid_b})
+
+
+def test_refresh_estimates_parse_inputs() -> None:
+    assert RefreshScannerEstimatesWorkflow.parse_inputs([]) == RefreshScannerEstimatesInputs()
+
+
+@pytest.mark.asyncio
+@parameterized.expand([("missing", False, "create"), ("present", True, "update")])
+async def test_create_estimates_schedule_routes_by_existence(_name: str, exists: bool, expected: str) -> None:
+    schedule_mod = "products.replay_vision.backend.temporal.schedule"
+    with (
+        patch(f"{schedule_mod}.a_schedule_exists", AsyncMock(return_value=exists)),
+        patch(f"{schedule_mod}.a_create_schedule", AsyncMock()) as create,
+        patch(f"{schedule_mod}.a_update_schedule", AsyncMock()) as update,
+    ):
+        await create_replay_vision_estimates_schedule(AsyncMock())
+    called, skipped = (create, update) if expected == "create" else (update, create)
+    called.assert_awaited_once()
+    skipped.assert_not_awaited()
+    assert called.call_args.args[1] == ESTIMATES_SCHEDULE_ID

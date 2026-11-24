@@ -1,0 +1,1272 @@
+import { MOCK_DEFAULT_TEAM, MOCK_GROUP_TYPES } from '~/lib/api.mock'
+
+import '@testing-library/jest-dom'
+
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { Provider } from 'kea'
+import posthog from 'posthog-js'
+
+import { lemonToast } from '@posthog/lemon-ui'
+
+import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { databaseTableListLogic } from 'scenes/data-management/database/databaseTableListLogic'
+import { EntityFilterProps, entityFilterLogic } from 'scenes/insights/filters/ActionFilter/entityFilterLogic'
+import { teamLogic } from 'scenes/teamLogic'
+
+import { FlagEvaluationsModeEnumApi } from '~/generated/core/api.schemas'
+import { useAvailableFeatures } from '~/mocks/features'
+import { useMocks } from '~/mocks/jest'
+import { actionsModel } from '~/models/actionsModel'
+import { groupsModel } from '~/models/groupsModel'
+import { propertyDefinitionsModel } from '~/models/propertyDefinitionsModel'
+import { NodeKind } from '~/queries/schema/schema-general'
+import { initKeaTests } from '~/test/init'
+import { eventDefinitions, searchAndSelect, setupInsightMocks } from '~/test/insight-testing'
+import {
+    AvailableFeature,
+    BaseMathType,
+    HogQLMathType,
+    InsightType,
+    PropertyFilterType,
+    PropertyMathType,
+    PropertyOperator,
+} from '~/types'
+
+import filtersJson from '../__mocks__/filters.json'
+import { SeriesNode } from '../seriesNode'
+import { ActionFilterRow } from './ActionFilterRow'
+import { taxonomicGroupTypeToSeriesNodeKind } from './actionFilterRowUtils'
+import { MathAvailability } from './types'
+
+// AutoSizer needs a mock because react-virtualized requires real DOM measurements
+jest.mock('lib/components/AutoSizer', () => ({
+    AutoSizer: ({ renderProp }: { renderProp: (size: { height: number; width: number }) => React.ReactNode }) =>
+        renderProp({ height: 400, width: 400 }),
+}))
+
+// HogQLEditor uses Monaco which requires Web Workers and cannot run in jsdom
+jest.mock('lib/components/HogQLEditor/HogQLEditor', () => ({
+    HogQLEditor: () => <div data-attr="mock-hogql-editor" />,
+}))
+
+// dnd-kit requires DndContext wrapping and gesture simulation
+jest.mock('@dnd-kit/sortable', () => ({
+    useSortable: () => ({
+        setNodeRef: jest.fn(),
+        attributes: {},
+        transform: null,
+        transition: null,
+        listeners: {},
+        isDragging: false,
+    }),
+}))
+
+const DEFAULT_NODE: SeriesNode = {
+    kind: NodeKind.EventsNode,
+    event: '$pageview',
+    name: '$pageview',
+    properties: [],
+}
+
+// Non-popup context: no trends display, no math → inline buttons shown
+const INLINE_CONTEXT = {
+    trendsDisplayCategory: null,
+    mathAvailability: MathAvailability.None,
+}
+
+function setup(
+    seriesOverride?: SeriesNode[],
+    logicProps: Partial<EntityFilterProps> = {}
+): {
+    logic: ReturnType<typeof entityFilterLogic.build>
+    onChange: jest.Mock
+} {
+    const series: SeriesNode[] = seriesOverride ?? [
+        { kind: NodeKind.EventsNode, event: '$pageview', name: '$pageview' },
+        { kind: NodeKind.EventsNode, event: '$pageview', name: '$pageview' },
+        { kind: NodeKind.ActionsNode, id: 9, name: 'Users signed up' },
+    ]
+    const onChange = jest.fn()
+    const logic = entityFilterLogic({ onChange, series, typeKey: 'test-key', ...logicProps })
+    logic.mount()
+    return { logic, onChange }
+}
+
+function renderRow(
+    logic: ReturnType<typeof entityFilterLogic.build>,
+    propOverrides: Record<string, any> = {}
+): ReturnType<typeof render> {
+    return render(
+        <Provider>
+            <ActionFilterRow
+                logic={logic}
+                node={DEFAULT_NODE}
+                uuid="test-uuid-1"
+                index={0}
+                typeKey="test-key"
+                mathAvailability={MathAvailability.All}
+                filterCount={2}
+                sortable={false}
+                hasBreakdown={false}
+                trendsDisplayCategory={null}
+                {...propOverrides}
+            />
+        </Provider>
+    )
+}
+
+describe('ActionFilterRow', () => {
+    afterEach(cleanup)
+
+    beforeEach(() => {
+        initKeaTests()
+
+        // setupInsightMocks provides realistic event/property definitions with search
+        // support, person properties, and query response handling
+        setupInsightMocks()
+
+        // Supplement with endpoints specific to ActionFilterRow
+        useMocks({
+            get: {
+                // insightLogic mounts alongside and fetches its insight by short_id; without
+                // a match it errors with "Insight ... not found"
+                '/api/environments/:team_id/insights/': ({ request }: { request: Request }) => [
+                    200,
+                    {
+                        results: [{ id: 1, short_id: new URL(request.url).searchParams.get('short_id'), query: null }],
+                    },
+                ],
+                '/api/projects/:team/actions/': { results: filtersJson.actions },
+                '/api/environments/:team/groups_types/': MOCK_GROUP_TYPES,
+                '/api/projects/:team/warehouse_tables/': { results: [] },
+                '/api/projects/:team/warehouse_saved_queries/': { results: [] },
+                '/api/projects/:team/warehouse_view_links/': { results: [] },
+            },
+        })
+
+        useAvailableFeatures([AvailableFeature.GROUP_ANALYTICS])
+        actionsModel.mount()
+        groupsModel.mount()
+        propertyDefinitionsModel.mount()
+    })
+
+    describe('taxonomicGroupTypeToSeriesNodeKind', () => {
+        it.each([
+            [TaxonomicFilterGroupType.Events, undefined, NodeKind.EventsNode],
+            [TaxonomicFilterGroupType.Actions, undefined, NodeKind.ActionsNode],
+            [TaxonomicFilterGroupType.DataWarehouse, undefined, NodeKind.DataWarehouseNode],
+            [
+                TaxonomicFilterGroupType.DataWarehouseSourceTables,
+                NodeKind.FunnelsDataWarehouseNode,
+                NodeKind.FunnelsDataWarehouseNode,
+            ],
+            [
+                TaxonomicFilterGroupType.DataWarehouseMaterializedViews,
+                NodeKind.LifecycleDataWarehouseNode,
+                NodeKind.LifecycleDataWarehouseNode,
+            ],
+            [TaxonomicFilterGroupType.PersonProperties, NodeKind.FunnelsDataWarehouseNode, NodeKind.EventsNode],
+        ] as const)('maps %s (warehouse kind %s) to %s', (groupType, warehouseKind, expected) => {
+            expect(taxonomicGroupTypeToSeriesNodeKind(groupType, warehouseKind)).toBe(expected)
+        })
+    })
+
+    describe('rendering', () => {
+        it('renders the filter element with event name', () => {
+            const { logic } = setup()
+            renderRow(logic)
+            expect(document.querySelector('.ActionFilterRow')).toBeInTheDocument()
+            // EntityFilterInfo renders $pageview as "Pageview" display name
+            expect(document.querySelector('.ActionFilterRow')!.textContent).toContain('Pageview')
+        })
+
+        it('shows the underlying event alongside a renamed series', () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                node: { ...DEFAULT_NODE, event: 'user signed up', name: 'Signed up', custom_name: 'Signed up' },
+            })
+            const row = document.querySelector('.ActionFilterRow')!
+            expect(row.textContent).toContain('Signed up')
+            expect(row.textContent).toContain('user signed up')
+        })
+
+        it('opens the picker with the renamed selection first, labelled by the series name', async () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                ...INLINE_CONTEXT,
+                node: { ...DEFAULT_NODE, event: 'user signed up', name: 'Signed up', custom_name: 'Signed up' },
+            })
+
+            await userEvent.click(screen.getByTestId('trend-element-subject-0'))
+
+            // The committed selection leads the list, labelled with the series' rename
+            // and revealing the event it actually queries.
+            await waitFor(() => {
+                const rows = Array.from(document.querySelectorAll('.taxonomic-list-row'))
+                const selectedRow = rows.find(
+                    (row) => row.textContent?.includes('Signed up') && row.textContent?.includes('user signed up')
+                )
+                expect(selectedRow).toBeTruthy()
+                expect(selectedRow!.getAttribute('data-attr')).toMatch(/-0$/)
+            })
+        })
+
+        describe('series indicators', () => {
+            it.each([
+                ['alpha', 'A'],
+                ['numeric', '1'],
+            ] as const)('shows %s series indicator', (type, expectedText) => {
+                const { logic } = setup()
+                renderRow(logic, { showSeriesIndicator: true, seriesIndicatorType: type })
+                expect(screen.getByText(expectedText)).toBeInTheDocument()
+            })
+
+            it('does not show series indicator section when showSeriesIndicator is false', () => {
+                const { logic } = setup()
+                renderRow(logic, { showSeriesIndicator: false })
+                expect(document.querySelector('.ActionFilterRow__start')).not.toBeInTheDocument()
+            })
+        })
+
+        describe('read-only mode', () => {
+            it('does not render action buttons', () => {
+                const { logic } = setup()
+                renderRow(logic, { readOnly: true })
+                expect(screen.queryByTitle('Delete graph series')).not.toBeInTheDocument()
+                expect(screen.queryByTitle('Rename graph series')).not.toBeInTheDocument()
+                expect(screen.queryByTitle('Duplicate graph series')).not.toBeInTheDocument()
+                expect(screen.queryByLabelText('Show more actions')).not.toBeInTheDocument()
+            })
+        })
+
+        describe('inline buttons mode', () => {
+            it('shows rename, duplicate, delete inline when not in popup context', () => {
+                const { logic } = setup()
+                renderRow(logic, INLINE_CONTEXT)
+                expect(screen.getByTitle('Rename graph series')).toBeInTheDocument()
+                expect(screen.getByTitle('Duplicate graph series')).toBeInTheDocument()
+                expect(screen.getByTitle('Delete graph series')).toBeInTheDocument()
+            })
+
+            it.each([
+                ['hideRename', 'Rename graph series'],
+                ['hideDuplicate', 'Duplicate graph series'],
+                ['hideDeleteBtn', 'Delete graph series'],
+            ])('hides button when %s is true', (prop, title) => {
+                const { logic } = setup()
+                renderRow(logic, { ...INLINE_CONTEXT, [prop]: true })
+                expect(screen.queryByTitle(title)).not.toBeInTheDocument()
+            })
+
+            it('hides duplicate and delete when singleFilter is true', () => {
+                const { logic } = setup()
+                renderRow(logic, { ...INLINE_CONTEXT, singleFilter: true })
+                expect(screen.queryByTitle('Duplicate graph series')).not.toBeInTheDocument()
+                expect(screen.queryByTitle('Delete graph series')).not.toBeInTheDocument()
+            })
+        })
+
+        describe('popup menu mode', () => {
+            it('shows ellipsis menu button in trends context', () => {
+                const { logic } = setup()
+                renderRow(logic, { trendsDisplayCategory: 'TotalValue' as any })
+                expect(screen.getByLabelText('Show more actions')).toBeInTheDocument()
+            })
+
+            it('shows ellipsis menu button in funnel context', () => {
+                const { logic } = setup()
+                renderRow(logic, { mathAvailability: MathAvailability.FunnelsOnly })
+                expect(screen.getByLabelText('Show more actions')).toBeInTheDocument()
+            })
+
+            it('does not show ellipsis menu in non-popup context', () => {
+                const { logic } = setup()
+                renderRow(logic, INLINE_CONTEXT)
+                expect(screen.queryByLabelText('Show more actions')).not.toBeInTheDocument()
+            })
+        })
+
+        describe('math availability', () => {
+            it.each([
+                [MathAvailability.All, true],
+                [MathAvailability.ActorsOnly, true],
+                [MathAvailability.CalendarHeatmapOnly, true],
+                [MathAvailability.FunnelsOnly, false],
+                [MathAvailability.None, false],
+            ])('math selector visibility for MathAvailability=%s is %s', (availability, visible) => {
+                const { logic } = setup()
+                renderRow(logic, { mathAvailability: availability })
+                if (visible) {
+                    expect(screen.getByTestId('math-selector-0')).toBeInTheDocument()
+                } else {
+                    expect(screen.queryByTestId('math-selector-0')).not.toBeInTheDocument()
+                }
+            })
+
+            it('renders property selector when MathAvailability.BoxPlotOnly', () => {
+                const { logic } = setup()
+                renderRow(logic, { mathAvailability: MathAvailability.BoxPlotOnly })
+                expect(screen.queryByTestId('math-selector-0')).not.toBeInTheDocument()
+                expect(screen.getByTestId('box-plot-property-select')).toBeInTheDocument()
+            })
+
+            it.each([
+                { tableType: 'data_warehouse', tableName: 'events_table', seriesName: 'events_table' },
+                // A flag calls series reads a PostHog table, which the warehouse table map leaves out.
+                { tableType: 'posthog', tableName: 'posthog.flag_evaluations', seriesName: 'Feature flag called' },
+            ])(
+                'offers only numeric columns of a $tableType table in the box plot property selector',
+                async ({ tableType, tableName, seriesName }) => {
+                    databaseTableListLogic.mount()
+                    databaseTableListLogic.actions.loadDatabaseSuccess({
+                        tables: {
+                            [tableName]: {
+                                type: tableType,
+                                id: 'wh-table-1',
+                                name: tableName,
+                                fields: {
+                                    duration: {
+                                        name: 'duration',
+                                        hogql_value: 'duration',
+                                        type: 'float',
+                                        schema_valid: true,
+                                    },
+                                    customer_name: {
+                                        name: 'customer_name',
+                                        hogql_value: 'customer_name',
+                                        type: 'string',
+                                        schema_valid: true,
+                                    },
+                                },
+                            },
+                        },
+                        joins: [],
+                    } as any)
+
+                    const dataWarehouseNode = {
+                        kind: NodeKind.DataWarehouseNode,
+                        id: tableName,
+                        name: seriesName,
+                        table_name: tableName,
+                    } as SeriesNode
+                    const { logic, onChange } = setup([dataWarehouseNode])
+                    renderRow(logic, {
+                        mathAvailability: MathAvailability.BoxPlotOnly,
+                        node: dataWarehouseNode,
+                    })
+
+                    await userEvent.click(screen.getByTestId('box-plot-property-select'))
+                    await screen.findByText('duration')
+                    // The box plot runner applies toFloat() to the selected column, so non-numeric
+                    // columns must not be offered
+                    expect(screen.queryByText('customer_name')).not.toBeInTheDocument()
+                    await userEvent.click(screen.getByText('duration'))
+
+                    await waitFor(() => {
+                        expect(onChange).toHaveBeenCalledWith([
+                            expect.objectContaining({
+                                kind: NodeKind.DataWarehouseNode,
+                                math_property: 'duration',
+                                math_property_type: TaxonomicFilterGroupType.DataWarehouseProperties,
+                            }),
+                        ])
+                    })
+                }
+            )
+        })
+
+        describe('property filters', () => {
+            it('shows property filter toggle button', () => {
+                const { logic } = setup()
+                renderRow(logic, { ...INLINE_CONTEXT, hideFilter: false })
+                expect(screen.getByTitle('Show filters')).toBeInTheDocument()
+            })
+
+            it('renders PropertyFilters when visibility is toggled on', () => {
+                const { logic } = setup()
+                logic.actions.setEntityFilterVisibility(0, true)
+                renderRow(logic)
+                // Real PropertyFilters renders with a page key
+                expect(document.querySelector('.ActionFilterRow-filters')).toBeInTheDocument()
+            })
+
+            it('does not render PropertyFilters when visibility is off', () => {
+                const { logic } = setup()
+                renderRow(logic)
+                expect(document.querySelector('.ActionFilterRow-filters')).not.toBeInTheDocument()
+            })
+
+            it.each<{ flags: string[]; variants: Record<string, string | boolean>; shown: boolean }>([
+                {
+                    flags: [FEATURE_FLAGS.BEHAVIORAL_PROPERTY_FILTER],
+                    variants: { [FEATURE_FLAGS.BEHAVIORAL_PROPERTY_FILTER]: true },
+                    shown: true,
+                },
+                { flags: [], variants: {}, shown: false },
+            ])('behavioral "Performed" entry point shown=$shown when flag present', ({ flags, variants, shown }) => {
+                featureFlagLogic.mount()
+                featureFlagLogic.actions.setFeatureFlags(flags, variants)
+                const { logic } = setup()
+                logic.actions.setEntityFilterVisibility(0, true)
+                renderRow(logic, { allowBehavioralPropertyFilter: true })
+                expect(!!screen.queryByText('Performed')).toBe(shown)
+            })
+        })
+
+        describe('drag handle', () => {
+            it.each([
+                [true, 3, true],
+                [true, 1, false],
+                [false, 3, false],
+            ])('sortable=%s filterCount=%s → visible=%s', (sortable, filterCount, visible) => {
+                const { logic } = setup()
+                renderRow(logic, { sortable, filterCount })
+                if (visible) {
+                    expect(document.querySelector('.ActionFilterRowDragHandle')).toBeInTheDocument()
+                } else {
+                    expect(document.querySelector('.ActionFilterRowDragHandle')).not.toBeInTheDocument()
+                }
+            })
+        })
+
+        describe('combine events button', () => {
+            it('shown when showCombine and not singleFilter', () => {
+                const { logic } = setup()
+                renderRow(logic, { ...INLINE_CONTEXT, showCombine: true, singleFilter: false })
+                expect(screen.getByTestId('show-prop-combine-0')).toBeInTheDocument()
+            })
+
+            it('hidden when singleFilter', () => {
+                const { logic } = setup()
+                renderRow(logic, { ...INLINE_CONTEXT, showCombine: true, singleFilter: true })
+                expect(screen.queryByTestId('show-prop-combine-0')).not.toBeInTheDocument()
+            })
+
+            it('hidden for data warehouse entities', () => {
+                const { logic } = setup()
+                renderRow(logic, {
+                    ...INLINE_CONTEXT,
+                    showCombine: true,
+                    singleFilter: false,
+                    node: { ...DEFAULT_NODE, kind: NodeKind.DataWarehouseNode } as SeriesNode,
+                })
+                expect(screen.queryByTestId('show-prop-combine-0')).not.toBeInTheDocument()
+            })
+        })
+
+        describe('custom renderRow', () => {
+            it('delegates to custom render function', () => {
+                const { logic } = setup()
+                const customRender = jest.fn(({ filter }) => <div data-attr="custom-row">{filter}</div>)
+                renderRow(logic, { renderRow: customRender })
+                expect(screen.getByTestId('custom-row')).toBeInTheDocument()
+                expect(customRender).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                        seriesIndicator: expect.anything(),
+                        filter: expect.anything(),
+                        suffix: undefined,
+                        propertyFiltersButton: expect.anything(),
+                        renameRowButton: expect.anything(),
+                        deleteButton: expect.anything(),
+                    })
+                )
+            })
+        })
+
+        describe('custom row suffix', () => {
+            it('renders string suffix', () => {
+                const { logic } = setup()
+                renderRow(logic, { customRowSuffix: 'my-suffix' })
+                expect(screen.getByText('my-suffix')).toBeInTheDocument()
+            })
+
+            it('calls function suffix with node, index, onClose', () => {
+                const { logic } = setup()
+                const suffixFn = jest.fn(({ node }) => <span data-attr="fn-suffix">{node.name}</span>)
+                renderRow(logic, { customRowSuffix: suffixFn })
+                expect(screen.getByTestId('fn-suffix')).toHaveTextContent('$pageview')
+                expect(suffixFn).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                        node: expect.objectContaining({ event: '$pageview' }),
+                        index: 0,
+                        onClose: expect.any(Function),
+                    })
+                )
+            })
+        })
+
+        describe('action entity type', () => {
+            it('renders with the action name', () => {
+                const { logic } = setup()
+                renderRow(logic, {
+                    node: { kind: NodeKind.ActionsNode, id: 9, name: 'Users signed up' } as SeriesNode,
+                })
+                expect(document.querySelector('.ActionFilterRow')!.textContent).toContain('Users signed up')
+            })
+        })
+    })
+
+    describe('interactions', () => {
+        it('dispatches removeLocalFilter on delete click', async () => {
+            const { logic, onChange } = setup()
+            renderRow(logic, { ...INLINE_CONTEXT, hideDeleteBtn: false, singleFilter: false })
+            await userEvent.click(screen.getByTitle('Delete graph series'))
+            // Deleting the first event (order 0) leaves only 1 event + 1 action, re-ordered
+            expect(onChange).toHaveBeenCalledWith([
+                expect.objectContaining({ kind: NodeKind.EventsNode, event: '$pageview' }),
+                expect.objectContaining({ kind: NodeKind.ActionsNode, id: 9 }),
+            ])
+            // Down from 3 series (2 events + 1 action) to 2
+            expect(onChange.mock.calls[0][0]).toHaveLength(2)
+        })
+
+        it('dispatches duplicateFilter on duplicate click', async () => {
+            const { logic, onChange } = setup()
+            renderRow(logic, { ...INLINE_CONTEXT, hideDuplicate: false, singleFilter: false })
+            await userEvent.click(screen.getByTitle('Duplicate graph series'))
+            const duplicated = onChange.mock.calls[0][0]
+            expect(duplicated).toHaveLength(4)
+            expect(duplicated[0]).toEqual(expect.objectContaining({ kind: NodeKind.EventsNode, event: '$pageview' }))
+            expect(duplicated[1]).toEqual(expect.objectContaining({ kind: NodeKind.EventsNode, event: '$pageview' }))
+        })
+
+        it('calls onRenameClick on rename', async () => {
+            const { logic } = setup()
+            const onRenameClick = jest.fn()
+            renderRow(logic, { ...INLINE_CONTEXT, hideRename: false, onRenameClick })
+            await userEvent.click(screen.getByTitle('Rename graph series'))
+            expect(onRenameClick).toHaveBeenCalled()
+        })
+
+        it('dispatches convertFilterToGroup on combine click', async () => {
+            const { logic, onChange } = setup()
+            renderRow(logic, { ...INLINE_CONTEXT, showCombine: true, singleFilter: false })
+            await userEvent.click(screen.getByTestId('show-prop-combine-0'))
+            // The combined row becomes a group holding the event it was built from
+            expect(onChange.mock.calls[0][0][0]).toEqual(
+                expect.objectContaining({
+                    kind: NodeKind.GroupNode,
+                    nodes: [expect.objectContaining({ kind: NodeKind.EventsNode, event: '$pageview' })],
+                })
+            )
+        })
+
+        it('toggles property filter visibility on filter button click', async () => {
+            const { logic } = setup()
+            renderRow(logic, { ...INLINE_CONTEXT, hideFilter: false })
+
+            expect(document.querySelector('.ActionFilterRow-filters')).not.toBeInTheDocument()
+
+            await userEvent.click(screen.getByTitle('Show filters'))
+
+            await waitFor(() => {
+                expect(document.querySelector('.ActionFilterRow-filters')).toBeInTheDocument()
+            })
+        })
+    })
+
+    describe('math selection', () => {
+        it('changing math type calls setFilters with updated math', async () => {
+            const { logic, onChange } = setup()
+            renderRow(logic, { mathAvailability: MathAvailability.All })
+
+            await userEvent.click(screen.getByTestId('math-selector-0'))
+
+            await waitFor(() => {
+                expect(screen.getByText('Unique users')).toBeInTheDocument()
+            })
+            await userEvent.click(screen.getByText('Unique users'))
+
+            expect(onChange).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ math: 'dau' })]))
+        })
+
+        it('shows property value selector when property math is active', () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                mathAvailability: MathAvailability.All,
+                node: {
+                    ...DEFAULT_NODE,
+                    math: PropertyMathType.Average,
+                    math_property: '$time',
+                },
+            })
+            expect(screen.getByTestId('math-property-select')).toBeInTheDocument()
+        })
+
+        it('shows HogQL expression button when HogQL math is active', () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                mathAvailability: MathAvailability.All,
+                node: {
+                    ...DEFAULT_NODE,
+                    math: HogQLMathType.HogQL,
+                    math_hogql: 'sum(price)',
+                },
+            })
+            expect(screen.getByTestId('math-hogql-select-0')).toBeInTheDocument()
+            expect(screen.getByText('sum(price)')).toBeInTheDocument()
+        })
+
+        it('defaults HogQL math expression to person_id for stickiness insights', async () => {
+            const { logic, onChange } = setup()
+            renderRow(logic, {
+                mathAvailability: MathAvailability.All,
+                insightType: InsightType.STICKINESS,
+            })
+
+            await userEvent.click(screen.getByTestId('math-selector-0'))
+            await waitFor(() => expect(screen.getByText('SQL expression')).toBeInTheDocument())
+            await userEvent.click(screen.getByText('SQL expression'))
+
+            expect(onChange).toHaveBeenCalledWith(
+                expect.arrayContaining([expect.objectContaining({ math_hogql: 'person_id' })])
+            )
+        })
+
+        it('does not show math selector inline for FunnelsOnly (it goes in the popup menu)', () => {
+            const { logic } = setup()
+            renderRow(logic, { mathAvailability: MathAvailability.FunnelsOnly })
+            // MathSelector should NOT be in the center section (it's in the popup menu instead)
+            expect(screen.queryByTestId('math-selector-0')).not.toBeInTheDocument()
+        })
+
+        it('selecting property math sets math_property and clears math_hogql', async () => {
+            const { logic, onChange } = setup()
+            renderRow(logic, {
+                mathAvailability: MathAvailability.All,
+                node: {
+                    ...DEFAULT_NODE,
+                    math: PropertyMathType.Average,
+                    math_property: '$time',
+                    math_hogql: 'count()',
+                },
+            })
+
+            // Simulate onMathPropertySelect
+            logic.actions.updateSeriesMath(0, {
+                math_hogql: undefined,
+                math_property: '$session_duration',
+                math_property_type: TaxonomicFilterGroupType.SessionProperties,
+            })
+
+            await waitFor(() => {
+                const call = onChange.mock.calls[onChange.mock.calls.length - 1][0]
+                expect(call).toEqual(
+                    expect.arrayContaining([
+                        expect.objectContaining({
+                            math_property: '$session_duration',
+                        }),
+                    ])
+                )
+                // math_hogql should not be present on the updated series
+                const updated = call.find((node: any) => node.math_property === '$session_duration')
+                expect(updated.math_hogql).toBeUndefined()
+            })
+        })
+
+        it('shows group math options when GROUP_ANALYTICS is enabled', async () => {
+            const { logic } = setup()
+            renderRow(logic, { mathAvailability: MathAvailability.All })
+
+            await userEvent.click(screen.getByTestId('math-selector-0'))
+
+            await waitFor(() => {
+                // MOCK_GROUP_TYPES provides organization, instance, project — the "Unique"
+                // dropdown in the math selector should contain group options derived from them
+                expect(screen.getByText('Unique users')).toBeInTheDocument()
+                expect(screen.getByText('Count per user')).toBeInTheDocument()
+                expect(screen.getByText('Property value')).toBeInTheDocument()
+            })
+        })
+    })
+
+    describe('funnel popup menu contents', () => {
+        it('shows rename and delete inside popup menu when opened', async () => {
+            const { logic } = setup()
+            renderRow(logic, { mathAvailability: MathAvailability.FunnelsOnly })
+
+            await userEvent.click(screen.getByLabelText('Show more actions'))
+
+            await waitFor(() => {
+                expect(screen.getByText('Rename')).toBeInTheDocument()
+                expect(screen.getByText('Delete')).toBeInTheDocument()
+            })
+        })
+
+        it('shows duplicate in popup menu when not singleFilter', async () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                mathAvailability: MathAvailability.FunnelsOnly,
+                singleFilter: false,
+            })
+
+            await userEvent.click(screen.getByLabelText('Show more actions'))
+
+            await waitFor(() => {
+                expect(screen.getByText('Duplicate')).toBeInTheDocument()
+            })
+        })
+
+        it('hides duplicate in popup menu when singleFilter', async () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                mathAvailability: MathAvailability.FunnelsOnly,
+                singleFilter: true,
+            })
+
+            await userEvent.click(screen.getByLabelText('Show more actions'))
+
+            await waitFor(() => {
+                expect(screen.getByText('Rename')).toBeInTheDocument()
+                expect(screen.queryByText('Duplicate')).not.toBeInTheDocument()
+            })
+        })
+
+        it('shows optional step checkbox for funnel steps after the first', async () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                mathAvailability: MathAvailability.FunnelsOnly,
+                index: 1,
+            })
+
+            await userEvent.click(screen.getByLabelText('Show more actions'))
+
+            await waitFor(() => {
+                expect(screen.getByText('Optional step')).toBeInTheDocument()
+            })
+        })
+
+        it('does not show optional step checkbox for the first funnel step', async () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                mathAvailability: MathAvailability.FunnelsOnly,
+                index: 0,
+            })
+
+            await userEvent.click(screen.getByLabelText('Show more actions'))
+
+            await waitFor(() => {
+                expect(screen.getByText('Rename')).toBeInTheDocument()
+                expect(screen.queryByText('Optional step')).not.toBeInTheDocument()
+            })
+        })
+
+        it('shows math selector inside funnel popup menu', async () => {
+            const { logic } = setup()
+            renderRow(logic, { mathAvailability: MathAvailability.FunnelsOnly })
+
+            await userEvent.click(screen.getByLabelText('Show more actions'))
+
+            await waitFor(() => {
+                // MathSelector renders inside the menu for funnels
+                expect(screen.getByTestId('math-selector-0')).toBeInTheDocument()
+            })
+        })
+
+        it('shows property filter outside the popup menu', () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                mathAvailability: MathAvailability.FunnelsOnly,
+                hideFilter: false,
+                showCombine: true,
+            })
+
+            // Filter button always visible outside the menu
+            expect(screen.getByTitle('Show filters')).toBeInTheDocument()
+        })
+    })
+
+    describe('event selection onChange handler', () => {
+        it('selecting an event updates the filter with the chosen event', async () => {
+            const { logic, onChange } = setup()
+            renderRow(logic, INLINE_CONTEXT)
+
+            await userEvent.click(screen.getByTestId('trend-element-subject-0'))
+
+            // setupInsightMocks provides realistic event definitions with search support
+            await waitFor(() => {
+                expect(screen.getByTestId('prop-filter-events-1')).toBeInTheDocument()
+            })
+            await userEvent.click(screen.getByTestId('prop-filter-events-1'))
+
+            await waitFor(() => {
+                expect(onChange).toHaveBeenCalledWith(
+                    expect.arrayContaining([
+                        expect.objectContaining({
+                            kind: NodeKind.EventsNode,
+                        }),
+                    ])
+                )
+            })
+        })
+
+        // These branches are triggered when the user selects an item from a specialized
+        // TaxonomicPopover tab. We test through the UI using searchAndSelect: open popover →
+        // switch tab → search (minSearchQueryLength=3) → select item → assert setFilters.
+        it.each([
+            {
+                tab: 'pageview_events',
+                searchText: 'exam',
+                resultValue: 'https://example.com',
+                expectedEventId: '$pageview',
+                expectedPropertyKey: '$current_url',
+                expectedOperator: PropertyOperator.IContains,
+            },
+            {
+                tab: 'screen_events',
+                searchText: 'home',
+                resultValue: 'HomeScreen',
+                expectedEventId: '$screen',
+                expectedPropertyKey: '$screen_name',
+                expectedOperator: PropertyOperator.Exact,
+            },
+            {
+                tab: 'autocapture_events',
+                searchText: 'sign',
+                resultValue: 'Sign Up',
+                expectedEventId: '$autocapture',
+                expectedPropertyKey: '$el_text',
+                expectedOperator: PropertyOperator.Exact,
+            },
+        ])(
+            '$tab selects $expectedEventId with $expectedPropertyKey property filter',
+            async ({ tab, searchText, resultValue, expectedEventId, expectedPropertyKey, expectedOperator }) => {
+                useMocks({
+                    get: {
+                        '/api/environments/:team/events/values/': [{ name: resultValue }, { name: 'other-value' }],
+                    },
+                })
+
+                const { logic, onChange } = setup()
+                renderRow(logic, {
+                    ...INLINE_CONTEXT,
+                    actionsTaxonomicGroupTypes: [
+                        TaxonomicFilterGroupType.Events,
+                        TaxonomicFilterGroupType.PageviewEvents,
+                        TaxonomicFilterGroupType.ScreenEvents,
+                        TaxonomicFilterGroupType.AutocaptureEvents,
+                    ],
+                })
+
+                await searchAndSelect('trend-element-subject-0', searchText, `prop-filter-${tab}-0`)
+
+                await waitFor(() => {
+                    const lastCall = onChange.mock.calls[onChange.mock.calls.length - 1][0]
+                    expect(lastCall).toEqual(
+                        expect.arrayContaining([
+                            expect.objectContaining({
+                                event: expectedEventId,
+                                properties: expect.arrayContaining([
+                                    expect.objectContaining({
+                                        key: expectedPropertyKey,
+                                        value: resultValue,
+                                        operator: expectedOperator,
+                                        type: PropertyFilterType.Event,
+                                    }),
+                                ]),
+                            }),
+                        ])
+                    )
+                })
+            }
+        )
+    })
+
+    describe('feature flag calls series', () => {
+        let teamHasFlagCalledDefinition: boolean
+        let appendSettledRow: boolean
+
+        beforeEach(() => {
+            // Recent picks persist to localStorage, and a recent Feature flag called row would lead the next test's list.
+            localStorage.clear()
+            teamHasFlagCalledDefinition = true
+            appendSettledRow = false
+            useMocks({
+                get: {
+                    '/api/projects/:team/event_definitions': ({ request }: { request: Request }) => {
+                        const params = new URL(request.url).searchParams
+                        const search = params.get('search') ?? ''
+                        const excluded: string[] = JSON.parse(params.get('excluded_properties') ?? '[]')
+                        const flagCalled = {
+                            ...eventDefinitions[0],
+                            id: 'flag-called',
+                            name: '$feature_flag_called',
+                            description: '',
+                        }
+                        // The last row tells a test that the list has rendered the response for this search.
+                        const settled = { ...eventDefinitions[0], id: 'settled', name: `settled: ${search}` }
+                        const results = [
+                            ...[...eventDefinitions, ...(teamHasFlagCalledDefinition ? [flagCalled] : [])]
+                                .filter((d) => d.name.includes(search))
+                                .filter((d) => !excluded.includes(d.name)),
+                            ...(appendSettledRow ? [settled] : []),
+                        ]
+                        return [200, { results, count: results.length }]
+                    },
+                },
+            })
+        })
+
+        function renderFlagCallsRow(mode: FlagEvaluationsModeEnumApi, node: SeriesNode = DEFAULT_NODE): jest.Mock {
+            appendSettledRow = true
+            teamLogic.actions.loadCurrentTeamSuccess({ ...MOCK_DEFAULT_TEAM, flag_evaluations_mode: mode })
+            const { logic, onChange } = setup([node])
+            renderRow(logic, {
+                ...INLINE_CONTEXT,
+                node,
+                flagCallsFromFlagEvaluations: true,
+                actionsTaxonomicGroupTypes: [TaxonomicFilterGroupType.Events, TaxonomicFilterGroupType.DataWarehouse],
+            })
+            return onChange
+        }
+
+        async function flagCalledRowsAfterSearching(searchQuery: string, onEventsTab = false): Promise<HTMLElement[]> {
+            await userEvent.click(screen.getByTestId('trend-element-subject-0'))
+            // The picker opens on the aggregated tab, because it offers more than one category.
+            if (onEventsTab) {
+                await userEvent.click(await screen.findByTestId('taxonomic-category-dropdown-trigger-pill'))
+                await userEvent.click(await screen.findByTestId('taxonomic-category-dropdown-item-events'))
+                expect(screen.getByTestId('taxonomic-category-dropdown-trigger-pill')).toHaveTextContent('Events')
+            }
+            await userEvent.click(await screen.findByTestId('taxonomic-filter-searchfield'))
+            await userEvent.paste(searchQuery)
+            // The wait covers the search debounce and the mock round trip, which outrun the default 1s on a loaded runner.
+            await screen.findAllByText(`settled: ${searchQuery}`, undefined, { timeout: 5000 })
+            const rows = Array.from(document.querySelectorAll<HTMLElement>('[data-attr^="prop-filter-"]')).filter(
+                (row) => row.textContent?.startsWith('Feature flag called') && !row.closest('.hidden')
+            )
+            // The aggregated tab renders its list twice in jsdom, so one row can appear under the same data-attr twice.
+            return rows.filter((row, index) => rows.findIndex((r) => r.dataset.attr === row.dataset.attr) === index)
+        }
+
+        it.each([
+            ['$feature_flag_called', false, true],
+            ['feature flag', false, false],
+            ['$feature_flag_called', true, true],
+            ['$feature_flag_called', true, false],
+        ])(
+            'offers one Feature flag called row on mode 2 for "%s" (definition: %s, Events tab: %s)',
+            async (searchQuery, hasDefinition, onEventsTab) => {
+                teamHasFlagCalledDefinition = hasDefinition
+                const captureSpy = jest.spyOn(posthog, 'capture')
+                const onChange = renderFlagCallsRow(FlagEvaluationsModeEnumApi.Number2)
+
+                const rows = await flagCalledRowsAfterSearching(searchQuery, onEventsTab)
+                expect(rows).toHaveLength(1)
+                await userEvent.click(rows[0])
+
+                await waitFor(() => {
+                    const lastCall = onChange.mock.calls[onChange.mock.calls.length - 1]?.[0]
+                    expect(lastCall?.[0]).toEqual(
+                        expect.objectContaining({
+                            kind: NodeKind.DataWarehouseNode,
+                            table_name: 'posthog.flag_evaluations',
+                        })
+                    )
+                })
+                expect(captureSpy).toHaveBeenCalledWith(
+                    'taxonomic filter item selected',
+                    expect.objectContaining({ wasHiddenEventStandIn: true })
+                )
+                captureSpy.mockRestore()
+            }
+        )
+
+        // The real row stays out of a mode 2 list, so a saved series reopens on the synthetic selected row.
+        it('reopens a saved flag calls series on mode 2 without a definition', async () => {
+            teamHasFlagCalledDefinition = false
+            renderFlagCallsRow(FlagEvaluationsModeEnumApi.Number2, {
+                kind: NodeKind.DataWarehouseNode,
+                id: 'posthog.flag_evaluations',
+                table_name: 'posthog.flag_evaluations',
+                name: 'Feature flag called',
+                timestamp_field: 'timestamp',
+                id_field: 'uuid',
+                distinct_id_field: 'distinct_id',
+            })
+
+            await userEvent.click(screen.getByTestId('trend-element-subject-0'))
+
+            await waitFor(() => {
+                expect(screen.getByTestId('prop-filter-events-0').textContent).toContain('Feature flag called')
+            })
+        })
+
+        it.each([
+            ['a team on mode 0', FlagEvaluationsModeEnumApi.Number0],
+            ['a team on mode 1', FlagEvaluationsModeEnumApi.Number1],
+        ])('offers no stand-in row to %s without a definition', async (_label, mode) => {
+            teamHasFlagCalledDefinition = false
+            renderFlagCallsRow(mode)
+
+            expect(await flagCalledRowsAfterSearching('feature_flag_called')).toHaveLength(0)
+        })
+
+        // entityFilterLogic copies only the warehouse fields named in its own popover fields. Each case
+        // passes the editor's fields to the logic as well as to the row.
+        it.each([
+            {
+                insight: 'trends on mode 1',
+                mode: FlagEvaluationsModeEnumApi.Number1,
+                mathAvailability: MathAvailability.None,
+                dataWarehousePopoverFields: undefined,
+                expected: {
+                    kind: NodeKind.DataWarehouseNode,
+                    name: 'Feature flag called',
+                    table_name: 'posthog.flag_evaluations',
+                    timestamp_field: 'timestamp',
+                    id_field: 'uuid',
+                    distinct_id_field: 'distinct_id',
+                },
+                description: /Insights include calls from the last 90 days/,
+            },
+            {
+                insight: 'funnels on mode 2',
+                mode: FlagEvaluationsModeEnumApi.Number2,
+                mathAvailability: MathAvailability.FunnelsOnly,
+                dataWarehousePopoverFields: [
+                    { key: 'id_field', label: 'Unique ID' },
+                    { key: 'timestamp_field', label: 'Timestamp' },
+                    { key: 'aggregation_target_field', label: 'Aggregation target', allowHogQL: true },
+                ],
+                expected: {
+                    table_name: 'posthog.flag_evaluations',
+                    timestamp_field: 'timestamp',
+                    id_field: 'uuid',
+                    aggregation_target_field: 'person_id',
+                },
+                description: /Insights include calls from the last 90 days/,
+            },
+            {
+                insight: 'trends on mode 0',
+                mode: FlagEvaluationsModeEnumApi.Number0,
+                mathAvailability: MathAvailability.None,
+                dataWarehousePopoverFields: undefined,
+                expected: { kind: NodeKind.EventsNode, event: '$feature_flag_called' },
+                description: /Insights and most SQL queries on this event switch tables with no/,
+            },
+        ])(
+            'describes and picks Feature flag called for $insight',
+            async ({ mode, mathAvailability, dataWarehousePopoverFields, expected, description }) => {
+                featureFlagLogic.mount()
+                featureFlagLogic.actions.setFeatureFlags([], { [FEATURE_FLAGS.FLAG_CALLED_MOVE_NOTICES]: true })
+                try {
+                    teamLogic.actions.loadCurrentTeamSuccess({ ...MOCK_DEFAULT_TEAM, flag_evaluations_mode: mode })
+                    const { logic, onChange } = setup(undefined, { dataWarehousePopoverFields })
+                    renderRow(logic, {
+                        ...INLINE_CONTEXT,
+                        mathAvailability,
+                        dataWarehousePopoverFields,
+                        flagCallsFromFlagEvaluations: true,
+                        actionsTaxonomicGroupTypes: [
+                            TaxonomicFilterGroupType.Events,
+                            TaxonomicFilterGroupType.Actions,
+                            TaxonomicFilterGroupType.DataWarehouse,
+                        ],
+                    })
+
+                    await userEvent.click(screen.getByTestId('trend-element-subject-0'))
+                    await userEvent.type(
+                        await screen.findByTestId('taxonomic-filter-searchfield'),
+                        '$feature_flag_called'
+                    )
+                    const [entry] = await screen.findAllByText('Feature flag called')
+                    await userEvent.hover(entry.closest('[data-attr^="prop-filter-"]') as HTMLElement)
+                    expect(await screen.findByText(description)).toBeInTheDocument()
+                    await userEvent.click(entry)
+
+                    await waitFor(() => {
+                        const lastCall = onChange.mock.calls[onChange.mock.calls.length - 1]?.[0]
+                        expect(lastCall?.[0]).toEqual(expect.objectContaining(expected))
+                    })
+                } finally {
+                    featureFlagLogic.actions.setFeatureFlags([], {})
+                }
+            }
+        )
+
+        it('carries the flag filters of an event series over when Feature flag called is picked again', async () => {
+            teamLogic.actions.loadCurrentTeamSuccess({
+                ...MOCK_DEFAULT_TEAM,
+                flag_evaluations_mode: FlagEvaluationsModeEnumApi.Number1,
+            })
+            const infoToast = jest.spyOn(lemonToast, 'info')
+            const eventsNode: SeriesNode = {
+                kind: NodeKind.EventsNode,
+                event: '$feature_flag_called',
+                name: '$feature_flag_called',
+                math: BaseMathType.WeeklyActiveUsers,
+                properties: [
+                    {
+                        key: '$feature_flag',
+                        value: 'probe-flag',
+                        operator: PropertyOperator.Exact,
+                        type: PropertyFilterType.Event,
+                    },
+                    {
+                        key: '$feature_flag_response',
+                        value: 'test',
+                        operator: PropertyOperator.Exact,
+                        type: PropertyFilterType.Event,
+                    },
+                    { key: '$feature_flag_response', operator: PropertyOperator.IsSet, type: PropertyFilterType.Event },
+                    { key: '$feature_flag', operator: PropertyOperator.IsNotSet, type: PropertyFilterType.Event },
+                    {
+                        key: '$browser',
+                        value: 'Chrome',
+                        operator: PropertyOperator.Exact,
+                        type: PropertyFilterType.Event,
+                    },
+                    { key: "properties.$lib = 'web'", type: PropertyFilterType.HogQL },
+                ],
+            }
+            const { logic, onChange } = setup([eventsNode])
+            renderRow(logic, {
+                ...INLINE_CONTEXT,
+                node: eventsNode,
+                flagCallsFromFlagEvaluations: true,
+                actionsTaxonomicGroupTypes: [TaxonomicFilterGroupType.Events, TaxonomicFilterGroupType.DataWarehouse],
+            })
+
+            await userEvent.click(screen.getByTestId('trend-element-subject-0'))
+            await userEvent.type(await screen.findByTestId('taxonomic-filter-searchfield'), '$feature_flag_called')
+            await userEvent.click(await screen.findByTestId('prop-filter-events-0'))
+
+            await waitFor(() => {
+                const lastCall = onChange.mock.calls[onChange.mock.calls.length - 1]?.[0]
+                expect(lastCall?.[0]).toEqual(
+                    expect.objectContaining({
+                        table_name: 'posthog.flag_evaluations',
+                        math: undefined,
+                        properties: [
+                            {
+                                key: 'flag_key',
+                                value: 'probe-flag',
+                                operator: PropertyOperator.Exact,
+                                type: PropertyFilterType.DataWarehouse,
+                            },
+                            {
+                                key: 'response',
+                                value: 'test',
+                                operator: PropertyOperator.Exact,
+                                type: PropertyFilterType.DataWarehouse,
+                            },
+                            {
+                                key: 'response',
+                                operator: PropertyOperator.IsSet,
+                                type: PropertyFilterType.DataWarehouse,
+                            },
+                            {
+                                key: 'flag_key',
+                                value: [''],
+                                operator: PropertyOperator.In,
+                                type: PropertyFilterType.DataWarehouse,
+                            },
+                            { key: "properties.$lib = 'web'", type: PropertyFilterType.HogQL },
+                        ],
+                    })
+                )
+            })
+            expect(infoToast.mock.calls.map(([message]) => message)).toEqual([
+                'Feature flag called supports only flag key, response and SQL filters, so 1 other filter was removed.',
+            ])
+            infoToast.mockRestore()
+        })
+
+        it('leaves out math that trends computes from events', async () => {
+            const flagCallsNode: SeriesNode = {
+                kind: NodeKind.DataWarehouseNode,
+                id: 'posthog.flag_evaluations',
+                table_name: 'posthog.flag_evaluations',
+                name: 'Feature flag called',
+                timestamp_field: 'timestamp',
+                id_field: 'uuid',
+                distinct_id_field: 'distinct_id',
+            }
+            const { logic } = setup([flagCallsNode])
+            renderRow(logic, { node: flagCallsNode, mathAvailability: MathAvailability.All })
+
+            await userEvent.click(screen.getByTestId('math-selector-0'))
+
+            expect(await screen.findByText('Unique users')).toBeInTheDocument()
+            for (const label of [
+                'Weekly active users',
+                'Monthly active users',
+                'First-ever occurrence',
+                'First occurrence matching filters',
+            ]) {
+                expect(screen.queryByText(label)).not.toBeInTheDocument()
+            }
+        })
+    })
+
+    describe('all events entity filter', () => {
+        it('renders "All events" placeholder for null event id', () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                node: {
+                    ...DEFAULT_NODE,
+                    id: null,
+                    name: 'All events',
+                },
+            })
+            expect(document.querySelector('.ActionFilterRow')!.textContent).toContain('All events')
+        })
+    })
+
+    describe('property filters section', () => {
+        it('shows filter count badge when filter has properties', () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                ...INLINE_CONTEXT,
+                hideFilter: false,
+                node: {
+                    ...DEFAULT_NODE,
+                    properties: [
+                        { key: '$browser', value: 'Chrome', operator: 'exact', type: 'event' },
+                        { key: '$os', value: 'Mac', operator: 'exact', type: 'event' },
+                    ],
+                },
+            })
+            // IconWithCount shows the property count
+            expect(screen.getByText('2')).toBeInTheDocument()
+        })
+
+        it('disables property filter button when filter id is empty', () => {
+            const { logic } = setup()
+            renderRow(logic, {
+                ...INLINE_CONTEXT,
+                hideFilter: false,
+                node: { ...DEFAULT_NODE, event: 'empty' },
+            })
+            const filterButton = screen.getByTitle('Show filters')
+            expect(filterButton).toHaveAttribute('aria-disabled', 'true')
+        })
+    })
+
+    describe('disabled state', () => {
+        it('disables TaxonomicPopover when disabled prop is true', () => {
+            const { logic } = setup()
+            renderRow(logic, { disabled: true })
+            const popoverButton = screen.getByTestId('trend-element-subject-0')
+            expect(popoverButton).toHaveAttribute('aria-disabled', 'true')
+        })
+
+        it('disables TaxonomicPopover when readOnly prop is true', () => {
+            const { logic } = setup()
+            renderRow(logic, { readOnly: true })
+            const popoverButton = screen.getByTestId('trend-element-subject-0')
+            expect(popoverButton).toHaveAttribute('aria-disabled', 'true')
+        })
+
+        it('disables math selector when readOnly is true', () => {
+            const { logic } = setup()
+            renderRow(logic, { readOnly: true, mathAvailability: MathAvailability.All })
+            const mathSelector = screen.getByTestId('math-selector-0')
+            expect(mathSelector).toHaveAttribute('aria-disabled', 'true')
+        })
+    })
+})

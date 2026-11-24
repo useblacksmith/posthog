@@ -1,0 +1,623 @@
+"""Repo-level headline aggregates and chart series for the repo hub.
+
+Every headline covers the window and the equal-length window before it.
+A headline-only caller passes ``empty_repo_series`` to ``query_repo_overview`` to skip the series scans.
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from posthog.hogql import ast
+
+from posthog.dataclasses import frozen
+
+from products.engineering_analytics.backend.facade.contracts import (
+    CostPerMergeBucket,
+    OpenToMergeBucket,
+    PassRateBucket,
+    ReadyToMergeBucket,
+    RepoOverview,
+    RevertShareBucket,
+    TimeToGreenBucket,
+)
+from products.engineering_analytics.backend.logic.queries._buckets import (
+    Granularity,
+    bucket_expr,
+    normalize_bucket,
+    pick_granularity,
+    window_buckets,
+)
+from products.engineering_analytics.backend.logic.queries._curated import CuratedGitHubSource, opt_float
+from products.engineering_analytics.backend.logic.queries._workflow_filters import (
+    run_started_floor_constant,
+    success_rate_expr,
+    window_pair_predicates,
+)
+from products.engineering_analytics.backend.logic.queries.delivery_pipeline import query_delivery_pipeline
+from products.engineering_analytics.backend.logic.queries.merge_queue_overview import (
+    query_merge_queue_overview,
+    query_merge_queue_trunk_outcomes,
+)
+from products.engineering_analytics.backend.logic.queries.pr_cost import (
+    WindowCostsWithPrev,
+    query_cost_per_merge_series,
+    query_workflow_window_costs_with_prev,
+)
+from products.engineering_analytics.backend.logic.queries.workflow_health import (
+    query_time_to_green_series,
+    query_time_to_green_window,
+)
+
+_RUNS_SELECT = f"""
+    SELECT
+        countIf(__CUR__) AS run_count,
+        countIf(__PREV__) AS run_count_prev,
+        {success_rate_expr("__CUR__")} AS success_rate,
+        {success_rate_expr("__PREV__")} AS success_rate_prev,
+        countIf(run_attempt > 1 AND __CUR__) AS rerun_cycles,
+        countIf(run_attempt > 1 AND __PREV__) AS rerun_cycles_prev,
+        countIf(head_branch = 'master' AND __CUR__) AS master_runs,
+        countIf(head_branch = 'main' AND __CUR__) AS main_runs
+    FROM __RUNS_SOURCE__ AS r
+    WHERE run_started_at >= {{prev_from}} __DATE_TO__
+"""
+
+# SPEC §6 excludes bots and drafts from cycle-time medians by default.
+_HUMAN_MERGES = "NOT is_bot AND NOT is_draft"
+
+# The merged counts keep bots, because they are the denominator of cost per merge and the cost
+# numerator counts every run whoever triggered it.
+_PR_SELECT = f"""
+    SELECT
+        quantileIf(0.5)(open_to_merge_seconds, __CUR_MERGED__ AND {_HUMAN_MERGES}) AS median_cur,
+        quantileIf(0.5)(open_to_merge_seconds, __PREV_MERGED__ AND {_HUMAN_MERGES}) AS median_prev,
+        __READY_MEDIAN_CUR__ AS ready_median_cur,
+        __READY_MEDIAN_PREV__ AS ready_median_prev,
+        countIf(__CUR_MERGED__) AS merged_cur,
+        countIf(__PREV_MERGED__) AS merged_prev,
+        countIf(__CUR_MERGED__ AND is_revert) AS reverting_cur,
+        countIf(__PREV_MERGED__ AND is_revert) AS reverting_prev
+    FROM __PR_SOURCE__ AS pr
+    __READY_JOIN__
+    WHERE merged_at IS NOT NULL AND merged_at >= {{prev_from}}
+"""
+
+_DEFAULT_BRANCH_SELECT = """
+    SELECT countIf(head_branch = 'master') AS master_runs, countIf(head_branch = 'main') AS main_runs
+    FROM __RUNS_SOURCE__ AS r
+    WHERE run_started_at >= {date_from} __DATE_TO__
+"""
+
+
+def query_default_branch(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+) -> str:
+    """'main' when it had more runs than 'master' in the window, else 'master'."""
+    date_to_clause = "AND run_started_at <= {date_to}" if date_to is not None else ""
+    placeholders: dict[str, ast.Expr] = {
+        "date_from": ast.Constant(value=date_from),
+        "run_started_floor": run_started_floor_constant(date_from),
+    }
+    if date_to is not None:
+        placeholders["date_to"] = ast.Constant(value=date_to)
+    response = curated.run(
+        _DEFAULT_BRANCH_SELECT.replace(
+            "__RUNS_SOURCE__", curated.run_source(started_floor=True, since=date_from)
+        ).replace("__DATE_TO__", date_to_clause),
+        query_type="engineering_analytics.default_branch",
+        placeholders=placeholders,
+    )
+    master_runs, main_runs = response.results[0] if response.results else (0, 0)
+    return "main" if (main_runs or 0) > (master_runs or 0) else "master"
+
+
+_PASS_RATE_SERIES_SELECT = f"""
+    SELECT
+        __BUCKET_FN__ AS bucket_start,
+        {success_rate_expr()} AS success_rate
+    FROM __RUNS_SOURCE__ AS r
+    WHERE run_started_at >= {{date_from}} __DATE_TO__
+    GROUP BY bucket_start
+    LIMIT 40000
+"""
+
+# A quantile over no sample returns 0, so ``n`` tells a bucket with no observed value apart from a
+# real zero median.
+_MERGE_MEDIAN_SERIES_SELECT = f"""
+    SELECT
+        __BUCKET_FN__ AS bucket_start,
+        quantile(0.5)(measure) AS p50,
+        countIf(measure IS NOT NULL) AS n
+    FROM (
+        SELECT merged_at, __MEASURE__ AS measure
+        FROM __PR_SOURCE__ AS pr
+        __READY_JOIN__
+        WHERE merged_at IS NOT NULL AND merged_at >= {{date_from}} __DATE_TO_MERGED__ AND {_HUMAN_MERGES}
+    )
+    GROUP BY bucket_start
+    LIMIT 40000
+"""
+
+
+def _query_merge_median_series(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+    granularity: Granularity,
+    measure: str,
+    join: str,
+    with_clause: str,
+    query_type: str,
+) -> list[tuple[datetime, float | None]]:
+    """One ``(bucket_start, p50)`` pair per bucket of the window, oldest first. p50 is the median of
+    ``measure`` over the PRs merged in the bucket, and None where the bucket had no sample."""
+    placeholders: dict[str, ast.Expr] = {"date_from": ast.Constant(value=date_from)}
+    date_to_clause = "AND merged_at <= {date_to}" if date_to is not None else ""
+    if date_to is not None:
+        placeholders["date_to"] = ast.Constant(value=date_to)
+    sql = with_clause + (
+        _MERGE_MEDIAN_SERIES_SELECT.replace("__MEASURE__", measure)
+        .replace("__READY_JOIN__", join)
+        .replace("__PR_SOURCE__", curated.pr_source())
+        .replace("__DATE_TO_MERGED__", date_to_clause)
+        .replace("__BUCKET_FN__", bucket_expr(granularity, "merged_at"))
+    )
+    response = curated.run(sql, query_type=query_type, placeholders=placeholders)
+    p50_by_bucket = {
+        normalize_bucket(bucket_start, granularity): (opt_float(p50) if (n or 0) > 0 else None)
+        for bucket_start, p50, n in response.results or []
+    }
+    return [(bucket, p50_by_bucket.get(bucket)) for bucket in window_buckets(date_from, date_to, granularity)]
+
+
+def query_success_rate_series(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+    granularity: Granularity,
+) -> list[PassRateBucket]:
+    """One bucket per step of the window, oldest first, over runs on all branches like the headline.
+    ``success_rate`` is None for a bucket with no pass-or-fail verdict."""
+    placeholders: dict[str, ast.Expr] = {
+        "date_from": ast.Constant(value=date_from),
+        "run_started_floor": run_started_floor_constant(date_from),
+    }
+    date_to_clause = "AND run_started_at <= {date_to}" if date_to is not None else ""
+    if date_to is not None:
+        placeholders["date_to"] = ast.Constant(value=date_to)
+    sql = (
+        _PASS_RATE_SERIES_SELECT.replace("__RUNS_SOURCE__", curated.run_source(started_floor=True, since=date_from))
+        .replace("__DATE_TO__", date_to_clause)
+        .replace("__BUCKET_FN__", bucket_expr(granularity, "run_started_at"))
+    )
+    response = curated.run(sql, query_type="engineering_analytics.success_rate_series", placeholders=placeholders)
+    rate_by_bucket = {
+        normalize_bucket(bucket_start, granularity): opt_float(success_rate)
+        for bucket_start, success_rate in response.results or []
+    }
+    return [
+        PassRateBucket(bucket_start=bucket, success_rate=rate_by_bucket.get(bucket))
+        for bucket in window_buckets(date_from, date_to, granularity)
+    ]
+
+
+def query_ready_to_merge_series(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+    granularity: Granularity,
+) -> list[ReadyToMergeBucket]:
+    """Median ready_to_merge_seconds per bucket, oldest first, bots and drafts excluded.
+    Empty when the measure is not observable, so a caller can fall back to the open-to-merge series."""
+    ready = curated.ready_to_merge_sql()
+    if not ready.observable:
+        return []
+    return [
+        ReadyToMergeBucket(bucket_start=bucket, p50_seconds=p50)
+        for bucket, p50 in _query_merge_median_series(
+            curated=curated,
+            date_from=date_from,
+            date_to=date_to,
+            granularity=granularity,
+            measure=ready.expr,
+            join=ready.join,
+            with_clause=ready.with_clause,
+            query_type="engineering_analytics.ready_to_merge_series",
+        )
+    ]
+
+
+def _share(part: int, whole: int) -> float | None:
+    return part / whole if whole else None
+
+
+_REVERT_SHARE_SERIES_SELECT = """
+    SELECT
+        __BUCKET_FN__ AS bucket_start,
+        count() AS merged,
+        countIf(is_revert) AS reverting
+    FROM __PR_SOURCE__ AS pr
+    WHERE merged_at IS NOT NULL AND merged_at >= {date_from} __DATE_TO_MERGED__
+    GROUP BY bucket_start
+    LIMIT 40000
+"""
+
+
+def query_revert_share_series(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+    granularity: Granularity,
+) -> list[RevertShareBucket]:
+    """One bucket per step of the window, oldest first, counting bots like the headline merge counts.
+    A bucket where nothing merged carries 0 merges and a None share."""
+    placeholders: dict[str, ast.Expr] = {"date_from": ast.Constant(value=date_from)}
+    date_to_clause = "AND merged_at <= {date_to}" if date_to is not None else ""
+    if date_to is not None:
+        placeholders["date_to"] = ast.Constant(value=date_to)
+    sql = (
+        _REVERT_SHARE_SERIES_SELECT.replace("__PR_SOURCE__", curated.pr_source())
+        .replace("__DATE_TO_MERGED__", date_to_clause)
+        .replace("__BUCKET_FN__", bucket_expr(granularity, "merged_at"))
+    )
+    response = curated.run(sql, query_type="engineering_analytics.revert_share_series", placeholders=placeholders)
+    counts_by_bucket = {
+        normalize_bucket(bucket_start, granularity): (int(merged or 0), int(reverting or 0))
+        for bucket_start, merged, reverting in response.results or []
+    }
+    buckets: list[RevertShareBucket] = []
+    for bucket in window_buckets(date_from, date_to, granularity):
+        merged, reverting = counts_by_bucket.get(bucket, (0, 0))
+        buckets.append(
+            RevertShareBucket(
+                bucket_start=bucket,
+                merged_pr_count=merged,
+                reverting_pr_count=reverting,
+                revert_share=_share(reverting, merged),
+            )
+        )
+    return buckets
+
+
+def query_open_to_merge_series(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+    granularity: Granularity,
+) -> list[OpenToMergeBucket]:
+    """Median open_to_merge_seconds per bucket, oldest first, bots and drafts excluded.
+    ``p50_seconds`` is None for a bucket with no sample."""
+    return [
+        OpenToMergeBucket(bucket_start=bucket, p50_seconds=p50)
+        for bucket, p50 in _query_merge_median_series(
+            curated=curated,
+            date_from=date_from,
+            date_to=date_to,
+            granularity=granularity,
+            measure="open_to_merge_seconds",
+            join="",
+            with_clause="",
+            query_type="engineering_analytics.open_to_merge_series",
+        )
+    ]
+
+
+@dataclass(frozen=True)
+class RepoSeries:
+    """The repo hub's chart series over one window, all on one bucket granularity."""
+
+    granularity: Granularity
+    cost: list[CostPerMergeBucket]
+    time_to_green: list[TimeToGreenBucket]
+    success_rate: list[PassRateBucket]
+    open_to_merge: list[OpenToMergeBucket]
+    ready_to_merge: list[ReadyToMergeBucket]
+    revert_share: list[RevertShareBucket]
+
+
+def query_repo_series(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+) -> RepoSeries:
+    granularity = pick_granularity(date_from, date_to)
+    return RepoSeries(
+        granularity=granularity,
+        cost=query_cost_per_merge_series(
+            curated=curated, date_from=date_from, date_to=date_to, granularity=granularity
+        ),
+        time_to_green=query_time_to_green_series(
+            curated=curated, date_from=date_from, date_to=date_to, granularity=granularity
+        ),
+        success_rate=query_success_rate_series(
+            curated=curated, date_from=date_from, date_to=date_to, granularity=granularity
+        ),
+        open_to_merge=query_open_to_merge_series(
+            curated=curated, date_from=date_from, date_to=date_to, granularity=granularity
+        ),
+        ready_to_merge=query_ready_to_merge_series(
+            curated=curated, date_from=date_from, date_to=date_to, granularity=granularity
+        ),
+        revert_share=query_revert_share_series(
+            curated=curated, date_from=date_from, date_to=date_to, granularity=granularity
+        ),
+    )
+
+
+def empty_repo_series(*, date_from: datetime, date_to: datetime | None) -> RepoSeries:
+    """No buckets and no scans, with the granularity a full read would use, because the contract's
+    granularity fields are not nullable."""
+    return RepoSeries(
+        granularity=pick_granularity(date_from, date_to),
+        cost=[],
+        time_to_green=[],
+        success_rate=[],
+        open_to_merge=[],
+        ready_to_merge=[],
+        revert_share=[],
+    )
+
+
+@frozen
+class _RunHeadlines:
+    run_count: int
+    run_count_prev: int
+    success_rate: float | None
+    success_rate_prev: float | None
+    rerun_cycles: int
+    rerun_cycles_prev: int
+    default_branch: str
+
+
+def _query_run_headlines(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+    prev_from: datetime,
+) -> _RunHeadlines:
+    date_to_clause = "AND run_started_at <= {date_to}" if date_to is not None else ""
+    windows = window_pair_predicates("run_started_at", date_to=date_to)
+    placeholders: dict[str, ast.Expr] = {
+        "date_from": ast.Constant(value=date_from),
+        "prev_from": ast.Constant(value=prev_from),
+        "run_started_floor": run_started_floor_constant(prev_from),
+    }
+    if date_to is not None:
+        placeholders["date_to"] = ast.Constant(value=date_to)
+    sql = (
+        _RUNS_SELECT.replace("__CUR__", windows.current)
+        .replace("__PREV__", windows.previous)
+        .replace("__RUNS_SOURCE__", curated.run_source(started_floor=True, since=prev_from))
+        .replace("__DATE_TO__", date_to_clause)
+    )
+    response = curated.run(sql, query_type="engineering_analytics.repo_overview_runs", placeholders=placeholders)
+    row = response.results[0] if response.results else (0, 0, None, None, 0, 0, 0, 0)
+    run_count, run_count_prev, success_rate, success_rate_prev, reruns, reruns_prev, master_runs, main_runs = row
+    return _RunHeadlines(
+        run_count=run_count,
+        run_count_prev=run_count_prev,
+        success_rate=opt_float(success_rate),
+        success_rate_prev=opt_float(success_rate_prev),
+        rerun_cycles=reruns,
+        rerun_cycles_prev=reruns_prev,
+        default_branch="main" if (main_runs or 0) > (master_runs or 0) else "master",
+    )
+
+
+@frozen
+class _MergeHeadlines:
+    median_open_to_merge_seconds: float | None
+    median_open_to_merge_seconds_prev: float | None
+    median_ready_to_merge_seconds: float | None
+    median_ready_to_merge_seconds_prev: float | None
+    merged_count: int
+    merged_count_prev: int
+    reverting_count: int
+    reverting_count_prev: int
+
+
+def _query_merge_headlines(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+    prev_from: datetime,
+) -> _MergeHeadlines:
+    windows = window_pair_predicates("merged_at", date_to=date_to)
+    ready = curated.ready_to_merge_sql()
+    placeholders: dict[str, ast.Expr] = {
+        "date_from": ast.Constant(value=date_from),
+        "prev_from": ast.Constant(value=prev_from),
+    }
+    if date_to is not None:
+        placeholders["date_to"] = ast.Constant(value=date_to)
+    sql = ready.with_clause + (
+        _PR_SELECT.replace("__READY_MEDIAN_CUR__", ready.median(scope=f"{windows.current} AND {_HUMAN_MERGES}"))
+        .replace("__READY_MEDIAN_PREV__", ready.median(scope=f"{windows.previous} AND {_HUMAN_MERGES}"))
+        .replace("__READY_JOIN__", ready.join)
+        .replace("__CUR_MERGED__", windows.current)
+        .replace("__PREV_MERGED__", windows.previous)
+        .replace("__PR_SOURCE__", curated.pr_source())
+    )
+    response = curated.run(sql, query_type="engineering_analytics.repo_overview_prs", placeholders=placeholders)
+    median_cur, median_prev, ready_cur, ready_prev, merged_cur, merged_prev, reverting_cur, reverting_prev = (
+        response.results[0] if response.results else (None, None, None, None, 0, 0, 0, 0)
+    )
+    return _MergeHeadlines(
+        median_open_to_merge_seconds=opt_float(median_cur),
+        median_open_to_merge_seconds_prev=opt_float(median_prev),
+        median_ready_to_merge_seconds=opt_float(ready_cur),
+        median_ready_to_merge_seconds_prev=opt_float(ready_prev),
+        merged_count=int(merged_cur or 0),
+        merged_count_prev=int(merged_prev or 0),
+        reverting_count=int(reverting_cur or 0),
+        reverting_count_prev=int(reverting_prev or 0),
+    )
+
+
+@frozen
+class _CostHeadlines:
+    billable_minutes: float | None
+    billable_minutes_prev: float | None
+    estimated_cost_usd: float | None
+    estimated_cost_usd_prev: float | None
+    cost_per_merge_usd: float | None
+    cost_per_merge_usd_prev: float | None
+    merge_queue_billable_minutes: float | None
+    merge_queue_billable_minutes_prev: float | None
+    depot_ci_billable_minutes: float | None
+    depot_ci_billable_minutes_prev: float | None
+
+
+def _derive_cost_headlines(costs: WindowCostsWithPrev, *, merged_count: int, merged_count_prev: int) -> _CostHeadlines:
+    cost_cur, cost_prev = costs.by_workflow, costs.by_workflow_prev
+    # A workflow with no costed job has a None estimated_cost_usd, which counts as 0 in the total.
+    billable_seconds = sum(c.billable_seconds or 0.0 for c in cost_cur.values()) if cost_cur else None
+    billable_seconds_prev = sum(c.billable_seconds or 0.0 for c in cost_prev.values()) if cost_prev else None
+    cost_usd = sum(c.estimated_cost_usd or 0.0 for c in cost_cur.values()) if cost_cur else None
+    cost_usd_prev = sum(c.estimated_cost_usd or 0.0 for c in cost_prev.values()) if cost_prev else None
+    return _CostHeadlines(
+        billable_minutes=billable_seconds / 60 if billable_seconds is not None else None,
+        billable_minutes_prev=billable_seconds_prev / 60 if billable_seconds_prev is not None else None,
+        estimated_cost_usd=opt_float(cost_usd),
+        estimated_cost_usd_prev=opt_float(cost_usd_prev),
+        cost_per_merge_usd=opt_float(cost_usd / merged_count) if cost_usd is not None and merged_count else None,
+        cost_per_merge_usd_prev=opt_float(cost_usd_prev / merged_count_prev)
+        if cost_usd_prev is not None and merged_count_prev
+        else None,
+        # The queue and Depot CI slices are None exactly when billable_minutes is None.
+        merge_queue_billable_minutes=costs.merge_queue_billable_seconds / 60 if cost_cur else None,
+        merge_queue_billable_minutes_prev=costs.merge_queue_billable_seconds_prev / 60 if cost_prev else None,
+        depot_ci_billable_minutes=costs.depot_ci_billable_seconds / 60 if cost_cur else None,
+        depot_ci_billable_minutes_prev=costs.depot_ci_billable_seconds_prev / 60 if cost_prev else None,
+    )
+
+
+def query_repo_overview(
+    *,
+    curated: CuratedGitHubSource,
+    date_from: datetime,
+    date_to: datetime | None,
+    series: RepoSeries,
+) -> RepoOverview:
+    end = date_to or datetime.now(tz=date_from.tzinfo)
+    prev_from = date_from - (end - date_from)
+
+    with curated.concurrent_reads() as reads:
+        runs_read = reads.submit(
+            lambda: _query_run_headlines(curated=curated, date_from=date_from, date_to=date_to, prev_from=prev_from)
+        )
+        merges_read = reads.submit(
+            lambda: _query_merge_headlines(curated=curated, date_from=date_from, date_to=date_to, prev_from=prev_from)
+        )
+        queue_read = reads.submit(
+            lambda: query_merge_queue_overview(
+                curated=curated, date_from=date_from, date_to=date_to, prev_from=prev_from
+            )
+        )
+        trunk_read = reads.submit(
+            lambda: query_merge_queue_trunk_outcomes(
+                curated=curated, date_from=date_from, date_to=date_to, prev_from=prev_from
+            )
+        )
+        time_to_green_read = reads.submit(
+            lambda: query_time_to_green_window(
+                curated=curated, date_from=date_from, date_to=date_to, prev_from=prev_from
+            )
+        )
+        pipeline_read = reads.submit(
+            lambda: query_delivery_pipeline(curated=curated, date_from=date_from, date_to=date_to)
+        )
+        costs_read = reads.submit(
+            lambda: query_workflow_window_costs_with_prev(
+                curated=curated, date_from=date_from, date_to=date_to, prev_from=prev_from
+            )
+        )
+    runs = runs_read.result()
+    merges = merges_read.result()
+    queue = queue_read.result()
+    trunk = trunk_read.result()
+    time_to_green = time_to_green_read.result()
+    pipeline = pipeline_read.result()
+    costs = _derive_cost_headlines(
+        costs_read.result(),
+        merged_count=merges.merged_count,
+        merged_count_prev=merges.merged_count_prev,
+    )
+
+    return RepoOverview(
+        run_count=runs.run_count,
+        run_count_prev=runs.run_count_prev,
+        success_rate=runs.success_rate,
+        success_rate_prev=runs.success_rate_prev,
+        rerun_cycles=runs.rerun_cycles,
+        rerun_cycles_prev=runs.rerun_cycles_prev,
+        merged_pr_count=merges.merged_count,
+        merged_pr_count_prev=merges.merged_count_prev,
+        reverting_pr_count=merges.reverting_count,
+        reverting_pr_count_prev=merges.reverting_count_prev,
+        revert_share=_share(merges.reverting_count, merges.merged_count),
+        revert_share_prev=_share(merges.reverting_count_prev, merges.merged_count_prev),
+        median_open_to_merge_seconds=merges.median_open_to_merge_seconds,
+        median_open_to_merge_seconds_prev=merges.median_open_to_merge_seconds_prev,
+        median_ready_to_merge_seconds=merges.median_ready_to_merge_seconds,
+        median_ready_to_merge_seconds_prev=merges.median_ready_to_merge_seconds_prev,
+        billable_minutes=costs.billable_minutes,
+        billable_minutes_prev=costs.billable_minutes_prev,
+        estimated_cost_usd=costs.estimated_cost_usd,
+        estimated_cost_usd_prev=costs.estimated_cost_usd_prev,
+        cost_per_merge_usd=costs.cost_per_merge_usd,
+        cost_per_merge_usd_prev=costs.cost_per_merge_usd_prev,
+        merge_queue_billable_minutes=costs.merge_queue_billable_minutes,
+        merge_queue_billable_minutes_prev=costs.merge_queue_billable_minutes_prev,
+        depot_ci_billable_minutes=costs.depot_ci_billable_minutes,
+        depot_ci_billable_minutes_prev=costs.depot_ci_billable_minutes_prev,
+        merge_queue_merged_pr_count=queue.merged_pr_count,
+        merge_queue_merged_pr_count_prev=queue.merged_pr_count_prev,
+        merge_queue_median_first_gate_to_merge_seconds=queue.median_first_gate_to_merge_seconds,
+        merge_queue_median_first_gate_to_merge_seconds_prev=queue.median_first_gate_to_merge_seconds_prev,
+        merge_queue_p90_first_gate_to_merge_seconds=queue.p90_first_gate_to_merge_seconds,
+        merge_queue_p90_first_gate_to_merge_seconds_prev=queue.p90_first_gate_to_merge_seconds_prev,
+        merge_queue_p95_first_gate_to_merge_seconds=queue.p95_first_gate_to_merge_seconds,
+        merge_queue_p95_first_gate_to_merge_seconds_prev=queue.p95_first_gate_to_merge_seconds_prev,
+        merge_queue_p99_first_gate_to_merge_seconds=queue.p99_first_gate_to_merge_seconds,
+        merge_queue_p99_first_gate_to_merge_seconds_prev=queue.p99_first_gate_to_merge_seconds_prev,
+        merge_queue_avg_attempts_per_merge=queue.avg_attempts_per_merge,
+        merge_queue_avg_attempts_per_merge_prev=queue.avg_attempts_per_merge_prev,
+        merge_queue_multi_attempt_merge_share=queue.multi_attempt_merge_share,
+        merge_queue_multi_attempt_merge_share_prev=queue.multi_attempt_merge_share_prev,
+        merge_queue_failed_gate_merge_share=queue.failed_gate_merge_share,
+        merge_queue_failed_gate_merge_share_prev=queue.failed_gate_merge_share_prev,
+        merge_queue_trunk_available=trunk.available,
+        merge_queue_failed_or_cancelled_share=trunk.failed_or_cancelled_share,
+        merge_queue_failed_or_cancelled_share_prev=trunk.failed_or_cancelled_share_prev,
+        merge_queue_skip_the_line_count=trunk.skip_the_line_count,
+        merge_queue_skip_the_line_count_prev=trunk.skip_the_line_count_prev,
+        median_time_to_green_seconds=time_to_green.median_seconds,
+        median_time_to_green_seconds_prev=time_to_green.median_seconds_prev,
+        jobs_available=curated.jobs_source() is not None,
+        default_branch=runs.default_branch,
+        cost_series=series.cost,
+        cost_series_granularity=series.granularity,
+        time_to_green_series=series.time_to_green,
+        time_to_green_series_granularity=series.granularity,
+        success_rate_series=series.success_rate,
+        success_rate_series_granularity=series.granularity,
+        open_to_merge_series=series.open_to_merge,
+        open_to_merge_series_granularity=series.granularity,
+        ready_to_merge_series=series.ready_to_merge,
+        ready_to_merge_series_granularity=series.granularity,
+        revert_share_series=series.revert_share,
+        revert_share_series_granularity=series.granularity,
+        delivery_pipeline=pipeline,
+    )

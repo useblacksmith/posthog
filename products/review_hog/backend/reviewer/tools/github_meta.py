@@ -1,0 +1,578 @@
+import re
+import logging
+from collections.abc import Iterable
+from typing import Any
+
+import requests
+
+from posthog.dataclasses import frozen
+from posthog.egress.github.transport import GitHubRateLimitError
+
+from products.review_hog.backend.reviewer.models.github_meta import PRComment, PRFile, PRFileUpdate, PRMetadata
+from products.review_hog.backend.reviewer.tools.github_client import (
+    GitHubAPIError,
+    github_api_get_paginated,
+    github_api_request,
+)
+
+logger = logging.getLogger(__name__)
+
+# GitHub's compare endpoint returns at most this many files, with no way to page the remainder.
+GITHUB_COMPARE_FILES_CAP = 300
+
+
+def _format_diff_section(filename: str, status: str, patch: str) -> str:
+    """One reviewed file's raw GitHub patch behind a clear header, for the point-in-time snapshot.
+
+    GitHub omits the patch for binary or very large files, so an empty patch is recorded explicitly
+    rather than silently dropped.
+    """
+    body = patch if patch.strip() else "(no patch available — file too large or binary)"
+    return f"=== {filename} [{status}] ===\n{body}"
+
+
+class PRFilter:
+    def __init__(self, *, review_tests_and_text: bool = False) -> None:
+        # The single-agent design was measured on diffs that kept test and `.txt` files; the pipeline drops them.
+        self.review_tests_and_text = review_tests_and_text
+
+    def skips(self, filename: str) -> bool:
+        """Whether the review leaves this file out, and its comments out of dedup."""
+        if self.review_tests_and_text:
+            return self.is_filtered_file(filename) and not filename.lower().endswith(".txt")
+        return self.is_filtered_file(filename) or self.is_test_file(filename)
+
+    @staticmethod
+    def is_test_file(filename: str) -> bool:
+        """Check if a filename matches common test file patterns.
+
+        Every pattern is anchored to a path/name boundary — a bare "test" substring match
+        would silently exclude production files like `latest-versions.ts` or
+        `0132_team_test_account_filters.py` from review. When in doubt, don't exclude:
+        reviewing a test file is cheap, silently skipping production code is not.
+        """
+        test_patterns = [
+            r"(^|/)test[_\-]",  # test_-/test--prefixed filenames, in any directory
+            r"[_\-]tests?\.",  # _test./-test./_tests.-suffixed filenames
+            r"\.test\.",  # .test. files (common in JS)
+            r"\.spec\.",  # .spec. files (common in JS)
+            r"(^|/)tests?/",  # files under a test/ or tests/ directory
+            r"(^|/)__tests__/",  # files under a __tests__/ directory
+        ]
+
+        return any(re.search(pattern, filename, re.IGNORECASE) for pattern in test_patterns)
+
+    @staticmethod
+    def is_filtered_file(filename: str) -> bool:
+        """Check if a filename should be filtered out from PR analysis.
+
+        Filters out lock files, build artifacts, and other auto-generated files
+        that don't need LLM review.
+        """
+        filter_patterns = [
+            # Lock files
+            r".*\.lock$",  # package-lock.json, yarn.lock, Cargo.lock, etc.
+            r".*lock\.json$",  # package-lock.json specifically
+            r".*lock\.yaml$",  # pnpm-lock.yaml, etc.
+            r".*lock\.yml$",  # lock.yml files
+            r".*\.lockb$",  # bun.lockb (binary lock file)
+            r"npm-shrinkwrap\.json$",  # npm shrinkwrap file
+            # Sum/hash files
+            r".*\.sum$",  # go.sum, etc.
+            r"go\.sum$",  # go.sum specifically
+            # Minified files
+            r".*\.min\.js$",  # minified JavaScript
+            r".*\.min\.css$",  # minified CSS
+            r".*\.min\.json$",  # minified JSON
+            # Source maps
+            r".*\.map$",  # source map files
+            r".*\.js\.map$",  # JavaScript source maps
+            r".*\.css\.map$",  # CSS source maps
+            # Build/dist directories
+            r"^dist/.*",  # dist directory
+            r".*/dist/.*",  # dist directory anywhere
+            r"^build/.*",  # build directory
+            r".*/build/.*",  # build directory anywhere
+            r"^out/.*",  # out directory
+            r".*/out/.*",  # out directory anywhere
+            r"^target/.*",  # target directory (Rust/Maven)
+            r".*/target/.*",  # target directory anywhere
+            # Images
+            r".*\.png$",  # PNG files
+            r".*\.jpg$",  # JPG files
+            r".*\.jpeg$",  # JPEG files
+            r".*\.gif$",  # GIF files
+            r".*\.bmp$",  # BMP files
+            r".*\.tiff$",  # TIFF files
+            r".*\.ico$",  # ICO files
+            r".*\.webp$",  # WebP files
+            # Snapshots
+            r".*\.snap$",  # Snap files
+            r".*\.snapshot$",  # Snapshot files
+            r".*\.snapfile$",  # Snapfile files
+            # Schema files (for PostHog, mostly)
+            r".*\.schema\.py$",  # Schema files
+            # TXT files
+            r".*\.txt$",  # TXT files
+        ]
+
+        return any(re.search(pattern, filename, re.IGNORECASE) for pattern in filter_patterns)
+
+
+class PRParser:
+    @staticmethod
+    def parse_github_pr_url(url: str) -> dict[str, str | int]:
+        """Parse GitHub PR URL and extract owner, repo, and PR number.
+
+        The number must end at a path boundary (`/pull/123abc` is rejected, not read as 123 — a typo
+        must not silently review a different PR); trailing paths like `/files` are accepted.
+        """
+        pattern = r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)(?=$|[/?#])"
+        match = re.match(pattern, url)
+        if not match:
+            raise ValueError(
+                f"Invalid GitHub PR URL format: {url}\nExpected format: https://github.com/OWNER/REPO/pull/NUMBER"
+            )
+        return {
+            "owner": match.group(1),
+            "repo": match.group(2),
+            "pr_number": int(match.group(3)),
+        }
+
+    @staticmethod
+    def parse_patch(patch: str) -> list[PRFileUpdate]:
+        """Parse a unified diff patch string into individual changes."""
+        if not patch:
+            return []
+        changes: list[PRFileUpdate] = []
+        lines = patch.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Look for hunk header
+            if not line.startswith("@@"):
+                i += 1
+                continue
+            # Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
+            match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if not match:
+                i += 1
+                continue
+            old_start = int(match.group(1))
+            new_start = int(match.group(3))
+            i += 1
+            # Process lines in this hunk
+            old_line = old_start
+            new_line = new_start
+            # Collect consecutive changes
+            current_type: str | None = None
+            current_lines: list[str] = []
+            current_old_start: int | None = None
+            current_new_start: int | None = None
+
+            def flush_current() -> None:
+                nonlocal current_type, current_lines, current_old_start, current_new_start
+                if current_type and current_lines:
+                    change = PRFileUpdate(type=current_type, code="\n".join(current_lines))
+
+                    # The loop below always stamps the matching start line when it sets the type.
+                    if current_type == "deletion":
+                        assert current_old_start is not None
+                        change.old_start_line = current_old_start
+                        change.old_end_line = current_old_start + len(current_lines) - 1
+                    elif current_type == "addition":
+                        assert current_new_start is not None
+                        change.new_start_line = current_new_start
+                        change.new_end_line = current_new_start + len(current_lines) - 1
+                    else:  # context
+                        assert current_old_start is not None and current_new_start is not None
+                        change.old_start_line = current_old_start
+                        change.old_end_line = current_old_start + len(current_lines) - 1
+                        change.new_start_line = current_new_start
+                        change.new_end_line = current_new_start + len(current_lines) - 1
+
+                    changes.append(change)
+
+                current_type = None
+                current_lines = []
+                current_old_start = None
+                current_new_start = None
+
+            while i < len(lines) and not lines[i].startswith("@@"):
+                line = lines[i]
+
+                if line.startswith("-"):
+                    # Deletion
+                    if current_type != "deletion":
+                        flush_current()
+                        current_type = "deletion"
+                        current_old_start = old_line
+                    current_lines.append(line[1:])
+                    old_line += 1
+
+                elif line.startswith("+"):
+                    # Addition
+                    if current_type != "addition":
+                        flush_current()
+                        current_type = "addition"
+                        current_new_start = new_line
+                    current_lines.append(line[1:])
+                    new_line += 1
+
+                elif line.startswith(" ") or line == "":
+                    # Context line
+                    if current_type != "context":
+                        flush_current()
+                        current_type = "context"
+                        current_old_start = old_line
+                        current_new_start = new_line
+                    # Handle empty context lines
+                    current_lines.append(line[1:] if line else "")
+                    old_line += 1
+                    new_line += 1
+
+                elif line.startswith("\\"):
+                    # Special line (e.g., "\ No newline at end of file")
+                    # Skip these
+                    pass
+                else:
+                    # Shouldn't happen in valid patch, but handle gracefully
+                    break
+
+                i += 1
+
+            # Flush any remaining changes
+            flush_current()
+            continue
+
+        return changes
+
+
+@frozen
+class FetchedFiles:
+    """The PR's reviewable files, their point-in-time diff, and the files the filter left out."""
+
+    pr_files: list[PRFile]
+    diff: str
+    skipped_paths: tuple[str, ...]
+
+
+@frozen
+class FetchedPR:
+    """Everything the review pipeline needs from one fetched review target."""
+
+    pr_metadata: PRMetadata
+    pr_comments: list[PRComment]
+    pr_files: list[PRFile]
+    # The reviewed files' point-in-time unified patch.
+    diff: str
+    # The commit GitHub computes the diff against. None when it was not asked for or GitHub did not return it.
+    merge_base_sha: str | None = None
+    skipped_paths: tuple[str, ...] = ()
+
+
+def _patch_omitted(file: dict[str, Any]) -> bool:
+    """True when GitHub sent no patch for a changed file, for example a large or binary file.
+
+    The review then sees the file name but none of its changes, so the file counts as skipped. Only a
+    pure rename has no changes to see.
+    """
+    if file.get("patch"):
+        return False
+    return not (file.get("status") == "renamed" and not (file["additions"] or file["deletions"]))
+
+
+def _read_files(files: Iterable[dict[str, Any]], pr_filter: PRFilter, pr_parser: PRParser) -> FetchedFiles:
+    pr_files: list[PRFile] = []
+    skipped_paths: list[str] = []
+    diff_sections: list[str] = []
+    for file in files:
+        if pr_filter.skips(file["filename"]):
+            skipped_paths.append(file["filename"])
+            continue
+        if _patch_omitted(file):
+            skipped_paths.append(file["filename"])
+        patch = file.get("patch")
+        pr_files.append(
+            PRFile(
+                filename=file["filename"],
+                previous_filename=file.get("previous_filename"),
+                status=file["status"],
+                additions=file["additions"],
+                deletions=file["deletions"],
+                changes=pr_parser.parse_patch(patch) if patch else [],
+            )
+        )
+        diff_sections.append(_format_diff_section(file["filename"], file["status"], patch or ""))
+    return FetchedFiles(pr_files=pr_files, diff="\n\n".join(diff_sections), skipped_paths=tuple(skipped_paths))
+
+
+def _merge_base_sha(comparison: dict[str, Any]) -> str | None:
+    sha = (comparison.get("merge_base_commit") or {}).get("sha")
+    return sha if isinstance(sha, str) else None
+
+
+def find_open_pr_for_branch(
+    *, token: str, repository: str, owner: str, head_branch: str, installation_id: str | None = None
+) -> tuple[int, str] | None:
+    """The first open PR whose head is `head_branch` on the base repo, as (number, html_url), or None.
+
+    One API call. Branch targets are origin branches by construction (the tasks agent pushes to the
+    base repo, never a fork), so the head qualifier is always `{base owner}:{branch}`.
+    """
+    pulls = github_api_request(
+        "GET",
+        f"/repos/{repository}/pulls",
+        token=token,
+        installation_id=installation_id,
+        endpoint="/repos/{owner}/{repo}/pulls",
+        params={"state": "open", "head": f"{owner}:{head_branch}", "per_page": 1},
+    ).json()
+    if not pulls:
+        return None
+    return pulls[0]["number"], pulls[0]["html_url"]
+
+
+def fetch_branch_compare(
+    *,
+    token: str,
+    repository: str,
+    head_branch: str,
+    installation_id: str | None = None,
+    review_tests_and_text: bool = False,
+) -> FetchedPR:
+    """Fetch a PR-less branch target as a compare diff against the repo's default branch.
+
+    Returns the same `FetchedPR` as `PRFetcher.fetch_pr_data`
+    — the pipeline middle (chunk → review → dedup → validate) consumes files + diff and doesn't care
+    where they came from. The metadata is synthesized with ``number=0`` ("no PR"); comments are empty
+    (there is no PR to carry them). Files are filtered exactly like the PR path.
+    """
+    base_branch = github_api_request(
+        "GET",
+        f"/repos/{repository}",
+        token=token,
+        installation_id=installation_id,
+        endpoint="/repos/{owner}/{repo}",
+    ).json()["default_branch"]
+    head_sha = github_api_request(
+        "GET",
+        f"/repos/{repository}/branches/{head_branch}",
+        token=token,
+        installation_id=installation_id,
+        endpoint="/repos/{owner}/{repo}/branches/{branch}",
+    ).json()["commit"]["sha"]
+    comparison = github_api_request(
+        "GET",
+        f"/repos/{repository}/compare/{base_branch}...{head_branch}",
+        token=token,
+        installation_id=installation_id,
+        endpoint="/repos/{owner}/{repo}/compare/{basehead}",
+    ).json()
+    # GitHub caps the compare payload at 300 files with no pagination, so a wider branch diff gets
+    # reviewed against only the first 300 changed files — warn so the gap is never silent.
+    files: list[dict[str, Any]] = comparison.get("files") or []
+    if len(files) >= GITHUB_COMPARE_FILES_CAP:
+        logger.warning(
+            "Branch compare %s %s...%s hit GitHub's %d-file cap; the review covers only the first %d changed files",
+            repository,
+            base_branch,
+            head_branch,
+            GITHUB_COMPARE_FILES_CAP,
+            GITHUB_COMPARE_FILES_CAP,
+        )
+
+    pr_filter = PRFilter(review_tests_and_text=review_tests_and_text)
+    pr_parser = PRParser()
+    fetched = _read_files(files, pr_filter, pr_parser)
+
+    metadata = PRMetadata(
+        number=0,
+        title=f"{repository}:{head_branch}",
+        body="",
+        state="open",
+        draft=False,
+        created_at="",
+        updated_at="",
+        author="",
+        base_branch=base_branch,
+        head_branch=head_branch,
+        is_fork=False,
+        head_sha=head_sha,
+        commits=comparison["total_commits"],
+        additions=sum(file["additions"] for file in files),
+        deletions=sum(file["deletions"] for file in files),
+        changed_files=len(files),
+    )
+    return FetchedPR(
+        pr_metadata=metadata,
+        pr_comments=[],
+        pr_files=fetched.pr_files,
+        diff=fetched.diff,
+        merge_base_sha=_merge_base_sha(comparison),
+        skipped_paths=fetched.skipped_paths,
+    )
+
+
+class PRFetcher:
+    def __init__(self, owner: str, repo: str, pr_number: int, token: str, installation_id: str | None = None) -> None:
+        # `token` is the team's GitHub App installation token, resolved server-side by the caller;
+        # `installation_id` keys the shared egress budget the calls are metered against.
+        if not token:
+            raise ValueError("A GitHub installation token is required to authenticate with the GitHub API.")
+        self.owner = owner
+        self.repo = repo
+        self.pr_number = pr_number
+        self._token = token
+        self._installation_id = installation_id
+
+    def fetch_pr_metadata(self, pr: dict[str, Any]) -> PRMetadata:
+        """Build the metadata from the PR's REST payload (``GET /repos/{owner}/{repo}/pulls/{n}``)."""
+        # A missing head repo (deleted fork) counts as a fork — we can't trust/reach the head ref.
+        head_repo = pr["head"]["repo"]["full_name"] if pr["head"].get("repo") else None
+        base_repo = pr["base"]["repo"]["full_name"] if pr["base"].get("repo") else None
+        is_fork = head_repo is None or head_repo != base_repo
+        return PRMetadata(
+            number=pr["number"],
+            title=pr["title"],
+            body=pr.get("body") or "",
+            state=pr["state"],
+            draft=pr["draft"],
+            created_at=pr.get("created_at") or "",
+            updated_at=pr.get("updated_at") or "",
+            author=pr["user"]["login"],
+            author_association=pr.get("author_association", "NONE"),
+            base_branch=pr["base"]["ref"],
+            head_branch=pr["head"]["ref"],
+            is_fork=is_fork,
+            head_sha=pr["head"]["sha"],
+            mergeable_state=pr.get("mergeable_state"),
+            requested_reviewers=[r["login"] for r in pr.get("requested_reviewers") or []],  # users, not teams
+            assignee=pr["assignee"]["login"] if pr.get("assignee") else None,
+            labels=[label["name"] for label in pr.get("labels") or []],
+            commits=pr["commits"],
+            additions=pr["additions"],
+            deletions=pr["deletions"],
+            changed_files=pr["changed_files"],
+        )
+
+    def fetch_head_sha(self) -> str:
+        """The commit the PR's head branch points at now."""
+        pr = github_api_request(
+            "GET",
+            f"/repos/{self.owner}/{self.repo}/pulls/{self.pr_number}",
+            token=self._token,
+            installation_id=self._installation_id,
+            endpoint="/repos/{owner}/{repo}/pulls/{pull_number}",
+        ).json()
+        return pr["head"]["sha"]
+
+    def fetch_pr_comments(self, pr_filter: PRFilter, *, raise_errors: bool = False) -> list[PRComment]:
+        """Fetch the PR's review comments (filtered files / test files dropped).
+
+        A GitHub error returns what was read so far, unless `raise_errors` asks for the error instead.
+        """
+        pr_comments: list[PRComment] = []
+        try:
+            for comment in github_api_get_paginated(
+                f"/repos/{self.owner}/{self.repo}/pulls/{self.pr_number}/comments",
+                token=self._token,
+                installation_id=self._installation_id,
+                endpoint="/repos/{owner}/{repo}/pulls/{pull_number}/comments",
+            ):
+                if pr_filter.skips(comment["path"]):
+                    continue
+                pr_comments.append(
+                    PRComment(
+                        id=comment["id"],
+                        path=comment["path"],
+                        line=comment.get("line"),
+                        start_line=comment.get("start_line"),
+                        body=comment["body"],
+                        diff_hunk=comment["diff_hunk"],
+                        user=comment["user"]["login"],
+                        created_at=comment["created_at"],
+                    )
+                )
+        except (GitHubAPIError, GitHubRateLimitError) as e:
+            if raise_errors:
+                raise
+            logger.warning(f"Could not fetch review comments: {e}")
+        return pr_comments
+
+    def fetch_pr_files(self, pr_filter: PRFilter, pr_parser: PRParser) -> FetchedFiles:
+        """Fetch the PR's reviewable files and the point-in-time unified diff snapshot.
+
+        ``skipped_paths`` are the files the filter left out and the files without a patch. The raw per-file patch is captured here — the only place with
+        the file's ``patch`` — into the ``diff`` snapshot, kept out of ``PRFile`` so it doesn't bloat
+        the prompts that dump ``pr_files``. The snapshot is the source for the durable per-turn
+        `commit` artefact (it anchors a finding to the exact reviewed code even after later
+        force-pushes).
+        """
+        try:
+            return _read_files(
+                github_api_get_paginated(
+                    f"/repos/{self.owner}/{self.repo}/pulls/{self.pr_number}/files",
+                    token=self._token,
+                    installation_id=self._installation_id,
+                    endpoint="/repos/{owner}/{repo}/pulls/{pull_number}/files",
+                ),
+                pr_filter,
+                pr_parser,
+            )
+        except (GitHubAPIError, GitHubRateLimitError) as e:
+            raise ValueError(f"Failed to fetch PR files: {e}") from e
+
+    def fetch_merge_base_sha(self, *, base_branch: str, head_sha: str) -> str | None:
+        """The commit GitHub computes the PR's diff against, or None when the compare call fails.
+
+        Best-effort, because only a review that cannot show its whole diff reads it.
+        """
+        try:
+            comparison = github_api_request(
+                "GET",
+                f"/repos/{self.owner}/{self.repo}/compare/{base_branch}...{head_sha}",
+                token=self._token,
+                installation_id=self._installation_id,
+                endpoint="/repos/{owner}/{repo}/compare/{basehead}",
+                # Only the merge base is needed, so ask for the smallest page of commits.
+                params={"per_page": 1},
+            ).json()
+        except (GitHubAPIError, GitHubRateLimitError, requests.RequestException) as error:
+            logger.warning("Could not read the merge base of PR #%s: %s", self.pr_number, type(error).__name__)
+            return None
+        return _merge_base_sha(comparison)
+
+    def fetch_pr_data(self, *, review_tests_and_text: bool = False, with_merge_base: bool = False) -> FetchedPR:
+        """Fetch PR data from the GitHub API, returning everything in-process (no files).
+
+        Returns a `FetchedPR` where ``diff`` is the reviewed files'
+        point-in-time unified patch. ``review_tests_and_text`` keeps test and ``.txt`` files (`PRFilter`).
+        ``with_merge_base`` also reads the merge base, one more API call.
+        """
+        pr = github_api_request(
+            "GET",
+            f"/repos/{self.owner}/{self.repo}/pulls/{self.pr_number}",
+            token=self._token,
+            installation_id=self._installation_id,
+            endpoint="/repos/{owner}/{repo}/pulls/{pull_number}",
+        ).json()
+        pr_filter = PRFilter(review_tests_and_text=review_tests_and_text)
+        pr_parser = PRParser()
+        pr_metadata = self.fetch_pr_metadata(pr)
+        pr_comments = self.fetch_pr_comments(pr_filter)
+        files = self.fetch_pr_files(pr_filter, pr_parser)
+        merge_base_sha = (
+            self.fetch_merge_base_sha(base_branch=pr_metadata.base_branch, head_sha=pr_metadata.head_sha)
+            if with_merge_base and pr_metadata.head_sha
+            else None
+        )
+        logger.info("PR data fetched successfully")
+        return FetchedPR(
+            pr_metadata=pr_metadata,
+            pr_comments=pr_comments,
+            pr_files=files.pr_files,
+            diff=files.diff,
+            merge_base_sha=merge_base_sha,
+            skipped_paths=files.skipped_paths,
+        )

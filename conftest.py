@@ -1,0 +1,439 @@
+import gc
+import os
+import sys
+import atexit
+import warnings
+import contextlib
+from collections.abc import Generator, Iterable, Iterator
+from functools import update_wrapper
+from pathlib import Path
+
+import pytest
+import time_machine
+
+from posthog.test.events_schema_prune import EventsSchemaPruner
+from posthog.test.junit import set_junit_report_location
+
+# The default MIXED mode reads naive strings as local time, so a non-UTC machine would
+# freeze at a different instant than CI does.
+time_machine.naive_mode = time_machine.NaiveMode.UTC  # ty: ignore[invalid-assignment]
+
+# Test-session boot — plugin imports and importing every collected test module —
+# allocates almost exclusively permanent objects, so automatic cyclic GC during that
+# phase only adds pauses (seconds on a full-tree CI shard collection). Run the boot
+# with GC off, then freeze the survivors into the permanent generation so the
+# collector never rescans them during the test phase. Tests themselves run with GC
+# enabled as usual. The window normally opens even earlier, in the pytest_boot_gc
+# plugin (`-p pytest_boot_gc` in pytest.ini), so that django.setup() (which
+# pytest-django runs before conftest files load) sits inside it too; the disable
+# here is the fallback for runs that don't load that plugin.
+gc.disable()
+
+
+def _end_gc_boot_window() -> None:
+    if gc.isenabled():
+        return
+    # Deliberately no gc.collect() before the freeze: sweeping the boot garbage
+    # (including items deselected by pytest-split sharding — measured at ~7k cyclic
+    # objects for a 5-way shard of posthog/api/test) costs ~0.5s per invocation but
+    # reclaims only ~1MB, so the garbage gets frozen along with the survivors.
+    gc.freeze()
+    gc.enable()
+    # Collect far less often than the default (700, 10, 10): test runs allocate heavily and
+    # cyclic garbage is reclaimed fine at these thresholds, while frequent young-gen sweeps
+    # over a large frozen heap cost real wall time (~10% of a unit-heavy suite; measured on
+    # products/warehouse_sources with peak RSS within 1% of the default thresholds).
+    gc.set_threshold(50_000, 20, 20)
+    # gc.get_referrers() cannot see referrers in the frozen permanent generation,
+    # which turns hypothesis's register_random() liveness check into a false positive
+    # for Randoms registered after the freeze (e.g. trio's module-level instance,
+    # registered when hypothesis is first imported). Refcounts are unaffected, so the
+    # ReferenceError path for real misuse still works; only the warning is spurious.
+    warnings.filterwarnings("ignore", message=r"It looks like `register_random` was passed")
+
+
+def _cache_reverse_rel_identity() -> None:
+    # ForeignObjectRel.identity is a plain property that rebuilds a large nested tuple
+    # (including make_hashable over limit_choices_to) on every __eq__/__hash__ call.
+    # Query compilation over models whose default manager applies .defer()/.only()
+    # (Team, User) hashes and compares these rel objects millions of times per test
+    # session. Rel objects are immutable once django.setup() has run, so caching the
+    # identity tuple and its hash per instance is safe and cuts that cost entirely.
+    from functools import cached_property  # noqa: PLC0415 — deferred until pytest_configure
+
+    from django.db.models.fields.reverse_related import (  # noqa: PLC0415 — deferred until pytest_configure
+        ForeignObjectRel,
+    )
+
+    def walk(klass):
+        yield klass
+        for sub in klass.__subclasses__():
+            yield from walk(sub)
+
+    for klass in walk(ForeignObjectRel):
+        prop = klass.__dict__.get("identity")
+        if isinstance(prop, property) and prop.fget is not None:
+            cached = cached_property(prop.fget)
+            cached.__set_name__(klass, "identity")
+            klass.identity = cached  # type: ignore[assignment]
+
+    def cached_hash(self) -> int:
+        try:
+            return self._identity_hash
+        except AttributeError:
+            self._identity_hash = h = hash(self.identity)
+            return h
+
+    ForeignObjectRel.__hash__ = cached_hash  # type: ignore[assignment]
+
+    # __eq__ compares the full identity tuples element by element (each element itself a
+    # Field with a non-trivial __eq__), and dict probing in select-mask construction calls
+    # it millions of times between the same pairs of objects. Rel objects are stable for
+    # the life of the process, so memoize results pairwise; keeping a strong ref to the
+    # other object means its id() can never be recycled while cached.
+    orig_eq = ForeignObjectRel.__eq__
+
+    def cached_eq(self, other):
+        if self is other:
+            return True
+        cache = self.__dict__.get("_eq_cache")
+        if cache is None:
+            cache = self.__dict__["_eq_cache"] = {}
+        entry = cache.get(id(other))
+        if entry is None:
+            entry = cache[id(other)] = (other, orig_eq(self, other))
+        return entry[1]
+
+    # _eq_cache is per-instance and per-session (unbounded), holding strong refs to every
+    # object each rel is ever compared with. Bounded by schema size, not test count, so
+    # harmless in practice — but don't mistake it for a per-test cache.
+    cached_eq.__wrapped__ = orig_eq  # exposes the original for the canary tests
+    ForeignObjectRel.__eq__ = cached_eq  # type: ignore[method-assign, assignment]
+
+
+def _cache_select_masks() -> None:
+    # Query.get_select_mask() rebuilds the defer/only select-mask dict on every queryset
+    # compile. Models whose default manager applies .defer() (Team, User) recompute the
+    # identical mask thousands of times per test session, and building it probes dicts
+    # keyed by fields/rels with expensive __hash__/__eq__. The result is a pure function
+    # of (model meta, defer flag, deferred names) and its only consumer reads it without
+    # mutating, so memoize it. Queries with filtered relations keep the original path.
+    from django.db.models.sql.query import Query  # noqa: PLC0415 — deferred until pytest_configure
+
+    orig_get_select_mask = Query.get_select_mask
+    masks: dict = {}
+
+    def get_select_mask(self):
+        field_names, defer = self.deferred_loading
+        if not field_names:
+            return {}
+        if self._filtered_relations:
+            return orig_get_select_mask(self)
+        key = (self.get_meta(), defer, frozenset(field_names))
+        mask = masks.get(key)
+        if mask is None:
+            mask = masks[key] = orig_get_select_mask(self)
+        return mask
+
+    get_select_mask.__wrapped__ = orig_get_select_mask  # exposes the original for the canary tests
+    Query.get_select_mask = get_select_mask  # type: ignore[method-assign]
+
+
+def _cache_drf_field_info() -> None:
+    # DRF's ModelSerializer.get_fields() calls model_meta.get_field_info(model) on every
+    # serializer *instantiation*, re-walking the model's forward and reverse relations each
+    # time. The result is static per model class and consumers never mutate it, so cache it.
+    from rest_framework.utils import model_meta  # noqa: PLC0415 — deferred until pytest_configure
+
+    orig_get_field_info = model_meta.get_field_info
+    infos: dict = {}
+
+    def get_field_info(model):
+        key = model if isinstance(model, type) else model.__class__
+        info = infos.get(key)
+        if info is None:
+            info = infos[key] = orig_get_field_info(model)
+        return info
+
+    get_field_info.__wrapped__ = orig_get_field_info  # exposes the original for the canary tests
+    model_meta.get_field_info = get_field_info  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
+
+
+def _cache_url_resolution() -> None:
+    # URL resolution walks PostHog's very large nested router linearly on every request
+    # (~thousands of pattern match attempts per resolve). Resolution is deterministic per
+    # (resolver, path) and URLResolver instances are stable module-level objects, so memoize
+    # matches. Keyed weakly by resolver so urlconf overrides (which build new resolvers)
+    # can't alias; the per-hit shallow copy keeps callers free to mutate the match/kwargs.
+    import weakref  # noqa: PLC0415 — deferred until pytest_configure
+
+    from django.urls import resolvers  # noqa: PLC0415 — deferred until pytest_configure
+
+    orig_resolve = resolvers.URLResolver.resolve
+    cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+    def resolve(self, path):
+        by_path = cache.get(self)
+        if by_path is None:
+            by_path = cache.setdefault(self, {})
+        path_str = str(path)
+        hit = by_path.get(path_str)
+        if hit is None:
+            hit = orig_resolve(self, path)
+            by_path[path_str] = hit
+        # ResolverMatch blocks copy.copy via __reduce_ex__, so clone through __dict__.
+        # Copy the kwargs dicts — the attributes consumers realistically mutate — so
+        # mutation can't poison the cached original.
+        match = object.__new__(type(hit))
+        match.__dict__.update(hit.__dict__)
+        match.kwargs = dict(hit.kwargs)
+        match.captured_kwargs = dict(getattr(hit, "captured_kwargs", None) or {})  # ty: ignore[invalid-assignment]
+        match.extra_kwargs = dict(getattr(hit, "extra_kwargs", None) or {})  # ty: ignore[invalid-assignment]
+        return match
+
+    resolve.__wrapped__ = orig_resolve  # exposes the original for the canary tests
+    resolvers.URLResolver.resolve = resolve  # type: ignore[method-assign]
+
+
+def _cache_fixture_parent_nodeids() -> None:
+    # FixtureManager._matchfactories rebuilds a node's parent sets for every fixture-name
+    # lookup, and collection resolves many fixture names per item. A node's parents are fixed at
+    # construction, so the sets can be reused for the collection session.
+    from _pytest import fixtures, nodes  # noqa: PLC0415 — deferred until pytest_configure
+
+    orig_matchfactories = fixtures.FixtureManager._matchfactories
+    parents: dict[nodes.Node, tuple[set[nodes.Node], set[str]]] = {}
+
+    def _matchfactories(
+        self: fixtures.FixtureManager, fixturedefs: Iterable[fixtures.FixtureDef[object]], node: nodes.Node
+    ) -> Iterator[fixtures.FixtureDef[object]]:
+        entry = parents.get(node)
+        if entry is None:
+            parent_nodes = set(node.iter_parents())
+            entry = parents[node] = (parent_nodes, {n.nodeid for n in parent_nodes})
+        parent_nodes, parentnodeids = entry
+        for fixturedef in fixturedefs:
+            if fixturedef.node is not None:
+                if fixturedef.node in parent_nodes:
+                    yield fixturedef
+            elif fixturedef.baseid in parentnodeids:
+                yield fixturedef
+
+    update_wrapper(_matchfactories, orig_matchfactories)
+    fixtures.FixtureManager._matchfactories = _matchfactories  # type: ignore[method-assign]
+
+
+def _report_subtest_failures_as_test_failures() -> None:
+    # pytest 9.1.1 reports unittest subTest failures without the failed-subtest counter that
+    # pytest-rerunfailures 16.7 needs. Removing addSubTest restores fail-fast test-level failures
+    # so retries work and successful retries leave no failures in JUnit XML.
+    from _pytest import unittest as pytest_unittest  # noqa: PLC0415 — deferred until pytest_configure
+
+    if "addSubTest" in vars(pytest_unittest.TestCaseFunction):
+        del pytest_unittest.TestCaseFunction.addSubTest
+
+
+def pytest_configure(config) -> None:
+    _report_subtest_failures_as_test_failures()
+    _cache_reverse_rel_identity()
+    _cache_select_masks()
+    _cache_drf_field_info()
+    _cache_url_resolution()
+    _cache_fixture_parent_nodeids()
+    from posthog.test import authentication_checks  # noqa: PLC0415 — deferred until pytest_configure
+
+    authentication_checks.install()
+    if record_path := os.environ.get("POSTHOG_EVENTS_SCHEMA_RECORD_PATH"):
+        from posthog.test.events_schema_recorder import (  # noqa: PLC0415 - keeps the Temporal client off other runs
+            EventsSchemaRecorder,
+        )
+
+        config.pluginmanager.register(EventsSchemaRecorder(Path(record_path)), "posthog-events-schema-recorder")
+    if prune_manifest := os.environ.get("POSTHOG_EVENTS_SCHEMA_PRUNE_MANIFEST"):
+        config.pluginmanager.register(EventsSchemaPruner(Path(prune_manifest)), "posthog-events-schema-pruner")
+
+
+def pytest_collection_finish() -> None:
+    _end_gc_boot_window()
+    # Collection imports temporalio only when a collected test touches Temporal, so other runs skip the import cost.
+    if "temporalio" in sys.modules:
+        from posthog.test import temporal_test_servers  # noqa: PLC0415 — only runs that use Temporal import it
+
+        temporal_test_servers.install()
+
+
+def _fail_on_caught_peer_lazy_loads() -> None:
+    from posthog.models.scoping import peer_lazy_loads  # noqa: PLC0415
+
+    # A blocked lazy load that app code caught still fails the test phase that made it.
+    if blocked := peer_lazy_loads.finish_test():
+        pytest.fail("\n".join(["Caught FieldFetchBlocked:", *blocked]))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item: pytest.Item) -> Generator[None]:
+    from posthog.models.scoping import peer_lazy_loads  # noqa: PLC0415
+    from posthog.test import authentication_checks  # noqa: PLC0415
+
+    marker = item.get_closest_marker("covers_authentication")
+    authentication_checks.start_test(marker.args if marker else ())
+    peer_lazy_loads.start_test()
+    try:
+        result = yield
+    except (pytest.skip.Exception, pytest.xfail.Exception):
+        # A skip or xfail must not hide a blocked load caught before it.
+        _fail_on_caught_peer_lazy_loads()
+        raise
+    _fail_on_caught_peer_lazy_loads()
+    return result
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Generator[None]:
+    from posthog.test import authentication_checks  # noqa: PLC0415
+
+    try:
+        result = yield
+    except (pytest.skip.Exception, pytest.xfail.Exception):
+        _fail_on_caught_peer_lazy_loads()
+        raise
+    if problems := authentication_checks.finish_test():
+        pytest.fail("\n".join(problems))
+    _fail_on_caught_peer_lazy_loads()
+    return result
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> Generator[None]:
+    from posthog.models.scoping import peer_lazy_loads  # noqa: PLC0415
+
+    # Drop what a failed call left, so teardown reports only its own loads.
+    peer_lazy_loads.start_test()
+    result = yield
+    _fail_on_caught_peer_lazy_loads()
+    return result
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) -> Generator[None]:
+    outcome = yield
+    set_junit_report_location(item, outcome.get_result())
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtestloop() -> None:
+    # Safety net for processes that never run a local collection (e.g. the
+    # pytest-xdist controller): end the window before the test loop starts.
+    _end_gc_boot_window()
+
+
+def pytest_unconfigure() -> None:
+    # Frozen objects skip the final cyclic collections of interpreter shutdown, so their
+    # finalizers run in the late teardown phase where extension modules may already be
+    # gone — observed as exit code 139 (SIGSEGV) on the Temporal CI shards. Restore the
+    # default heap state so shutdown behaves exactly as without the boot window.
+    gc.unfreeze()
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_cmdline_main(config: pytest.Config) -> Generator[None, int | pytest.ExitCode, int | pytest.ExitCode]:
+    exit_code = yield
+    # pytest's wrap_session has already run pytest_sessionfinish (JUnit XML, split durations) and
+    # pytest_unconfigure (including the gc.unfreeze above), and pytest-cov has saved its data.
+    # A green session then skips the interpreter teardown, which frees each object of a large
+    # collection one by one. A failing session exits normally, so no red shard's reports depend on
+    # that ordering. An xdist worker sends its results after this hook, so it exits normally too.
+    if (
+        os.environ.get("POSTHOG_PYTEST_HARD_EXIT") == "1"
+        and exit_code == pytest.ExitCode.OK
+        and "PYTEST_XDIST_WORKER" not in os.environ
+    ):
+        # A private CPython API. It runs the atexit flushes of the analytics client and the report
+        # buffer, but not threading's exit callbacks, so thread pools are not joined.
+        atexit._run_exitfuncs()
+        with contextlib.suppress(BrokenPipeError):
+            sys.stdout.flush()
+            sys.stderr.flush()
+        os._exit(0)
+    return exit_code
+
+
+@pytest.fixture(autouse=True)
+def _activate_personhog_fake(request):
+    """Force all person/group reads through the personhog fake for every test.
+
+    The fake is seeded explicitly by the test helpers in posthog.test.persons
+    (create_person, create_group, etc.).  While the fake is active, ORM access to
+    persons-DB models raises (PersonsDBORMBlockedError) so nothing can silently
+    fall back to the persons DB.
+
+    Tests that exercise the persons DB layer itself (sync, backfill, maintenance
+    commands) opt out with ``@pytest.mark.persons_db_direct`` — either on the
+    class/function or as a module-level ``pytestmark``.
+    """
+    if request.node.get_closest_marker("persons_db_direct"):
+        yield
+        return
+    from posthog.personhog_client.fake_client import activate_personhog_fake  # noqa: PLC0415, I001 — lazy import avoids connecting signals before Django is ready
+
+    with activate_personhog_fake():
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _link_raw_warehouse_source_credentials(request):
+    """Give each warehouse source that a test saves with raw ``job_inputs`` the credentials row and the reference
+    column that ``SourceInputsStore`` would write.
+
+    The store reads connection fields only from that row and OAuth pointers only from that column, so without
+    them a source built with ``ExternalDataSource.objects.create(job_inputs=...)`` cannot be read. Tests that
+    check the stored state of the credentials themselves opt out with
+    ``@pytest.mark.raw_warehouse_source_credentials``, on the class, the function or as a module-level
+    ``pytestmark``.
+    """
+    if request.node.get_closest_marker("raw_warehouse_source_credentials"):
+        yield
+        return
+    # Lazy, so the models do not load before Django is ready.
+    from products.warehouse_sources.backend.facade.testing import link_raw_source_credentials  # noqa: PLC0415
+
+    with link_raw_source_credentials():
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _clean_persons_db_for_direct_tests(request):
+    """Truncate the persons DB before each persons_db_direct test.
+
+    These tests seed the persons DB through off-Django psycopg (posthog.test.persons), which
+    commits outside Django's per-test transaction and so is NOT rolled back at teardown. Because
+    team ids reset every test (the main DB rolls back), leaked rows from a prior test would bleed
+    into the next one's reused team id. Truncating before the test (when no Django persons
+    transaction holds locks yet) clears that carryover without risking a TRUNCATE lock hang.
+    """
+    if not request.node.get_closest_marker("persons_db_direct"):
+        yield
+        return
+
+    from posthog.persons_db import persons_db_connection  # noqa: PLC0415
+
+    with persons_db_connection(writer=True, autocommit=True) as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+            "AND tablename NOT LIKE 'pg_%' AND tablename NOT LIKE '_sqlx_%' AND tablename != '_persons_migrations'"
+        )
+        tables = [row[0] for row in cursor.fetchall()]
+        if tables:
+            cursor.execute(f"TRUNCATE TABLE {', '.join(tables)} RESTART IDENTITY CASCADE")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _query_cache_raw_redis_uses_fakeredis(monkeypatch):
+    """In tests the query_cache alias is backed by LocMem, which has no Redis connection
+    to hand out, so raw-client lookups against it get the shared fakeredis instead."""
+    from posthog import redis  # noqa: PLC0415
+    from posthog.query_cache import storage  # noqa: PLC0415
+
+    monkeypatch.setattr(storage, "query_cache_raw_client", lambda: redis.get_client())
+    monkeypatch.setattr(storage, "query_cache_read_client", lambda: redis.get_client())

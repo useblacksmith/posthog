@@ -1,0 +1,312 @@
+import clsx from 'clsx'
+
+import {
+    LegacyDisplayEntity,
+    formatEventName,
+    getDisplayNameFromEntityFilter,
+    isAllEventsEntityFilter,
+} from 'lib/insights/entityFilterNames'
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { ensureStringIsNotBlank } from 'lib/utils/strings'
+import { getEventDefinitionIcon } from 'scenes/data-management/events/DefinitionHeader'
+import { FEATURE_FLAG_CALLED_EVENT, FLAG_EVALUATIONS_TABLE } from 'scenes/feature-flags/flagEvaluationsTable'
+import { flagCallsSeriesName } from 'scenes/insights/filters/ActionFilter/flagCallsSeries'
+import {
+    SeriesNode,
+    isActionsSeriesNode,
+    isEventsSeriesNode,
+    isGroupSeriesNode,
+    isWarehouseSeriesNode,
+} from 'scenes/insights/filters/ActionFilter/seriesNode'
+
+import { getCoreFilterDefinition } from '~/taxonomy/helpers'
+import { ActionFilter, EntityTypes } from '~/types'
+
+import { TaxonomicFilterGroupType } from './TaxonomicFilter/types'
+
+/** A series reaches this component either as a query node or as the legacy entity filter that
+ *  query responses and the legacy-persisted surfaces still carry. */
+export type DisplayableEntity = LegacyDisplayEntity | ActionFilter | SeriesNode
+
+/** Reads a node into the legacy display fields, so one set of display rules serves both shapes. */
+export type DisplayEntityFilter = (LegacyDisplayEntity | ActionFilter) & { table_name?: string }
+
+export function toDisplayEntityFilter(filter: DisplayableEntity): DisplayEntityFilter {
+    const displayFilter = nodeToDisplayEntityFilter(filter)
+    // Trends and lifecycle results describe a warehouse series as an events entity whose id is the table name.
+    // Funnel results describe a warehouse step with no id and the table name in `name`.
+    if (
+        displayFilter.id === FLAG_EVALUATIONS_TABLE ||
+        (displayFilter.type === EntityTypes.DATA_WAREHOUSE &&
+            (displayFilter.table_name ?? displayFilter.name) === FLAG_EVALUATIONS_TABLE)
+    ) {
+        const name = ensureStringIsNotBlank(displayFilter.name)
+        return {
+            ...displayFilter,
+            type: EntityTypes.EVENTS,
+            id: FEATURE_FLAG_CALLED_EVENT,
+            // Any name other than the table's is a rename, for example one set through the API.
+            name: name && name !== FLAG_EVALUATIONS_TABLE ? name : flagCallsSeriesName(),
+            table_name: undefined,
+        }
+    }
+    return displayFilter
+}
+
+function nodeToDisplayEntityFilter(filter: DisplayableEntity): DisplayEntityFilter {
+    if (!('kind' in filter)) {
+        return filter
+    }
+    const shared = { name: filter.name, custom_name: filter.custom_name }
+    if (isEventsSeriesNode(filter)) {
+        return { ...shared, type: EntityTypes.EVENTS, id: filter.event ?? null }
+    }
+    if (isActionsSeriesNode(filter)) {
+        return { ...shared, type: EntityTypes.ACTIONS, id: filter.id }
+    }
+    if (isWarehouseSeriesNode(filter)) {
+        return { ...shared, type: EntityTypes.DATA_WAREHOUSE, id: filter.table_name, table_name: filter.table_name }
+    }
+    if (isGroupSeriesNode(filter)) {
+        return { ...shared, type: EntityTypes.GROUPS, id: null }
+    }
+    return { ...shared, id: null }
+}
+
+interface UnderlyingEntity {
+    /** The raw key the filter queries: event name as sent, action name, or table name. */
+    raw: string
+    /** Human-readable form of the raw key (core event labels applied). */
+    display: string
+    kind: 'event' | 'events' | 'action' | 'data warehouse table'
+}
+
+/**
+ * The concrete thing a series filter queries, independent of any renames on the series.
+ * A series can be renamed via `custom_name` or by overriding `name` directly (e.g. via the
+ * API), so neither of those fields reliably reveals what is actually being queried.
+ */
+function getUnderlyingEntity(filter: DisplayEntityFilter): UnderlyingEntity | null {
+    if (filter.type === EntityTypes.ACTIONS) {
+        const raw = ensureStringIsNotBlank(filter.name) ?? (filter.id != null ? String(filter.id) : null)
+        return raw ? { raw, display: raw, kind: 'action' } : null
+    }
+    if (filter.type === EntityTypes.DATA_WAREHOUSE) {
+        const tableName =
+            'table_name' in filter && typeof filter.table_name === 'string'
+                ? ensureStringIsNotBlank(filter.table_name)
+                : null
+        const raw = tableName ?? (typeof filter.id === 'string' ? ensureStringIsNotBlank(filter.id) : null)
+        return raw ? { raw, display: raw, kind: 'data warehouse table' } : null
+    }
+    if (filter.type === EntityTypes.GROUPS) {
+        // Inline event groups hold their comma-separated event keys in `name`
+        const raw = ensureStringIsNotBlank(filter.name)
+        return raw ? { raw, display: formatEventName(raw) ?? raw, kind: raw.includes(',') ? 'events' : 'event' } : null
+    }
+    // Events — filters without an explicit type are events by convention
+    if (typeof filter.id === 'string' && filter.id) {
+        return { raw: filter.id, display: formatEventName(filter.id) ?? filter.id, kind: 'event' }
+    }
+    return null
+}
+
+interface EntityFilterDisplayInfo {
+    /** The label users see for the series: `custom_name`, falling back to `name`/`id`. */
+    displayName?: string
+    /** The non-custom label (`name`/`id`) — the reveal for renamed series without a
+     *  single underlying key (an all-events series). */
+    baseName?: string
+    underlying: UnderlyingEntity | null
+    /** True when the label alone doesn't reveal the underlying entity. */
+    isRenamed: boolean
+}
+
+function getEntityFilterDisplayInfo(
+    entity: DisplayableEntity,
+    filterGroupType?: TaxonomicFilterGroupType
+): EntityFilterDisplayInfo {
+    const filter = toDisplayEntityFilter(entity)
+    let name: string | undefined
+    if (isAllEventsEntityFilter(filter) && !filter?.custom_name) {
+        name = 'All events'
+    } else {
+        const raw = getDisplayNameFromEntityFilter(filter, false)
+        name =
+            (filterGroupType ? getCoreFilterDefinition(raw, filterGroupType)?.label?.trim() : null) ?? raw ?? undefined
+    }
+    const customName = filter?.custom_name ? (getDisplayNameFromEntityFilter(filter, true) ?? undefined) : undefined
+    const displayName = customName ?? name
+    const underlying = getUnderlyingEntity(filter)
+    return {
+        displayName,
+        baseName: name,
+        underlying,
+        // A label equal to either form of the underlying key already reveals it — e.g. a
+        // name-less `$pageview` series displays the raw key itself, so it isn't a rename.
+        isRenamed:
+            !!displayName && !!underlying && underlying.display !== displayName && underlying.raw !== displayName,
+    }
+}
+
+export interface SeriesRename {
+    /** The label users see for the series. */
+    label: string
+    /** The raw key the series actually queries. */
+    raw: string
+}
+
+/**
+ * The rename a series carries, when its label hides the thing it queries — the pickers
+ * use it to label the committed selection like the series the user clicked. Data
+ * warehouse series keep their own committed-selection affordance, so they never report one.
+ */
+export function getSeriesRename(entity: DisplayableEntity | null | undefined): SeriesRename | null {
+    if (!entity) {
+        return null
+    }
+    const filter = toDisplayEntityFilter(entity)
+    if (filter.type === EntityTypes.DATA_WAREHOUSE) {
+        return null
+    }
+    const { displayName, underlying, isRenamed } = getEntityFilterDisplayInfo(filter)
+    return isRenamed && displayName && underlying ? { label: displayName, raw: underlying.raw } : null
+}
+
+function EntityFilterInfoTooltipTitle({
+    displayName,
+    underlying,
+}: {
+    displayName: string
+    underlying: UnderlyingEntity | null
+}): JSX.Element {
+    return (
+        <div className="flex flex-col gap-0.5">
+            <span className="font-semibold">{displayName}</span>
+            {underlying &&
+                underlying.raw !== displayName &&
+                (underlying.kind === 'event' || underlying.kind === 'events' ? (
+                    <span>
+                        {underlying.kind === 'events' ? 'Events sent as' : 'Event sent as'}{' '}
+                        <code>{underlying.raw}</code>
+                    </span>
+                ) : underlying.kind === 'action' ? (
+                    <span>Action: {underlying.raw}</span>
+                ) : (
+                    <span>
+                        Data warehouse table: <code>{underlying.raw}</code>
+                    </span>
+                ))}
+        </div>
+    )
+}
+
+interface EntityFilterInfoProps {
+    filter?: DisplayableEntity | null
+    allowWrap?: boolean
+    showSingleName?: boolean
+    style?: React.CSSProperties
+    layout?: 'row' | 'column'
+    filterGroupType?: TaxonomicFilterGroupType
+    isOptional?: boolean
+    showIcon?: boolean
+}
+
+export function EntityFilterInfo({
+    filter: entity,
+    allowWrap = false,
+    showSingleName = false,
+    style,
+    layout = 'row',
+    filterGroupType,
+    isOptional = false,
+    showIcon = false,
+}: EntityFilterInfoProps): JSX.Element {
+    const isColumn = layout === 'column'
+    const isRow = !isColumn && !allowWrap
+
+    // `filter` is null for formula series (and can be absent for other callers); render nothing
+    // rather than dereferencing it in getEntityFilterDisplayInfo.
+    if (!entity) {
+        return <></>
+    }
+    const filter = toDisplayEntityFilter(entity)
+
+    const { displayName, baseName, underlying, isRenamed } = getEntityFilterDisplayInfo(filter, filterGroupType)
+
+    // Reveal the underlying entity (and the tooltip) only when the label hides it — an
+    // unrenamed series keeps a single plain label. A renamed series without a single
+    // underlying key (an all-events series) falls back to revealing its base name.
+    const underlyingName = isRenamed
+        ? underlying?.display
+        : filter?.custom_name && baseName && baseName !== displayName
+          ? baseName
+          : undefined
+    const showTooltip = isRenamed
+
+    const icon = showIcon
+        ? getEventDefinitionIcon({
+              id: String(filter.id ?? ''),
+              name: filter.name || String(filter.id ?? ''),
+              is_action: filter.type === EntityTypes.ACTIONS,
+              is_data_warehouse: filter.type === EntityTypes.DATA_WAREHOUSE,
+          })
+        : null
+
+    const content = (
+        // eslint-disable-next-line react/forbid-dom-props
+        <span
+            className={clsx(
+                isColumn
+                    ? 'flex flex-col items-start gap-0.5'
+                    : isRow && 'flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap'
+            )}
+            style={style}
+        >
+            <span className={clsx((icon || isRow) && 'inline-flex items-center gap-1 max-w-full', isRow && 'min-w-0')}>
+                {icon}
+                <span
+                    className={clsx(
+                        'EntityFilterInfo max-w-full',
+                        !allowWrap && 'whitespace-nowrap truncate',
+                        isRow && 'min-w-0'
+                    )}
+                    title={showTooltip ? undefined : displayName}
+                >
+                    {displayName}
+                </span>
+            </span>
+            {isOptional && (
+                <span
+                    className={clsx(
+                        'text-xs font-normal text-secondary normal-case',
+                        isRow ? 'shrink-0' : !isColumn && 'ml-1'
+                    )}
+                >
+                    (optional)
+                </span>
+            )}
+            {underlyingName && !showSingleName && (
+                <span
+                    className={clsx(
+                        'EntityFilterInfo max-w-full text-secondary text-xs',
+                        isColumn ? (icon ? 'ml-5' : '') : isRow ? 'min-w-0 shrink-[100]' : 'ml-1',
+                        !allowWrap && 'whitespace-nowrap truncate'
+                    )}
+                    title={showTooltip ? undefined : underlyingName}
+                >
+                    {underlyingName}
+                </span>
+            )}
+        </span>
+    )
+
+    if (!showTooltip || !displayName) {
+        return content
+    }
+    return (
+        <Tooltip title={<EntityFilterInfoTooltipTitle displayName={displayName} underlying={underlying} />}>
+            {content}
+        </Tooltip>
+    )
+}

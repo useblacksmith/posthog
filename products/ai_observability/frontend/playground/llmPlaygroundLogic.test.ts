@@ -1,0 +1,2202 @@
+import { router } from 'kea-router'
+import { expectLogic } from 'kea-test-utils'
+
+import { urls } from 'scenes/urls'
+
+import { resumeKeaLoadersErrors, silenceKeaLoadersErrors } from '~/initKea'
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+
+import { modelPickerLogic, type ModelOption } from '../modelPickerLogic'
+import { llmPlaygroundModelLogic } from './llmPlaygroundModelLogic'
+import { createPromptConfig, llmPlaygroundPromptsLogic } from './llmPlaygroundPromptsLogic'
+import { llmPlaygroundRunLogic } from './llmPlaygroundRunLogic'
+
+const MOCK_MODEL_OPTIONS: ModelOption[] = [
+    { id: 'gpt-4.1', name: 'GPT-4.1', provider: 'OpenAI', description: '', isRecommended: false },
+    { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', provider: 'OpenAI', description: '', isRecommended: false },
+    { id: 'gpt-5', name: 'GPT-5', provider: 'OpenAI', description: '', isRecommended: false },
+    { id: 'gpt-5-mini', name: 'GPT-5 Mini', provider: 'OpenAI', description: '', isRecommended: false },
+    { id: 'claude-3-opus', name: 'Claude 3 Opus', provider: 'Anthropic', description: '', isRecommended: false },
+]
+
+const DEFAULT_MODEL = 'gpt-5-mini'
+
+describe('llmPlaygroundLogic', () => {
+    let runLogic: ReturnType<typeof llmPlaygroundRunLogic.build>
+
+    beforeEach(() => {
+        initKeaTests()
+
+        useMocks({
+            get: {
+                '/api/llm_proxy/models/': MOCK_MODEL_OPTIONS,
+                '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                    active_provider_key: null,
+                },
+                '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                    results: [],
+                },
+            },
+        })
+
+        runLogic = llmPlaygroundRunLogic()
+        runLogic.mount()
+    })
+
+    afterEach(() => {
+        runLogic.unmount()
+    })
+
+    describe('closest model matching', () => {
+        it('should return exact match when model exists', async () => {
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'gpt-5',
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5')
+        })
+
+        it('should match by longest prefix', async () => {
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'gpt-5-mini-2025-08-07',
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5-mini')
+        })
+
+        it('should match shorter prefix when longer not available', async () => {
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'gpt-5-2025-08-07',
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5')
+        })
+
+        it('should return default model when no match found', async () => {
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'llama-3-70b',
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe(DEFAULT_MODEL)
+        })
+
+        it('should handle empty model list gracefully', async () => {
+            useMocks({
+                get: {
+                    '/api/llm_proxy/models/': [],
+                    '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                        active_provider_key: null,
+                    },
+                    '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                        results: [],
+                    },
+                },
+            })
+
+            // Reload playground models so the empty mock takes effect
+            modelPickerLogic.actions.loadPlaygroundModels()
+
+            const emptyRunLogic = llmPlaygroundRunLogic()
+            emptyRunLogic.mount()
+
+            await expectLogic(emptyRunLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'gpt-5-2025-08-07',
+                input: 'test input',
+            })
+
+            // No models available yet, so preserve the requested model instead of guessing.
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5-2025-08-07')
+
+            emptyRunLogic.unmount()
+        })
+    })
+
+    describe('setupPlaygroundFromEvent model matching', () => {
+        it('should resolve pending model after model options load when setup happens early', async () => {
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'gpt-5-2025-08-07',
+                input: 'test input',
+            })
+
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5')
+        })
+
+        it('should set valid model directly', async () => {
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'claude-3-opus',
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('claude-3-opus')
+        })
+
+        it('should handle missing model in payload', async () => {
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            const originalModel = llmPlaygroundPromptsLogic.values.model
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe(originalModel)
+        })
+
+        it('should preserve other payload data when model matching', async () => {
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            const testInput = 'Hello, world!'
+            const testTools = [{ name: 'search', description: 'Search tool' }]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'gpt-5-2025-08-07',
+                input: testInput,
+                tools: testTools,
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5')
+            expect(llmPlaygroundPromptsLogic.values.tools).toEqual(testTools)
+            expect(llmPlaygroundPromptsLogic.values.messages.length).toBeGreaterThan(0)
+        })
+
+        it('should prefer longer prefix matches', async () => {
+            const extendedMockOptions = [
+                ...MOCK_MODEL_OPTIONS,
+                { id: 'gpt-5-mini-turbo', name: 'GPT-5 Mini Turbo', provider: 'OpenAI', description: '' },
+            ]
+
+            useMocks({
+                get: {
+                    '/api/llm_proxy/models/': extendedMockOptions,
+                    '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                        active_provider_key: null,
+                    },
+                    '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                        results: [],
+                    },
+                },
+            })
+
+            // Reload playground models with the extended mock data
+            modelPickerLogic.actions.loadPlaygroundModels()
+
+            const testRunLogic = llmPlaygroundRunLogic()
+            testRunLogic.mount()
+
+            await expectLogic(testRunLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'gpt-5-mini-turbo-2025',
+                input: 'test',
+            })
+
+            // 'gpt-5-mini-turbo' is the longest prefix match (16 chars vs 10 for 'gpt-5-mini')
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5-mini-turbo')
+
+            testRunLogic.unmount()
+        })
+
+        it('should keep trace model ID and map to the matching provider key', async () => {
+            const byokModels: ModelOption[] = [
+                {
+                    id: 'anthropic/claude-sonnet-4',
+                    name: 'Claude Sonnet 4',
+                    provider: 'openrouter',
+                    description: '',
+                },
+            ]
+
+            runLogic.unmount()
+
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                        active_provider_key: null,
+                    },
+                    '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                        results: [{ id: 'openrouter-key-1', provider: 'openrouter', state: 'ok' }],
+                    },
+                    '/api/llm_proxy/models/': ({ request }) => {
+                        if (new URL(request.url).searchParams.get('provider_key_id') === 'openrouter-key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                    '/api/projects/:team_id/llm_analytics/provider_keys/:key_id/models/': ({ params }) => {
+                        if (params.key_id === 'openrouter-key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                },
+            })
+
+            const testRunLogic = llmPlaygroundRunLogic()
+            testRunLogic.mount()
+            await expectLogic(testRunLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'anthropic/claude-sonnet-4',
+                provider: 'gateway',
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('anthropic/claude-sonnet-4')
+            expect(llmPlaygroundPromptsLogic.values.selectedProviderKeyId).toBe('openrouter-key-1')
+
+            testRunLogic.unmount()
+        })
+
+        it('should keep trace model ID even when setup runs before keys/models load', async () => {
+            const byokModels: ModelOption[] = [
+                {
+                    id: 'anthropic/claude-sonnet-4-5-20250929',
+                    name: 'Claude Sonnet 4.5',
+                    provider: 'openrouter',
+                    description: '',
+                },
+            ]
+
+            runLogic.unmount()
+
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                        active_provider_key: null,
+                    },
+                    '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                        results: [{ id: 'openrouter-key-1', provider: 'openrouter', state: 'ok' }],
+                    },
+                    '/api/llm_proxy/models/': ({ request }) => {
+                        if (new URL(request.url).searchParams.get('provider_key_id') === 'openrouter-key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                    '/api/projects/:team_id/llm_analytics/provider_keys/:key_id/models/': ({ params }) => {
+                        if (params.key_id === 'openrouter-key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                },
+            })
+
+            const testRunLogic = llmPlaygroundRunLogic()
+            testRunLogic.mount()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'anthropic/claude-sonnet-4-5-20250929',
+                provider: 'gateway',
+                input: 'test input',
+            })
+
+            await expectLogic(testRunLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('anthropic/claude-sonnet-4-5-20250929')
+            expect(llmPlaygroundPromptsLogic.values.selectedProviderKeyId).toBe('openrouter-key-1')
+
+            testRunLogic.unmount()
+        })
+
+        it('should map gateway snapshot model IDs to the closest same-prefix catalog model', async () => {
+            const byokModels: ModelOption[] = [
+                {
+                    id: 'anthropic/claude-sonnet-4.5',
+                    name: 'Claude Sonnet 4.5',
+                    provider: 'openrouter',
+                    description: '',
+                },
+            ]
+
+            runLogic.unmount()
+
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                        active_provider_key: null,
+                    },
+                    '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                        results: [{ id: 'openrouter-key-1', provider: 'openrouter', state: 'ok' }],
+                    },
+                    '/api/llm_proxy/models/': ({ request }) => {
+                        if (new URL(request.url).searchParams.get('provider_key_id') === 'openrouter-key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                    '/api/projects/:team_id/llm_analytics/provider_keys/:key_id/models/': ({ params }) => {
+                        if (params.key_id === 'openrouter-key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                },
+            })
+
+            const testRunLogic = llmPlaygroundRunLogic()
+            testRunLogic.mount()
+            await expectLogic(testRunLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'anthropic/claude-sonnet-4-5-20250929',
+                provider: 'gateway',
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('anthropic/claude-sonnet-4.5')
+            expect(llmPlaygroundPromptsLogic.values.selectedProviderKeyId).toBe('openrouter-key-1')
+
+            testRunLogic.unmount()
+        })
+
+        it('should consistently pick the first provider key by sorted order when multiple keys match', async () => {
+            const byokModelId = 'anthropic/claude-sonnet-4'
+
+            runLogic.unmount()
+
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                        active_provider_key: null,
+                    },
+                    '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                        // Deliberately reverse API order to ensure we don't pick "last loaded"
+                        results: [
+                            { id: 'openrouter-key-z', provider: 'openrouter', name: 'Z key', state: 'ok' },
+                            { id: 'openrouter-key-a', provider: 'openrouter', name: 'A key', state: 'ok' },
+                        ],
+                    },
+                    '/api/llm_proxy/models/': ({ request }) => {
+                        const providerKeyId = new URL(request.url).searchParams.get('provider_key_id')
+                        if (providerKeyId === 'openrouter-key-z' || providerKeyId === 'openrouter-key-a') {
+                            return [
+                                200,
+                                [
+                                    {
+                                        id: byokModelId,
+                                        name: 'Claude Sonnet 4',
+                                        provider: 'openrouter',
+                                        description: '',
+                                    },
+                                ],
+                            ]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                    '/api/projects/:team_id/llm_analytics/provider_keys/:key_id/models/': ({ params }) => {
+                        const providerKeyId = params.key_id
+                        if (providerKeyId === 'openrouter-key-z' || providerKeyId === 'openrouter-key-a') {
+                            return [
+                                200,
+                                [
+                                    {
+                                        id: byokModelId,
+                                        name: 'Claude Sonnet 4',
+                                        provider: 'openrouter',
+                                        description: '',
+                                    },
+                                ],
+                            ]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                },
+            })
+
+            const testRunLogic = llmPlaygroundRunLogic()
+            testRunLogic.mount()
+            await expectLogic(testRunLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'anthropic/claude-sonnet-4',
+                provider: 'gateway',
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe(byokModelId)
+            expect(llmPlaygroundPromptsLogic.values.selectedProviderKeyId).toBe('openrouter-key-a')
+
+            testRunLogic.unmount()
+        })
+
+        it('should keep playground model selection even when BYOK models are available', async () => {
+            const byokModels: ModelOption[] = [
+                {
+                    id: 'anthropic/claude-sonnet-4.5',
+                    name: 'Claude Sonnet 4.5',
+                    provider: 'openrouter',
+                    description: '',
+                },
+            ]
+
+            runLogic.unmount()
+
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                        active_provider_key: null,
+                    },
+                    '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                        results: [{ id: 'openrouter-key-1', provider: 'openrouter', state: 'ok' }],
+                    },
+                    '/api/llm_proxy/models/': ({ request }) => {
+                        if (new URL(request.url).searchParams.get('provider_key_id') === 'openrouter-key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                    '/api/projects/:team_id/llm_analytics/provider_keys/:key_id/models/': ({ params }) => {
+                        if (params.key_id === 'openrouter-key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                },
+            })
+
+            const testRunLogic = llmPlaygroundRunLogic()
+            testRunLogic.mount()
+            await expectLogic(testRunLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                model: 'gpt-5-mini',
+                provider: 'gateway',
+                input: 'test input',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5-mini')
+            expect(llmPlaygroundPromptsLogic.values.selectedProviderKeyId).toBe(null)
+
+            testRunLogic.unmount()
+        })
+    })
+
+    describe('loadPlaygroundModels auto-correction', () => {
+        it('should auto-correct invalid model after loading playground models', async () => {
+            const testRunLogic = llmPlaygroundRunLogic()
+            testRunLogic.mount()
+
+            llmPlaygroundPromptsLogic.actions.setModel('gpt-5-2025-08-07')
+
+            modelPickerLogic.actions.loadPlaygroundModels()
+
+            await expectLogic(testRunLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5')
+
+            testRunLogic.unmount()
+        })
+
+        it('should not change valid models during loading', async () => {
+            llmPlaygroundPromptsLogic.actions.setModel('claude-3-opus')
+
+            const testRunLogic = llmPlaygroundRunLogic()
+            testRunLogic.mount()
+
+            await expectLogic(testRunLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('claude-3-opus')
+
+            testRunLogic.unmount()
+        })
+
+        it('should preserve playground models when reload fails', async () => {
+            // The reload deliberately fails the loadPlaygroundModels loader.
+            silenceKeaLoadersErrors()
+            try {
+                await expectLogic(runLogic).toFinishAllListeners()
+                expect(modelPickerLogic.values.playgroundModels).toEqual(MOCK_MODEL_OPTIONS)
+
+                useMocks({
+                    get: {
+                        '/api/llm_proxy/models/': () => [500, { detail: 'API Error' }],
+                        '/api/environments/:team_id/llm_analytics/evaluation_config/': () => [
+                            500,
+                            { detail: 'API Error' },
+                        ],
+                        '/api/environments/:team_id/llm_analytics/provider_keys/': () => [500, { detail: 'API Error' }],
+                    },
+                })
+
+                modelPickerLogic.actions.loadPlaygroundModels()
+                await expectLogic(runLogic).toFinishAllListeners()
+
+                expect(modelPickerLogic.values.playgroundModels).toEqual(MOCK_MODEL_OPTIONS)
+            } finally {
+                resumeKeaLoadersErrors()
+            }
+        })
+    })
+
+    describe('Message Management', () => {
+        it('should clear all messages when clearConversation is called', () => {
+            llmPlaygroundPromptsLogic.actions.addMessage({ role: 'user', content: 'Hello' })
+            llmPlaygroundPromptsLogic.actions.addMessage({ role: 'assistant', content: 'Hi there!' })
+            llmPlaygroundPromptsLogic.actions.addMessage({ role: 'system', content: 'System message' })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toHaveLength(3)
+
+            llmPlaygroundPromptsLogic.actions.clearConversation()
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toHaveLength(0)
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([])
+        })
+
+        it('should delete message at specific index', () => {
+            llmPlaygroundPromptsLogic.actions.setMessages([
+                { role: 'user', content: 'First' },
+                { role: 'assistant', content: 'Second' },
+                { role: 'user', content: 'Third' },
+            ])
+
+            llmPlaygroundPromptsLogic.actions.deleteMessage(1)
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'First' },
+                { role: 'user', content: 'Third' },
+            ])
+        })
+
+        it('should handle deleteMessage with invalid indices gracefully', () => {
+            llmPlaygroundPromptsLogic.actions.setMessages([{ role: 'user', content: 'Only message' }])
+
+            llmPlaygroundPromptsLogic.actions.deleteMessage(-1)
+            expect(llmPlaygroundPromptsLogic.values.messages).toHaveLength(1)
+
+            llmPlaygroundPromptsLogic.actions.deleteMessage(5)
+            expect(llmPlaygroundPromptsLogic.values.messages).toHaveLength(1)
+
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toBe('Only message')
+        })
+
+        it('should add messages with different roles', () => {
+            llmPlaygroundPromptsLogic.actions.addMessage({ role: 'user', content: 'User message' })
+            llmPlaygroundPromptsLogic.actions.addMessage({ role: 'assistant', content: 'Assistant message' })
+            llmPlaygroundPromptsLogic.actions.addMessage({ role: 'system', content: 'System message' })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'User message' },
+                { role: 'assistant', content: 'Assistant message' },
+                { role: 'system', content: 'System message' },
+            ])
+        })
+
+        it('should add message with default values when partial message provided', () => {
+            llmPlaygroundPromptsLogic.actions.addMessage({ content: 'Just content' })
+
+            expect(llmPlaygroundPromptsLogic.values.messages[0]).toEqual({
+                role: 'user', // default role
+                content: 'Just content',
+            })
+
+            llmPlaygroundPromptsLogic.actions.addMessage({ role: 'assistant' })
+
+            expect(llmPlaygroundPromptsLogic.values.messages[1]).toEqual({
+                role: 'assistant',
+                content: '', // default content
+            })
+        })
+
+        it('should update message at specific index', () => {
+            llmPlaygroundPromptsLogic.actions.setMessages([
+                { role: 'user', content: 'Original' },
+                { role: 'assistant', content: 'Response' },
+            ])
+
+            llmPlaygroundPromptsLogic.actions.updateMessage(0, { content: 'Updated content' })
+
+            expect(llmPlaygroundPromptsLogic.values.messages[0]).toEqual({
+                role: 'user',
+                content: 'Updated content',
+            })
+
+            llmPlaygroundPromptsLogic.actions.updateMessage(1, { role: 'user', content: 'Changed everything' })
+
+            expect(llmPlaygroundPromptsLogic.values.messages[1]).toEqual({
+                role: 'user',
+                content: 'Changed everything',
+            })
+        })
+
+        it('should not update message with invalid index', () => {
+            llmPlaygroundPromptsLogic.actions.setMessages([{ role: 'user', content: 'Original' }])
+
+            const originalMessages = [...llmPlaygroundPromptsLogic.values.messages]
+
+            llmPlaygroundPromptsLogic.actions.updateMessage(-1, { content: 'Should not update' })
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual(originalMessages)
+
+            llmPlaygroundPromptsLogic.actions.updateMessage(10, { content: 'Should not update' })
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual(originalMessages)
+        })
+
+        it('should swap a message with its neighbor and ignore moves past the edges', () => {
+            llmPlaygroundPromptsLogic.actions.setMessages([
+                { role: 'user', content: 'first' },
+                { role: 'assistant', content: 'second' },
+                { role: 'user', content: 'third' },
+            ])
+
+            llmPlaygroundPromptsLogic.actions.moveMessage(2, 'up')
+            expect(llmPlaygroundPromptsLogic.values.messages.map((m) => m.content)).toEqual([
+                'first',
+                'third',
+                'second',
+            ])
+
+            llmPlaygroundPromptsLogic.actions.moveMessage(0, 'up')
+            llmPlaygroundPromptsLogic.actions.moveMessage(2, 'down')
+            expect(llmPlaygroundPromptsLogic.values.messages.map((m) => m.content)).toEqual([
+                'first',
+                'third',
+                'second',
+            ])
+        })
+
+        it('should append a result as an assistant message and start the next user turn', () => {
+            llmPlaygroundPromptsLogic.actions.setMessages([{ role: 'user', content: 'Hello' }])
+
+            llmPlaygroundPromptsLogic.actions.addResultToConversation('Hi there!')
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Hello' },
+                { role: 'assistant', content: 'Hi there!' },
+                { role: 'user', content: '' },
+            ])
+        })
+
+        it('should start an empty tool result per call so the user can mock answers and run again', () => {
+            llmPlaygroundPromptsLogic.actions.setMessages([{ role: 'user', content: 'Weather?' }])
+
+            llmPlaygroundPromptsLogic.actions.addResultToConversation('', [
+                { id: 'call_1', name: 'get_weather', arguments: '{"location": "Paris"}' },
+                { id: 'call_2', name: 'get_weather', arguments: '{"location": "Rome"}' },
+            ])
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Weather?' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [
+                        { id: 'call_1', name: 'get_weather', arguments: '{"location": "Paris"}' },
+                        { id: 'call_2', name: 'get_weather', arguments: '{"location": "Rome"}' },
+                    ],
+                },
+                { role: 'tool', content: '', toolCallId: 'call_1', toolName: 'get_weather' },
+                { role: 'tool', content: '', toolCallId: 'call_2', toolName: 'get_weather' },
+            ])
+        })
+
+        it('should append a result to the targeted prompt without changing other prompt columns', () => {
+            llmPlaygroundPromptsLogic.actions.setPromptConfigs([
+                createPromptConfig({
+                    id: 'prompt-one',
+                    messages: [{ role: 'user', content: 'First prompt' }],
+                }),
+                createPromptConfig({
+                    id: 'prompt-two',
+                    messages: [{ role: 'user', content: 'Second prompt' }],
+                }),
+            ])
+
+            llmPlaygroundPromptsLogic.actions.addResultToConversation('Second response', undefined, 'prompt-two')
+
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs).toMatchObject([
+                {
+                    id: 'prompt-one',
+                    messages: [{ role: 'user', content: 'First prompt' }],
+                },
+                {
+                    id: 'prompt-two',
+                    messages: [
+                        { role: 'user', content: 'Second prompt' },
+                        { role: 'assistant', content: 'Second response' },
+                        { role: 'user', content: '' },
+                    ],
+                },
+            ])
+        })
+
+        it.each([
+            ['empty string', ''],
+            ['whitespace only', '   \n  '],
+        ])('should ignore %s responses so the action cannot add blank assistant turns', (_, response) => {
+            const original = [{ role: 'user' as const, content: 'Hello' }]
+            llmPlaygroundPromptsLogic.actions.setMessages(original)
+
+            llmPlaygroundPromptsLogic.actions.addResultToConversation(response)
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual(original)
+        })
+    })
+
+    describe('effectiveModelOptions', () => {
+        it('should return playground models when no BYOK keys exist', async () => {
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundModelLogic.values.effectiveModelOptions).toEqual(MOCK_MODEL_OPTIONS)
+        })
+
+        it('should return playground models when all keys are invalid', async () => {
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                        active_provider_key: null,
+                    },
+                    '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                        results: [{ id: 'key-1', provider: 'openai', state: 'invalid' }],
+                    },
+                    '/api/llm_proxy/models/': MOCK_MODEL_OPTIONS,
+                },
+            })
+
+            const testRunLogic = llmPlaygroundRunLogic()
+            testRunLogic.mount()
+            await expectLogic(testRunLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundModelLogic.values.hasByokKeys).toBe(false)
+            expect(llmPlaygroundModelLogic.values.effectiveModelOptions).toEqual(MOCK_MODEL_OPTIONS)
+
+            testRunLogic.unmount()
+        })
+
+        it('should return playground models when provider keys API fails', async () => {
+            // The provider keys loader deliberately fails here.
+            silenceKeaLoadersErrors()
+            try {
+                useMocks({
+                    get: {
+                        '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                            active_provider_key: null,
+                        },
+                        '/api/environments/:team_id/llm_analytics/provider_keys/': () => [500, { detail: 'API Error' }],
+                        '/api/llm_proxy/models/': MOCK_MODEL_OPTIONS,
+                    },
+                })
+
+                const testRunLogic = llmPlaygroundRunLogic()
+                testRunLogic.mount()
+                await expectLogic(testRunLogic).toFinishAllListeners()
+
+                expect(llmPlaygroundModelLogic.values.effectiveModelOptions).toEqual(MOCK_MODEL_OPTIONS)
+
+                testRunLogic.unmount()
+            } finally {
+                resumeKeaLoadersErrors()
+            }
+        })
+
+        it('should return BYOK models when valid keys exist and models have loaded', async () => {
+            const byokModels: ModelOption[] = [{ id: 'gpt-4.1', name: 'GPT-4.1', provider: 'OpenAI', description: '' }]
+
+            runLogic.unmount()
+
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/llm_analytics/evaluation_config/': {
+                        active_provider_key: null,
+                    },
+                    '/api/environments/:team_id/llm_analytics/provider_keys/': {
+                        results: [{ id: 'key-1', provider: 'openai', state: 'ok' }],
+                    },
+                    '/api/llm_proxy/models/': ({ request }) => {
+                        if (new URL(request.url).searchParams.get('provider_key_id') === 'key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                    '/api/projects/:team_id/llm_analytics/provider_keys/:key_id/models/': ({ params }) => {
+                        if (params.key_id === 'key-1') {
+                            return [200, byokModels]
+                        }
+                        return [200, MOCK_MODEL_OPTIONS]
+                    },
+                },
+            })
+
+            runLogic = llmPlaygroundRunLogic()
+            runLogic.mount()
+            await expectLogic(runLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundModelLogic.values.hasByokKeys).toBe(true)
+            expect(llmPlaygroundModelLogic.values.effectiveModelOptions).toEqual(
+                byokModels.map((m) => ({
+                    ...m,
+                    isRecommended: false,
+                    providerKeyId: 'key-1',
+                    supportsDecisions: false,
+                    supportsChat: true,
+                    supportsReasoning: false,
+                }))
+            )
+        })
+    })
+
+    describe('setupPlaygroundFromEvent Input Processing', () => {
+        it('should handle array input with system, user, and assistant messages', () => {
+            const input = [
+                { role: 'system', content: 'You are a helpful assistant.' },
+                { role: 'user', content: 'Hello' },
+                { role: 'assistant', content: 'Hi there!' },
+                { role: 'user', content: 'How are you?' },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.systemPrompt).toBe('You are a helpful assistant.')
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Hello' },
+                { role: 'assistant', content: 'Hi there!' },
+                { role: 'user', content: 'How are you?' },
+            ])
+        })
+
+        it('should concatenate multiple system messages', () => {
+            const input = [
+                { role: 'system', content: 'You are a helpful assistant.' },
+                { role: 'system', content: 'Always respond in a friendly manner.' },
+                { role: 'system', content: 'Use markdown formatting when appropriate.' },
+                { role: 'user', content: 'Hello' },
+                { role: 'assistant', content: 'Hi there!' },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.systemPrompt).toBe(
+                'You are a helpful assistant.\n\nAlways respond in a friendly manner.\n\nUse markdown formatting when appropriate.'
+            )
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Hello' },
+                { role: 'assistant', content: 'Hi there!' },
+            ])
+        })
+
+        it('should normalize role names (ai/model to assistant)', () => {
+            const input = [
+                { role: 'user', content: 'Question' },
+                { role: 'ai', content: 'AI response' },
+                { role: 'model', content: 'Model response' },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Question' },
+                { role: 'assistant', content: 'AI response' },
+                { role: 'assistant', content: 'Model response' },
+            ])
+        })
+
+        it('should handle string input as initial user message', () => {
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                input: 'Simple string prompt',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Simple string prompt' },
+            ])
+            expect(llmPlaygroundPromptsLogic.values.systemPrompt).toBe('You are a helpful AI assistant.')
+        })
+
+        it('should handle object input with content field', () => {
+            const input = {
+                content: 'Content from object',
+                someOtherField: 'ignored',
+            }
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Content from object' },
+            ])
+        })
+
+        it('should handle object input with non-string content field', () => {
+            const input = {
+                content: { nested: 'data', array: [1, 2, 3] },
+            }
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages[0].role).toBe('user')
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toContain('"nested"')
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toContain('"data"')
+            const content = llmPlaygroundPromptsLogic.values.messages[0].content
+            expect(content).toContain('1')
+            expect(content).toContain('2')
+            expect(content).toContain('3')
+            expect(content).toContain('array')
+        })
+
+        it('should JSON stringify object without content field', () => {
+            const input = {
+                someField: 'value',
+                anotherField: 123,
+            }
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages[0].role).toBe('user')
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toContain('"someField"')
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toContain('"value"')
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toContain('123')
+        })
+
+        it.each([
+            [
+                'an array',
+                [
+                    { type: 'function', function: { name: 'search', description: 'Search tool' } },
+                    { type: 'function', function: { name: 'calculator', description: 'Math tool' } },
+                ],
+                [
+                    { type: 'function', function: { name: 'search', description: 'Search tool' } },
+                    { type: 'function', function: { name: 'calculator', description: 'Math tool' } },
+                ],
+            ],
+            [
+                'a dictionary',
+                {
+                    search: { type: 'function', function: { name: 'search', description: 'Search tool' } },
+                    calculator: { type: 'function', function: { name: 'calculator', description: 'Math tool' } },
+                },
+                [
+                    { type: 'function', function: { name: 'search', description: 'Search tool' } },
+                    { type: 'function', function: { name: 'calculator', description: 'Math tool' } },
+                ],
+            ],
+            [
+                'a single tool object',
+                { type: 'function', function: { name: 'search', description: 'Search tool' } },
+                [{ type: 'function', function: { name: 'search', description: 'Search tool' } }],
+            ],
+            [
+                'a provider container',
+                { functionDeclarations: [{ name: 'search', description: 'Search tool' }] },
+                [{ functionDeclarations: [{ name: 'search', description: 'Search tool' }] }],
+            ],
+        ])('should handle tools parameter as %s', (_, tools, expectedTools) => {
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                input: 'Test',
+                tools,
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.tools).toEqual(expectedTools)
+        })
+
+        it('should default messages with unknown roles to user', () => {
+            const input = [
+                { role: 'user', content: 'Valid user' },
+                { role: 'invalid_role', content: 'Unknown role defaults to user' },
+                { role: 'assistant', content: 'Valid assistant' },
+                { role: 'unknown', content: 'Also defaults to user' },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Valid user' },
+                { role: 'user', content: 'Unknown role defaults to user' },
+                { role: 'assistant', content: 'Valid assistant' },
+                { role: 'user', content: 'Also defaults to user' },
+            ])
+        })
+
+        it('should handle messages with non-string content', () => {
+            const input = [
+                { role: 'user', content: { text: 'Complex content' } },
+                { role: 'assistant', content: ['array', 'content'] },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toContain('"text"')
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toContain('"Complex content"')
+            // Pretty-printed JSON array
+            expect(llmPlaygroundPromptsLogic.values.messages[1].content).toContain('"array"')
+            expect(llmPlaygroundPromptsLogic.values.messages[1].content).toContain('"content"')
+        })
+
+        it('should extract plain text from trace-style content arrays', () => {
+            const input = [
+                { role: 'user', content: [{ text: 'hi', type: 'text' }] },
+                { role: 'assistant', content: [{ text: 'PART 1/2: Let me check that.', type: 'text' }] },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'hi' },
+                { role: 'assistant', content: 'PART 1/2: Let me check that.' },
+            ])
+        })
+
+        it('should handle OpenAI-style messages with tool_calls and null content', () => {
+            const input = [
+                { role: 'user', content: 'What is the weather in Paris?' },
+                {
+                    role: 'assistant',
+                    content: null,
+                    tool_calls: [
+                        {
+                            type: 'function',
+                            id: 'call_123',
+                            function: { name: 'get_weather', arguments: '{"city": "Paris"}' },
+                        },
+                    ],
+                },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'What is the weather in Paris?' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'call_123', name: 'get_weather', arguments: '{"city": "Paris"}' }],
+                },
+            ])
+        })
+
+        it.each([
+            {
+                name: 'Anthropic mixed text + tool_use',
+                content: [
+                    { type: 'text', text: 'Let me search for that.' },
+                    { type: 'tool_use', id: 'tu_1', name: 'search', input: { query: 'cats' } },
+                ],
+                expectedMessages: [
+                    {
+                        role: 'assistant',
+                        content: 'Let me search for that.',
+                        toolCalls: [
+                            { id: 'tu_1', name: 'search', arguments: JSON.stringify({ query: 'cats' }, null, 2) },
+                        ],
+                    },
+                ],
+            },
+            {
+                name: 'Anthropic tool_use only',
+                content: [{ type: 'tool_use', id: 'tu_1', name: 'do_thing', input: { param: 'value' } }],
+                expectedMessages: [
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [
+                            { id: 'tu_1', name: 'do_thing', arguments: JSON.stringify({ param: 'value' }, null, 2) },
+                        ],
+                    },
+                ],
+            },
+            {
+                name: 'Anthropic tool_result',
+                content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'Result data here' }],
+                expectedMessages: [{ role: 'tool', content: 'Result data here', toolCallId: 'tu_1' }],
+            },
+            {
+                name: 'OpenAI Responses API function_call',
+                content: [{ type: 'function_call', name: 'my_func', call_id: 'fc_1', arguments: '{"x": 1}' }],
+                expectedMessages: [
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [{ id: 'fc_1', name: 'my_func', arguments: '{"x": 1}' }],
+                    },
+                ],
+            },
+            {
+                name: 'OpenAI Responses API function_call_output',
+                content: [{ type: 'function_call_output', call_id: 'fc_1', output: 'result: 42' }],
+                expectedMessages: [{ role: 'tool', content: 'result: 42', toolCallId: 'fc_1' }],
+            },
+        ])('should import $name content blocks as structured turns', ({ content, expectedMessages }) => {
+            const input = [{ role: 'assistant', content }]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual(expectedMessages)
+        })
+
+        it('should import tool-role messages as tool turns with the name resolved from the call', () => {
+            const input = [
+                { role: 'user', content: 'What year was Python created?' },
+                {
+                    role: 'assistant',
+                    content: null,
+                    tool_calls: [
+                        {
+                            type: 'function',
+                            id: 'call_abc',
+                            function: { name: 'research', arguments: '{"question":"..."}' },
+                        },
+                    ],
+                },
+                { role: 'tool', tool_call_id: 'call_abc', content: 'Python was created in 1991.' },
+                { role: 'assistant', content: 'Python was created in 1991.' },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'What year was Python created?' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'call_abc', name: 'research', arguments: '{"question":"..."}' }],
+                },
+                {
+                    role: 'tool',
+                    content: 'Python was created in 1991.',
+                    toolCallId: 'call_abc',
+                    toolName: 'research',
+                },
+                { role: 'assistant', content: 'Python was created in 1991.' },
+            ])
+        })
+
+        it('should import Anthropic-style tool_result user messages as tool turns', () => {
+            const input = [
+                { role: 'user', content: 'Search cats' },
+                {
+                    role: 'assistant',
+                    content: [{ type: 'tool_use', id: 'tu_1', name: 'search', input: { query: 'cats' } }],
+                },
+                {
+                    role: 'user',
+                    content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'Found 42 cats' }],
+                },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Search cats' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'tu_1', name: 'search', arguments: JSON.stringify({ query: 'cats' }, null, 2) }],
+                },
+                { role: 'tool', content: 'Found 42 cats', toolCallId: 'tu_1', toolName: 'search' },
+            ])
+        })
+
+        it('should import a tool message without a preceding assistant as a tool turn without a name', () => {
+            const input = [{ role: 'tool', tool_call_id: 'call_123', content: 'Weather in Paris: 22°C' }]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'tool', content: 'Weather in Paris: 22°C', toolCallId: 'call_123' },
+            ])
+        })
+
+        it('should import a tool message without a tool_call_id as a tool turn without an id', () => {
+            const input = [{ role: 'tool', content: 'Some result' }]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([{ role: 'tool', content: 'Some result' }])
+        })
+
+        it('should handle OpenAI Responses API top-level function_call and function_call_output items in input', () => {
+            // The Responses API sends function_call and function_call_output items at the top level
+            // of the conversation array alongside regular role-bearing messages, but with no `role`.
+            const input = [
+                { role: 'system', content: 'You are a helpful assistant.' },
+                { role: 'user', content: 'What is the weather?' },
+                {
+                    type: 'function_call',
+                    name: 'ask_clarification',
+                    call_id: 'call_abc123',
+                    arguments: '{"question":"Which city?","options":["London","Paris"]}',
+                },
+                {
+                    type: 'function_call_output',
+                    call_id: 'call_abc123',
+                    output: 'London',
+                },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            // system is extracted; the call and its output become structured turns
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'What is the weather?' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [
+                        {
+                            id: 'call_abc123',
+                            name: 'ask_clarification',
+                            arguments: '{"question":"Which city?","options":["London","Paris"]}',
+                        },
+                    ],
+                },
+                { role: 'tool', content: 'London', toolCallId: 'call_abc123', toolName: 'ask_clarification' },
+            ])
+        })
+
+        it('should handle OpenAI Responses API function_call item in output', () => {
+            // Matches $ai_output_choices shape when the model responds with a tool call
+            const input = [{ role: 'user', content: 'Find me some products' }]
+            const output = [
+                {
+                    type: 'function_call',
+                    name: 'search_products',
+                    call_id: 'call_def456',
+                    arguments: '{"queries":["blue widgets"]}',
+                    id: 'fc_001',
+                    status: 'completed',
+                },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input, output })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Find me some products' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [
+                        { id: 'call_def456', name: 'search_products', arguments: '{"queries":["blue widgets"]}' },
+                    ],
+                },
+            ])
+        })
+
+        it('should import function_call and function_call_output items in output as structured turns', () => {
+            // A function_call followed immediately by function_call_output in $ai_output_choices
+            const input = [{ role: 'user', content: 'What is the weather in Paris?' }]
+            const output = [
+                {
+                    type: 'function_call',
+                    name: 'get_weather',
+                    call_id: 'call_ghi789',
+                    arguments: '{"city":"Paris"}',
+                    status: 'completed',
+                },
+                {
+                    type: 'function_call_output',
+                    call_id: 'call_ghi789',
+                    output: '22°C, sunny',
+                    status: 'completed',
+                },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input, output })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'What is the weather in Paris?' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'call_ghi789', name: 'get_weather', arguments: '{"city":"Paris"}' }],
+                },
+                { role: 'tool', content: '22°C, sunny', toolCallId: 'call_ghi789', toolName: 'get_weather' },
+            ])
+        })
+
+        it('should not produce "null" string for messages with null content', () => {
+            const input = [{ role: 'user', content: null, tool_calls: [] }]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toHaveLength(1)
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).not.toBe('null')
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toBe('')
+        })
+
+        it('should not crash when content contains circular references or BigInt values', () => {
+            const circular: Record<string, unknown> = { foo: 'bar' }
+            circular.self = circular
+            const input = [
+                { role: 'user', content: circular },
+                { role: 'assistant', content: [{ type: 'tool_use', name: 'x', input: { big: 1n } }] },
+            ]
+
+            expect(() => llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })).not.toThrow()
+            expect(llmPlaygroundPromptsLogic.values.messages).toHaveLength(2)
+            // Fallbacks are stringified via String(), not empty — we just verify content exists.
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).not.toBe('')
+            expect(llmPlaygroundPromptsLogic.values.messages[1].toolCalls?.[0].name).toBe('x')
+        })
+
+        it('should append output as assistant messages alongside input', () => {
+            const input = [{ role: 'user', content: 'Hello' }]
+            const output = [{ role: 'assistant', content: 'Hi there!' }]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input, output })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Hello' },
+                { role: 'assistant', content: 'Hi there!' },
+            ])
+        })
+
+        it('should append output with structured content blocks', () => {
+            const input = [{ role: 'user', content: 'Search for cats' }]
+            const output = [
+                {
+                    role: 'assistant',
+                    content: [
+                        { type: 'text', text: 'Let me search.' },
+                        { type: 'tool_use', id: 'tu_1', name: 'search', input: { query: 'cats' } },
+                    ],
+                },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input, output })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Search for cats' },
+                {
+                    role: 'assistant',
+                    content: 'Let me search.',
+                    toolCalls: [{ id: 'tu_1', name: 'search', arguments: JSON.stringify({ query: 'cats' }, null, 2) }],
+                },
+            ])
+        })
+
+        it('should handle OpenAI Responses API output (type: "message" with output_text content blocks)', () => {
+            const input = [{ role: 'user', content: 'hello' }]
+            // Shape matches $ai_output_choices from a real gpt-5 Responses API trace: the outer array
+            // elements carry `type: "message"` and `role: "assistant"` at the top level, and the text
+            // lives in `output_text` content blocks (not `text`). This exercises the generic object
+            // branch of flattenOutputMessages (no `choices`/`message` wrapper) plus formatContentBlock's
+            // output_text case.
+            const output = [
+                {
+                    type: 'message',
+                    role: 'assistant',
+                    status: 'completed',
+                    content: [
+                        {
+                            type: 'output_text',
+                            text: 'Hi! What are you shopping for today?',
+                            annotations: [],
+                            logprobs: [],
+                        },
+                    ],
+                },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input, output })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'hello' },
+                { role: 'assistant', content: 'Hi! What are you shopping for today?' },
+            ])
+        })
+
+        it('should unwrap OpenAI choices-shaped output', () => {
+            const input = [{ role: 'user', content: 'Hi' }]
+            const output = {
+                choices: [
+                    {
+                        finish_reason: 'stop',
+                        index: 0,
+                        message: { role: 'assistant', content: 'Hello!' },
+                    },
+                ],
+            }
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input, output })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Hi' },
+                { role: 'assistant', content: 'Hello!' },
+            ])
+        })
+
+        it('should not stack-overflow on deeply nested message wrappers in output', () => {
+            // Simulate a pathological `{ message: { message: … } }` chain deeper than the cap.
+            let output: unknown = { role: 'assistant', content: 'buried' }
+            for (let i = 0; i < 500; i++) {
+                output = { message: output }
+            }
+            const input = [{ role: 'user', content: 'hi' }]
+
+            expect(() => llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input, output })).not.toThrow()
+            // The wrapper chain is longer than MAX_OUTPUT_FLATTEN_DEPTH (100), so the output is
+            // dropped entirely and only the input message remains.
+            expect(llmPlaygroundPromptsLogic.values.messages).toHaveLength(1)
+            expect(llmPlaygroundPromptsLogic.values.messages[0]).toEqual({ role: 'user', content: 'hi' })
+        })
+
+        it('should default output messages without a role to assistant', () => {
+            const output = [{ content: 'Standalone reply' }]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ output })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toHaveLength(1)
+            expect(llmPlaygroundPromptsLogic.values.messages[0]).toEqual({
+                role: 'assistant',
+                content: 'Standalone reply',
+            })
+        })
+
+        it('should format OpenAI-style top-level tool_calls in output', () => {
+            const input = [{ role: 'user', content: 'What is the weather in Paris?' }]
+            const output = [
+                {
+                    role: 'assistant',
+                    content: null,
+                    tool_calls: [
+                        {
+                            type: 'function',
+                            id: 'call_abc',
+                            function: { name: 'get_weather', arguments: '{"city": "Paris"}' },
+                        },
+                    ],
+                },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input, output })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'What is the weather in Paris?' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'call_abc', name: 'get_weather', arguments: '{"city": "Paris"}' }],
+                },
+            ])
+        })
+
+        it('should reset to default system prompt when none provided', () => {
+            llmPlaygroundPromptsLogic.actions.setSystemPrompt('Custom prompt')
+
+            const input = [
+                { role: 'user', content: 'No system message here' },
+                { role: 'assistant', content: 'Response' },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.systemPrompt).toBe('You are a helpful AI assistant.')
+        })
+
+        it('should preserve existing model if not provided in payload', () => {
+            llmPlaygroundPromptsLogic.actions.setModel('claude-3-opus')
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                input: 'Test without model',
+            })
+
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('claude-3-opus')
+        })
+
+        it('should populate playground from Gemini OTel parts-shaped input', () => {
+            // Matches what opentelemetry-instrumentation-google-generativeai emits in gen_ai.input.messages.
+            const input = [
+                { role: 'user', parts: [{ type: 'text', content: 'What is the capital of France?' }] },
+                { role: 'model', parts: [{ type: 'text', content: 'The capital of France is Paris.' }] },
+                { role: 'user', parts: [{ type: 'text', content: 'And of Spain?' }] },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'What is the capital of France?' },
+                { role: 'assistant', content: 'The capital of France is Paris.' },
+                { role: 'user', content: 'And of Spain?' },
+            ])
+        })
+
+        it('should populate system prompt + conversation from a Gemini OTel trace shape', () => {
+            // After Fix A (ingestion) prepends the system message synthesized from gen_ai.system_instructions,
+            // the playground sees a mix of standard `{role, content}` and OTel parts-shaped items.
+            const input = [
+                { role: 'system', content: 'You are a concise assistant.' },
+                { role: 'user', parts: [{ type: 'text', content: 'Tell me about Paris.' }] },
+                { role: 'model', parts: [{ type: 'text', content: 'Paris is the capital of France.' }] },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            expect(llmPlaygroundPromptsLogic.values.systemPrompt).toBe('You are a concise assistant.')
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([
+                { role: 'user', content: 'Tell me about Paris.' },
+                { role: 'assistant', content: 'Paris is the capital of France.' },
+            ])
+        })
+
+        it('should join multi-part text content for OTel parts messages', () => {
+            const input = [
+                {
+                    role: 'user',
+                    parts: [
+                        { type: 'text', content: 'First chunk.' },
+                        { type: 'text', content: 'Second chunk.' },
+                    ],
+                },
+            ]
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({ input })
+
+            const message = llmPlaygroundPromptsLogic.values.messages[0]
+            expect(message.role).toBe('user')
+            expect(message.content).toBe('First chunk.\n\nSecond chunk.')
+        })
+    })
+
+    describe('Multi-prompt state management', () => {
+        it('should start with a single prompt config', () => {
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs).toHaveLength(1)
+            expect(llmPlaygroundPromptsLogic.values.activePromptId).toBe(
+                llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            )
+        })
+
+        it('should duplicate the source prompt when adding a new prompt', () => {
+            const originalPrompt = llmPlaygroundPromptsLogic.values.promptConfigs[0]
+            llmPlaygroundPromptsLogic.actions.setSystemPrompt('Custom system prompt')
+            llmPlaygroundPromptsLogic.actions.addMessage({ role: 'user', content: 'Hello' })
+
+            llmPlaygroundPromptsLogic.actions.addPromptConfig(originalPrompt.id)
+
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs).toHaveLength(2)
+            const newPrompt = llmPlaygroundPromptsLogic.values.promptConfigs[1]
+            expect(newPrompt.id).not.toBe(originalPrompt.id)
+            expect(newPrompt.systemPrompt).toBe('Custom system prompt')
+            expect(newPrompt.messages).toEqual([{ role: 'user', content: 'Hello' }])
+        })
+
+        it('should set activePromptId to the new prompt on add', () => {
+            const originalId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            llmPlaygroundPromptsLogic.actions.addPromptConfig(originalId)
+
+            const newPrompt = llmPlaygroundPromptsLogic.values.promptConfigs[1]
+            expect(llmPlaygroundPromptsLogic.values.activePromptId).toBe(newPrompt.id)
+        })
+
+        it('should fall back to last prompt when no sourcePromptId provided', () => {
+            llmPlaygroundPromptsLogic.actions.addPromptConfig()
+
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs).toHaveLength(2)
+        })
+
+        it('should remove a prompt config', () => {
+            const firstId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            llmPlaygroundPromptsLogic.actions.addPromptConfig(firstId)
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs).toHaveLength(2)
+
+            const secondId = llmPlaygroundPromptsLogic.values.promptConfigs[1].id
+            llmPlaygroundPromptsLogic.actions.removePromptConfig(secondId)
+
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs).toHaveLength(1)
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs[0].id).toBe(firstId)
+        })
+
+        it('should not allow removing the last prompt config', () => {
+            const onlyId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            llmPlaygroundPromptsLogic.actions.removePromptConfig(onlyId)
+
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs).toHaveLength(1)
+        })
+
+        it('should switch activePromptId when the active prompt is removed', () => {
+            const firstId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            llmPlaygroundPromptsLogic.actions.addPromptConfig(firstId)
+            const secondId = llmPlaygroundPromptsLogic.values.promptConfigs[1].id
+
+            expect(llmPlaygroundPromptsLogic.values.activePromptId).toBe(secondId)
+
+            llmPlaygroundPromptsLogic.actions.removePromptConfig(secondId)
+
+            expect(llmPlaygroundPromptsLogic.values.activePromptId).toBe(firstId)
+        })
+
+        it('should not change activePromptId when a non-active prompt is removed', () => {
+            const firstId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            llmPlaygroundPromptsLogic.actions.addPromptConfig(firstId)
+            const secondId = llmPlaygroundPromptsLogic.values.promptConfigs[1].id
+
+            llmPlaygroundPromptsLogic.actions.setActivePromptId(firstId)
+            expect(llmPlaygroundPromptsLogic.values.activePromptId).toBe(firstId)
+
+            llmPlaygroundPromptsLogic.actions.removePromptConfig(secondId)
+
+            expect(llmPlaygroundPromptsLogic.values.activePromptId).toBe(firstId)
+        })
+
+        it('should target the first prompt when no promptId provided to setModel', () => {
+            const firstPrompt = llmPlaygroundPromptsLogic.values.promptConfigs[0]
+            llmPlaygroundPromptsLogic.actions.addPromptConfig(firstPrompt.id)
+
+            llmPlaygroundPromptsLogic.actions.setModel('claude-3-opus')
+
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs[0].model).toBe('claude-3-opus')
+        })
+
+        it('should target a specific prompt when promptId is provided', () => {
+            const firstId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            llmPlaygroundPromptsLogic.actions.addPromptConfig(firstId)
+            const secondId = llmPlaygroundPromptsLogic.values.promptConfigs[1].id
+
+            llmPlaygroundPromptsLogic.actions.setSystemPrompt('Prompt 2 system', secondId)
+
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs[0].systemPrompt).not.toBe('Prompt 2 system')
+            expect(llmPlaygroundPromptsLogic.values.promptConfigs[1].systemPrompt).toBe('Prompt 2 system')
+        })
+    })
+
+    describe('Comparison items', () => {
+        it('should start with empty comparison items', () => {
+            expect(llmPlaygroundRunLogic.values.comparisonItems).toEqual([])
+        })
+
+        it('should add items to comparison', () => {
+            const item = {
+                id: 'test-1',
+                promptId: 'prompt-1',
+                model: 'gpt-5',
+                systemPrompt: 'test',
+                requestMessages: [],
+                response: 'Hello',
+            }
+
+            llmPlaygroundRunLogic.actions.addToComparison(item)
+
+            expect(llmPlaygroundRunLogic.values.comparisonItems).toHaveLength(1)
+            expect(llmPlaygroundRunLogic.values.comparisonItems[0]).toEqual(item)
+        })
+
+        it('should update a comparison item by id', () => {
+            const item = {
+                id: 'test-1',
+                promptId: 'prompt-1',
+                model: 'gpt-5',
+                systemPrompt: 'test',
+                requestMessages: [],
+                response: '',
+            }
+
+            llmPlaygroundRunLogic.actions.addToComparison(item)
+            llmPlaygroundRunLogic.actions.updateComparisonItem('test-1', { response: 'Updated response' })
+
+            expect(llmPlaygroundRunLogic.values.comparisonItems[0].response).toBe('Updated response')
+        })
+
+        it('should clear comparison items on submitPrompt', () => {
+            llmPlaygroundRunLogic.actions.addToComparison({
+                id: 'test-1',
+                promptId: 'prompt-1',
+                model: 'gpt-5',
+                systemPrompt: 'test',
+                requestMessages: [],
+                response: 'old response',
+            })
+
+            expect(llmPlaygroundRunLogic.values.comparisonItems).toHaveLength(1)
+
+            llmPlaygroundRunLogic.actions.submitPrompt()
+
+            expect(llmPlaygroundRunLogic.values.comparisonItems).toEqual([])
+        })
+    })
+
+    describe('deleteMessage bounds check', () => {
+        it.each([
+            { index: -1, description: 'negative index' },
+            { index: 5, description: 'out-of-bounds index' },
+        ])('should not modify messages with $description', ({ index }) => {
+            llmPlaygroundPromptsLogic.actions.setMessages([{ role: 'user', content: 'Only message' }])
+
+            llmPlaygroundPromptsLogic.actions.deleteMessage(index)
+
+            expect(llmPlaygroundPromptsLogic.values.messages).toHaveLength(1)
+            expect(llmPlaygroundPromptsLogic.values.messages[0].content).toBe('Only message')
+        })
+    })
+
+    describe('linkedSource', () => {
+        it('should return null source when no source is set', () => {
+            expect(llmPlaygroundPromptsLogic.values.linkedSource).toEqual({
+                type: null,
+                promptName: null,
+                promptVersion: null,
+                evaluationId: null,
+                evaluationName: null,
+            })
+        })
+
+        it('should reflect source after setupPlaygroundFromEvent with sourcePromptName', async () => {
+            useMocks({
+                get: {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': {
+                        id: 'prompt-123',
+                        name: 'my-prompt',
+                        prompt: 'You are helpful.',
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'prompt',
+                sourcePromptName: 'my-prompt',
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            const linked = llmPlaygroundPromptsLogic.values.linkedSource
+            expect(linked.type).toBe('prompt')
+            expect(linked.promptName).toBe('my-prompt')
+        })
+
+        it('should reflect source after setupPlaygroundFromEvent with sourceEvaluationId', async () => {
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/evaluations/:id/': {
+                        id: 'eval-456',
+                        name: 'my-eval',
+                        evaluation_type: 'llm_judge',
+                        evaluation_config: { prompt: 'Judge this.' },
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'evaluation',
+                sourceEvaluationId: 'eval-456',
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            const linked = llmPlaygroundPromptsLogic.values.linkedSource
+            expect(linked.type).toBe('evaluation')
+            expect(linked.evaluationId).toBe('eval-456')
+            expect(linked.evaluationName).toBe('my-eval')
+        })
+
+        it('should clear linked source', async () => {
+            useMocks({
+                get: {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': {
+                        id: 'prompt-123',
+                        name: 'my-prompt',
+                        prompt: 'You are helpful.',
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'prompt',
+                sourcePromptName: 'my-prompt',
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.clearLinkedSource()
+
+            const linked = llmPlaygroundPromptsLogic.values.linkedSource
+            expect(linked.type).toBeNull()
+            expect(linked.promptName).toBeNull()
+        })
+    })
+
+    describe('setupPlaygroundFromEvent with source', () => {
+        it('should set system prompt from fetched prompt', async () => {
+            useMocks({
+                get: {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': {
+                        id: 'prompt-1',
+                        name: 'test-prompt',
+                        prompt: 'Be concise.',
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'prompt',
+                sourcePromptName: 'test-prompt',
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundPromptsLogic.values.systemPrompt).toBe('Be concise.')
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([])
+        })
+
+        it('should restore the whole panel from a prompt saved with playground config', async () => {
+            await expectLogic(runLogic).toFinishAllListeners()
+            useMocks({
+                get: {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': {
+                        id: 'prompt-full',
+                        name: 'full-prompt',
+                        prompt: 'You help {{customer}}.',
+                        config: {
+                            model: 'gpt-5',
+                            provider: 'openai',
+                            // A key this team does not have: model matching should still land on gpt-5
+                            provider_key_id: 'key-from-another-team',
+                            temperature: 0.7,
+                            max_tokens: 1024,
+                            thinking: true,
+                            reasoning_effort: 'high',
+                            tools: [{ type: 'function', function: { name: 'lookup' } }],
+                            response_format: {
+                                type: 'json_schema',
+                                json_schema: { name: 'verdict', schema: { type: 'object' }, strict: true },
+                            },
+                            messages: [{ role: 'user', content: 'Hi {{name}}' }],
+                        },
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'prompt',
+                sourcePromptName: 'full-prompt',
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundPromptsLogic.values.systemPrompt).toBe('You help {{customer}}.')
+            expect(llmPlaygroundPromptsLogic.values.messages).toEqual([{ role: 'user', content: 'Hi {{name}}' }])
+            expect(llmPlaygroundPromptsLogic.values.temperature).toBe(0.7)
+            expect(llmPlaygroundPromptsLogic.values.maxTokens).toBe(1024)
+            expect(llmPlaygroundPromptsLogic.values.thinking).toBe(true)
+            expect(llmPlaygroundPromptsLogic.values.reasoningLevel).toBe('high')
+            expect(llmPlaygroundPromptsLogic.values.tools).toEqual([{ type: 'function', function: { name: 'lookup' } }])
+            expect(llmPlaygroundPromptsLogic.values.responseFormat).toEqual({
+                type: 'json_schema',
+                json_schema: { name: 'verdict', schema: { type: 'object' }, strict: true },
+            })
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5')
+        })
+
+        it.each(['boolean', 'numeric'])('loads a %s evaluation into Playground', async (outputType) => {
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/evaluations/:id/': {
+                        id: 'eval-1',
+                        name: 'judge-eval',
+                        evaluation_type: 'llm_judge',
+                        output_type: outputType,
+                        evaluation_config: { prompt: 'Rate the response.' },
+                        model_configuration: { model: 'gpt-5', provider_key_id: null },
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'evaluation',
+                sourceEvaluationId: 'eval-1',
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundPromptsLogic.values.systemPrompt).toBe('Rate the response.')
+            expect(llmPlaygroundPromptsLogic.values.model).toBe('gpt-5')
+            expect(router.values.searchParams).toHaveProperty('source_evaluation_id', 'eval-1')
+        })
+
+        it('should show error toast when prompt fetch fails', async () => {
+            useMocks({
+                get: {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': () => [404, { detail: 'Not found' }],
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'prompt',
+                sourcePromptName: 'nonexistent-prompt',
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(llmPlaygroundPromptsLogic.values.sourceSetupLoading).toBe(false)
+        })
+
+        it('syncs source param via replace, not push (regression for pageview loop)', async () => {
+            // Previously `finishSourceSetup` used `router.actions.push`, which adds a history
+            // entry and fires a `$pageview` on every setup. If `urlToAction` re-entered the
+            // setup path (e.g. because multiple keyed logic instances were mounted), each
+            // iteration pushed another history entry, producing thousands of pageviews per
+            // minute on the AI observability playground. Switching to `replace` keeps history
+            // bounded so a single missed dedup cannot snowball.
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/evaluations/:id/': {
+                        id: 'eval-1',
+                        name: 'judge-eval',
+                        evaluation_type: 'llm_judge',
+                        evaluation_config: { prompt: 'Rate.' },
+                    },
+                },
+            })
+
+            const initialHistoryLength = window.history.length
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'evaluation',
+                sourceEvaluationId: 'eval-1',
+            })
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(router.values.searchParams).toHaveProperty('source_evaluation_id', 'eval-1')
+            expect(window.history.length).toBe(initialHistoryLength)
+        })
+
+        it('urlToAction runs setup for the single playground instance from source params', async () => {
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/evaluations/:id/': {
+                        id: 'eval-2',
+                        name: 'judge-eval',
+                        evaluation_type: 'llm_judge',
+                        evaluation_config: { prompt: 'Rate.' },
+                    },
+                },
+            })
+
+            const instance = llmPlaygroundPromptsLogic()
+            instance.mount()
+
+            try {
+                router.actions.push(`${urls.aiObservabilityPlayground()}?source_evaluation_id=eval-2&_=${Date.now()}`)
+                await expectLogic(instance).toFinishAllListeners()
+
+                expect(instance.values.linkedSource).toMatchObject({
+                    type: 'evaluation',
+                    evaluationId: 'eval-2',
+                })
+            } finally {
+                instance.unmount()
+            }
+        })
+    })
+
+    describe('save actions', () => {
+        it('saveAsNewPrompt should call create API with the full panel in config', async () => {
+            let createBody: Record<string, any> | undefined
+            useMocks({
+                post: {
+                    '/api/projects/:team_id/llm_prompts/': async ({ request }) => {
+                        createBody = (await request.json()) as Record<string, any>
+                        return [201, { id: 'new-1', name: 'saved-prompt', prompt: 'test' }]
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setSystemPrompt('My system prompt')
+            llmPlaygroundPromptsLogic.actions.setTemperature(0.3)
+            llmPlaygroundPromptsLogic.actions.addMessage({ role: 'user', content: 'Hi {{name}}' })
+            const promptId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            llmPlaygroundPromptsLogic.actions.saveAsNewPrompt(promptId, 'saved-prompt', {
+                model: 'gpt-5',
+                provider: 'openai',
+                provider_key_id: null,
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(createBody).toMatchObject({
+                name: 'saved-prompt',
+                prompt: 'My system prompt',
+                config: {
+                    model: 'gpt-5',
+                    provider: 'openai',
+                    temperature: 0.3,
+                    messages: [{ role: 'user', content: 'Hi {{name}}' }],
+                },
+            })
+            expect(router.values.searchParams).toHaveProperty('source_prompt_name', 'saved-prompt')
+            expect(router.values.searchParams).not.toHaveProperty('source_evaluation_id')
+        })
+
+        it.each([
+            { output_type: 'boolean', output_config: undefined },
+            { output_type: 'boolean', output_config: { allows_na: true, true_is_failure: true } },
+            {
+                output_type: 'numeric',
+                output_config: { min: 0, max: 100, allows_na: true, passing_rule: { operator: 'gte', threshold: 70 } },
+            },
+            { output_type: 'sentiment', output_config: { aggregate: 'mean' } },
+        ])('saveAsNewEvaluation preserves output settings: %j', async ({ output_type, output_config }) => {
+            let createdBody: Record<string, unknown> | undefined
+            useMocks({
+                get: {
+                    '/api/projects/:team_id/evaluations/:id/': { output_type, output_config },
+                },
+                post: {
+                    '/api/environments/:team_id/evaluations/': async ({ request }) => {
+                        createdBody = (await request.json()) as Record<string, unknown>
+                        return [201, { id: 'eval-new', name: 'saved-eval' }]
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setSystemPrompt('Judge prompt')
+            const promptId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            if (output_config) {
+                llmPlaygroundPromptsLogic.actions.setPromptConfigs([
+                    {
+                        ...llmPlaygroundPromptsLogic.values.promptConfigs[0],
+                        sourceType: 'evaluation',
+                        sourceEvaluationId: 'eval-source',
+                    },
+                ])
+            }
+            llmPlaygroundPromptsLogic.actions.saveAsNewEvaluation(promptId, 'saved-eval', {
+                model: 'gpt-5',
+                provider: 'openai',
+                provider_key_id: null,
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(createdBody).toMatchObject({
+                evaluation_config: { prompt: 'Judge prompt' },
+                output_type: output_type === 'sentiment' ? 'boolean' : output_type,
+                enabled: false,
+            })
+            expect(createdBody?.output_config).toEqual(output_type === 'sentiment' ? undefined : output_config)
+            expect(router.values.searchParams).toHaveProperty('source_evaluation_id', 'eval-new')
+            expect(router.values.searchParams).not.toHaveProperty('source_prompt_name')
+        })
+
+        it('does not create a boolean copy when the source evaluation cannot be loaded', async () => {
+            const createEvaluation = jest.fn(() => [201, { id: 'eval-new', name: 'saved-eval' }])
+            useMocks({
+                get: {
+                    '/api/projects/:team_id/evaluations/:id/': () => [404, { detail: 'Not found' }],
+                },
+                post: {
+                    '/api/environments/:team_id/evaluations/': createEvaluation,
+                },
+            })
+            const prompt = llmPlaygroundPromptsLogic.values.promptConfigs[0]
+            llmPlaygroundPromptsLogic.actions.setPromptConfigs([
+                { ...prompt, sourceType: 'evaluation', sourceEvaluationId: 'eval-missing' },
+            ])
+            llmPlaygroundPromptsLogic.actions.saveAsNewEvaluation(prompt.id, 'saved-eval', {
+                model: 'gpt-5',
+                provider: 'openai',
+                provider_key_id: null,
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(createEvaluation).not.toHaveBeenCalled()
+            expect(llmPlaygroundPromptsLogic.values.saving).toBe(false)
+        })
+
+        it('saveToLinkedPrompt publishes the panel config and preserves config keys it does not own', async () => {
+            let updateBody: Record<string, any> | undefined
+            useMocks({
+                get: {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': {
+                        id: 'prompt-linked',
+                        name: 'linked',
+                        prompt: 'Old prompt.',
+                        config: { custom_pipeline: { stage: 2 }, temperature: 0.9 },
+                        latest_version: 3,
+                    },
+                },
+                patch: {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': async ({ request }) => {
+                        updateBody = (await request.json()) as Record<string, any>
+                        return [200, { id: 'prompt-linked', name: 'linked', prompt: updateBody.prompt }]
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'prompt',
+                sourcePromptName: 'linked',
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setSystemPrompt('Updated prompt.')
+            llmPlaygroundPromptsLogic.actions.setTemperature(0.1)
+            const promptId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            llmPlaygroundPromptsLogic.actions.saveToLinkedPrompt(promptId, {
+                model: 'gpt-5',
+                provider: 'openai',
+                provider_key_id: null,
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(updateBody).toMatchObject({
+                prompt: 'Updated prompt.',
+                base_version: 3,
+                config: {
+                    custom_pipeline: { stage: 2 },
+                    model: 'gpt-5',
+                    temperature: 0.1,
+                },
+            })
+        })
+
+        it.each(['boolean', 'numeric'])('saveToLinkedEvaluation preserves %s output settings', async (outputType) => {
+            let updatedBody: Record<string, unknown> | undefined
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/evaluations/:id/': {
+                        id: 'eval-linked',
+                        name: 'linked-eval',
+                        evaluation_type: 'llm_judge',
+                        output_type: outputType,
+                        evaluation_config: { prompt: 'Old eval prompt.' },
+                    },
+                },
+                patch: {
+                    '/api/environments/:team_id/evaluations/:id/': async ({ request }) => {
+                        updatedBody = (await request.json()) as Record<string, unknown>
+                        return [200, { id: 'eval-linked', name: 'linked-eval' }]
+                    },
+                },
+            })
+
+            llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
+                sourceType: 'evaluation',
+                sourceEvaluationId: 'eval-linked',
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            llmPlaygroundPromptsLogic.actions.setSystemPrompt('New eval prompt.')
+            const promptId = llmPlaygroundPromptsLogic.values.promptConfigs[0].id
+            llmPlaygroundPromptsLogic.actions.saveToLinkedEvaluation(promptId, {
+                model: 'gpt-5',
+                provider: 'openai',
+                provider_key_id: null,
+            })
+
+            await expectLogic(llmPlaygroundPromptsLogic).toFinishAllListeners()
+
+            expect(updatedBody).toEqual({
+                evaluation_config: { prompt: 'New eval prompt.' },
+                model_configuration: { model: 'gpt-5', provider: 'openai', provider_key_id: null },
+            })
+        })
+    })
+})

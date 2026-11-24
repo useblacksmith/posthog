@@ -1,0 +1,1452 @@
+from typing import Any
+
+from posthog.test.base import APIBaseTest
+from unittest.mock import ANY, MagicMock, Mock, patch
+
+from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import connection
+from django.test import SimpleTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
+
+import boto3
+from clickhouse_driver.errors import ServerException
+from parameterized import parameterized
+from rest_framework.exceptions import ValidationError
+from rest_framework.test import APIRequestFactory
+
+from posthog.models import Team
+from posthog.models.activity_logging.activity_log import ActivityLog
+from posthog.test.anti_ssrf import mock_anti_ssrf_dns_lookup
+
+from products.data_warehouse.backend.direct_postgres import DIRECT_POSTGRES_URL_PATTERN
+from products.data_warehouse.backend.presentation.views.table import (
+    SELF_MANAGED_CREATE_BLOCKED_MESSAGE,
+    CreateTableFromUploadSerializer,
+    SimpleTableSerializer,
+    TableSerializer,
+    resolve_created_via,
+)
+from products.warehouse_sources.backend.facade.models import (
+    DataWarehouseCredential,
+    DataWarehouseTable,
+    ExternalDataSchema,
+    ExternalDataSource,
+)
+
+
+class TestResolveCreatedVia(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("no_transport_markers", {}, "api"),
+            ("mcp_server", {"user-agent": "posthog/mcp-server 1.0.0"}, "mcp"),
+            ("mcp_client_header", {"x-posthog-client": "mcp"}, "mcp"),
+            ("cli_wraps_mcp", {"user-agent": "posthog-cli"}, "mcp"),
+            ("wizard", {"user-agent": "posthog/wizard 1.0.0"}, "wizard"),
+            (
+                "wizard_running_self_driving",
+                {"user-agent": "posthog/wizard 1.0.0 (program: self-driving)"},
+                "self_driving",
+            ),
+            ("posthog_code", {"user-agent": "posthog/code 1.0.0"}, "self_driving"),
+            ("desktop_app", {"user-agent": "posthog/desktop.hog.dev 1.0.0"}, "self_driving"),
+            ("mobile_app", {"user-agent": "posthog/mobile.hog.dev 1.0.0"}, "self_driving"),
+            # Terraform has no attribution value of its own, so it counts as a plain API caller
+            # rather than silently borrowing an agent surface.
+            ("terraform", {"user-agent": "posthog/terraform-provider 1.0.0"}, "api"),
+        ]
+    )
+    def test_attributes_request_to_its_transport(self, _: str, headers: dict[str, str], expected: str):
+        assert resolve_created_via(APIRequestFactory().post("/", headers=headers)) == expected
+
+
+class TestTableNameValidation(SimpleTestCase):
+    @parameterized.expand([("root", "models"), ("nested", "models.revenue")])
+    def test_unchanged_legacy_name_is_allowed(self, _case: str, name: str) -> None:
+        instance = DataWarehouseTable(name=name)
+        assert TableSerializer(instance=instance).validate_name(name) == name
+
+    @parameterized.expand([("root", "models"), ("nested", "models.revenue")])
+    def test_models_namespace_is_reserved(self, _case: str, name: str) -> None:
+        with self.assertRaises(ValidationError):
+            TableSerializer().validate_name(name)
+        with self.assertRaises(ValidationError):
+            CreateTableFromUploadSerializer().validate_table_name(name)
+        instance = DataWarehouseTable(name=name)
+        with self.assertRaises(DjangoValidationError):
+            instance.clean()
+        with self.assertRaises(DjangoValidationError):
+            instance.save()
+
+
+class TestTable(APIBaseTest):
+    def test_update_table_blocks_unsafe_url_patterns(self):
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            url_pattern="https://your-org.s3.amazonaws.com/bucket/whatever.pqt",
+            columns={},
+        )
+        with patch("posthog.security.url_validation.is_dev_mode", return_value=False):
+            response = self.client.patch(
+                f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+                {
+                    "url_pattern": "https://127.0.0.1/latest/meta-data/",
+                },
+            )
+        assert response.status_code == 400
+        assert "Local/Loopback host not allowed" in str(response.json())
+
+    @patch(
+        "products.warehouse_sources.backend.models.table.DataWarehouseTable.validate_column_type",
+        return_value=True,
+    )
+    def test_update_schema_200_old_column_style(self, patch_validate_column_type):
+        table = DataWarehouseTable.objects.create(
+            name="test_table", format="Parquet", team=self.team, team_id=self.team.pk, columns={"id": "Nullable(Int64)"}
+        )
+        response = self.client.post(
+            f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}/update_schema", {"updates": {"id": "float"}}
+        )
+
+        table.refresh_from_db()
+
+        assert response.status_code == 200
+        columns = table.columns
+        assert columns is not None
+        assert columns["id"] == {"clickhouse": "Nullable(Float64)", "hogql": "FloatDatabaseField", "valid": True}
+
+    @patch(
+        "products.warehouse_sources.backend.models.table.DataWarehouseTable.validate_column_type",
+        return_value=True,
+    )
+    def test_update_schema_200_new_column_style(self, patch_validate_column_type):
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={"id": {"clickhouse": "Nullable(Int64)", "hogql": "IntegerDatabaseField"}},
+        )
+        response = self.client.post(
+            f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}/update_schema", {"updates": {"id": "float"}}
+        )
+
+        table.refresh_from_db()
+
+        assert response.status_code == 200
+        columns = table.columns
+        assert columns is not None
+        assert columns["id"] == {"clickhouse": "Nullable(Float64)", "hogql": "FloatDatabaseField", "valid": True}
+
+        log = ActivityLog.objects.get(scope="DataWarehouseTable", item_id=str(table.id))
+        assert (log.activity, log.user) == ("updated", self.user)
+        assert log.detail is not None
+        assert log.detail["changes"] == [
+            {
+                "type": "DataWarehouseTable",
+                "field": "columns",
+                "action": "changed",
+                "before": "masked",
+                "after": "masked",
+            }
+        ]
+
+    def test_update_schema_200_no_updates(self):
+        columns = {"id": {"clickhouse": "Nullable(Int64)", "hogql": "IntegerDatabaseField"}}
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns=columns,
+        )
+        response = self.client.post(
+            f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}/update_schema", {"updates": {}}
+        )
+
+        table.refresh_from_db()
+
+        assert response.status_code == 200
+        assert table.columns == columns
+
+        response = self.client.post(f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}/update_schema", {})
+
+        table.refresh_from_db()
+
+        assert response.status_code == 200
+        assert table.columns == columns
+
+    def test_update_schema_400_with_source(self):
+        columns = {"id": {"clickhouse": "Nullable(Int64)", "hogql": "IntegerDatabaseField"}}
+
+        source = ExternalDataSource.objects.create(team=self.team, team_id=self.team.pk)
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns=columns,
+            external_data_source_id=source.pk,
+        )
+        response = self.client.post(
+            f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}/update_schema", {"updates": {"id": "float"}}
+        )
+
+        table.refresh_from_db()
+
+        assert response.status_code == 400
+        assert response.json()["message"] == "The table must be a manually linked table"
+        assert table.columns == columns
+
+    def test_update_schema_400_with_non_existing_column(self):
+        columns = {"id": {"clickhouse": "Nullable(Int64)", "hogql": "IntegerDatabaseField"}}
+
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns=columns,
+        )
+        response = self.client.post(
+            f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}/update_schema",
+            {"updates": {"some_other_column": "float"}},
+        )
+
+        table.refresh_from_db()
+
+        assert response.status_code == 400
+        assert response.json()["message"] == "Column some_other_column does not exist on table"
+        assert table.columns == columns
+
+    def test_update_schema_400_with_invalid_type(self):
+        columns = {"id": {"clickhouse": "Nullable(Int64)", "hogql": "IntegerDatabaseField"}}
+
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns=columns,
+        )
+        response = self.client.post(
+            f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}/update_schema",
+            {"updates": {"id": "another_type"}},
+        )
+
+        table.refresh_from_db()
+
+        assert response.status_code == 400
+        assert response.json()["message"] == "Can not parse type another_type for column id - type does not exist"
+        assert table.columns == columns
+
+    @parameterized.expand([("delete_endpoint", "delete", 204), ("patch_deleted_flag", "patch", 200)])
+    def test_delete_table(self, _name: str, method: str, expected_status: int):
+        table = DataWarehouseTable.objects.create(
+            name="test_table", format="Parquet", team=self.team, team_id=self.team.pk, columns={}
+        )
+        url = f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}"
+        response = self.client.delete(url) if method == "delete" else self.client.patch(url, {"deleted": True})
+
+        assert response.status_code == expected_status
+
+        table.refresh_from_db()
+
+        assert table.deleted is True
+        assert ActivityLog.objects.filter(
+            scope="DataWarehouseTable", item_id=str(table.id), activity="deleted", user=self.user
+        ).exists()
+
+    def test_delete_table_with_source(self):
+        source = ExternalDataSource.objects.create(team=self.team, team_id=self.team.pk)
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            external_data_source_id=source.pk,
+        )
+        response = self.client.delete(f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}")
+
+        assert response.status_code == 400
+
+        table.refresh_from_db()
+
+        assert table.deleted is False
+
+    @parameterized.expand(
+        [
+            # (label, prefix, access_method, storage_name, expected_hogql_name)
+            (
+                "warehouse_no_prefix",
+                "",
+                ExternalDataSource.AccessMethod.WAREHOUSE,
+                "googleanalytics_devices",
+                "googleanalytics.devices",
+            ),
+            (
+                "warehouse_multi_word_schema",
+                "",
+                ExternalDataSource.AccessMethod.WAREHOUSE,
+                "googleanalytics_daily_active_users",
+                "googleanalytics.daily_active_users",
+            ),
+            (
+                "warehouse_with_prefix",
+                "myprefix_",
+                ExternalDataSource.AccessMethod.WAREHOUSE,
+                "myprefix_googleanalytics_devices",
+                "googleanalytics.myprefix.devices",
+            ),
+            # Direct-query sources are referenced by their raw storage name, not a dotted form.
+            ("direct_access", "", ExternalDataSource.AccessMethod.DIRECT, "accounts", "accounts"),
+        ]
+    )
+    def test_simple_table_serializer_hogql_name(
+        self, _label: str, prefix: str, access_method: str, storage_name: str, expected: str
+    ):
+        source = ExternalDataSource.objects.create(
+            team=self.team,
+            team_id=self.team.pk,
+            source_type="GoogleAnalytics",
+            prefix=prefix,
+            access_method=access_method,
+        )
+        table = DataWarehouseTable.objects.create(
+            name=storage_name,
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            external_data_source_id=source.pk,
+        )
+
+        assert SimpleTableSerializer().get_hogql_name(table) == expected
+
+    def test_simple_table_serializer_hogql_name_without_source(self):
+        table = DataWarehouseTable.objects.create(
+            name="self_managed_table", format="Parquet", team=self.team, team_id=self.team.pk, columns={}
+        )
+
+        assert SimpleTableSerializer().get_hogql_name(table) == "self_managed_table"
+
+    def test_table_without_a_schema_reports_no_external_schema(self):
+        DataWarehouseTable.objects.create(
+            name="unsynced_table", format="Parquet", team=self.team, team_id=self.team.pk, columns={}
+        )
+
+        response = self.client.get(f"/api/environments/{self.team.id}/warehouse_tables/")
+
+        assert response.status_code == 200
+        table = next(row for row in response.json()["results"] if row["name"] == "unsynced_table")
+        # An id-less object here reads as "this table has a schema" to every consumer, and anything
+        # that then binds by `external_schema.id` gets nothing.
+        assert table["external_schema"] is None
+
+    def test_refresh_schema_direct_postgres_table_not_exposed_via_warehouse_tables_api(self):
+        source = ExternalDataSource.objects.create(
+            team=self.team,
+            team_id=self.team.pk,
+            source_id="source-id",
+            connection_id="connection-id",
+            destination_id="destination-id",
+            source_type="Postgres",
+            access_method=ExternalDataSource.AccessMethod.DIRECT,
+        )
+        table = DataWarehouseTable.objects.create(
+            name="accounts",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            url_pattern="https://example.com/should-not-matter.parquet",
+            external_data_source_id=source.pk,
+            columns={"id": {"clickhouse": "Int32", "hogql": "integer", "valid": True}},
+        )
+
+        response = self.client.post(f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}/refresh_schema")
+
+        assert response.status_code == 404
+
+    def test_list_tables_includes_warehouse_postgres_source_tables(self):
+        source = ExternalDataSource.objects.create(
+            team=self.team,
+            team_id=self.team.pk,
+            source_id="source-id",
+            connection_id="connection-id",
+            destination_id="destination-id",
+            source_type="Postgres",
+            access_method=ExternalDataSource.AccessMethod.WAREHOUSE,
+        )
+        table = DataWarehouseTable.objects.create(
+            name="accounts",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            url_pattern=DIRECT_POSTGRES_URL_PATTERN,
+            external_data_source_id=source.pk,
+            columns={"id": {"clickhouse": "Int32", "hogql": "integer", "valid": True}},
+        )
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/warehouse_tables/")
+
+        assert response.status_code == 200
+        assert response.json()["count"] == 1
+        assert response.json()["results"][0]["id"] == str(table.id)
+
+    def _pinned_table(self, name: str = "orders") -> tuple[DataWarehouseTable, ExternalDataSchema]:
+        table = DataWarehouseTable.objects.create(
+            name=name,
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            url_pattern=f"https://example.com/{name}/*.parquet",
+        )
+        source = ExternalDataSource.objects.create(
+            team=self.team,
+            team_id=self.team.pk,
+            source_type="AwsS3",
+            access_method=ExternalDataSource.AccessMethod.WAREHOUSE,
+        )
+        schema = ExternalDataSchema.objects.create(
+            name=name,
+            team=self.team,
+            source=source,
+            sync_type_config={
+                "schema_metadata": {
+                    "self_managed_table": {
+                        "table_id": str(table.id),
+                        "url_pattern": table.url_pattern,
+                        "format": "Parquet",
+                    }
+                }
+            },
+        )
+        return table, schema
+
+    @parameterized.expand(
+        [
+            ("pinned_by_live_schema", lambda t, s, other: None, True),
+            (
+                "schema_deleted",
+                lambda t, s, other: ExternalDataSchema.objects.filter(pk=s.pk).update(deleted=True),
+                False,
+            ),
+            (
+                "source_deleted",
+                lambda t, s, other: ExternalDataSource.objects.filter(pk=s.source_id).update(deleted=True),
+                False,
+            ),
+            (
+                "table_already_has_source",
+                lambda t, s, other: DataWarehouseTable.objects.filter(pk=t.pk).update(external_data_source=s.source),
+                False,
+            ),
+            (
+                "pin_abandoned",
+                lambda t, s, other: ExternalDataSchema.objects.filter(pk=s.pk).update(
+                    sync_type_config={
+                        "schema_metadata": {
+                            "self_managed_table": {
+                                "table_id": str(t.id),
+                                "url_pattern": t.url_pattern,
+                                "format": "Parquet",
+                                "abandon_reason": "gone",
+                            }
+                        }
+                    }
+                ),
+                False,
+            ),
+            (
+                "pin_in_other_team",
+                lambda t, s, other: ExternalDataSchema.objects.filter(pk=s.pk).update(team_id=other.pk),
+                False,
+            ),
+            (
+                "table_url_edited_since_migration",
+                lambda t, s, other: DataWarehouseTable.objects.filter(pk=t.pk).update(
+                    url_pattern="https://example.com/elsewhere/*.parquet"
+                ),
+                False,
+            ),
+            (
+                "table_format_edited_since_migration",
+                lambda t, s, other: DataWarehouseTable.objects.filter(pk=t.pk).update(format="CSV"),
+                False,
+            ),
+            (
+                "schema_linked_to_replacement_table",
+                lambda t, s, other: ExternalDataSchema.objects.filter(pk=s.pk).update(
+                    table=DataWarehouseTable.objects.create(
+                        name="replacement",
+                        format="Parquet",
+                        team_id=t.team_id,
+                        url_pattern="https://example.com/replacement/*.parquet",
+                        external_data_source_id=s.source_id,
+                    )
+                ),
+                False,
+            ),
+        ]
+    )
+    def test_pending_source_id(self, _name, mutate, expect_pending):
+        table, schema = self._pinned_table()
+        unrelated = DataWarehouseTable.objects.create(
+            name="unrelated",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            url_pattern="https://example.com/unrelated/*.parquet",
+        )
+        other_team = Team.objects.create(organization=self.organization, name="Other")
+        mutate(table, schema, other_team)
+
+        results = {
+            row["id"]: row
+            for row in self.client.get(f"/api/projects/{self.team.pk}/warehouse_tables/?include_columns=false").json()[
+                "results"
+            ]
+        }
+        expected = str(schema.source_id) if expect_pending else None
+        assert results[str(table.id)]["pending_source_id"] == expected
+        assert results[str(unrelated.id)]["pending_source_id"] is None
+
+        detail = self.client.get(f"/api/projects/{self.team.pk}/warehouse_tables/{table.id}/").json()
+        assert detail["pending_source_id"] == expected
+
+        filtered = self.client.get(
+            f"/api/projects/{self.team.pk}/warehouse_tables/?include_columns=false&pending_source=true"
+        ).json()["results"]
+        assert [row["id"] for row in filtered] == ([str(table.id)] if expect_pending else [])
+
+    def test_pending_source_id_is_resolved_once_per_list(self):
+        self._pinned_table("one")
+        url = f"/api/projects/{self.team.pk}/warehouse_tables/?include_columns=false"
+        for name in ("two", "three", "four"):
+            self._pinned_table(name)
+        with CaptureQueriesContext(connection) as several:
+            response = self.client.get(url)
+
+        assert [row["pending_source_id"] is not None for row in response.json()["results"]] == [True] * 4
+        pending_lookups = [q["sql"] for q in several.captured_queries if "self_managed_table" in q["sql"]]
+        assert len(pending_lookups) == 1
+
+    def _synced_table(self, source: ExternalDataSource, name: str) -> DataWarehouseTable:
+        table = DataWarehouseTable.objects.create(
+            name=name,
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            url_pattern=f"https://example.com/{name}.parquet",
+            external_data_source_id=source.pk,
+        )
+        ExternalDataSchema.objects.create(name=name, team=self.team, source=source, table=table)
+        return table
+
+    def test_external_schema_query_count_does_not_grow_with_tables(self):
+        source = ExternalDataSource.objects.create(
+            team=self.team,
+            team_id=self.team.pk,
+            source_type="Stripe",
+            access_method=ExternalDataSource.AccessMethod.WAREHOUSE,
+        )
+        url = f"/api/projects/{self.team.pk}/warehouse_tables/?include_columns=false"
+        self._synced_table(source, "charges")
+        self.client.get(url)
+        with CaptureQueriesContext(connection) as one_table:
+            self.client.get(url)
+        for name in ("customers", "invoices", "refunds"):
+            self._synced_table(source, name)
+        with CaptureQueriesContext(connection) as four_tables:
+            response = self.client.get(url)
+
+        assert sorted(row["external_schema"]["name"] for row in response.json()["results"]) == [
+            "charges",
+            "customers",
+            "invoices",
+            "refunds",
+        ]
+        assert len(four_tables.captured_queries) == len(one_table.captured_queries)
+
+    def test_list_tables_exposes_hogql_name_and_honors_include_columns(self):
+        source = ExternalDataSource.objects.create(
+            team=self.team,
+            team_id=self.team.pk,
+            source_type="GoogleAnalytics",
+            prefix="",
+            access_method=ExternalDataSource.AccessMethod.WAREHOUSE,
+        )
+        DataWarehouseTable.objects.create(
+            name="googleanalytics_devices",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            url_pattern="https://example.com/devices.parquet",
+            external_data_source_id=source.pk,
+            columns={"id": {"clickhouse": "Int32", "hogql": "integer", "valid": True}},
+        )
+
+        default = self.client.get(f"/api/projects/{self.team.pk}/warehouse_tables/").json()["results"][0]
+        # The picker labels by the dotted HogQL name, not the raw storage identifier.
+        assert default["hogql_name"] == "googleanalytics.devices"
+        assert "id" in [column["name"] for column in default["columns"]]
+
+        # A picker that only needs names opts out of the expensive per-table column serialization.
+        skipped = self.client.get(f"/api/projects/{self.team.pk}/warehouse_tables/?include_columns=false").json()[
+            "results"
+        ][0]
+        assert skipped["hogql_name"] == "googleanalytics.devices"
+        assert skipped["columns"] == []
+
+    def test_update_table_name_to_existing_name(self):
+        table = DataWarehouseTable.objects.create(
+            name="test_table", format="Parquet", team=self.team, team_id=self.team.pk, columns={}
+        )
+        DataWarehouseTable.objects.create(
+            name="test_table2", format="Parquet", team=self.team, team_id=self.team.pk, columns={}
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+            {
+                "name": "test_table2",
+            },
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "A table or view with this name already exists. Choose a different name."
+
+    def test_update_table_name_to_same_name(self):
+        table = DataWarehouseTable.objects.create(
+            name="test_table", format="Parquet", team=self.team, team_id=self.team.pk, columns={}
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+            {
+                "name": "test_table",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["name"] == "test_table"
+
+    def test_update_table_name(self):
+        table = DataWarehouseTable.objects.create(
+            name="test_table", format="Parquet", team=self.team, team_id=self.team.pk, columns={}
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+            {
+                "name": "test_table2",
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["name"] == "test_table2"
+
+    def test_update_options_keeps_the_history_table_marker(self):
+        table = DataWarehouseTable.objects.create(
+            name="orders_cdc",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            options={"history_table": True},
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+            {"options": {}},
+            format="json",
+        )
+        assert response.status_code == 200, response.content
+        table.refresh_from_db()
+        assert table.is_history_table
+
+    def test_update_table_url_pattern_to_internal_bucket(self):
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            url_pattern="https://your-org.s3.amazonaws.com/bucket/whatever.pqt",
+        )
+        with override_settings(DATAWAREHOUSE_BUCKET_DOMAIN="somedomain.com"):
+            response = self.client.patch(
+                f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+                {"url_pattern": "https://somedomain.com/some/path.pqt"},
+            )
+            assert response.status_code == 400
+
+        table.refresh_from_db()
+        assert table.url_pattern == "https://your-org.s3.amazonaws.com/bucket/whatever.pqt"
+
+    @parameterized.expand(
+        [
+            # The path-style endpoint names the same bucket as DATAWAREHOUSE_BUCKET_DOMAIN without
+            # containing that domain, which is what made this reachable.
+            ("posthog_bucket_path_style", "https://s3.us-east-1.amazonaws.com/ph-warehouse/file_uploads/team_*/*.csv"),
+            ("unrelated_bucket", "https://acme-exports.s3.amazonaws.com/exports/*.csv"),
+        ]
+    )
+    @override_settings(
+        DATAWAREHOUSE_BUCKET_DOMAIN="warehouse-files.posthog.example", DATAWAREHOUSE_BUCKET="ph-warehouse"
+    )
+    def test_update_cannot_repoint_a_table_that_reads_with_the_node_role(self, _name: str, target_url: str):
+        hosted_url = "https://warehouse-files.posthog.example/file_uploads/team_1/abc/data.csv"
+        table = DataWarehouseTable.objects.create(
+            name="uploaded_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            url_pattern=hosted_url,
+        )
+
+        with (
+            patch("posthog.security.url_validation.is_dev_mode", return_value=False),
+            mock_anti_ssrf_dns_lookup(),
+        ):
+            response = self.client.patch(
+                f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+                {"url_pattern": target_url},
+            )
+
+        assert response.status_code == 400
+        table.refresh_from_db()
+        assert table.url_pattern == hosted_url
+
+    @override_settings(
+        DATAWAREHOUSE_BUCKET_DOMAIN="warehouse-files.posthog.example", DATAWAREHOUSE_BUCKET="ph-warehouse"
+    )
+    def test_update_keeps_the_posthog_built_url_of_an_uploaded_table(self):
+        hosted_url = "https://warehouse-files.posthog.example/file_uploads/team_1/abc/data.csv"
+        table = DataWarehouseTable.objects.create(
+            name="uploaded_table",
+            format="CSVWithNames",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            url_pattern=hosted_url,
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+            {"name": "renamed_table", "url_pattern": hosted_url},
+        )
+
+        assert response.status_code == 200
+        table.refresh_from_db()
+        assert table.name == "renamed_table"
+        assert table.url_pattern == hosted_url
+
+    def test_update_can_repoint_a_table_that_has_its_own_credential(self):
+        from products.warehouse_sources.backend.facade.models import DataWarehouseCredential
+
+        credential = DataWarehouseCredential.objects.create(
+            team=self.team, access_key="access_key", access_secret="access_secret"
+        )
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            url_pattern="https://acme-exports.s3.amazonaws.com/old/*.pqt",
+            credential=credential,
+        )
+
+        with (
+            patch("posthog.security.url_validation.is_dev_mode", return_value=False),
+            mock_anti_ssrf_dns_lookup(),
+        ):
+            response = self.client.patch(
+                f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+                {"url_pattern": "https://acme-exports.s3.amazonaws.com/new/*.pqt"},
+            )
+
+        assert response.status_code == 200
+        table.refresh_from_db()
+        assert table.url_pattern == "https://acme-exports.s3.amazonaws.com/new/*.pqt"
+
+    def test_update_table_credential_blank_access_key(self):
+        from products.warehouse_sources.backend.facade.models import DataWarehouseCredential
+
+        credential = DataWarehouseCredential.objects.create(
+            team=self.team, access_key="original_key", access_secret="original_secret"
+        )
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            credential=credential,
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+            {"credential": {"access_key": "  ", "access_secret": "new_secret"}},
+        )
+        assert response.status_code == 400
+
+        credential.refresh_from_db()
+        assert credential.access_key == "original_key"
+
+    @parameterized.expand(
+        [
+            ("key_and_secret", {"access_key": "new_key", "access_secret": "new_secret"}),
+            ("key_only", {"access_key": "new_key"}),
+        ]
+    )
+    def test_update_credential_of_a_table_without_one_is_a_validation_error(self, _name, credential):
+        table = DataWarehouseTable.objects.create(
+            name="uploaded_table",
+            format="CSVWithNames",
+            team=self.team,
+            columns={},
+            url_pattern=f"https://warehouse.posthog.test/file_uploads/team_{self.team.pk}/abc/data.csv",
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}", {"credential": credential}, format="json"
+        )
+
+        assert response.status_code == 400, response.json()
+        assert "no credential" in str(response.json())
+        table.refresh_from_db()
+        assert table.credential_id is None
+
+    def test_update_table_credential_blank_access_secret(self):
+        from products.warehouse_sources.backend.facade.models import DataWarehouseCredential
+
+        credential = DataWarehouseCredential.objects.create(
+            team=self.team, access_key="original_key", access_secret="original_secret"
+        )
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            credential=credential,
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+            {"credential": {"access_key": "new_key", "access_secret": ""}},
+        )
+        assert response.status_code == 400
+
+        credential.refresh_from_db()
+        assert credential.access_secret == "original_secret"
+
+    def test_update_table_credential_null_field_values_rejected(self):
+        from products.warehouse_sources.backend.facade.models import DataWarehouseCredential
+
+        credential = DataWarehouseCredential.objects.create(
+            team=self.team, access_key="original_key", access_secret="original_secret"
+        )
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            credential=credential,
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+            {"credential": {"access_key": None, "access_secret": None}},
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+
+        credential.refresh_from_db()
+        assert credential.access_key == "original_key"
+        assert credential.access_secret == "original_secret"
+
+    def test_update_table_credential_null_rejected(self):
+        from products.warehouse_sources.backend.facade.models import DataWarehouseCredential
+
+        credential = DataWarehouseCredential.objects.create(
+            team=self.team, access_key="original_key", access_secret="original_secret"
+        )
+        table = DataWarehouseTable.objects.create(
+            name="test_table",
+            format="Parquet",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            credential=credential,
+        )
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/warehouse_tables/{table.id}",
+            {"credential": None},
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+
+        credential.refresh_from_db()
+        assert credential.access_key == "original_key"
+        assert credential.access_secret == "original_secret"
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_creates_new_table(self, mock_boto3_client, mock_feature_enabled):
+        mock_s3 = MagicMock()
+        mock_boto3_client.return_value = mock_s3
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        file_content = b"id,name,value\n1,Test,100\n2,Test2,200"
+        test_file = SimpleUploadedFile("test_file.csv", file_content, content_type="text/csv")
+
+        with (
+            patch("products.warehouse_sources.backend.models.table.DataWarehouseTable.get_columns") as mock_get_columns,
+            # Quote detection reads the file for real, which a mocked S3 client can't serve.
+            patch(
+                "products.warehouse_sources.backend.models.table.DataWarehouseTable.detect_csv_double_quotes_setting",
+                return_value=True,
+            ),
+        ):
+            mock_get_columns.return_value = {
+                "id": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": True},
+                "name": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": True},
+                "value": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": True},
+            }
+
+            with self.settings(
+                DATAWAREHOUSE_LOCAL_ACCESS_KEY="test_key",
+                DATAWAREHOUSE_LOCAL_ACCESS_SECRET="test_secret",
+                DATAWAREHOUSE_BUCKET_DOMAIN="test-bucket.s3.amazonaws.com",
+                DATAWAREHOUSE_BUCKET="test-warehouse-bucket",
+            ):
+                response = self.client.post(
+                    f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                    {"file": test_file, "name": "test_csv_table", "format": "CSVWithNames"},
+                    format="multipart",
+                )
+
+        assert response.status_code == 201
+        assert response.json()["name"] == "test_csv_table"
+        assert response.json()["format"] == "CSVWithNames"
+
+        # Verify the table was created
+        table = DataWarehouseTable.objects.get(name="test_csv_table")
+        assert table is not None
+        assert table.options == {"csv_allow_double_quotes": True}
+
+        # Verify S3 client was called to upload the file
+        mock_s3.upload_fileobj.assert_called_once_with(
+            ANY, "test-warehouse-bucket", f"managed/team_{self.team.id}/test_file.csv"
+        )
+
+        # Verify URL pattern was set correctly
+        assert table.url_pattern == f"https://test-bucket.s3.amazonaws.com/managed/team_{self.team.id}/test_file.csv"
+
+    @parameterized.expand(
+        [
+            ("neither_quote_setting_parses", None, "comma-separated CSV with a header row"),
+            ("the_read_fails_outright", ServerException("Access Denied", code=499), "Failed to upload file"),
+        ]
+    )
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_leaves_no_table_when_the_csv_cannot_be_read(
+        self, _name, detect_outcome, expected_message, mock_boto3_client, mock_feature_enabled
+    ):
+        mock_boto3_client.return_value = MagicMock()
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        test_file = SimpleUploadedFile("test_file.csv", b'id,name\n1,"Test\n', content_type="text/csv")
+        detect = Mock(side_effect=detect_outcome) if isinstance(detect_outcome, Exception) else Mock(return_value=None)
+
+        s3 = MagicMock()
+
+        with (
+            patch.object(DataWarehouseTable, "detect_csv_double_quotes_setting", detect),
+            patch("products.data_warehouse.backend.presentation.views.table.get_s3_client", return_value=s3),
+            self.settings(
+                DATAWAREHOUSE_LOCAL_ACCESS_KEY="test_key",
+                DATAWAREHOUSE_LOCAL_ACCESS_SECRET="test_secret",
+                DATAWAREHOUSE_BUCKET_DOMAIN="test-bucket.s3.amazonaws.com",
+                DATAWAREHOUSE_BUCKET="test-warehouse-bucket",
+            ),
+        ):
+            response = self.client.post(
+                f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                {"file": test_file, "name": "unreadable_csv", "format": "CSVWithNames"},
+                format="multipart",
+            )
+
+        assert response.status_code == 400
+        assert expected_message in response.json()["message"]
+        assert not DataWarehouseTable.objects.filter(name="unreadable_csv").exists()
+        s3.rm.assert_called_once_with(f"test-warehouse-bucket/managed/team_{self.team.id}/test_file.csv")
+
+    @patch("posthoganalytics.feature_enabled", return_value=False)
+    def test_file_upload_api_disabled(self, mock_feature_enabled):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        file_content = b"id,name,value\n1,Test,100\n2,Test2,200"
+        test_file = SimpleUploadedFile("test_file", file_content, content_type="text/csv")
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/warehouse_tables/file/",
+            {"file": test_file, "name": "test_csv_table", "format": "CSVWithNames"},
+            format="multipart",
+        )
+
+        assert response.status_code == 400
+        assert response.json()["message"] == "Warehouse API is not enabled for this organization"
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_invalid_table_name(self, mock_boto3_client, mock_feature_enabled):
+        mock_s3 = MagicMock()
+        mock_boto3_client.return_value = mock_s3
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        file_content = b"id,name,value\n1,Test,100\n2,Test2,200"
+        test_file = SimpleUploadedFile("test-file.csv", file_content, content_type="text/csv")
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/warehouse_tables/file/",
+            {"file": test_file, "name": "test-table", "format": "CSVWithNames"},
+            format="multipart",
+        )
+
+        assert response.status_code == 400
+        assert "Table names must start with a letter or underscore" in response.json()["message"]
+
+    @patch.object(DataWarehouseTable, "detect_csv_double_quotes_setting", lambda self: True)
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_updates_existing_table(self, mock_boto3_client, mock_feature_enabled):
+        mock_s3 = MagicMock()
+        mock_boto3_client.return_value = mock_s3
+
+        existing_table = DataWarehouseTable.objects.create(
+            name="existing_table",
+            format="CSVWithNames",
+            team=self.team,
+            team_id=self.team.pk,
+            columns={},
+            url_pattern=f"https://test-bucket.s3.amazonaws.com/managed/team_{self.team.id}/old_file.csv",
+        )
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        file_content = b"id,new_name,value\n1,Test,100\n2,Test2,200"
+        test_file = SimpleUploadedFile("updated_file.csv", file_content, content_type="text/csv")
+
+        with patch(
+            "products.warehouse_sources.backend.models.table.DataWarehouseTable.get_columns"
+        ) as mock_get_columns:
+            mock_get_columns.return_value = {
+                "id": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": True},
+                "new_name": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": True},
+                "value": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": True},
+            }
+
+            with self.settings(
+                DATAWAREHOUSE_LOCAL_ACCESS_KEY="test_key",
+                DATAWAREHOUSE_LOCAL_ACCESS_SECRET="test_secret",
+                DATAWAREHOUSE_BUCKET_DOMAIN="test-bucket.s3.amazonaws.com",
+                DATAWAREHOUSE_BUCKET="test-warehouse-bucket",
+            ):
+                # The second upload changes no metadata and must still be logged.
+                for _ in range(2):
+                    test_file.seek(0)
+                    response = self.client.post(
+                        f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                        {"file": test_file, "name": "existing_table", "format": "CSVWithNames"},
+                        format="multipart",
+                    )
+                    assert response.status_code == 201
+
+        # Verify the table was updated
+        existing_table.refresh_from_db()
+        assert (
+            existing_table.url_pattern
+            == f"https://test-bucket.s3.amazonaws.com/managed/team_{self.team.id}/updated_file.csv"
+        )
+
+        # columns will be false as validation doesn't work for mocked fields
+        assert existing_table.columns == {
+            "id": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": False},
+            "new_name": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": False},
+            "value": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": False},
+        }
+
+        # Verify S3 client was called to upload the file
+        mock_s3.upload_fileobj.assert_called_with(
+            ANY, "test-warehouse-bucket", f"managed/team_{self.team.id}/updated_file.csv"
+        )
+
+        assert (
+            ActivityLog.objects.filter(
+                scope="DataWarehouseTable", item_id=str(existing_table.id), activity="updated", user=self.user
+            ).count()
+            == 2
+        )
+
+    @parameterized.expand(
+        [
+            ("no_url", "", False, False),
+            ("customer_bucket", "https://exports.example.com/orders.csv", True, False),
+            (
+                "file_upload_folder",
+                "https://test-bucket.s3.amazonaws.com/file_uploads/team_{team}/11111111-1111-1111-1111-111111111111/a.csv",
+                False,
+                False,
+            ),
+            ("another_teams_folder", "https://test-bucket.s3.amazonaws.com/managed/team_999999/a.csv", False, False),
+            ("sourced_table", "https://test-bucket.s3.amazonaws.com/managed/team_{team}/a.csv", False, True),
+            ("nested_key", "https://test-bucket.s3.amazonaws.com/managed/team_{team}/x/a.csv", False, False),
+        ]
+    )
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_refuses_a_table_it_did_not_make(
+        self, _name, url_pattern, with_credential, with_source, mock_boto3_client, mock_feature_enabled
+    ):
+        mock_s3 = MagicMock()
+        mock_boto3_client.return_value = mock_s3
+        url_pattern = url_pattern.format(team=self.team.id)
+        existing_table = DataWarehouseTable.objects.create(
+            name="existing_table",
+            format="CSVWithNames",
+            team=self.team,
+            columns={},
+            url_pattern=url_pattern,
+            credential=(
+                DataWarehouseCredential.objects.create(team=self.team, access_key="key", access_secret="secret")
+                if with_credential
+                else None
+            ),
+            external_data_source=(
+                ExternalDataSource.objects.create(
+                    team=self.team, source_id="s", connection_id="c", status="Running", source_type="Stripe"
+                )
+                if with_source
+                else None
+            ),
+        )
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        with self.settings(
+            DATAWAREHOUSE_BUCKET_DOMAIN="test-bucket.s3.amazonaws.com", DATAWAREHOUSE_BUCKET="test-warehouse-bucket"
+        ):
+            response = self.client.post(
+                f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                {"file": SimpleUploadedFile("new.csv", b"id\n1\n"), "name": "existing_table"},
+                format="multipart",
+            )
+
+        assert response.status_code == 400
+        assert "already exists" in response.json()["message"]
+        existing_table.refresh_from_db()
+        assert existing_table.url_pattern == url_pattern
+        mock_s3.upload_fileobj.assert_not_called()
+
+    def _delete_all_from_s3(self, s3_client, bucket_name, prefix=""):
+        """Helper to delete all objects in a bucket with a given prefix."""
+        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+        if "Contents" in response:
+            for obj in response["Contents"]:
+                if "Key" in obj:
+                    s3_client.delete_object(Bucket=bucket_name, Key=obj["Key"])
+
+    @patch.object(DataWarehouseTable, "detect_csv_double_quotes_setting", lambda self: True)
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    def test_file_upload_with_minio(self, mock_feature_enabled):
+        """Test file upload using actual MinIO bucket instead of mocking."""
+
+        # Create a unique bucket name for testing
+        test_bucket_name = f"test-warehouse"
+
+        # Setup real S3 client
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=settings.OBJECT_STORAGE_ENDPOINT,
+            aws_access_key_id="object_storage_root_user",
+            aws_secret_access_key="object_storage_root_password",
+            region_name="us-east-1",
+        )
+
+        s3_client.create_bucket(Bucket=test_bucket_name)
+
+        # Create a test file
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        file_content = b"id,name,value\n1,Test,100\n2,Test2,200"
+        test_file = SimpleUploadedFile("test_file.csv", file_content, content_type="text/csv")
+
+        # Patch get_columns to return test columns
+        with patch(
+            "products.warehouse_sources.backend.models.table.DataWarehouseTable.get_columns"
+        ) as mock_get_columns:
+            mock_get_columns.return_value = {
+                "id": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": False},
+                "name": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": False},
+                "value": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": False},
+            }
+            # Patch the settings to use our test bucket
+            with self.settings(
+                DATAWAREHOUSE_LOCAL_ACCESS_KEY="object_storage_root_user",
+                DATAWAREHOUSE_LOCAL_ACCESS_SECRET="object_storage_root_password",
+                DATAWAREHOUSE_BUCKET_DOMAIN="test-bucket.s3.amazonaws.com",
+                BUCKET_URL=f"s3://{test_bucket_name}",
+                DATAWAREHOUSE_BUCKET=test_bucket_name,
+            ):
+                # Make the API request
+                response = self.client.post(
+                    f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                    {"file": test_file, "name": "minio_csv_table", "format": "CSVWithNames"},
+                    format="multipart",
+                )
+
+        # Assert the response is successful
+        self.assertEqual(response.status_code, 201)
+
+        # Verify the table was created
+        table = DataWarehouseTable.objects.get(name="minio_csv_table")
+        self.assertIsNotNone(table)
+
+        # Check that the file was actually uploaded to MinIO
+        objects = s3_client.list_objects_v2(
+            Bucket=test_bucket_name, Prefix=f"managed/team_{self.team.id}/test_file.csv"
+        )
+        self.assertIn("Contents", objects, "No objects found in the bucket")
+
+        # TODO: DRY
+        self._delete_all_from_s3(s3_client, test_bucket_name)
+        s3_client.delete_bucket(Bucket=test_bucket_name)
+
+    @patch.object(DataWarehouseTable, "detect_csv_double_quotes_setting", lambda self: True)
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_sanitizes_filename_for_s3_key(self, mock_boto3_client, mock_feature_enabled):
+        """Django strips path components via os.path.basename in UploadedFile._set_name.
+        Our regex further sanitizes special characters. Verify the S3 key uses the sanitized name."""
+        mock_s3 = MagicMock()
+        mock_boto3_client.return_value = mock_s3
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        # Django will strip "../team_999/" leaving "evil file (1).csv"
+        # Our regex then converts spaces and parens to underscores
+        test_file = SimpleUploadedFile("evil file (1).csv", b"col1\nval1", content_type="text/csv")
+
+        with patch(
+            "products.warehouse_sources.backend.models.table.DataWarehouseTable.get_columns"
+        ) as mock_get_columns:
+            mock_get_columns.return_value = {
+                "col1": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": True},
+            }
+            with self.settings(
+                DATAWAREHOUSE_BUCKET="test-warehouse-bucket",
+                DATAWAREHOUSE_BUCKET_DOMAIN="test-bucket.s3.amazonaws.com",
+            ):
+                response = self.client.post(
+                    f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                    {"file": test_file, "name": "test_table", "format": "CSVWithNames"},
+                    format="multipart",
+                )
+
+        assert response.status_code == 201
+        # Verify special characters were replaced with underscores in S3 key and url_pattern
+        mock_s3.upload_fileobj.assert_called_once_with(
+            ANY, "test-warehouse-bucket", f"managed/team_{self.team.id}/evil_file__1_.csv"
+        )
+        table = DataWarehouseTable.objects.get(name="test_table")
+        assert (
+            table.url_pattern == f"https://test-bucket.s3.amazonaws.com/managed/team_{self.team.id}/evil_file__1_.csv"
+        )
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_table_name_defaults_to_sanitized_filename(self, mock_boto3_client, mock_feature_enabled):
+        mock_s3 = MagicMock()
+        mock_boto3_client.return_value = mock_s3
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        test_file = SimpleUploadedFile("my data (2).csv", b"col1\nval1", content_type="text/csv")
+
+        with patch(
+            "products.warehouse_sources.backend.models.table.DataWarehouseTable.get_columns"
+        ) as mock_get_columns:
+            mock_get_columns.return_value = {
+                "col1": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": True},
+            }
+            with self.settings(
+                DATAWAREHOUSE_BUCKET="test-warehouse-bucket",
+                DATAWAREHOUSE_BUCKET_DOMAIN="test-bucket.s3.amazonaws.com",
+            ):
+                response = self.client.post(
+                    f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                    {"file": test_file, "format": "CSVWithNames"},
+                    format="multipart",
+                )
+
+        # Sanitized filename "my_data__2_.csv" has dots, which the table name
+        # regex rejects — so the user must provide a valid name separately
+        assert response.status_code == 400
+        assert "Table names must start with a letter" in response.json()["message"]
+
+    @patch.object(DataWarehouseTable, "detect_csv_double_quotes_setting", lambda self: True)
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_table_name_defaults_to_sanitized_filename_when_valid(
+        self, mock_boto3_client, mock_feature_enabled
+    ):
+        mock_s3 = MagicMock()
+        mock_boto3_client.return_value = mock_s3
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        # Filename without extension or special chars → valid as table name
+        test_file = SimpleUploadedFile("my_data", b"col1\nval1", content_type="text/csv")
+
+        with patch(
+            "products.warehouse_sources.backend.models.table.DataWarehouseTable.get_columns"
+        ) as mock_get_columns:
+            mock_get_columns.return_value = {
+                "col1": {"clickhouse": "Nullable(String)", "hogql": "StringDatabaseField", "valid": True},
+            }
+            with self.settings(
+                DATAWAREHOUSE_BUCKET="test-warehouse-bucket",
+                DATAWAREHOUSE_BUCKET_DOMAIN="test-bucket.s3.amazonaws.com",
+            ):
+                response = self.client.post(
+                    f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                    {"file": test_file, "format": "CSVWithNames"},
+                    format="multipart",
+                )
+
+        assert response.status_code == 201
+        table = DataWarehouseTable.objects.get(name="my_data")
+        assert table is not None
+
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_rejects_dot_filename(self, mock_boto3_client, mock_feature_enabled):
+        mock_boto3_client.return_value = MagicMock()
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        test_file = SimpleUploadedFile(".hidden", b"col1\nval1", content_type="text/csv")
+
+        with self.settings(DATAWAREHOUSE_BUCKET="test-warehouse-bucket"):
+            response = self.client.post(
+                f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                {"file": test_file, "name": "test_table", "format": "CSVWithNames"},
+                format="multipart",
+            )
+
+        assert response.status_code == 400
+        assert response.json()["message"] == "Invalid filename"
+
+    @parameterized.expand(
+        [
+            ("garbage", "InvalidFormat"),
+            ("injection", "'; DROP TABLE"),
+        ]
+    )
+    @patch("posthoganalytics.feature_enabled", return_value=True)
+    @patch("boto3.client")
+    def test_file_upload_invalid_format_rejected(self, _name, bad_format, mock_boto3_client, mock_feature_enabled):
+        mock_boto3_client.return_value = MagicMock()
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        test_file = SimpleUploadedFile("safe_file.csv", b"col1\nval1", content_type="text/csv")
+
+        with self.settings(DATAWAREHOUSE_BUCKET="test-warehouse-bucket"):
+            response = self.client.post(
+                f"/api/projects/{self.team.id}/warehouse_tables/file/",
+                {"file": test_file, "name": "test_table", "format": bad_format},
+                format="multipart",
+            )
+
+        assert response.status_code == 400
+        assert "Invalid format" in response.json()["message"]
+
+
+class TestSelfManagedTableCreationRefused(APIBaseTest):
+    def _create(self, payload: dict[str, Any]) -> Any:
+        return self.client.post(f"/api/projects/{self.team.id}/warehouse_tables/", payload)
+
+    def _existing_table(self) -> DataWarehouseTable:
+        credential = DataWarehouseCredential.objects.create(access_key="key", access_secret="secret", team=self.team)
+        return DataWarehouseTable.objects.create(
+            name="existing_table",
+            format="Parquet",
+            team=self.team,
+            credential=credential,
+            url_pattern="https://your-org.s3.amazonaws.com/bucket/*.pqt",
+            columns={},
+        )
+
+    @parameterized.expand(
+        [
+            (
+                "with_credential",
+                {
+                    "name": "bucket_table",
+                    "url_pattern": "https://your-org.s3.amazonaws.com/bucket/*.pqt",
+                    "credential": {"access_key": "_accesskey", "access_secret": "_accesssecret"},
+                    "format": "Parquet",
+                },
+            ),
+            (
+                "without_credential",
+                {
+                    "name": "bucket_table",
+                    "url_pattern": "https://your-org.s3.amazonaws.com/bucket/*.pqt",
+                    "format": "Parquet",
+                },
+            ),
+            ("unsafe_url", {"name": "bucket_table", "url_pattern": "http://localhost/x", "format": "Parquet"}),
+            ("empty_body", {}),
+        ]
+    )
+    @patch("products.warehouse_sources.backend.models.table.DataWarehouseTable.get_columns")
+    def test_create_is_refused(self, _name: str, payload: dict[str, Any], patch_get_columns: Any):
+        response = self._create(payload)
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == SELF_MANAGED_CREATE_BLOCKED_MESSAGE
+        patch_get_columns.assert_not_called()
+        assert DataWarehouseTable.objects.filter(team=self.team).count() == 0
+        assert DataWarehouseCredential.objects.filter(team=self.team).count() == 0
+
+    @parameterized.expand(
+        [
+            ("rename", {"name": "renamed_table"}),
+            ("same_url", {"url_pattern": "https://your-org.s3.amazonaws.com/bucket/*.pqt"}),
+        ]
+    )
+    def test_update_of_an_existing_table_still_works(self, _name: str, payload: dict[str, str]):
+        table = self._existing_table()
+
+        response = self.client.patch(f"/api/projects/{self.team.id}/warehouse_tables/{table.id}/", payload)
+
+        assert response.status_code == 200, response.json()
+        table.refresh_from_db()
+        for field, value in payload.items():
+            assert getattr(table, field) == value
+
+    def test_list_and_delete_of_an_existing_table_still_work(self):
+        table = self._existing_table()
+
+        list_response = self.client.get(f"/api/projects/{self.team.id}/warehouse_tables/")
+        assert list_response.status_code == 200
+        assert [row["id"] for row in list_response.json()["results"]] == [str(table.id)]
+
+        delete_response = self.client.delete(f"/api/projects/{self.team.id}/warehouse_tables/{table.id}/")
+        assert delete_response.status_code == 204

@@ -1,0 +1,235 @@
+import os
+from typing import Optional
+
+from posthog.settings.base_variables import DEBUG, TEST
+from posthog.settings.utils import get_from_env
+from posthog.utils import str_to_bool
+
+if TEST or DEBUG:
+    OBJECT_STORAGE_ENDPOINT = os.getenv("OBJECT_STORAGE_ENDPOINT", "http://objectstorage:19000")
+    OBJECT_STORAGE_ACCESS_KEY_ID: Optional[str] = os.getenv("OBJECT_STORAGE_ACCESS_KEY_ID", "object_storage_root_user")
+    OBJECT_STORAGE_SECRET_ACCESS_KEY: Optional[str] = os.getenv(
+        "OBJECT_STORAGE_SECRET_ACCESS_KEY", "object_storage_root_password"
+    )
+else:
+    OBJECT_STORAGE_ENDPOINT = os.getenv("OBJECT_STORAGE_ENDPOINT", "")
+    # To enable us to specify that the AWS provided credentials for e.g. the EC2
+    # or Fargate task, we default to `None` rather than "" as this will, when
+    # passed to boto, result in the correct credentials being used.
+    OBJECT_STORAGE_ACCESS_KEY_ID = os.getenv("OBJECT_STORAGE_ACCESS_KEY_ID", "") or None
+    OBJECT_STORAGE_SECRET_ACCESS_KEY = os.getenv("OBJECT_STORAGE_SECRET_ACCESS_KEY", "") or None
+
+OBJECT_STORAGE_ENABLED = get_from_env("OBJECT_STORAGE_ENABLED", True if DEBUG else False, type_cast=str_to_bool)
+OBJECT_STORAGE_PUBLIC_ENDPOINT = os.getenv("OBJECT_STORAGE_PUBLIC_ENDPOINT", "") or OBJECT_STORAGE_ENDPOINT
+OBJECT_STORAGE_REGION = os.getenv("OBJECT_STORAGE_REGION", "us-east-1")
+OBJECT_STORAGE_BUCKET = os.getenv("OBJECT_STORAGE_BUCKET", "posthog")
+OBJECT_STORAGE_TRANSFER_ACCELERATION = get_from_env(
+    "OBJECT_STORAGE_TRANSFER_ACCELERATION", False, type_cast=str_to_bool
+)
+OBJECT_STORAGE_EXPORTS_FOLDER = os.getenv("OBJECT_STORAGE_EXPORTS_FOLDER", "exports")
+OBJECT_STORAGE_MEDIA_UPLOADS_FOLDER = os.getenv("OBJECT_STORAGE_MEDIA_UPLOADS_FOLDER", "media_uploads")
+# Origin of a CDN that caches the /uploaded_media route, e.g. "https://us-media.posthog.com". Empty serves
+# media URLs from SITE_URL, so every load reaches Django.
+UPLOADED_MEDIA_PUBLIC_URL = os.getenv("UPLOADED_MEDIA_PUBLIC_URL", "").rstrip("/")
+OBJECT_STORAGE_ERROR_TRACKING_SOURCE_MAPS_FOLDER = os.getenv(
+    "OBJECT_STORAGE_ERROR_TRACKING_SOURCE_MAPS_FOLDER", "symbolsets"
+)
+OBJECT_STORAGE_S3_QUERY_CACHE_FOLDER = os.getenv("OBJECT_STORAGE_S3_QUERY_CACHE_FOLDER", "query_cache")
+OBJECT_STORAGE_TASKS_FOLDER = os.getenv("OBJECT_STORAGE_TASKS_FOLDER", "tasks")
+OBJECT_STORAGE_LEGAL_DOCUMENTS_FOLDER = os.getenv("OBJECT_STORAGE_LEGAL_DOCUMENTS_FOLDER", "legal_documents")
+OBJECT_STORAGE_EXTERNAL_WEB_ANALYTICS_BUCKET = os.getenv("OBJECT_STORAGE_EXTERNAL_WEB_ANALYTICS_BUCKET", "posthog")
+
+# Endpoint the ClickHouse *cluster* uses to reach the frames bucket for that INSERT — which is
+# NOT always OBJECT_STORAGE_ENDPOINT. CI points OBJECT_STORAGE_ENDPOINT at localhost:19000 for
+# the test process, but ClickHouse runs in docker-compose and reaches object storage by service
+# name (objectstorage:19000) — using localhost there makes the cluster connect to itself and the
+# s3() call hangs. So in TEST/DEBUG default to the cluster-reachable host; on prod it stays empty
+# and the URL builder falls back to the virtual-hosted AWS form (IAM role, no inline keys),
+# mirroring IDENTITY_MATCHING_S3_ENDPOINT (the sibling CH-side s3 writer). Frames live in
+# NOTEBOOKS_FRAME_STORE_S3_BUCKET (below), which the app presigns and the kernel fetches from.
+if TEST or DEBUG:
+    NOTEBOOKS_FRAME_STORE_S3_ENDPOINT = os.getenv("NOTEBOOKS_FRAME_STORE_S3_ENDPOINT", "http://objectstorage:19000")
+else:
+    NOTEBOOKS_FRAME_STORE_S3_ENDPOINT = os.getenv("NOTEBOOKS_FRAME_STORE_S3_ENDPOINT", "")
+
+# Frames get a dedicated bucket in cloud (its own 1-day TTL, and a least-privilege grant so the
+# ClickHouse writer identity can PutObject there without access to the general object store).
+# Falls back to OBJECT_STORAGE_BUCKET so dev / CI / self-hosted work with no extra config.
+#
+# There is deliberately no region knob beside it. ClickHouse writes the object and the app
+# presigns it, and the app's presigning client is built once from OBJECT_STORAGE_REGION — so a
+# frames-only region would put the write in one region and the SigV4 credential scope in
+# another, and AWS would reject every presigned fetch. The bucket is per product; the region is
+# per deployment.
+NOTEBOOKS_FRAME_STORE_S3_BUCKET = os.getenv("NOTEBOOKS_FRAME_STORE_S3_BUCKET") or OBJECT_STORAGE_BUCKET
+
+# Query cache specific bucket - falls back to general object storage bucket if not set
+QUERY_CACHE_S3_BUCKET = os.getenv("QUERY_CACHE_S3_BUCKET") or OBJECT_STORAGE_BUCKET
+
+# Entries whose zstd-compressed form is at least this large go to S3 (with a Redis pointer) when
+# the query-cache-s3-writes flag allows; smaller ones always stay inline in Redis. The threshold
+# applies to compressed bytes because that is what an entry actually costs in Redis. Query results
+# compress roughly 3-15x, so the 128KB default corresponds to about 0.4-2MB of serialized JSON:
+# dashboard tiles, which almost never reach that size, stay on sub-millisecond Redis reads while
+# the byte-heavy tail of ad-hoc and API results moves off the cluster.
+QUERY_CACHE_S3_MIN_COMPRESSED_BYTES = get_from_env("QUERY_CACHE_S3_MIN_COMPRESSED_BYTES", 128 * 1024, type_cast=int)
+
+# Video segment clustering workflow bucket - should have a 24h lifecycle rule for automatic cleanup
+VIDEO_SEGMENT_CLUSTERING_S3_BUCKET = os.getenv("VIDEO_SEGMENT_CLUSTERING_S3_BUCKET") or OBJECT_STORAGE_BUCKET
+
+# Billing usage report bucket — holds the daily JSONL chunks the billing
+# service consumes. Falls back to the general bucket if not set so dev /
+# self-hosted continue to work without extra configuration.
+BILLING_USAGE_REPORTS_S3_BUCKET = os.getenv("BILLING_USAGE_REPORTS_S3_BUCKET") or OBJECT_STORAGE_BUCKET
+
+# Agent platform bundle bucket — stores `ass deploy` bundles. Lifecycle should
+# expire non-`ready` bundles after a grace period (handled by infra). Falls
+# back to the general bucket in dev / self-hosted.
+AGENT_BUNDLES_S3_BUCKET = os.getenv("AGENT_BUNDLES_S3_BUCKET") or OBJECT_STORAGE_BUCKET
+
+# AI observability blob storage — offloaded binary payloads (images, files) from ai_events,
+# content-addressed under `{prefix}{team_id}/sha256/{hash}`. The nodejs ingestion writer reads
+# the same AI_BLOB_S3_BUCKET / AI_BLOB_S3_PREFIX env vars but defaults both to "" (offload
+# disabled) — any deployment enabling offload must set bucket AND prefix identically on both
+# services, or every read silently 404s. Defaults here match the local-dev ingestion wiring.
+AI_BLOB_S3_BUCKET = os.getenv("AI_BLOB_S3_BUCKET", "ai-blobs")
+AI_BLOB_S3_PREFIX = os.getenv("AI_BLOB_S3_PREFIX", "aio/")
+
+# Inbox ranking modeling dataset (products/signals/dags/inbox_ranking): daily report-grain
+# Parquet snapshots the ranking model trains on. Unset bucket on Cloud means the dags skip until
+# the dedicated bucket is provisioned; local dev falls back to the object-storage service. The
+# bucket is written by Dagster via boto3 (node role on prod) and read by project-2 warehouse
+# tables and mlhog training via a separate read-only credential.
+INBOX_RANKING_DATASET_S3_BUCKET = os.getenv("INBOX_RANKING_DATASET_S3_BUCKET", "")
+INBOX_RANKING_DATASET_S3_PREFIX = os.getenv("INBOX_RANKING_DATASET_S3_PREFIX", "inbox_ranking")
+# Training dag (products/signals/dags/inbox_ranking/training): how many daily snapshots back the
+# examples reach, and how many trailing days of reports grade a candidate.
+INBOX_RANKING_TRAINING_LOOKBACK_DAYS = get_from_env("INBOX_RANKING_TRAINING_LOOKBACK_DAYS", 90, type_cast=int)
+INBOX_RANKING_TRAINING_HOLDOUT_DAYS = get_from_env("INBOX_RANKING_TRAINING_HOLDOUT_DAYS", 7, type_cast=int)
+# Serving publish (products/signals/dags/inbox_ranking/training/dag.py): once this many days have
+# passed since the last promotion, the daily publish serves the newest version of the served recipe
+# that passed the promotion gate. 0 turns the step off, and promotion is then only the manual
+# `inbox_ranking_promote_job`. A valid `interval_days` in the `inbox-ranking-auto-promotion` flag
+# payload takes precedence over this value.
+INBOX_RANKING_AUTO_PROMOTE_INTERVAL_DAYS = get_from_env("INBOX_RANKING_AUTO_PROMOTE_INTERVAL_DAYS", 1, type_cast=int)
+# Labels refresh sensor (products/signals/dags/inbox_ranking/dataset): how many stale labels
+# partitions one hourly tick rewrites after a FEATURE_SCHEMA_VERSION bump, newest first.
+INBOX_RANKING_LABELS_REFRESH_MAX_RUNS = get_from_env("INBOX_RANKING_LABELS_REFRESH_MAX_RUNS", 6, type_cast=int)
+# A second deployment's object store that receives a copy of every serving publish, so a region
+# that does not train still serves the trained models. Reached via ambient AWS config. Unset means
+# no mirror.
+INBOX_RANKING_SERVING_MIRROR_BUCKET = os.getenv("INBOX_RANKING_SERVING_MIRROR_BUCKET", "")
+INBOX_RANKING_SERVING_MIRROR_REGION = os.getenv("INBOX_RANKING_SERVING_MIRROR_REGION", "")
+# Project vectors in the mirror region (products/signals/dags/inbox_ranking/mirror). The region builds
+# them from its own report embeddings and the engagement export the training region writes to its
+# object store. Off by default: the schedule skips its ticks until this is set.
+INBOX_RANKING_MIRROR_PROJECT_VECTORS_ENABLED = get_from_env(
+    "INBOX_RANKING_MIRROR_PROJECT_VECTORS_ENABLED", False, type_cast=str_to_bool
+)
+# Serving manifest (products/signals/dags/inbox_ranking/training/serving.py): how many of the served
+# family's newest versions the sweep also scores, read from the last 2N days. Each one costs the
+# sweep one more model per pass. The served entry, these versions and one challenger per other family
+# share the manifest's 5 entries, so a higher N leaves less room for the challengers.
+INBOX_RANKING_SERVING_RECENT_VERSIONS = get_from_env("INBOX_RANKING_SERVING_RECENT_VERSIONS", 2, type_cast=int)
+# Scorer (products/signals/backend/ranking/scorer.py): report ids per ClickHouse vector read. A
+# larger call is paged at this size. The sweep also gives one scorer call at most this many ids, which
+# bounds the vectors and matrices one call holds.
+INBOX_RANKING_SCORING_BATCH_SIZE = get_from_env("INBOX_RANKING_SCORING_BATCH_SIZE", 500, type_cast=int)
+# Scoring sweep (products/signals/backend/ranking/sweep.py). Off by default: the schedule still
+# ticks, but the activity returns before it reads or writes anything. The 7-day max age keeps the
+# vector read to at most two weekly partitions, because the rolling window crosses one Monday
+# boundary. It also stays well inside the 3-month vector TTL. An older report keeps its latest
+# score and does not get a new score after a manifest change. The per-tick cap
+# makes the first run after enabling drain the backlog over several ticks.
+INBOX_RANKING_SCORING_ENABLED = get_from_env("INBOX_RANKING_SCORING_ENABLED", False, type_cast=str_to_bool)
+INBOX_RANKING_SCORING_INTERVAL_MINUTES = get_from_env("INBOX_RANKING_SCORING_INTERVAL_MINUTES", 15, type_cast=int)
+INBOX_RANKING_SCORING_MAX_AGE_DAYS = get_from_env("INBOX_RANKING_SCORING_MAX_AGE_DAYS", 7, type_cast=int)
+INBOX_RANKING_SCORING_MAX_REPORTS_PER_TICK = get_from_env(
+    "INBOX_RANKING_SCORING_MAX_REPORTS_PER_TICK", 2000, type_cast=int
+)
+# The sweep records the facts of each report it scores (products/signals/backend/ranking/report_facts.py).
+# Off turns off only the facts read and its events, and scoring does not change.
+INBOX_RANKING_RECORD_REPORT_FACTS = get_from_env("INBOX_RANKING_RECORD_REPORT_FACTS", True, type_cast=str_to_bool)
+# Activity summary tick (products/signals/backend/activity_summary/tick.py). The `activity-summary`
+# flag payload gates the work and holds the caps, so the schedule ticks in every environment.
+ACTIVITY_SUMMARY_TICK_INTERVAL_MINUTES = get_from_env("ACTIVITY_SUMMARY_TICK_INTERVAL_MINUTES", 60, type_cast=int)
+# Personal inbox ranking tick (products/signals/backend/personal_ranking/tick.py). The `tick` object of the
+# `personal-inbox-ranking` flag payload gates the work. It ticks more often than the list's target interval,
+# so a list comes due soon after the interval passes.
+PERSONAL_INBOX_RANKING_TICK_INTERVAL_MINUTES = get_from_env(
+    "PERSONAL_INBOX_RANKING_TICK_INTERVAL_MINUTES", 15, type_cast=int
+)
+
+# Identity matching scratch storage (products/growth `identity_matching_job`). The job writes
+# per-run Parquet objects via ClickHouse `INSERT INTO FUNCTION s3(...)` and the read API globs
+# them back with `s3(...)`, so only the ClickHouse cluster needs bucket access — the Dagster
+# process and the web process never touch boto3. Retention is owned by the bucket lifecycle
+# policy (there is no MergeTree TTL on S3); infra must expire the prefix (≥ the eval horizon so
+# a run's inputs survive until evaluation). Prod bucket names are infra-provided via env and
+# never committed; local/dev/test reuse the object-storage service (SeaweedFS).
+IDENTITY_MATCHING_S3_BUCKET = os.getenv("IDENTITY_MATCHING_S3_BUCKET") or OBJECT_STORAGE_BUCKET
+IDENTITY_MATCHING_S3_PREFIX = os.getenv("IDENTITY_MATCHING_S3_PREFIX", "identity_matching")
+IDENTITY_MATCHING_S3_REGION = os.getenv("IDENTITY_MATCHING_S3_REGION") or OBJECT_STORAGE_REGION
+# Endpoint is set for S3-compatible object storage (local/dev/test); empty on prod, where the
+# cluster reaches the bucket over AWS S3 via its attached IAM role (so no endpoint and no keys
+# — the credential question is owned by infra, mirroring events_backfill_to_duckling).
+#
+# This must be the endpoint the ClickHouse *cluster* can reach, which is not always
+# OBJECT_STORAGE_ENDPOINT: CI points OBJECT_STORAGE_ENDPOINT at `localhost:19000` for the test
+# process, but ClickHouse runs in docker-compose and reaches object storage by its service name
+# (`objectstorage:19000`) — using `localhost` there makes the cluster connect to itself and the
+# s3() call hangs. So in TEST/DEBUG default to the cluster-reachable host (matching the
+# `objectstorage:19000` convention in data_warehouse / web_analytics_s3); on prod it stays empty.
+if TEST or DEBUG:
+    IDENTITY_MATCHING_S3_ENDPOINT: Optional[str] = (
+        os.getenv("IDENTITY_MATCHING_S3_ENDPOINT", "http://objectstorage:19000") or None
+    )
+else:
+    IDENTITY_MATCHING_S3_ENDPOINT = os.getenv("IDENTITY_MATCHING_S3_ENDPOINT", "") or None
+
+# Dictionary staging (posthog/dags/common/staged_dictionary.py), used by deletes_job and by the
+# person-overrides squash. A dictionary reaches every host of the main cluster because its
+# source table is replicated, and
+# replication is exactly what stops at a cluster boundary: a cluster with its own Keeper can never
+# join that replica set. So when a target's storage lives on another cluster, the job stages the
+# dictionary rows here as Parquet and each host there loads the same object for itself.
+# Written and read by the ClickHouse cluster via `INSERT INTO FUNCTION s3(...)` / `s3(...)`, so
+# only the cluster needs bucket access; the Dagster process never touches boto3. Nothing deletes
+# these objects, so infra must expire the prefix through the bucket lifecycle policy. They hold
+# team ids and the person uuids already recorded on the Postgres AsyncDeletion rows.
+DICTIONARY_STAGING_S3_BUCKET = os.getenv("DICTIONARY_STAGING_S3_BUCKET") or OBJECT_STORAGE_BUCKET
+DICTIONARY_STAGING_S3_PREFIX = os.getenv("DICTIONARY_STAGING_S3_PREFIX", "deletes_dictionaries")
+DICTIONARY_STAGING_S3_REGION = os.getenv("DICTIONARY_STAGING_S3_REGION") or OBJECT_STORAGE_REGION
+# Must be an endpoint the ClickHouse cluster can reach, which is not always OBJECT_STORAGE_ENDPOINT;
+# see the IDENTITY_MATCHING_S3_ENDPOINT note above for why localhost breaks under TEST.
+if TEST or DEBUG:
+    DICTIONARY_STAGING_S3_ENDPOINT: Optional[str] = (
+        os.getenv("DICTIONARY_STAGING_S3_ENDPOINT", "http://objectstorage:19000") or None
+    )
+else:
+    DICTIONARY_STAGING_S3_ENDPOINT = os.getenv("DICTIONARY_STAGING_S3_ENDPOINT", "") or None
+
+# Replay Vision labeling benchmark. Frozen cases are written under this bucket and prefix; an empty bucket
+# disables the build. The prefix must sit outside the exports lifecycle rule, since a benchmark version is kept.
+REPLAY_VISION_BENCHMARK_BUCKET = os.getenv("REPLAY_VISION_BENCHMARK_BUCKET", "")
+REPLAY_VISION_BENCHMARK_PREFIX = os.getenv("REPLAY_VISION_BENCHMARK_PREFIX", "replay-vision-benchmark")
+# The labeling suite's benchmark export API (MLHog labeling/replay/EXPORT.md), and a read-scoped `lbl_` token for it.
+REPLAY_VISION_BENCHMARK_LABELING_URL = os.getenv("REPLAY_VISION_BENCHMARK_LABELING_URL", "")
+REPLAY_VISION_BENCHMARK_LABELING_TOKEN = os.getenv("REPLAY_VISION_BENCHMARK_LABELING_TOKEN", "")
+
+# Data deletion staging (posthog/dags/data_deletion_requests.py). Property removal copies each
+# shard's cleaned rows here before it deletes the originals, so between the delete and the reingest
+# these objects are the only copy of those rows. Only the ClickHouse cluster reads and writes them,
+# through `s3(...)`: the cleaned data files and the small per-step progress files alike. The Dagster
+# process never calls S3 for this flow. Nothing deletes the objects, so infra must expire them
+# through the bucket lifecycle policy.
+DATA_DELETION_STAGING_S3_BUCKET = os.getenv("DATA_DELETION_STAGING_S3_BUCKET") or OBJECT_STORAGE_BUCKET
+DATA_DELETION_STAGING_S3_PREFIX = os.getenv("DATA_DELETION_STAGING_S3_PREFIX", "data_deletion_staging")
+DATA_DELETION_STAGING_S3_REGION = os.getenv("DATA_DELETION_STAGING_S3_REGION") or OBJECT_STORAGE_REGION
+# Must be an endpoint the ClickHouse cluster can reach; see the IDENTITY_MATCHING_S3_ENDPOINT note above.
+if TEST or DEBUG:
+    DATA_DELETION_STAGING_S3_ENDPOINT: Optional[str] = (
+        os.getenv("DATA_DELETION_STAGING_S3_ENDPOINT", "http://objectstorage:19000") or None
+    )
+else:
+    DATA_DELETION_STAGING_S3_ENDPOINT = os.getenv("DATA_DELETION_STAGING_S3_ENDPOINT", "") or None

@@ -1,0 +1,2010 @@
+mod consistency;
+mod error;
+pub mod field_mask;
+mod types;
+
+#[cfg(test)]
+mod tests;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use personhog_common::persons::COOKIELESS_SENTINEL_VALUE;
+use personhog_proto::personhog::replica::v1::person_hog_replica_server::PersonHogReplica;
+use personhog_proto::personhog::types::v1::{
+    AckPersonTombstonesRequest, AckPersonTombstonesResponse, CheckCohortMembershipRequest,
+    CohortMembership, CohortMembershipResponse, CountCohortMembersRequest,
+    CountCohortMembersResponse, CountGroupTypeMappingsRequest, CountGroupTypeMappingsResponse,
+    CreateGroupRequest, CreateGroupResponse, DeleteCohortMemberRequest, DeleteCohortMemberResponse,
+    DeleteCohortMembersBulkRequest, DeleteCohortMembersBulkResponse,
+    DeleteCohortMembersByPersonIdsRequest, DeleteCohortMembersByPersonIdsResponse,
+    DeleteGroupTypeMappingRequest, DeleteGroupTypeMappingResponse,
+    DeleteGroupTypeMappingsBatchForTeamRequest, DeleteGroupTypeMappingsBatchForTeamResponse,
+    DeleteGroupsBatchForTeamRequest, DeleteGroupsBatchForTeamResponse,
+    DeleteHashKeyOverridesByTeamsRequest, DeleteHashKeyOverridesByTeamsResponse,
+    DeletePersonsBatchForTeamRequest, DeletePersonsBatchForTeamResponse,
+    DeletePersonsMode as ProtoDeletePersonsMode, DeletePersonsRequest, DeletePersonsResponse,
+    DeleteTombstonedPersonsRequest, DeleteTombstonedPersonsResponse,
+    DistinctIdRow as ProtoDistinctIdRow, DistinctIdWithVersion,
+    DistinctIdWriteAction as ProtoDistinctIdWriteAction,
+    DistinctIdWriteOutcome as ProtoDistinctIdWriteOutcome,
+    DistinctIdWriteResult as ProtoDistinctIdWriteResult, EnsurePersonVersionFloorsRequest,
+    EnsurePersonVersionFloorsResponse, GetDistinctIdRowsRequest, GetDistinctIdRowsResponse,
+    GetDistinctIdsForPersonRequest, GetDistinctIdsForPersonResponse,
+    GetDistinctIdsForPersonsRequest, GetDistinctIdsForPersonsResponse, GetGroupRequest,
+    GetGroupResponse, GetGroupTypeMappingByDashboardIdRequest,
+    GetGroupTypeMappingByDashboardIdResponse, GetGroupTypeMappingsByProjectIdRequest,
+    GetGroupTypeMappingsByProjectIdsRequest, GetGroupTypeMappingsByTeamIdRequest,
+    GetGroupTypeMappingsByTeamIdsRequest, GetGroupsBatchRequest, GetGroupsBatchResponse,
+    GetGroupsRequest, GetHashKeyOverrideContextRequest, GetHashKeyOverrideContextResponse,
+    GetPersonByDistinctIdRequest, GetPersonByUuidRequest, GetPersonRequest, GetPersonResponse,
+    GetPersonTombstonesRequest, GetPersonTombstonesResponse, GetPersonsByDistinctIdsInTeamRequest,
+    GetPersonsByDistinctIdsRequest, GetPersonsByUuidsRequest, GetPersonsRequest, GroupKey,
+    GroupTypeMapping, GroupTypeMappingCount, GroupTypeMappingsBatchResponse,
+    GroupTypeMappingsByKey, GroupTypeMappingsResponse, GroupWithKey, GroupsResponse,
+    HashKeyOverride, HashKeyOverrideContext as ProtoHashKeyOverrideContext,
+    InsertCohortMembersRequest, InsertCohortMembersResponse, ListCohortMemberIdsRequest,
+    ListCohortMemberIdsResponse, ListGroupsRequest, ListGroupsResponse,
+    ListPersonTombstoneQueueRequest, ListPersonTombstoneQueueResponse, ListPersonsForTeamRequest,
+    ListPersonsForTeamResponse, PersonDistinctIds, PersonListEntry as ProtoPersonListEntry,
+    PersonTombstoneQueueEntry, PersonVersionFloorResult, PersonWithDistinctIds,
+    PersonWithTeamDistinctId, PersonsByDistinctIdsInTeamResponse, PersonsByDistinctIdsResponse,
+    PersonsResponse, RaiseOutcome as ProtoRaiseOutcome, RaisePersonVersionFloorResult,
+    RaisePersonVersionFloorsRequest, RaisePersonVersionFloorsResponse,
+    RestoreOutcome as ProtoRestoreOutcome, RestorePersonResult, RestorePersonsRequest,
+    RestorePersonsResponse, SetPersonDistinctIdVersionFloorRequest,
+    SetPersonDistinctIdVersionFloorResponse, SetPersonVersionFloorRequest,
+    SetPersonVersionFloorResponse, SplitPersonRequest, SplitPersonResponse,
+    SplitResult as ProtoSplitResult, TeamDistinctId, TombstonedDistinctId, TombstonedPerson,
+    UpdateGroupRequest, UpdateGroupResponse, UpdateGroupTypeMappingRequest,
+    UpdateGroupTypeMappingResponse, UpsertHashKeyOverridesRequest, UpsertHashKeyOverridesResponse,
+    VersionFloorOutcome as ProtoVersionFloorOutcome, WriteDistinctIdsRequest,
+    WriteDistinctIdsResponse,
+};
+use tonic::{Request, Response, Status};
+use uuid::Uuid;
+
+use crate::storage::{self, FullStorage};
+
+const MAX_BATCH_LOOKUP_SIZE: usize = 250;
+const MAX_BATCH_DELETE_SIZE: i64 = 50_000;
+const MAX_LIST_COHORT_MEMBER_IDS_LIMIT: i32 = 10_000;
+const MAX_COHORT_MEMBER_IDS_PER_REQUEST: usize = 10_000;
+const MAX_LIST_GROUPS_LIMIT: i32 = 1_000;
+// Splits run in a single all-or-nothing transaction holding row locks, so the
+// cap bounds both lock-hold time and payload size — same order as batch lookups.
+const MAX_SPLIT_BATCH_SIZE: usize = 250;
+// Version floors also run in one transaction holding
+// row locks, so they take the same cap as splits.
+const MAX_LOCKED_WRITE_BATCH_SIZE: usize = 250;
+const MAX_DISTINCT_ID_ROWS_SIZE: usize = 1000;
+const DEFAULT_LIST_PERSONS_LIMIT: i64 = 1000;
+const MAX_LIST_PERSONS_LIMIT: i64 = 10_000;
+
+use consistency::{reject_strong_consistency, to_storage_consistency};
+use error::log_and_convert_error;
+use field_mask::{
+    apply_group_field_mask, apply_person_field_mask, build_field_mask, group_needs_properties,
+    person_needs_properties,
+};
+
+/// Dependent rows one DeleteTombstonedPersons call deletes when the request leaves max_rows at 0.
+const DELETE_TOMBSTONED_DEFAULT_ROWS: i64 = 1000;
+
+pub struct PersonHogReplicaService {
+    storage: Arc<dyn FullStorage>,
+}
+
+impl PersonHogReplicaService {
+    pub fn new(storage: Arc<dyn FullStorage>) -> Self {
+        Self { storage }
+    }
+}
+
+#[tonic::async_trait]
+impl PersonHogReplica for PersonHogReplicaService {
+    // ============================================================
+    // Person lookups by ID/UUID
+    // ============================================================
+
+    async fn get_person(
+        &self,
+        request: Request<GetPersonRequest>,
+    ) -> Result<Response<GetPersonResponse>, Status> {
+        let req = request.into_inner();
+        reject_strong_consistency(&req.read_options)?;
+
+        let person = self
+            .storage
+            .get_person_by_id(req.team_id, req.person_id)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_person"))?;
+
+        Ok(Response::new(GetPersonResponse {
+            person: person.map(Into::into),
+        }))
+    }
+
+    async fn get_persons(
+        &self,
+        request: Request<GetPersonsRequest>,
+    ) -> Result<Response<PersonsResponse>, Status> {
+        let req = request.into_inner();
+        reject_strong_consistency(&req.read_options)?;
+
+        if req.person_ids.len() > MAX_BATCH_LOOKUP_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "Maximum {MAX_BATCH_LOOKUP_SIZE} person IDs per request"
+            )));
+        }
+
+        let include_props = person_needs_properties(&req.read_options);
+        let persons = self
+            .storage
+            .get_persons_by_ids(req.team_id, &req.person_ids, include_props)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_persons"))?;
+
+        let found_ids: std::collections::HashSet<i64> = persons.iter().map(|p| p.id).collect();
+        let missing_ids: Vec<i64> = req
+            .person_ids
+            .into_iter()
+            .filter(|id| !found_ids.contains(id))
+            .collect();
+
+        let mask = build_field_mask(&req.read_options);
+        let mut proto_persons: Vec<_> = persons.into_iter().map(Into::into).collect();
+        for p in &mut proto_persons {
+            apply_person_field_mask(p, &mask);
+        }
+
+        Ok(Response::new(PersonsResponse {
+            persons: proto_persons,
+            missing_ids,
+        }))
+    }
+
+    async fn get_person_by_uuid(
+        &self,
+        request: Request<GetPersonByUuidRequest>,
+    ) -> Result<Response<GetPersonResponse>, Status> {
+        let req = request.into_inner();
+        reject_strong_consistency(&req.read_options)?;
+
+        let uuid = Uuid::parse_str(&req.uuid)
+            .map_err(|e| Status::invalid_argument(format!("Invalid UUID: {e}")))?;
+
+        let person = self
+            .storage
+            .get_person_by_uuid(req.team_id, uuid)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_person_by_uuid"))?;
+
+        Ok(Response::new(GetPersonResponse {
+            person: person.map(Into::into),
+        }))
+    }
+
+    async fn get_persons_by_uuids(
+        &self,
+        request: Request<GetPersonsByUuidsRequest>,
+    ) -> Result<Response<PersonsResponse>, Status> {
+        let req = request.into_inner();
+        reject_strong_consistency(&req.read_options)?;
+
+        if req.uuids.len() > MAX_BATCH_LOOKUP_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "Maximum {MAX_BATCH_LOOKUP_SIZE} UUIDs per request"
+            )));
+        }
+
+        let uuids: Vec<Uuid> = req
+            .uuids
+            .iter()
+            .map(|s| Uuid::parse_str(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Status::invalid_argument(format!("Invalid UUID: {e}")))?;
+
+        let include_props = person_needs_properties(&req.read_options);
+        let persons = self
+            .storage
+            .get_persons_by_uuids(req.team_id, &uuids, include_props)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_persons_by_uuids"))?;
+
+        let mask = build_field_mask(&req.read_options);
+        let mut proto_persons: Vec<_> = persons.into_iter().map(Into::into).collect();
+        for p in &mut proto_persons {
+            apply_person_field_mask(p, &mask);
+        }
+
+        Ok(Response::new(PersonsResponse {
+            persons: proto_persons,
+            missing_ids: Vec::new(),
+        }))
+    }
+
+    // ============================================================
+    // Person lookups by Distinct ID
+    // ============================================================
+
+    async fn get_person_by_distinct_id(
+        &self,
+        request: Request<GetPersonByDistinctIdRequest>,
+    ) -> Result<Response<GetPersonResponse>, Status> {
+        let req = request.into_inner();
+        reject_strong_consistency(&req.read_options)?;
+
+        let person = self
+            .storage
+            .get_person_by_distinct_id(req.team_id, &req.distinct_id)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_person_by_distinct_id"))?;
+
+        Ok(Response::new(GetPersonResponse {
+            person: person.map(Into::into),
+        }))
+    }
+
+    async fn get_persons_by_distinct_ids_in_team(
+        &self,
+        request: Request<GetPersonsByDistinctIdsInTeamRequest>,
+    ) -> Result<Response<PersonsByDistinctIdsInTeamResponse>, Status> {
+        let req = request.into_inner();
+        reject_strong_consistency(&req.read_options)?;
+
+        if req.distinct_ids.len() > MAX_BATCH_LOOKUP_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "Maximum {MAX_BATCH_LOOKUP_SIZE} distinct IDs per request"
+            )));
+        }
+
+        let include_props = person_needs_properties(&req.read_options);
+        let results = self
+            .storage
+            .get_persons_by_distinct_ids_in_team(req.team_id, &req.distinct_ids, include_props)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_persons_by_distinct_ids_in_team"))?;
+
+        let mask = build_field_mask(&req.read_options);
+        Ok(Response::new(PersonsByDistinctIdsInTeamResponse {
+            results: results
+                .into_iter()
+                .map(|(distinct_id, person)| {
+                    let mut p: Option<_> = person.map(Into::into);
+                    if let Some(ref mut person) = p {
+                        apply_person_field_mask(person, &mask);
+                    }
+                    PersonWithDistinctIds {
+                        distinct_id,
+                        person: p,
+                    }
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_persons_by_distinct_ids(
+        &self,
+        request: Request<GetPersonsByDistinctIdsRequest>,
+    ) -> Result<Response<PersonsByDistinctIdsResponse>, Status> {
+        let req = request.into_inner();
+        reject_strong_consistency(&req.read_options)?;
+
+        if req.team_distinct_ids.len() > MAX_BATCH_LOOKUP_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "Maximum {MAX_BATCH_LOOKUP_SIZE} distinct IDs per request"
+            )));
+        }
+
+        let include_props = person_needs_properties(&req.read_options);
+        let team_distinct_ids: Vec<(i64, String)> = req
+            .team_distinct_ids
+            .into_iter()
+            .map(|tdi| (tdi.team_id, tdi.distinct_id))
+            .collect();
+
+        let results = self
+            .storage
+            .get_persons_by_distinct_ids_cross_team(&team_distinct_ids, include_props)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_persons_by_distinct_ids"))?;
+
+        let mask = build_field_mask(&req.read_options);
+        Ok(Response::new(PersonsByDistinctIdsResponse {
+            results: results
+                .into_iter()
+                .map(|((team_id, distinct_id), person)| {
+                    let mut p: Option<_> = person.map(Into::into);
+                    if let Some(ref mut person) = p {
+                        apply_person_field_mask(person, &mask);
+                    }
+                    PersonWithTeamDistinctId {
+                        key: Some(TeamDistinctId {
+                            team_id,
+                            distinct_id,
+                        }),
+                        person: p,
+                    }
+                })
+                .collect(),
+        }))
+    }
+
+    // ============================================================
+    // Distinct ID operations
+    // ============================================================
+
+    async fn get_distinct_ids_for_person(
+        &self,
+        request: Request<GetDistinctIdsForPersonRequest>,
+    ) -> Result<Response<GetDistinctIdsForPersonResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+        let limit = req.limit.filter(|&l| l > 0);
+        let cursor_id = req.cursor_id;
+
+        let distinct_ids = self
+            .storage
+            .get_distinct_ids_for_person(req.team_id, req.person_id, consistency, limit, cursor_id)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_distinct_ids_for_person"))?;
+
+        let next_cursor_id = if let Some(l) = limit {
+            if distinct_ids.len() as i64 >= l {
+                distinct_ids.last().map(|d| d.id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(Response::new(GetDistinctIdsForPersonResponse {
+            distinct_ids: distinct_ids
+                .into_iter()
+                .map(|d| DistinctIdWithVersion {
+                    distinct_id: d.distinct_id,
+                    version: d.version,
+                    id: Some(d.id),
+                })
+                .collect(),
+            next_cursor_id,
+        }))
+    }
+
+    async fn get_distinct_ids_for_persons(
+        &self,
+        request: Request<GetDistinctIdsForPersonsRequest>,
+    ) -> Result<Response<GetDistinctIdsForPersonsResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+        let limit_per_person = req.limit_per_person.filter(|&l| l > 0);
+
+        let mappings = self
+            .storage
+            .get_distinct_ids_for_persons(
+                req.team_id,
+                &req.person_ids,
+                consistency,
+                limit_per_person,
+            )
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_distinct_ids_for_persons"))?;
+
+        // Group by person_id
+        let mut by_person: HashMap<i64, Vec<DistinctIdWithVersion>> = HashMap::new();
+        for mapping in mappings {
+            by_person
+                .entry(mapping.person_id)
+                .or_default()
+                .push(DistinctIdWithVersion {
+                    distinct_id: mapping.distinct_id,
+                    version: mapping.version,
+                    id: None,
+                });
+        }
+
+        let person_distinct_ids = by_person
+            .into_iter()
+            .map(|(person_id, distinct_ids)| PersonDistinctIds {
+                person_id,
+                distinct_ids,
+            })
+            .collect();
+
+        Ok(Response::new(GetDistinctIdsForPersonsResponse {
+            person_distinct_ids,
+        }))
+    }
+
+    // ============================================================
+    // Person deletes
+    // ============================================================
+
+    async fn delete_persons(
+        &self,
+        request: Request<DeletePersonsRequest>,
+    ) -> Result<Response<DeletePersonsResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.person_uuids.len() > 1000 {
+            return Err(Status::invalid_argument(
+                "Maximum 1000 person UUIDs per request",
+            ));
+        }
+
+        let uuids: Vec<Uuid> = req
+            .person_uuids
+            .iter()
+            .map(|s| Uuid::parse_str(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Status::invalid_argument(format!("Invalid UUID: {e}")))?;
+
+        match ProtoDeletePersonsMode::try_from(req.mode) {
+            Ok(ProtoDeletePersonsMode::Unspecified | ProtoDeletePersonsMode::Tombstone) => {}
+            Ok(ProtoDeletePersonsMode::Hard) => {
+                return Err(Status::invalid_argument(
+                    "DELETE_PERSONS_MODE_HARD is not supported: tombstone the persons, or delete a deleted team's persons with DeletePersonsBatchForTeam",
+                ))
+            }
+            Err(_) => {
+                return Err(Status::invalid_argument(format!(
+                    "Unknown DeletePersonsMode {}",
+                    req.mode
+                )))
+            }
+        }
+
+        let outcome = self
+            .storage
+            .delete_persons(req.team_id, &uuids)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_persons"))?;
+
+        let tombstoned = outcome.tombstones.is_some();
+        let tombstones = outcome
+            .tombstones
+            .unwrap_or_default()
+            .into_iter()
+            .map(tombstone_to_proto)
+            .collect();
+
+        Ok(Response::new(DeletePersonsResponse {
+            deleted_count: outcome.deleted,
+            tombstoned,
+            tombstones,
+        }))
+    }
+
+    async fn delete_persons_batch_for_team(
+        &self,
+        request: Request<DeletePersonsBatchForTeamRequest>,
+    ) -> Result<Response<DeletePersonsBatchForTeamResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.batch_size <= 0 || req.batch_size > MAX_BATCH_DELETE_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "batch_size must be between 1 and {MAX_BATCH_DELETE_SIZE}"
+            )));
+        }
+
+        let deleted_count = self
+            .storage
+            .delete_persons_batch_for_team(req.team_id, req.batch_size)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_persons_batch_for_team"))?;
+
+        Ok(Response::new(DeletePersonsBatchForTeamResponse {
+            deleted_count,
+        }))
+    }
+
+    async fn get_person_tombstones(
+        &self,
+        request: Request<GetPersonTombstonesRequest>,
+    ) -> Result<Response<GetPersonTombstonesResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.person_uuids.len() > 1000 {
+            return Err(Status::invalid_argument(
+                "Maximum 1000 person UUIDs per request",
+            ));
+        }
+
+        let uuids: Vec<Uuid> = req
+            .person_uuids
+            .iter()
+            .map(|s| Uuid::parse_str(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Status::invalid_argument(format!("Invalid UUID: {e}")))?;
+
+        let tombstones = self
+            .storage
+            .get_person_tombstones(req.team_id, &uuids)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_person_tombstones"))?;
+
+        Ok(Response::new(GetPersonTombstonesResponse {
+            tombstones: tombstones.into_iter().map(tombstone_to_proto).collect(),
+        }))
+    }
+
+    async fn ack_person_tombstones(
+        &self,
+        request: Request<AckPersonTombstonesRequest>,
+    ) -> Result<Response<AckPersonTombstonesResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.tombstones.len() > 1000 {
+            return Err(Status::invalid_argument(
+                "Maximum 1000 tombstones per request",
+            ));
+        }
+
+        let acked: Vec<(Uuid, i64)> = req
+            .tombstones
+            .iter()
+            .map(|t| Uuid::parse_str(&t.person_uuid).map(|uuid| (uuid, t.version)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Status::invalid_argument(format!("Invalid UUID: {e}")))?;
+
+        let cleared_count = self
+            .storage
+            .ack_person_tombstones(req.team_id, &acked)
+            .await
+            .map_err(|e| log_and_convert_error(e, "ack_person_tombstones"))?;
+
+        Ok(Response::new(AckPersonTombstonesResponse { cleared_count }))
+    }
+
+    async fn list_person_tombstone_queue(
+        &self,
+        request: Request<ListPersonTombstoneQueueRequest>,
+    ) -> Result<Response<ListPersonTombstoneQueueResponse>, Status> {
+        let req = request.into_inner();
+
+        let limit = match req.limit {
+            0 => 1000,
+            1..=1000 => req.limit,
+            _ => return Err(Status::invalid_argument("limit must be between 0 and 1000")),
+        };
+        let after_uuid = if req.after_person_uuid.is_empty() {
+            Uuid::nil()
+        } else {
+            Uuid::parse_str(&req.after_person_uuid)
+                .map_err(|e| Status::invalid_argument(format!("Invalid UUID: {e}")))?
+        };
+
+        let entries = self
+            .storage
+            .list_person_tombstone_queue((req.after_team_id, after_uuid), req.team_id, limit)
+            .await
+            .map_err(|e| log_and_convert_error(e, "list_person_tombstone_queue"))?;
+
+        Ok(Response::new(ListPersonTombstoneQueueResponse {
+            entries: entries
+                .into_iter()
+                .map(|entry| PersonTombstoneQueueEntry {
+                    team_id: entry.team_id,
+                    person_uuid: entry.person_uuid.to_string(),
+                    person_version: entry.person_version,
+                    tombstoned_at: entry.tombstoned_at_ms,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn delete_tombstoned_persons(
+        &self,
+        request: Request<DeleteTombstonedPersonsRequest>,
+    ) -> Result<Response<DeleteTombstonedPersonsResponse>, Status> {
+        let req = request.into_inner();
+
+        if !req.person_uuids.is_empty() && !req.bounded_persons.is_empty() {
+            return Err(Status::invalid_argument(
+                "Set either person_uuids or bounded_persons, not both",
+            ));
+        }
+        if req.person_uuids.len().max(req.bounded_persons.len()) > 1000 {
+            return Err(Status::invalid_argument(
+                "Maximum 1000 person UUIDs per request",
+            ));
+        }
+
+        let parse_uuid = |s: &str| {
+            Uuid::parse_str(s).map_err(|e| Status::invalid_argument(format!("Invalid UUID: {e}")))
+        };
+        let version_guard_applied = !req.bounded_persons.is_empty();
+        let mut targets: Vec<storage::TombstoneTarget> =
+            Vec::with_capacity(req.person_uuids.len() + req.bounded_persons.len());
+        for uuid in &req.person_uuids {
+            targets.push(storage::TombstoneTarget::unbounded(parse_uuid(uuid)?));
+        }
+        for bounded in &req.bounded_persons {
+            if bounded.max_version < 0 {
+                return Err(Status::invalid_argument("max_version must not be negative"));
+            }
+            targets.push(storage::TombstoneTarget {
+                uuid: parse_uuid(&bounded.person_uuid)?,
+                max_version: bounded.max_version,
+            });
+        }
+        if req.max_rows < 0 {
+            return Err(Status::invalid_argument("max_rows must not be negative"));
+        }
+        let max_rows = if req.max_rows == 0 {
+            DELETE_TOMBSTONED_DEFAULT_ROWS
+        } else {
+            req.max_rows
+        };
+
+        let outcome = self
+            .storage
+            .delete_tombstoned_persons(req.team_id, &targets, max_rows)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_tombstoned_persons"))?;
+
+        Ok(Response::new(DeleteTombstonedPersonsResponse {
+            deleted_count: outcome.deleted,
+            skipped_live_count: outcome.skipped_live,
+            version_guard_applied,
+            skipped_version_count: outcome.skipped_version,
+            blocked_person_uuids: outcome
+                .blocked_uuids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            pending_person_uuids: outcome
+                .pending_uuids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            rows_deleted: outcome.rows_deleted,
+        }))
+    }
+
+    // ============================================================
+    // Feature Flag support
+    // ============================================================
+
+    async fn get_hash_key_override_context(
+        &self,
+        request: Request<GetHashKeyOverrideContextRequest>,
+    ) -> Result<Response<GetHashKeyOverrideContextResponse>, Status> {
+        let req = request.into_inner();
+
+        // Strong consistency routes to the primary database, which is important for this endpoint:
+        // 1. The caller has just written hash key overrides and needs to read them back
+        // 2. The caller needs the latest person existence state (e.g., for write validation)
+        //
+        // Note: This implementation queries person data on the primary database directly to attain strong consistency.
+        // When personhog-leader is implemented, person table data will be cached on leader pods.
+        // At that point, strong consistency for person data will require routing to the leader
+        // service rather than the primary database.
+        // Once that service is implemented and in use, using personhog-replica for this query will have to be
+        // re-assessed as its consistency guarantee will be broken
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let results = self
+            .storage
+            .get_hash_key_override_context(
+                req.team_id,
+                &req.distinct_ids,
+                req.check_person_exists,
+                consistency,
+            )
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_hash_key_override_context"))?;
+
+        Ok(Response::new(GetHashKeyOverrideContextResponse {
+            results: results
+                .into_iter()
+                .map(|r| ProtoHashKeyOverrideContext {
+                    person_id: r.person_id,
+                    distinct_id: r.distinct_id,
+                    overrides: r
+                        .overrides
+                        .into_iter()
+                        .map(|o| HashKeyOverride {
+                            feature_flag_key: o.feature_flag_key,
+                            hash_key: o.hash_key,
+                        })
+                        .collect(),
+                    existing_feature_flag_keys: r.existing_feature_flag_keys,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn upsert_hash_key_overrides(
+        &self,
+        request: Request<UpsertHashKeyOverridesRequest>,
+    ) -> Result<Response<UpsertHashKeyOverridesResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.hash_key == COOKIELESS_SENTINEL_VALUE {
+            return Err(Status::invalid_argument(format!(
+                "hash_key must not be {COOKIELESS_SENTINEL_VALUE}"
+            )));
+        }
+
+        let inserted_count = self
+            .storage
+            .upsert_hash_key_overrides(
+                req.team_id,
+                &req.distinct_ids,
+                &req.feature_flag_keys,
+                &req.hash_key,
+            )
+            .await
+            .map_err(|e| log_and_convert_error(e, "upsert_hash_key_overrides"))?;
+
+        Ok(Response::new(UpsertHashKeyOverridesResponse {
+            inserted_count,
+        }))
+    }
+
+    async fn delete_hash_key_overrides_by_teams(
+        &self,
+        request: Request<DeleteHashKeyOverridesByTeamsRequest>,
+    ) -> Result<Response<DeleteHashKeyOverridesByTeamsResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.batch_size <= 0 || req.batch_size > MAX_BATCH_DELETE_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "batch_size must be between 1 and {MAX_BATCH_DELETE_SIZE}"
+            )));
+        }
+
+        let deleted_count = self
+            .storage
+            .delete_hash_key_overrides_by_teams(&req.team_ids, req.batch_size)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_hash_key_overrides_by_teams"))?;
+
+        Ok(Response::new(DeleteHashKeyOverridesByTeamsResponse {
+            deleted_count,
+        }))
+    }
+
+    // ============================================================
+    // Cohort membership
+    // ============================================================
+
+    async fn check_cohort_membership(
+        &self,
+        request: Request<CheckCohortMembershipRequest>,
+    ) -> Result<Response<CohortMembershipResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let memberships = self
+            .storage
+            .check_cohort_membership(req.person_id, &req.cohort_ids, consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "check_cohort_membership"))?;
+
+        Ok(Response::new(CohortMembershipResponse {
+            memberships: memberships
+                .into_iter()
+                .map(|m| CohortMembership {
+                    cohort_id: m.cohort_id,
+                    is_member: m.is_member,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn count_cohort_members(
+        &self,
+        request: Request<CountCohortMembersRequest>,
+    ) -> Result<Response<CountCohortMembersResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.cohort_ids.is_empty() {
+            return Ok(Response::new(CountCohortMembersResponse { count: 0 }));
+        }
+
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let count = self
+            .storage
+            .count_cohort_members(&req.cohort_ids, consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "count_cohort_members"))?;
+
+        Ok(Response::new(CountCohortMembersResponse { count }))
+    }
+
+    async fn delete_cohort_member(
+        &self,
+        request: Request<DeleteCohortMemberRequest>,
+    ) -> Result<Response<DeleteCohortMemberResponse>, Status> {
+        let req = request.into_inner();
+
+        let deleted = self
+            .storage
+            .delete_cohort_member(req.cohort_id, req.person_id)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_cohort_member"))?;
+
+        Ok(Response::new(DeleteCohortMemberResponse { deleted }))
+    }
+
+    async fn delete_cohort_members_bulk(
+        &self,
+        request: Request<DeleteCohortMembersBulkRequest>,
+    ) -> Result<Response<DeleteCohortMembersBulkResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.cohort_ids.is_empty() {
+            return Ok(Response::new(DeleteCohortMembersBulkResponse {
+                deleted_count: 0,
+            }));
+        }
+
+        if req.batch_size <= 0 || req.batch_size > 10000 {
+            return Err(Status::invalid_argument(
+                "batch_size must be between 1 and 10000",
+            ));
+        }
+
+        let batch_size = req.batch_size;
+
+        let deleted_count = self
+            .storage
+            .delete_cohort_members_bulk(&req.cohort_ids, batch_size)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_cohort_members_bulk"))?;
+
+        Ok(Response::new(DeleteCohortMembersBulkResponse {
+            deleted_count,
+        }))
+    }
+
+    async fn delete_cohort_members_by_person_ids(
+        &self,
+        request: Request<DeleteCohortMembersByPersonIdsRequest>,
+    ) -> Result<Response<DeleteCohortMembersByPersonIdsResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.person_ids.len() > MAX_COHORT_MEMBER_IDS_PER_REQUEST {
+            return Err(Status::invalid_argument(format!(
+                "Maximum {MAX_COHORT_MEMBER_IDS_PER_REQUEST} person IDs per request"
+            )));
+        }
+
+        if req.person_ids.is_empty() {
+            return Ok(Response::new(DeleteCohortMembersByPersonIdsResponse {
+                deleted_count: 0,
+            }));
+        }
+
+        let deleted_count = self
+            .storage
+            .delete_cohort_members_by_person_ids(req.cohort_id, &req.person_ids)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_cohort_members_by_person_ids"))?;
+
+        Ok(Response::new(DeleteCohortMembersByPersonIdsResponse {
+            deleted_count,
+        }))
+    }
+
+    async fn insert_cohort_members(
+        &self,
+        request: Request<InsertCohortMembersRequest>,
+    ) -> Result<Response<InsertCohortMembersResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.person_ids.len() > MAX_COHORT_MEMBER_IDS_PER_REQUEST {
+            return Err(Status::invalid_argument(format!(
+                "Maximum {MAX_COHORT_MEMBER_IDS_PER_REQUEST} person IDs per request"
+            )));
+        }
+
+        if req.person_ids.is_empty() {
+            return Ok(Response::new(InsertCohortMembersResponse {
+                inserted_count: 0,
+            }));
+        }
+
+        let inserted_count = self
+            .storage
+            .insert_cohort_members(req.cohort_id, &req.person_ids, req.version)
+            .await
+            .map_err(|e| log_and_convert_error(e, "insert_cohort_members"))?;
+
+        Ok(Response::new(InsertCohortMembersResponse {
+            inserted_count,
+        }))
+    }
+
+    async fn list_cohort_member_ids(
+        &self,
+        request: Request<ListCohortMemberIdsRequest>,
+    ) -> Result<Response<ListCohortMemberIdsResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let limit = if req.limit <= 0 || req.limit > MAX_LIST_COHORT_MEMBER_IDS_LIMIT {
+            MAX_LIST_COHORT_MEMBER_IDS_LIMIT
+        } else {
+            req.limit
+        };
+
+        let (person_ids, next_cursor) = self
+            .storage
+            .list_cohort_member_ids(req.cohort_id, req.cursor, limit, consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "list_cohort_member_ids"))?;
+
+        Ok(Response::new(ListCohortMemberIdsResponse {
+            person_ids,
+            next_cursor: next_cursor.unwrap_or(0),
+        }))
+    }
+
+    // ============================================================
+    // Groups
+    // ============================================================
+
+    async fn get_group(
+        &self,
+        request: Request<GetGroupRequest>,
+    ) -> Result<Response<GetGroupResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let group = self
+            .storage
+            .get_group(
+                req.team_id,
+                req.group_type_index,
+                &req.group_key,
+                consistency,
+            )
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_group"))?;
+
+        Ok(Response::new(GetGroupResponse {
+            group: group.map(Into::into),
+        }))
+    }
+
+    async fn get_groups(
+        &self,
+        request: Request<GetGroupsRequest>,
+    ) -> Result<Response<GroupsResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+        let include_props = group_needs_properties(&req.read_options);
+
+        let identifiers: Vec<storage::GroupIdentifier> = req
+            .group_identifiers
+            .iter()
+            .map(|gi| storage::GroupIdentifier {
+                group_type_index: gi.group_type_index,
+                group_key: gi.group_key.clone(),
+            })
+            .collect();
+
+        let groups = self
+            .storage
+            .get_groups(req.team_id, &identifiers, consistency, include_props)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_groups"))?;
+
+        // Find missing groups
+        let found_keys: std::collections::HashSet<(i32, String)> = groups
+            .iter()
+            .map(|g| (g.group_type_index, g.group_key.clone()))
+            .collect();
+
+        let missing_groups = req
+            .group_identifiers
+            .into_iter()
+            .filter(|gi| !found_keys.contains(&(gi.group_type_index, gi.group_key.clone())))
+            .collect();
+
+        let mask = build_field_mask(&req.read_options);
+        let mut proto_groups: Vec<_> = groups.into_iter().map(Into::into).collect();
+        for g in &mut proto_groups {
+            apply_group_field_mask(g, &mask);
+        }
+
+        Ok(Response::new(GroupsResponse {
+            groups: proto_groups,
+            missing_groups,
+        }))
+    }
+
+    async fn get_groups_batch(
+        &self,
+        request: Request<GetGroupsBatchRequest>,
+    ) -> Result<Response<GetGroupsBatchResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+        let include_props = group_needs_properties(&req.read_options);
+
+        let keys: Vec<storage::GroupKey> = req
+            .keys
+            .iter()
+            .map(|k| storage::GroupKey {
+                team_id: k.team_id,
+                group_type_index: k.group_type_index,
+                group_key: k.group_key.clone(),
+            })
+            .collect();
+
+        let results = self
+            .storage
+            .get_groups_batch(&keys, consistency, include_props)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_groups_batch"))?;
+
+        // Build a map of found groups
+        let mut found: HashMap<(i64, i32, String), storage::Group> = results
+            .into_iter()
+            .map(|(k, g)| ((k.team_id, k.group_type_index, k.group_key), g))
+            .collect();
+
+        // Return results for all requested keys
+        let mask = build_field_mask(&req.read_options);
+        let results = req
+            .keys
+            .into_iter()
+            .map(|k| {
+                let key = (k.team_id, k.group_type_index, k.group_key.clone());
+                let mut group: Option<_> = found.remove(&key).map(Into::into);
+                if let Some(ref mut g) = group {
+                    apply_group_field_mask(g, &mask);
+                }
+                GroupWithKey {
+                    key: Some(GroupKey {
+                        team_id: k.team_id,
+                        group_type_index: k.group_type_index,
+                        group_key: k.group_key,
+                    }),
+                    group,
+                }
+            })
+            .collect();
+
+        Ok(Response::new(GetGroupsBatchResponse { results }))
+    }
+
+    async fn list_groups(
+        &self,
+        request: Request<ListGroupsRequest>,
+    ) -> Result<Response<ListGroupsResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+        let include_props = group_needs_properties(&req.read_options);
+
+        let limit = if req.limit <= 0 || req.limit > MAX_LIST_GROUPS_LIMIT {
+            MAX_LIST_GROUPS_LIMIT
+        } else {
+            req.limit
+        };
+
+        let cursor_created_at = if req.cursor_created_at_ms > 0 {
+            chrono::DateTime::from_timestamp_millis(req.cursor_created_at_ms)
+        } else {
+            None
+        };
+
+        let (groups, has_more) = self
+            .storage
+            .list_groups(
+                req.team_id,
+                req.group_type_index,
+                &req.group_key_contains,
+                &req.search,
+                cursor_created_at,
+                req.cursor_id,
+                limit,
+                consistency,
+                include_props,
+            )
+            .await
+            .map_err(|e| log_and_convert_error(e, "list_groups"))?;
+
+        let mask = build_field_mask(&req.read_options);
+        let mut proto_groups: Vec<_> = groups.into_iter().map(Into::into).collect();
+        for g in &mut proto_groups {
+            apply_group_field_mask(g, &mask);
+        }
+
+        Ok(Response::new(ListGroupsResponse {
+            groups: proto_groups,
+            has_more,
+        }))
+    }
+
+    // ============================================================
+    // Group Type Mappings
+    // ============================================================
+
+    async fn get_group_type_mappings_by_team_id(
+        &self,
+        request: Request<GetGroupTypeMappingsByTeamIdRequest>,
+    ) -> Result<Response<GroupTypeMappingsResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let mappings = self
+            .storage
+            .get_group_type_mappings_by_team_id(req.team_id, consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_group_type_mappings_by_team_id"))?;
+
+        Ok(Response::new(GroupTypeMappingsResponse {
+            mappings: mappings.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    async fn get_group_type_mappings_by_team_ids(
+        &self,
+        request: Request<GetGroupTypeMappingsByTeamIdsRequest>,
+    ) -> Result<Response<GroupTypeMappingsBatchResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let all_mappings = self
+            .storage
+            .get_group_type_mappings_by_team_ids(&req.team_ids, consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_group_type_mappings_by_team_ids"))?;
+
+        // Group by team_id
+        let mut by_team: HashMap<i64, Vec<GroupTypeMapping>> = HashMap::new();
+        for mapping in all_mappings {
+            by_team
+                .entry(mapping.team_id)
+                .or_default()
+                .push(Into::into(mapping));
+        }
+
+        let results = req
+            .team_ids
+            .into_iter()
+            .map(|team_id| GroupTypeMappingsByKey {
+                key: team_id,
+                mappings: by_team.remove(&team_id).unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Response::new(GroupTypeMappingsBatchResponse { results }))
+    }
+
+    async fn get_group_type_mappings_by_project_id(
+        &self,
+        request: Request<GetGroupTypeMappingsByProjectIdRequest>,
+    ) -> Result<Response<GroupTypeMappingsResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let mappings = self
+            .storage
+            .get_group_type_mappings_by_project_id(req.project_id, consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_group_type_mappings_by_project_id"))?;
+
+        Ok(Response::new(GroupTypeMappingsResponse {
+            mappings: mappings.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    async fn get_group_type_mappings_by_project_ids(
+        &self,
+        request: Request<GetGroupTypeMappingsByProjectIdsRequest>,
+    ) -> Result<Response<GroupTypeMappingsBatchResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let all_mappings = self
+            .storage
+            .get_group_type_mappings_by_project_ids(&req.project_ids, consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_group_type_mappings_by_project_ids"))?;
+
+        // Group by project_id
+        let mut by_project: HashMap<i64, Vec<GroupTypeMapping>> = HashMap::new();
+        for mapping in all_mappings {
+            by_project
+                .entry(mapping.project_id)
+                .or_default()
+                .push(Into::into(mapping));
+        }
+
+        let results = req
+            .project_ids
+            .into_iter()
+            .map(|project_id| GroupTypeMappingsByKey {
+                key: project_id,
+                mappings: by_project.remove(&project_id).unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Response::new(GroupTypeMappingsBatchResponse { results }))
+    }
+
+    async fn count_group_type_mappings(
+        &self,
+        request: Request<CountGroupTypeMappingsRequest>,
+    ) -> Result<Response<CountGroupTypeMappingsResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let counts = self
+            .storage
+            .count_group_type_mappings(consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "count_group_type_mappings"))?;
+
+        Ok(Response::new(CountGroupTypeMappingsResponse {
+            counts: counts
+                .into_iter()
+                .map(|(team_id, count)| GroupTypeMappingCount { team_id, count })
+                .collect(),
+        }))
+    }
+
+    async fn get_group_type_mapping_by_dashboard_id(
+        &self,
+        request: Request<GetGroupTypeMappingByDashboardIdRequest>,
+    ) -> Result<Response<GetGroupTypeMappingByDashboardIdResponse>, Status> {
+        let req = request.into_inner();
+        let consistency = to_storage_consistency(&req.read_options);
+
+        let mapping = self
+            .storage
+            .get_group_type_mapping_by_dashboard_id(req.team_id, req.dashboard_id, consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_group_type_mapping_by_dashboard_id"))?;
+
+        Ok(Response::new(GetGroupTypeMappingByDashboardIdResponse {
+            mapping: mapping.map(Into::into),
+        }))
+    }
+
+    // ============================================================
+    // Group writes
+    // ============================================================
+
+    async fn create_group(
+        &self,
+        request: Request<CreateGroupRequest>,
+    ) -> Result<Response<CreateGroupResponse>, Status> {
+        let req = request.into_inner();
+
+        let created_at = match req.created_at {
+            Some(ts) => chrono::DateTime::from_timestamp_millis(ts).ok_or_else(|| {
+                Status::invalid_argument(format!("Invalid created_at timestamp: {ts}"))
+            })?,
+            None => chrono::Utc::now(),
+        };
+
+        let group_properties: serde_json::Value = serde_json::from_slice(&req.group_properties)
+            .map_err(|e| Status::invalid_argument(format!("Invalid group_properties JSON: {e}")))?;
+
+        let group = self
+            .storage
+            .create_group(
+                req.team_id,
+                req.group_type_index,
+                &req.group_key,
+                &group_properties,
+                created_at,
+            )
+            .await
+            .map_err(|e| log_and_convert_error(e, "create_group"))?;
+
+        Ok(Response::new(CreateGroupResponse {
+            group: Some(group.into()),
+        }))
+    }
+
+    async fn update_group(
+        &self,
+        request: Request<UpdateGroupRequest>,
+    ) -> Result<Response<UpdateGroupResponse>, Status> {
+        let req = request.into_inner();
+
+        let valid_fields = [
+            "group_properties",
+            "properties_last_updated_at",
+            "properties_last_operation",
+            "created_at",
+        ];
+        for field in &req.update_mask {
+            if !valid_fields.contains(&field.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "Invalid update_mask field: {field}"
+                )));
+            }
+        }
+
+        let group_properties: Option<serde_json::Value> = req
+            .group_properties
+            .as_ref()
+            .map(|b| serde_json::from_slice(b))
+            .transpose()
+            .map_err(|e| Status::invalid_argument(format!("Invalid group_properties JSON: {e}")))?;
+
+        let properties_last_updated_at: Option<serde_json::Value> = req
+            .properties_last_updated_at
+            .as_ref()
+            .map(|b| serde_json::from_slice(b))
+            .transpose()
+            .map_err(|e| {
+                Status::invalid_argument(format!("Invalid properties_last_updated_at JSON: {e}"))
+            })?;
+
+        let properties_last_operation: Option<serde_json::Value> = req
+            .properties_last_operation
+            .as_ref()
+            .map(|b| serde_json::from_slice(b))
+            .transpose()
+            .map_err(|e| {
+                Status::invalid_argument(format!("Invalid properties_last_operation JSON: {e}"))
+            })?;
+
+        let created_at = req
+            .created_at
+            .map(|ts| chrono::DateTime::from_timestamp_micros(ts).unwrap_or_default());
+
+        let group = self
+            .storage
+            .update_group(
+                req.team_id,
+                req.group_type_index,
+                &req.group_key,
+                &req.update_mask,
+                group_properties.as_ref(),
+                properties_last_updated_at.as_ref(),
+                properties_last_operation.as_ref(),
+                created_at,
+            )
+            .await
+            .map_err(|e| log_and_convert_error(e, "update_group"))?;
+
+        Ok(Response::new(UpdateGroupResponse {
+            group: group.as_ref().map(|g| g.clone().into()),
+            updated: group.is_some(),
+        }))
+    }
+
+    async fn delete_groups_batch_for_team(
+        &self,
+        request: Request<DeleteGroupsBatchForTeamRequest>,
+    ) -> Result<Response<DeleteGroupsBatchForTeamResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.batch_size <= 0 || req.batch_size > MAX_BATCH_DELETE_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "batch_size must be between 1 and {MAX_BATCH_DELETE_SIZE}"
+            )));
+        }
+
+        let deleted_count = self
+            .storage
+            .delete_groups_batch_for_team(req.team_id, req.batch_size)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_groups_batch_for_team"))?;
+
+        Ok(Response::new(DeleteGroupsBatchForTeamResponse {
+            deleted_count,
+        }))
+    }
+
+    // ============================================================
+    // Group type mapping writes
+    // ============================================================
+
+    async fn update_group_type_mapping(
+        &self,
+        request: Request<UpdateGroupTypeMappingRequest>,
+    ) -> Result<Response<UpdateGroupTypeMappingResponse>, Status> {
+        let req = request.into_inner();
+
+        let valid_fields = [
+            "name_singular",
+            "name_plural",
+            "detail_dashboard_id",
+            "default_columns",
+            "created_at",
+        ];
+        for field in &req.update_mask {
+            if !valid_fields.contains(&field.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "Invalid update_mask field: {field}"
+                )));
+            }
+        }
+
+        let default_columns: Option<Vec<String>> = if let Some(ref bytes) = req.default_columns {
+            Some(serde_json::from_slice(bytes).map_err(|e| {
+                Status::invalid_argument(format!("Invalid default_columns JSON: {e}"))
+            })?)
+        } else {
+            None
+        };
+
+        let created_at = match req.created_at {
+            Some(ts) => Some(chrono::DateTime::from_timestamp_millis(ts).ok_or_else(|| {
+                Status::invalid_argument(format!("Invalid created_at timestamp: {ts}"))
+            })?),
+            None => None,
+        };
+
+        let mapping = self
+            .storage
+            .update_group_type_mapping(
+                req.project_id,
+                req.group_type_index,
+                &req.update_mask,
+                req.name_singular.as_deref(),
+                req.name_plural.as_deref(),
+                req.detail_dashboard_id,
+                default_columns.as_deref(),
+                created_at,
+            )
+            .await
+            .map_err(|e| log_and_convert_error(e, "update_group_type_mapping"))?;
+
+        match mapping {
+            Some(m) => Ok(Response::new(UpdateGroupTypeMappingResponse {
+                mapping: Some(m.into()),
+            })),
+            None => Err(Status::not_found("GroupTypeMapping not found")),
+        }
+    }
+
+    async fn delete_group_type_mapping(
+        &self,
+        request: Request<DeleteGroupTypeMappingRequest>,
+    ) -> Result<Response<DeleteGroupTypeMappingResponse>, Status> {
+        let req = request.into_inner();
+
+        let deleted = self
+            .storage
+            .delete_group_type_mapping(req.project_id, req.group_type_index)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_group_type_mapping"))?;
+
+        Ok(Response::new(DeleteGroupTypeMappingResponse { deleted }))
+    }
+
+    async fn delete_group_type_mappings_batch_for_team(
+        &self,
+        request: Request<DeleteGroupTypeMappingsBatchForTeamRequest>,
+    ) -> Result<Response<DeleteGroupTypeMappingsBatchForTeamResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.batch_size <= 0 || req.batch_size > MAX_BATCH_DELETE_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "batch_size must be between 1 and {MAX_BATCH_DELETE_SIZE}"
+            )));
+        }
+
+        let deleted_count = self
+            .storage
+            .delete_group_type_mappings_batch_for_team(req.team_id, req.batch_size)
+            .await
+            .map_err(|e| log_and_convert_error(e, "delete_group_type_mappings_batch_for_team"))?;
+
+        Ok(Response::new(DeleteGroupTypeMappingsBatchForTeamResponse {
+            deleted_count,
+        }))
+    }
+
+    // ============================================================
+    // Person split
+    // ============================================================
+
+    async fn split_person(
+        &self,
+        request: Request<SplitPersonRequest>,
+    ) -> Result<Response<SplitPersonResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.distinct_ids_to_split.is_empty() {
+            return Ok(Response::new(SplitPersonResponse { splits: vec![] }));
+        }
+
+        if req.distinct_ids_to_split.len() > MAX_SPLIT_BATCH_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "Maximum {MAX_SPLIT_BATCH_SIZE} distinct_ids per split_person request"
+            )));
+        }
+
+        let unique_dids: HashSet<&str> = req
+            .distinct_ids_to_split
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        if unique_dids.len() != req.distinct_ids_to_split.len() {
+            return Err(Status::invalid_argument(
+                "Duplicate distinct_ids in split_person request",
+            ));
+        }
+
+        let results = self
+            .storage
+            .split_person(req.team_id, req.person_id, &req.distinct_ids_to_split)
+            .await
+            .map_err(|e| match &e {
+                storage::StorageError::NotFound(msg) => Status::not_found(msg.clone()),
+                storage::StorageError::FailedPrecondition(msg) => {
+                    Status::failed_precondition(msg.clone())
+                }
+                _ => log_and_convert_error(e, "split_person"),
+            })?;
+
+        Ok(Response::new(SplitPersonResponse {
+            splits: results
+                .into_iter()
+                .map(|r| ProtoSplitResult {
+                    distinct_id: r.distinct_id,
+                    new_person_uuid: r.new_person_uuid.to_string(),
+                    new_person_version: r.new_person_version,
+                    pdi_version: r.pdi_version,
+                    new_person_created_at_ms: r.new_person_created_at.timestamp_millis(),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn set_person_distinct_id_version_floor(
+        &self,
+        request: Request<SetPersonDistinctIdVersionFloorRequest>,
+    ) -> Result<Response<SetPersonDistinctIdVersionFloorResponse>, Status> {
+        let req = request.into_inner();
+
+        let person = self
+            .storage
+            .set_person_distinct_id_version_floor(req.team_id, &req.distinct_id, req.min_version)
+            .await
+            .map_err(|e| log_and_convert_error(e, "set_person_distinct_id_version_floor"))?;
+
+        Ok(Response::new(SetPersonDistinctIdVersionFloorResponse {
+            person: person.map(Into::into),
+        }))
+    }
+
+    async fn set_person_version_floor(
+        &self,
+        request: Request<SetPersonVersionFloorRequest>,
+    ) -> Result<Response<SetPersonVersionFloorResponse>, Status> {
+        let req = request.into_inner();
+
+        let updated = self
+            .storage
+            .set_person_version_floor(req.team_id, req.person_id, req.min_version)
+            .await
+            .map_err(|e| log_and_convert_error(e, "set_person_version_floor"))?;
+
+        Ok(Response::new(SetPersonVersionFloorResponse { updated }))
+    }
+
+    // ============================================================
+    // Version floors
+    // ============================================================
+
+    async fn ensure_person_version_floors(
+        &self,
+        request: Request<EnsurePersonVersionFloorsRequest>,
+    ) -> Result<Response<EnsurePersonVersionFloorsResponse>, Status> {
+        let req = request.into_inner();
+
+        check_floor_batch(
+            req.floors
+                .iter()
+                .map(|f| (f.person_uuid.as_str(), f.min_version)),
+        )?;
+        let floors: Vec<(Uuid, i64)> = req
+            .floors
+            .iter()
+            .map(|f| parse_uuid(&f.person_uuid).map(|uuid| (uuid, f.min_version)))
+            .collect::<Result<_, _>>()?;
+        // Two spellings of one UUID pass the string check but lock the same row.
+        let mut seen = HashSet::with_capacity(floors.len());
+        if let Some((uuid, _)) = floors.iter().find(|(uuid, _)| !seen.insert(*uuid)) {
+            return Err(Status::invalid_argument(format!(
+                "Duplicate key in request: {uuid}"
+            )));
+        }
+
+        let results = self
+            .storage
+            .ensure_person_version_floors(req.team_id, &floors)
+            .await
+            .map_err(|e| log_and_convert_error(e, "ensure_person_version_floors"))?;
+
+        Ok(Response::new(EnsurePersonVersionFloorsResponse {
+            results: results
+                .into_iter()
+                .map(|r| PersonVersionFloorResult {
+                    person_uuid: r.uuid.to_string(),
+                    outcome: floor_outcome_to_proto(r.outcome) as i32,
+                    version: r.version,
+                })
+                .collect(),
+        }))
+    }
+    async fn get_distinct_id_rows(
+        &self,
+        request: Request<GetDistinctIdRowsRequest>,
+    ) -> Result<Response<GetDistinctIdRowsResponse>, Status> {
+        let req = request.into_inner();
+        if req.distinct_ids.len() > MAX_DISTINCT_ID_ROWS_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "Maximum {MAX_DISTINCT_ID_ROWS_SIZE} distinct ids per request"
+            )));
+        }
+        let consistency = to_storage_consistency(&req.read_options);
+        let rows = self
+            .storage
+            .get_distinct_id_rows(req.team_id, &req.distinct_ids, consistency)
+            .await
+            .map_err(|e| log_and_convert_error(e, "get_distinct_id_rows"))?;
+
+        Ok(Response::new(GetDistinctIdRowsResponse {
+            rows: rows.into_iter().map(distinct_id_row_to_proto).collect(),
+        }))
+    }
+
+    async fn list_persons_for_team(
+        &self,
+        request: Request<ListPersonsForTeamRequest>,
+    ) -> Result<Response<ListPersonsForTeamResponse>, Status> {
+        let req = request.into_inner();
+        reject_strong_consistency(&req.read_options)?;
+        let limit = match req.limit {
+            0 => DEFAULT_LIST_PERSONS_LIMIT,
+            l if (1..=MAX_LIST_PERSONS_LIMIT).contains(&l) => l,
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "limit must be between 1 and {MAX_LIST_PERSONS_LIMIT}"
+                )))
+            }
+        };
+        let persons = self
+            .storage
+            .list_persons_for_team(
+                req.team_id,
+                req.after_person_id,
+                req.before_person_id,
+                limit,
+            )
+            .await
+            .map_err(|e| log_and_convert_error(e, "list_persons_for_team"))?;
+
+        let next_after_person_id = if persons.len() as i64 >= limit {
+            persons.last().map(|p| p.id)
+        } else {
+            None
+        };
+        Ok(Response::new(ListPersonsForTeamResponse {
+            persons: persons
+                .into_iter()
+                .map(|p| ProtoPersonListEntry {
+                    id: p.id,
+                    uuid: p.uuid.to_string(),
+                    version: p.version,
+                    is_deleted: p.is_deleted,
+                    has_live_distinct_ids: p.has_live_distinct_ids,
+                    created_at_ms: p.created_at.timestamp_millis(),
+                })
+                .collect(),
+            next_after_person_id,
+        }))
+    }
+    async fn raise_person_version_floors(
+        &self,
+        request: Request<RaisePersonVersionFloorsRequest>,
+    ) -> Result<Response<RaisePersonVersionFloorsResponse>, Status> {
+        let req = request.into_inner();
+        check_floor_batch(
+            req.floors
+                .iter()
+                .map(|f| (f.person_uuid.as_str(), f.min_version)),
+        )?;
+        let floors: Vec<(Uuid, i64)> = req
+            .floors
+            .iter()
+            .map(|f| parse_uuid(&f.person_uuid).map(|uuid| (uuid, f.min_version)))
+            .collect::<Result<_, _>>()?;
+        reject_duplicate_uuids(floors.iter().map(|(uuid, _)| *uuid))?;
+
+        let results = self
+            .storage
+            .raise_person_version_floors(req.team_id, &floors)
+            .await
+            .map_err(|e| log_and_convert_error(e, "raise_person_version_floors"))?;
+
+        Ok(Response::new(RaisePersonVersionFloorsResponse {
+            results: results
+                .into_iter()
+                .map(|r| RaisePersonVersionFloorResult {
+                    person_uuid: r.uuid.to_string(),
+                    outcome: raise_outcome_to_proto(r.outcome) as i32,
+                    version: r.version,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn restore_persons(
+        &self,
+        request: Request<RestorePersonsRequest>,
+    ) -> Result<Response<RestorePersonsResponse>, Status> {
+        let req = request.into_inner();
+        check_floor_batch(
+            req.persons
+                .iter()
+                .map(|p| (p.person_uuid.as_str(), p.version)),
+        )?;
+        let persons: Vec<storage::types::RestoredPerson> = req
+            .persons
+            .iter()
+            .map(|p| {
+                let properties: serde_json::Value =
+                    serde_json::from_slice(&p.properties).map_err(|e| {
+                        Status::invalid_argument(format!("Invalid properties JSON: {e}"))
+                    })?;
+                if !properties.is_object() {
+                    return Err(Status::invalid_argument("properties must be a JSON object"));
+                }
+                Ok(storage::types::RestoredPerson {
+                    uuid: parse_uuid(&p.person_uuid)?,
+                    properties,
+                    created_at: chrono::DateTime::from_timestamp_millis(p.created_at_ms)
+                        .ok_or_else(|| Status::invalid_argument("created_at_ms out of range"))?,
+                    is_identified: p.is_identified,
+                    version: p.version,
+                    distinct_ids: p
+                        .distinct_ids
+                        .iter()
+                        .map(|d| (d.distinct_id.clone(), d.version))
+                        .collect(),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        reject_duplicate_uuids(persons.iter().map(|p| p.uuid))?;
+        check_restored_distinct_ids(&persons)?;
+
+        let results = self
+            .storage
+            .restore_persons(req.team_id, &persons)
+            .await
+            .map_err(|e| log_and_convert_error(e, "restore_persons"))?;
+
+        Ok(Response::new(RestorePersonsResponse {
+            results: results
+                .into_iter()
+                .map(|r| RestorePersonResult {
+                    person_uuid: r.uuid.to_string(),
+                    outcome: restore_outcome_to_proto(r.outcome) as i32,
+                    person_id: r.person_id,
+                    version: r.version,
+                    restored_distinct_ids: r.restored_distinct_ids,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn write_distinct_ids(
+        &self,
+        request: Request<WriteDistinctIdsRequest>,
+    ) -> Result<Response<WriteDistinctIdsResponse>, Status> {
+        let req = request.into_inner();
+        check_floor_batch(
+            req.writes
+                .iter()
+                .map(|w| (w.distinct_id.as_str(), w.min_version)),
+        )?;
+        let writes: Vec<storage::types::DistinctIdWrite> = req
+            .writes
+            .iter()
+            .map(|w| {
+                let action = match ProtoDistinctIdWriteAction::try_from(w.action) {
+                    Ok(ProtoDistinctIdWriteAction::Insert) => {
+                        storage::types::DistinctIdWriteAction::Insert
+                    }
+                    Ok(ProtoDistinctIdWriteAction::Raise) => {
+                        storage::types::DistinctIdWriteAction::Raise
+                    }
+                    Ok(ProtoDistinctIdWriteAction::Tombstone) => {
+                        storage::types::DistinctIdWriteAction::Tombstone
+                    }
+                    _ => {
+                        return Err(Status::invalid_argument(format!(
+                            "Unknown action {} for {}",
+                            w.action, w.distinct_id
+                        )))
+                    }
+                };
+                Ok(storage::types::DistinctIdWrite {
+                    distinct_id: w.distinct_id.clone(),
+                    action,
+                    person_uuid: parse_uuid(&w.person_uuid)?,
+                    min_version: w.min_version,
+                    expected_version: w.expected_version,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let results = self
+            .storage
+            .write_distinct_ids(req.team_id, &writes)
+            .await
+            .map_err(|e| log_and_convert_error(e, "write_distinct_ids"))?;
+
+        Ok(Response::new(WriteDistinctIdsResponse {
+            results: results
+                .into_iter()
+                .map(|r| ProtoDistinctIdWriteResult {
+                    distinct_id: r.distinct_id,
+                    outcome: write_outcome_to_proto(r.outcome) as i32,
+                    row: r.row.map(distinct_id_row_to_proto),
+                })
+                .collect(),
+        }))
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_uuid(s: &str) -> Result<Uuid, Status> {
+    Uuid::parse_str(s).map_err(|e| Status::invalid_argument(format!("Invalid UUID: {e}")))
+}
+
+#[allow(clippy::result_large_err)]
+fn check_write_batch<'a>(keys: impl ExactSizeIterator<Item = &'a str>) -> Result<(), Status> {
+    if keys.len() > MAX_LOCKED_WRITE_BATCH_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "Maximum {MAX_LOCKED_WRITE_BATCH_SIZE} keys per request"
+        )));
+    }
+    let mut seen = HashSet::with_capacity(keys.len());
+    for key in keys {
+        if !seen.insert(key) {
+            return Err(Status::invalid_argument(format!(
+                "Duplicate key in request: {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn check_floor_batch<'a>(
+    floors: impl ExactSizeIterator<Item = (&'a str, i64)> + Clone,
+) -> Result<(), Status> {
+    check_write_batch(floors.clone().map(|(key, _)| key))?;
+    for (key, min_version) in floors {
+        if min_version < 0 {
+            return Err(Status::invalid_argument(format!(
+                "min_version must not be negative, got {min_version} for {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn floor_outcome_to_proto(outcome: storage::VersionFloorOutcome) -> ProtoVersionFloorOutcome {
+    match outcome {
+        storage::VersionFloorOutcome::TombstoneInserted => {
+            ProtoVersionFloorOutcome::TombstoneInserted
+        }
+        storage::VersionFloorOutcome::TombstoneRaised => ProtoVersionFloorOutcome::TombstoneRaised,
+        storage::VersionFloorOutcome::TombstoneAtFloor => {
+            ProtoVersionFloorOutcome::TombstoneAtFloor
+        }
+        storage::VersionFloorOutcome::Live => ProtoVersionFloorOutcome::Live,
+    }
+}
+
+fn tombstone_to_proto(person: storage::types::TombstonedPerson) -> TombstonedPerson {
+    TombstonedPerson {
+        person_uuid: person.uuid.to_string(),
+        version: person.version,
+        distinct_ids: person
+            .distinct_ids
+            .into_iter()
+            .map(|did| TombstonedDistinctId {
+                distinct_id: did.distinct_id,
+                version: did.version,
+            })
+            .collect(),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn check_restored_distinct_ids(persons: &[storage::types::RestoredPerson]) -> Result<(), Status> {
+    let ids: Vec<&(String, i64)> = persons.iter().flat_map(|p| &p.distinct_ids).collect();
+    if ids.len() > MAX_DISTINCT_ID_ROWS_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "At most {MAX_DISTINCT_ID_ROWS_SIZE} distinct ids per restore, got {}",
+            ids.len()
+        )));
+    }
+    let mut seen = HashSet::with_capacity(ids.len());
+    for (distinct_id, version) in ids {
+        if distinct_id.is_empty() {
+            return Err(Status::invalid_argument("distinct_id must not be empty"));
+        }
+        if *version < 0 {
+            return Err(Status::invalid_argument(format!(
+                "version must not be negative, got {version} for {distinct_id}"
+            )));
+        }
+        if !seen.insert(distinct_id.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "Duplicate distinct_id in request: {distinct_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn reject_duplicate_uuids(uuids: impl Iterator<Item = Uuid>) -> Result<(), Status> {
+    // Two spellings of one UUID pass the string check but lock the same row.
+    let mut seen = HashSet::new();
+    for uuid in uuids {
+        if !seen.insert(uuid) {
+            return Err(Status::invalid_argument(format!(
+                "Duplicate key in request: {uuid}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn distinct_id_row_to_proto(row: storage::types::DistinctIdRow) -> ProtoDistinctIdRow {
+    ProtoDistinctIdRow {
+        distinct_id: row.distinct_id,
+        person_id: row.person_id,
+        person_uuid: row.person_uuid.map(|u| u.to_string()),
+        version: row.version,
+        is_deleted: row.is_deleted,
+        person_is_deleted: row.person_is_deleted,
+    }
+}
+
+fn raise_outcome_to_proto(outcome: storage::types::RaiseOutcome) -> ProtoRaiseOutcome {
+    match outcome {
+        storage::types::RaiseOutcome::Raised => ProtoRaiseOutcome::Raised,
+        storage::types::RaiseOutcome::AtOrAbove => ProtoRaiseOutcome::AtOrAbove,
+        storage::types::RaiseOutcome::NotLive => ProtoRaiseOutcome::NotLive,
+        storage::types::RaiseOutcome::Missing => ProtoRaiseOutcome::Missing,
+    }
+}
+
+fn restore_outcome_to_proto(outcome: storage::types::RestoreOutcome) -> ProtoRestoreOutcome {
+    match outcome {
+        storage::types::RestoreOutcome::Inserted => ProtoRestoreOutcome::Inserted,
+        storage::types::RestoreOutcome::ExistsLive => ProtoRestoreOutcome::ExistsLive,
+        storage::types::RestoreOutcome::ExistsTombstoned => ProtoRestoreOutcome::ExistsTombstoned,
+        storage::types::RestoreOutcome::NoDistinctId => ProtoRestoreOutcome::NoDistinctId,
+    }
+}
+
+fn write_outcome_to_proto(
+    outcome: storage::types::DistinctIdWriteOutcome,
+) -> ProtoDistinctIdWriteOutcome {
+    match outcome {
+        storage::types::DistinctIdWriteOutcome::Applied => ProtoDistinctIdWriteOutcome::Applied,
+        storage::types::DistinctIdWriteOutcome::Unchanged => ProtoDistinctIdWriteOutcome::Unchanged,
+        storage::types::DistinctIdWriteOutcome::PreconditionFailed => {
+            ProtoDistinctIdWriteOutcome::PreconditionFailed
+        }
+        storage::types::DistinctIdWriteOutcome::PersonNotLive => {
+            ProtoDistinctIdWriteOutcome::PersonNotLive
+        }
+    }
+}

@@ -1,0 +1,880 @@
+import json
+from typing import Any
+
+from posthog.test.base import BaseTest, ClickhouseTestMixin
+
+from parameterized import parameterized
+
+from posthog.hogql.query import execute_hogql_query
+
+from posthog.constants import AvailableFeature
+
+from products.access_control.backend.facade.user_access_control import UserAccessControl
+from products.access_control.backend.models.access_control import AccessControl
+from products.engineering_analytics.backend.logic.sources import (
+    TRUNK_MERGE_QUEUE_SCHEMA,
+    TRUNK_QUARANTINED_TESTS_SCHEMA,
+    list_github_sources,
+    resolve_trunk_merge_queue_table,
+    resolve_trunk_quarantined_tests_source,
+)
+from products.engineering_analytics.backend.logic.views import (
+    ci_job_history,
+    depot_ci,
+    job_costs,
+    pull_requests,
+    trunk_quarantined_tests,
+    workflow_jobs,
+    workflow_runs,
+)
+from products.engineering_analytics.backend.logic.views.source_schema import (
+    DEPOT_JOB_ATTEMPTS_COLUMNS,
+    PULL_REQUESTS_COLUMNS,
+    TRUNK_QUARANTINED_TESTS_COLUMNS,
+    TRUNK_QUARANTINED_TESTS_V1_COLUMNS,
+    WORKFLOW_JOBS_COLUMNS,
+    WORKFLOW_RUNS_COLUMNS,
+)
+from products.engineering_analytics.backend.tests._github_fixtures import (
+    _pr_row,
+    _quarantined_row,
+    _run_row,
+    create_github_source,
+    create_github_warehouse_table,
+    create_trunk_source,
+    create_warehouse_table_row,
+    link_schema,
+    pr_association,
+    pr_association_entry,
+    repo_id,
+)
+from products.engineering_analytics.backend.tests._logic_helpers import _job_row
+
+
+def _github_runs(runs_table: str) -> str:
+    return depot_ci.with_depot_runs(runs_table, None, None, None)
+
+
+class TestListGithubSourcesAccessControl(BaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL}
+        ]
+        self.organization.save()
+
+    def test_none_resource_access_fails_closed_to_self_created_sources(self) -> None:
+        mine = create_github_source(self.team, prefix="mine_", source_id="gh-mine")
+        mine.created_by = self.user
+        mine.save()
+        theirs = create_github_source(self.team, prefix="theirs_", source_id="gh-theirs")
+        access_control = UserAccessControl(user=self.user, team=self.team)
+
+        assert len(list_github_sources(team=self.team, user_access_control=access_control)) == 2
+
+        AccessControl.objects.create(team=self.team, resource="external_data_source", access_level="none")
+        visible = list_github_sources(
+            team=self.team, user_access_control=UserAccessControl(user=self.user, team=self.team)
+        )
+        assert [source.id for source in visible] == [str(mine.id)]
+
+        # The filter counts only member and role rows as grants. A default object row for everyone
+        # does not count.
+        AccessControl.objects.create(
+            team=self.team,
+            resource="external_data_source",
+            resource_id=str(theirs.id),
+            access_level="editor",
+            organization_member=self.organization_membership,
+        )
+        visible = list_github_sources(
+            team=self.team, user_access_control=UserAccessControl(user=self.user, team=self.team)
+        )
+        assert {source.id for source in visible} == {str(mine.id), str(theirs.id)}
+
+    def test_trunk_resolver_denied_user_resolves_none(self) -> None:
+        source = create_trunk_source(self.team)
+        table = create_warehouse_table_row(
+            self.team, name="trunkprefix_trunk_io_merge_queue_pull_requests", source=source
+        )
+        link_schema(self.team, source, name=TRUNK_MERGE_QUEUE_SCHEMA, table=table)
+
+        assert resolve_trunk_merge_queue_table(self.team) == table.name
+        assert (
+            resolve_trunk_merge_queue_table(self.team, UserAccessControl(user=self.user, team=self.team)) == table.name
+        )
+
+        AccessControl.objects.create(team=self.team, resource="external_data_source", access_level="none")
+        assert resolve_trunk_merge_queue_table(self.team, UserAccessControl(user=self.user, team=self.team)) is None
+
+    @parameterized.expand(
+        [
+            ("same_repo", {"repo_owner": "PostHog", "repo_name": "posthog"}, True),
+            ("legacy_without_repo_keys", {}, True),
+            ("other_repo", {"repo_owner": "PostHog", "repo_name": "posthog-js"}, False),
+        ]
+    )
+    def test_trunk_quarantine_resolver_never_serves_another_repos_source(
+        self, _name: str, job_inputs: dict[str, str], resolves: bool
+    ) -> None:
+        source = create_trunk_source(self.team, job_inputs=job_inputs)
+        table = create_warehouse_table_row(self.team, name="trunkprefix_quarantined_tests", source=source)
+        link_schema(self.team, source, name=TRUNK_QUARANTINED_TESTS_SCHEMA, table=table)
+
+        resolved = resolve_trunk_quarantined_tests_source(self.team, "posthog/posthog")
+
+        assert (resolved.table if resolved else None) == (table.name if resolves else None)
+
+
+class TestEngineeringAnalyticsViews(ClickhouseTestMixin, BaseTest):
+    def _create_table(self, base_name: str, columns: dict, rows: list[dict[str, Any]]) -> str:
+        return create_github_warehouse_table(self, base_name, columns, rows)
+
+    def _select(self, sql: str) -> list[tuple]:
+        return execute_hogql_query(query=sql, team=self.team, query_type="engineering_analytics.test").results
+
+    def test_pull_requests_view_maps_columns(self) -> None:
+        table_name = self._create_table(
+            "github_pull_requests",
+            PULL_REQUESTS_COLUMNS,
+            [
+                _pr_row(
+                    10,
+                    "alice",
+                    "closed",
+                    0,
+                    "2026-01-10 10:00:00",
+                    merged_at="2026-01-12 10:00:00",
+                    head_sha="sha10",
+                    labels=("bug", "p1"),
+                ),
+                _pr_row(11, "dependabot[bot]", "closed", 0, "2026-01-11 10:00:00", merged_at="2026-01-11 12:00:00"),
+                _pr_row(12, "charlie", "open", 1, "2026-01-08 10:00:00"),
+                _pr_row(
+                    13,
+                    "trunk-io[bot]",
+                    "open",
+                    1,
+                    "2026-01-13 10:00:00",
+                    head_ref="trunk-merge/pr-10/cabec75e-5181-4429-aea5-0501a52d0688",
+                ),
+                # The same branch shape with an ordinary author. Branch names are contributor-controlled,
+                # so the shape alone must not drop a PR.
+                _pr_row(
+                    14,
+                    "mallory",
+                    "open",
+                    0,
+                    "2026-01-14 10:00:00",
+                    head_ref="trunk-merge/pr-10/deadbeef-0000-0000-0000-000000000000",
+                ),
+            ],
+        )
+
+        rows = self._select(
+            "SELECT number, author_handle, is_bot, repo_owner, repo_name, labels, state, is_draft, "
+            "head_sha, open_to_merge_seconds "
+            f"FROM ({pull_requests.build_query(table_name)}) AS pr ORDER BY number"
+        )
+
+        by_number = {row[0]: row for row in rows}
+        assert by_number[10][1:] == (
+            "alice",
+            False,
+            "PostHog",
+            "posthog",
+            ["bug", "p1"],
+            "merged",
+            False,
+            "sha10",
+            172800,
+        )
+        # ClickHouse returns a Bool as 1 or 0.
+        assert by_number[11][2] == 1
+        assert by_number[12][6] == "open"
+        assert by_number[12][7] == 1
+        assert by_number[12][9] is None
+        # PR 13 is a merge-queue gate branch that the queue bot authored. PR 14 has the same branch
+        # shape but a human author.
+        assert 13 not in by_number
+        assert 14 in by_number
+
+    def test_workflow_runs_view_maps_columns(self) -> None:
+        table_name = self._create_table(
+            "github_workflow_runs",
+            WORKFLOW_RUNS_COLUMNS,
+            [
+                _run_row(2001, "CI", "sha1", "completed", "success", "2026-01-20 10:00:00", "2026-01-20 10:30:00"),
+                _run_row(2002, "CI", "sha2", "completed", "failure", "2026-01-22 10:00:00", "2026-01-22 10:45:00"),
+                _run_row(2003, "Deploy", "sha3", "in_progress", None, "2026-01-25 10:00:00", "2026-01-25 10:05:00"),
+                _run_row(
+                    2004,
+                    "CI",
+                    "sha4",
+                    "completed",
+                    "success",
+                    "2026-01-26 10:00:00",
+                    "2026-01-26 10:20:00",
+                    # The association names the temporary PR the queue opened (9001). The branch
+                    # names the PR being landed (44).
+                    pr_number=9001,
+                    head_branch="trunk-merge/pr-44/cabec75e-5181-4429-aea5-0501a52d0688",
+                    actor="trunk-io[bot]",
+                ),
+                # The same branch shape with an ordinary actor.
+                _run_row(
+                    2005,
+                    "CI",
+                    "sha5",
+                    "completed",
+                    "success",
+                    "2026-01-27 10:00:00",
+                    "2026-01-27 10:20:00",
+                    pr_number=9002,
+                    head_branch="trunk-merge/pr-44/deadbeef-0000-0000-0000-000000000000",
+                    actor="mallory",
+                ),
+            ],
+        )
+
+        rows = self._select(
+            "SELECT workflow_name, status, conclusion, duration_seconds, repo_owner, repo_name, "
+            "pr_number, is_merge_queue "
+            f"FROM ({workflow_runs.build_query(_github_runs(table_name))}) AS r ORDER BY id"
+        )
+
+        assert rows[0][:6] == ("CI", "completed", "success", 1800, "PostHog", "posthog")
+        assert rows[1][3] == 2700
+        assert rows[2][:6] == ("Deploy", "in_progress", None, None, "PostHog", "posthog")
+        assert rows[3][6:] == (44, 1)
+        assert rows[4][6:] == (9002, 0)
+
+    def test_depot_ci_attempts_read_as_runs_jobs_and_cost(self) -> None:
+        # Run 901 handed its commit to Depot, which ran it, so only the Depot run of that commit counts.
+        # Run 902 handed off a commit that Depot never ran, so run 902 is the only record of it.
+        runs_table = self._create_table(
+            "github_workflow_runs",
+            WORKFLOW_RUNS_COLUMNS,
+            [
+                _run_row(
+                    run_id,
+                    "Backend CI",
+                    sha,
+                    "completed",
+                    conclusion,
+                    "2026-09-24 14:50:00",
+                    "2026-09-24 15:05:00",
+                    pr_number=pr_number,
+                    run_attempt=run_attempt,
+                )
+                for run_id, sha, pr_number, conclusion, run_attempt in (
+                    (901, "abc123", 101991, "success", 1),
+                    (902, "def456", 101991, "success", 1),
+                    (903, "fed789", 101991, "success", 1),
+                    (904, "abc123", 101992, "success", 1),
+                    (905, "abc123", 101991, "failure", 1),
+                    (906, "abc123", 101991, "failure", 2),
+                    (907, "abc123", 101991, "success", 1),
+                    (908, "abc123", 101991, "success", 2),
+                )
+            ]
+            # A merge-queue gate for PR 101991, tested through gate PR 101993, handed its commit to Depot.
+            + [
+                _run_row(
+                    909,
+                    "Backend CI",
+                    "gat123",
+                    "completed",
+                    "success",
+                    "2026-09-24 14:50:00",
+                    "2026-09-24 15:05:00",
+                    pr_number=101993,
+                    head_branch="trunk-merge/pr-101991/aaaa",
+                    actor="trunk-io[bot]",
+                )
+            ],
+        )
+        jobs_table = self._create_table(
+            "github_workflow_jobs",
+            WORKFLOW_JOBS_COLUMNS,
+            [
+                _job_row(9011, 901, "Hand off backend tests to Depot CI", "success", head_sha="abc123"),
+                _job_row(9012, 901, "Django Tests Pass", "success", head_sha="abc123"),
+                _job_row(9021, 902, "Hand off backend tests to Depot CI", "success", head_sha="def456"),
+                _job_row(9031, 903, "Hand off backend tests to Depot CI", "skipped", head_sha="fed789"),
+                _job_row(9041, 904, "Hand off backend tests to Depot CI", "success", head_sha="abc123"),
+                _job_row(9042, 904, "Django Tests Pass", "success", head_sha="abc123"),
+                _job_row(9051, 905, "Hand off backend tests to Depot CI", "success", head_sha="abc123"),
+                _job_row(9052, 905, "Django Tests Pass", "failure", head_sha="abc123"),
+                _job_row(9061, 906, "Hand off backend tests to Depot CI", "success", head_sha="abc123"),
+                _job_row(9062, 906, "Django Tests Pass", "success", head_sha="abc123"),
+                _job_row(9063, 906, "Django Tests Pass", "failure", head_sha="abc123", run_attempt=2),
+                _job_row(9071, 907, "Hand off backend tests to Depot CI", "success", head_sha="abc123"),
+                _job_row(9072, 907, "Django Tests Pass", "success", head_sha="abc123"),
+                _job_row(9073, 907, "Django Tests Pass", "", head_sha="abc123", run_attempt=2)
+                | {"status": "in_progress", "conclusion": None},
+                _job_row(9081, 908, "Hand off backend tests to Depot CI", "success", head_sha="abc123"),
+                _job_row(
+                    9082,
+                    908,
+                    "Django Tests Pass",
+                    "failure",
+                    head_sha="abc123",
+                    started="2026-09-01 14:00:00",
+                    completed="2026-09-01 14:02:00",
+                ),
+                _job_row(9083, 908, "Django Tests Pass", "success", head_sha="abc123", run_attempt=2),
+                _job_row(9091, 909, "Hand off backend tests to Depot CI", "success", head_sha="gat123"),
+                _job_row(9092, 909, "Django Tests Pass", "success", head_sha="gat123"),
+            ],
+        )
+
+        prs_table = self._create_table(
+            "github_pull_requests",
+            PULL_REQUESTS_COLUMNS,
+            [
+                _pr_row(101991, "octocat", "open", 0, "2026-09-24T14:00:00Z", head_ref="feature/depot"),
+                _pr_row(
+                    101993, "trunk-io[bot]", "open", 1, "2026-09-24T14:30:00Z", head_ref="trunk-merge/pr-101991/aaaa"
+                ),
+            ],
+        )
+
+        def attempt(
+            attempt_id: str,
+            attempt: int,
+            status: str,
+            started: str,
+            finished: str,
+            *,
+            job_id: str = "p4kd9tq2xs",
+            run_id: str = "427q556wmn",
+            run_workflow_count: int = 1,
+            workflow_id: str = "6n4tghls33",
+            workflow_name: str = "Backend CI on Depot",
+            workflow_status: str = "finished",
+            ref: str = "refs/pull/101991/merge",
+            display_name: str = "Product tests (experiments)",
+            repo: str = "PostHog/posthog",
+            job_key: str = "ci-backend.yml:turbo-tests:matrix-38",
+            head_sha: str = "abc123",
+            sha: str = "",
+        ) -> dict[str, str | int]:
+            return {
+                "run_id": run_id,
+                "run_workflow_count": run_workflow_count,
+                "repo": repo,
+                "ref": ref,
+                "head_sha": head_sha,
+                "sha": sha,
+                "workflow_id": workflow_id,
+                "workflow_name": workflow_name,
+                "workflow_status": workflow_status,
+                "workflow_created_at": "2026-09-24T14:51:17.948Z",
+                "workflow_started_at": "2026-09-24T14:51:18.000Z",
+                "workflow_finished_at": "2026-09-24T15:01:18.000Z",
+                "job_id": job_id,
+                "job_key": job_key,
+                "job_display_name": display_name,
+                "attempt_id": attempt_id,
+                "attempt": attempt,
+                "attempt_status": status,
+                "attempt_started_at": started,
+                "attempt_finished_at": finished,
+                "sandbox_id": "sandbox",
+            }
+
+        # This workflow is not the handed-off one, but it shares the commit of run 902. The two must not pair.
+        schedule: dict[str, Any] = {
+            "run_id": "bbbbbbbbbb",
+            "run_workflow_count": 2,
+            "ref": "refs/heads/master",
+            "head_sha": "",
+            "sha": "def456",
+        }
+        depot_table = self._create_table(
+            "depot_job_attempts",
+            DEPOT_JOB_ATTEMPTS_COLUMNS,
+            [
+                attempt(
+                    "c2d3f4g5h6",
+                    1,
+                    "finished",
+                    "2026-09-24T14:51:20.000Z",
+                    "2026-09-24T14:51:30.000Z",
+                    job_id="j2k3l4m5n6",
+                    display_name="Wait for GitHub Actions to hand off backend tests",
+                    job_key="ci-backend.yml:wait-for-handoff",
+                ),
+                attempt("zf6sbbn2wh", 1, "failed", "2026-09-24T14:53:00.000Z", "2026-09-24T14:55:00.000Z"),
+                attempt("3v4pbsqvfc", 2, "finished", "2026-09-24T14:56:00.000Z", "2026-09-24T14:59:00.000Z"),
+                # A job with no display name falls back to its key.
+                attempt(
+                    "b82nsv77wl",
+                    1,
+                    "finished",
+                    "2026-09-24T14:52:00.000Z",
+                    "2026-09-24T14:52:30.000Z",
+                    job_id="t7m3xc4pzb",
+                    display_name="",
+                ),
+                # A run with two workflows keys each workflow by its own id.
+                attempt(
+                    "q28m5dl5rg",
+                    1,
+                    "finished",
+                    "2026-09-24T14:52:00.000Z",
+                    "2026-09-24T14:53:00.000Z",
+                    job_id="w2hq8vn5cd",
+                    workflow_id="cccccccccc",
+                    workflow_name="Monitor",
+                    workflow_status="finished",
+                    **schedule,
+                ),
+                attempt(
+                    "h8qn5x801q",
+                    1,
+                    "failed",
+                    "2026-09-24T14:52:00.000Z",
+                    "2026-09-24T14:53:00.000Z",
+                    job_id="x9fz3kr7bm",
+                    workflow_id="dddddddddd",
+                    workflow_name="Timing",
+                    workflow_status="failed",
+                    **schedule,
+                ),
+                # Depot waited for a hand-off GitHub never made. It lists no attempt for the jobs it skipped.
+                attempt(
+                    "m4n5p6q7r8",
+                    1,
+                    "finished",
+                    "2026-09-24T14:52:00.000Z",
+                    "2026-09-24T14:52:02.000Z",
+                    job_id="s4t5v6w7x8",
+                    run_id="5555555555",
+                    workflow_id="6666666666",
+                    workflow_status="finished",
+                    job_key="ci-backend.yml:wait-for-handoff",
+                ),
+                attempt(
+                    "m4n5p6q7r9",
+                    1,
+                    "failed",
+                    "2026-09-24T14:52:00.000Z",
+                    "2026-09-24T14:52:02.000Z",
+                    job_id="s4t5v6w7x9",
+                    run_id="5555555556",
+                    workflow_id="6666666667",
+                    workflow_status="failed",
+                    job_key="ci-backend.yml:wait-for-handoff",
+                ),
+                *(
+                    attempt(
+                        attempt_id,
+                        1,
+                        "finished",
+                        "2026-09-24T14:52:00.000Z",
+                        "2026-09-24T14:53:00.000Z",
+                        job_id=job_id,
+                        run_id="7777777777",
+                        workflow_id="8888888888",
+                        ref="refs/pull/101993/merge",
+                        head_sha="gat123",
+                        job_key=job_key,
+                    )
+                    for attempt_id, job_id, job_key in (
+                        ("g7h8j9k0l1", "g1h2j3k4l5", "ci-backend.yml:wait-for-handoff"),
+                        ("g7h8j9k0l2", "g1h2j3k4l6", "ci-backend.yml:turbo-tests:matrix-38"),
+                    )
+                ),
+                # This attempt belongs to another repository, so no read of PostHog/posthog keeps it.
+                attempt(
+                    "k3w9v2rq8b",
+                    1,
+                    "finished",
+                    "2026-09-24T14:52:00.000Z",
+                    "2026-09-24T14:53:00.000Z",
+                    job_id="y6tc2pw4hn",
+                    run_id="zzzzzzzzzz",
+                    repo="PostHog/other",
+                ),
+            ],
+        )
+        depot = depot_ci.DepotJobAttempts(table=depot_table, repository="PostHog/posthog")
+        runs = depot_ci.with_depot_runs(runs_table, depot, prs_table, jobs_table)
+        jobs = depot_ci.with_depot_jobs(jobs_table, depot, runs_table)
+
+        # 80213453736890 is the GITHUB_RUN_ID Depot CI gave run 427q556wmn, as its per-test traces report it.
+        assert self._select(
+            "SELECT id, workflow_name, conclusion, pr_number, head_branch, duration_seconds, repo_owner, run_attempt "
+            f"FROM ({workflow_runs.build_query(runs)}) AS r ORDER BY id"
+        ) == [
+            (902, "Backend CI", "success", 101991, "main", 900, "PostHog", 1),
+            (903, "Backend CI", "success", 101991, "main", 900, "PostHog", 1),
+            (904, "Backend CI", "success", 101992, "main", 900, "PostHog", 1),
+            (905, "Backend CI", "failure", 101991, "main", 900, "PostHog", 1),
+            (906, "Backend CI", "failure", 101991, "main", 900, "PostHog", 2),
+            (907, "Backend CI", "success", 101991, "main", 900, "PostHog", 1),
+            (908, "Backend CI", "success", 101991, "main", 900, "PostHog", 2),
+            (80213453736890, "Backend CI on Depot", "success", 101991, "feature/depot", 600, "PostHog", 2),
+            (101808620689656, "Backend CI on Depot", "failure", 101991, "feature/depot", 600, "PostHog", 1),
+            (
+                142532068965517,
+                "Backend CI on Depot",
+                "success",
+                101991,
+                "trunk-merge/pr-101991/aaaa",
+                600,
+                "PostHog",
+                1,
+            ),
+            (223978965517241, "Monitor", "success", 0, "master", 600, "PostHog", 1),
+            (244340689655172, "Timing", "failure", 0, "master", 600, "PostHog", 1),
+        ]
+        assert self._select(
+            f"SELECT DISTINCT run_id FROM ({workflow_jobs.build_query(jobs)}) AS j ORDER BY run_id"
+        ) == [
+            (902,),
+            (903,),
+            (904,),
+            (905,),
+            (906,),
+            (907,),
+            (908,),
+            (80213453736890,),
+            (101808620689656,),
+            (142532068965517,),
+            (223978965517241,),
+            (244340689655172,),
+        ]
+        job_rows = "SELECT ci_engine, id, run_id, run_attempt, is_rerun_copy FROM ({}) AS j ORDER BY ci_engine, id, run_attempt"
+        assert self._select(job_rows.format(workflow_jobs.build_query(jobs))) == self._select(
+            job_rows.format(workflow_jobs.build_query(workflow_jobs.JobsTable.of(jobs.rows)))
+        )
+        assert self._select(
+            "SELECT run_id, run_attempt, name, conclusion, duration_seconds, is_rerun_copy "
+            f"FROM ({workflow_jobs.build_query(jobs)}) AS j WHERE run_id = 80213453736890 ORDER BY started_at, run_attempt"
+        ) == [
+            (80213453736890, 1, "Wait for GitHub Actions to hand off backend tests", "success", 10, 0),
+            (80213453736890, 2, "Wait for GitHub Actions to hand off backend tests", "success", 10, 1),
+            (80213453736890, 1, "ci-backend.yml:turbo-tests:matrix-38", "success", 30, 0),
+            # Listed again under the run's second attempt, like a job GitHub did not re-run.
+            (80213453736890, 2, "ci-backend.yml:turbo-tests:matrix-38", "success", 30, 1),
+            (80213453736890, 1, "Product tests (experiments)", "failure", 120, 0),
+            (80213453736890, 2, "Product tests (experiments)", "success", 180, 0),
+        ]
+        assert self._select(
+            "SELECT DISTINCT provider, vcpu, estimated_cost_usd > 0, head_branch, is_rerun_copy "
+            f"FROM ({job_costs.build_query(jobs_table=jobs, runs_table=runs)}) AS c WHERE run_id = 80213453736890 "
+            "ORDER BY is_rerun_copy"
+        ) == [("depot", 2, 1, "feature/depot", 0), ("depot", 2, 0, "feature/depot", 1)]
+        assert self._select(
+            "SELECT DISTINCT head_branch "
+            f"FROM ({ci_job_history.build_query(jobs_table=jobs, runs_table=runs)}) AS h WHERE run_id = 80213453736890"
+        ) == [("feature/depot",)]
+
+        assert self._select(
+            "SELECT DISTINCT ci_engine, native_run_id, native_workflow_run_id "
+            f"FROM ({workflow_runs.build_query(runs)}) AS r "
+            "WHERE id IN (902, 80213453736890, 223978965517241) ORDER BY id"
+        ) == [
+            ("github_actions", "902", "902"),
+            ("depot_ci", "427q556wmn", "6n4tghls33"),
+            ("depot_ci", "bbbbbbbbbb", "cccccccccc"),
+        ]
+        for view in (job_costs, ci_job_history):
+            assert self._select(
+                "SELECT DISTINCT ci_engine, native_run_id, native_workflow_run_id, native_attempt_id "
+                f"FROM ({view.build_query(jobs_table=jobs, runs_table=runs)}) AS j "
+                "WHERE native_attempt_id = '3v4pbsqvfc'"
+            ) == [("depot_ci", "427q556wmn", "6n4tghls33", "3v4pbsqvfc")]
+
+    @parameterized.expand(
+        [
+            ("queue_bot_gate_pr", "trunk-io[bot]", 101991, 1),
+            ("spoofed_branch_shape", "mallory", 117864, 0),
+        ]
+    )
+    def test_depot_merge_queue_gate_run_resolves_to_the_landed_pr(
+        self, _name: str, gate_pr_author: str, expected_pr_number: int, expected_is_merge_queue: int
+    ) -> None:
+        runs_table = self._create_table(
+            "github_workflow_runs",
+            WORKFLOW_RUNS_COLUMNS,
+            [
+                _run_row(
+                    901, "Backend CI", "abc123", "completed", "success", "2026-09-24 14:50:00", "2026-09-24 15:05:00"
+                )
+            ],
+        )
+        prs_table = self._create_table(
+            "github_pull_requests",
+            PULL_REQUESTS_COLUMNS,
+            [
+                _pr_row(
+                    117864,
+                    gate_pr_author,
+                    "open",
+                    1,
+                    "2026-09-24T14:00:00Z",
+                    head_ref="trunk-merge/pr-101991/1b92e8cf-acbf-4658-8071-4cf622123da8",
+                )
+            ],
+        )
+        depot_table = self._create_table(
+            "depot_job_attempts",
+            DEPOT_JOB_ATTEMPTS_COLUMNS,
+            [
+                {
+                    "run_id": "427q556wmn",
+                    "run_workflow_count": 1,
+                    "repo": "PostHog/posthog",
+                    "ref": "refs/pull/117864/merge",
+                    "head_sha": "abc123",
+                    "sha": "",
+                    "workflow_id": "6n4tghls33",
+                    "workflow_name": "Backend CI on Depot",
+                    "workflow_status": "failed",
+                    "workflow_created_at": "2026-09-24T14:51:17.948Z",
+                    "workflow_started_at": "2026-09-24T14:51:18.000Z",
+                    "workflow_finished_at": "2026-09-24T15:01:18.000Z",
+                    "job_id": "p4kd9tq2xs",
+                    "job_key": "ci-backend.yml:django-tests",
+                    "job_display_name": "Django Tests Pass on Depot",
+                    "attempt_id": "zf6sbbn2wh",
+                    "attempt": 1,
+                    "attempt_status": "failed",
+                    "attempt_started_at": "2026-09-24T14:53:00.000Z",
+                    "attempt_finished_at": "2026-09-24T14:55:00.000Z",
+                    "sandbox_id": "sandbox",
+                }
+            ],
+        )
+        depot = depot_ci.DepotJobAttempts(table=depot_table, repository="PostHog/posthog")
+        runs = depot_ci.with_depot_runs(runs_table, depot, prs_table, None)
+
+        assert self._select(
+            f"SELECT pr_number, is_merge_queue FROM ({workflow_runs.build_query(runs)}) AS r WHERE ci_engine = 'depot_ci'"
+        ) == [(expected_pr_number, expected_is_merge_queue)]
+
+    def test_pull_requests_view_handles_null_user(self) -> None:
+        # The source lands user as Nullable(String), and it is NULL for a PR by a deleted GitHub
+        # account. nullIf('', '') gives a typed NULL.
+        head_json = '{"sha": "sha5"}'
+        base_json = '{"repo": {"full_name": "PostHog/posthog"}}'
+        raw = (
+            "(SELECT 100 AS id, 5 AS number, 'PR 5' AS title, 'open' AS state, false AS draft, "
+            f"nullIf('', '') AS user, '{head_json}' AS head, '{base_json}' AS base, '[]' AS labels, "
+            "'2026-01-10 10:00:00' AS created_at, '2026-01-10 10:00:00' AS updated_at, "
+            "nullIf('', '') AS merged_at, nullIf('', '') AS closed_at, nullIf('', '') AS merge_commit_sha)"
+        )
+        rows = self._select(
+            f"SELECT author_handle, author_avatar_url, is_bot FROM ({pull_requests.build_query(raw)}) AS pr"
+        )
+        assert rows[0] == ("", "", 0)
+
+    def test_workflow_runs_view_handles_null_pull_requests(self) -> None:
+        # The source lands pull_requests and actor as Nullable(String). nullIf('', '') gives a typed NULL.
+        repo_json = '{"full_name": "PostHog/posthog"}'
+        raw = (
+            "(SELECT 1 AS id, 'CI' AS name, 'sha1' AS head_sha, "
+            "'trunk-merge/pr-44/cabec75e' AS head_branch, 'completed' AS status, "
+            "'success' AS conclusion, 1 AS run_attempt, nullIf('', '') AS pull_requests, "
+            f"'{repo_json}' AS repository, nullIf('', '') AS head_commit, nullIf('', '') AS actor, "
+            "'2026-01-20 10:00:00' AS run_started_at, '2026-01-20 10:30:00' AS updated_at, "
+            "'2026-01-20 10:00:00' AS created_at)"
+        )
+        rows = self._select(
+            f"SELECT pr_number, repo_owner, repo_name, is_merge_queue FROM ({workflow_runs.build_query(_github_runs(raw))}) AS r"
+        )
+        assert rows[0] == (0, "PostHog", "posthog", 0)
+
+    def test_workflow_runs_view_attributes_only_own_repo_prs_and_falls_back_to_the_merge_commit(self) -> None:
+        # GitHub lists every PR in the fork network that shares the head SHA, so only an entry whose
+        # base.repo.id is the run's repository.id counts.
+        own, fork = "PostHog/posthog", "Mu-L/posthog-1"
+        cases: list[tuple[str, str | None, str | None, int, int | None]] = [
+            # (head_branch, pull_requests, commit message, expected pr_number, expected commit_pr_number)
+            ("pr-branch", pr_association(42, base_repo=own), "feat: wip", 42, None),
+            # A default-branch push that carries only foreign entries.
+            ("master", pr_association(1379, 3, base_repo=fork), "feat: thing (#73832)", 0, 73832),
+            # A foreign entry is listed before the entry of the run's own repository.
+            (
+                "pr-branch",
+                json.dumps([pr_association_entry(1379, base_repo=fork), pr_association_entry(42, base_repo=own)]),
+                "feat: wip",
+                42,
+                None,
+            ),
+            ("master", None, "chore: direct push", 0, None),
+        ]
+        rows = [
+            {
+                "id": 5000 + index,
+                "name": "CI",
+                "head_sha": f"sha{index}",
+                "head_branch": head_branch,
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-01-20 10:00:00",
+                "run_started_at": "2026-01-20 10:00:00",
+                "updated_at": "2026-01-20 10:30:00",
+                "run_attempt": 1,
+                "pull_requests": association,
+                "repository": json.dumps({"full_name": own, "id": repo_id(own)}),
+                "head_commit": json.dumps({"message": message}),
+            }
+            for index, (head_branch, association, message, _, _) in enumerate(cases)
+        ]
+        table_name = self._create_table("github_workflow_runs", WORKFLOW_RUNS_COLUMNS, rows)
+
+        results = self._select(
+            f"SELECT id, pr_number, commit_pr_number FROM ({workflow_runs.build_query(_github_runs(table_name))}) AS r ORDER BY id"
+        )
+        assert results == [(5000 + index, pr, commit_pr) for index, (_, _, _, pr, commit_pr) in enumerate(cases)]
+
+    def test_workflow_runs_view_resolves_default_branch_pushes_through_the_merge_commit(self) -> None:
+        # GitHub fills merge_commit_sha on an open PR with a temporary test-merge commit, so only a
+        # merged PR may attribute a run.
+        own = "PostHog/posthog"
+        cases: list[tuple[str, str, int | None]] = [
+            # (head_sha, commit message, expected commit_pr_number)
+            # A merge-commit landing with no (#NNNN) in the subject.
+            ("shaA", "fix: regenerate generated types", 101),
+            # The PR that carries this SHA is open.
+            ("shaB", "chore: direct push", None),
+            # No PR row carries this SHA, so the message suffix applies.
+            ("shaC", "feat: thing (#103)", 103),
+            # Two merged PRs share this merge commit, and the run must stay one row.
+            ("shaD", "feat: stacked landing (#104)", 104),
+        ]
+        prs = [
+            _pr_row(
+                101,
+                "alice",
+                "closed",
+                0,
+                "2026-01-19 09:00:00",
+                merged_at="2026-01-20 09:00:00",
+                merge_commit_sha="shaA",
+            ),
+            _pr_row(102, "bob", "open", 0, "2026-01-19 09:00:00", merge_commit_sha="shaB"),
+            _pr_row(
+                104,
+                "carol",
+                "closed",
+                0,
+                "2026-01-19 09:00:00",
+                merged_at="2026-01-20 09:00:00",
+                merge_commit_sha="shaD",
+            ),
+            _pr_row(
+                105,
+                "dave",
+                "closed",
+                0,
+                "2026-01-19 09:00:00",
+                merged_at="2026-01-20 09:00:00",
+                merge_commit_sha="shaD",
+            ),
+        ]
+        runs = [
+            {
+                "id": 6000 + index,
+                "name": "CI",
+                "head_sha": head_sha,
+                "head_branch": "master",
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-01-20 10:00:00",
+                "run_started_at": "2026-01-20 10:00:00",
+                "updated_at": "2026-01-20 10:30:00",
+                "run_attempt": 1,
+                "pull_requests": None,
+                "repository": json.dumps({"full_name": own, "id": repo_id(own)}),
+                "head_commit": json.dumps({"message": message}),
+            }
+            for index, (head_sha, message, _) in enumerate(cases)
+        ]
+        prs_table = self._create_table("github_pull_requests", PULL_REQUESTS_COLUMNS, prs)
+        runs_table = self._create_table("github_workflow_runs", WORKFLOW_RUNS_COLUMNS, runs)
+
+        query = workflow_runs.build_query(_github_runs(runs_table), pull_requests_table=prs_table)
+        results = self._select(f"SELECT id, commit_pr_number FROM ({query}) AS r ORDER BY id")
+        assert results == [(6000 + index, expected) for index, (_, _, expected) in enumerate(cases)]
+
+    def test_workflow_runs_view_tolerates_all_nullable_columns(self) -> None:
+        sparse_run: dict[str, Any] = {
+            "id": 4001,
+            "name": "CI",
+            "head_sha": "shaQ",
+            "status": "completed",
+            "conclusion": None,
+            "created_at": None,
+            "run_started_at": None,
+            "updated_at": None,
+            "run_attempt": None,
+            "pull_requests": None,
+            "repository": None,
+        }
+        table_name = self._create_table("github_workflow_runs", WORKFLOW_RUNS_COLUMNS, [sparse_run])
+        rows = self._select(
+            "SELECT status, conclusion, duration_seconds, repo_owner, repo_name, pr_number, run_attempt "
+            f"FROM ({workflow_runs.build_query(_github_runs(table_name))}) AS r"
+        )
+        assert rows[0] == ("completed", None, None, "", "", 0, None)
+
+    @parameterized.expand([("v1_shape", False), ("v2_shape", True)])
+    def test_trunk_quarantined_tests_view_labels_runners_and_reconstructs_paths(
+        self, _name: str, v2_shape: bool
+    ) -> None:
+        # Trunk overloads `parent` per uploader. A table keeps the v1 shape until its source moves
+        # to the v2 API and resyncs.
+        table_name = self._create_table(
+            "trunkio_quarantinedtests",
+            TRUNK_QUARANTINED_TESTS_COLUMNS if v2_shape else TRUNK_QUARANTINED_TESTS_V1_COLUMNS,
+            [
+                _quarantined_row(
+                    file="posthog/api/test/test_person.py",
+                    name="test_merge",
+                    classname="posthog.api.test.test_person.TestPerson",
+                    parent="pytest",
+                    v2_shape=v2_shape,
+                ),
+                _quarantined_row(
+                    file="",
+                    name="k3s_integration",
+                    classname="personhog-coordination",
+                    parent="personhog-coordination::k3s_integration",
+                    v2_shape=v2_shape,
+                ),
+                _quarantined_row(
+                    file="src/cdp/cdp.test.ts",
+                    name="routes",
+                    classname="",
+                    parent="src/cdp/cdp.test.ts",
+                    v2_shape=v2_shape,
+                ),
+            ],
+        )
+        query = trunk_quarantined_tests.build_query(table_name, v2_shape=v2_shape)
+        rows = self._select(f"SELECT runner, nodeid, source_path, crate, trunk_url FROM ({query}) AS q ORDER BY runner")
+
+        def url(name: str) -> str | None:
+            return (
+                f"https://app.trunk.io/example/flaky-tests/collections/collection/tests/case-{name}"
+                if v2_shape
+                else None
+            )
+
+        assert rows == [
+            ("jest", "src/cdp/cdp.test.ts::routes", "src/cdp/cdp.test.ts", "", url("routes")),
+            (
+                "pytest",
+                "posthog/api/test/test_person.py::TestPerson::test_merge",
+                "posthog/api/test/test_person.py",
+                "",
+                url("test_merge"),
+            ),
+            ("rust", "personhog-coordination::k3s_integration", "", "personhog-coordination", url("k3s_integration")),
+        ]

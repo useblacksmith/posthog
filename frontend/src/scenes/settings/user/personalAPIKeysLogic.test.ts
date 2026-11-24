@@ -1,0 +1,272 @@
+import { MOCK_DEFAULT_USER } from 'lib/api.mock'
+
+import { router } from 'kea-router'
+import { expectLogic } from 'kea-test-utils'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+import { dayjs } from 'lib/dayjs'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
+
+import { themeLogic } from '~/layout/navigation-3000/themeLogic'
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+import { PersonalAPIKeyType } from '~/types'
+
+import { expiresAtForOption, personalAPIKeysLogic } from './personalAPIKeysLogic'
+
+describe('personalAPIKeysLogic', () => {
+    let logic: ReturnType<typeof personalAPIKeysLogic.build>
+    let capturedCreatePayload: any = null
+
+    beforeEach(() => {
+        capturedCreatePayload = null
+
+        useMocks({
+            get: {
+                '/api/personal_api_keys/': [],
+                '/api/projects/': { results: [], count: 0, next: null, previous: null },
+            },
+            post: {
+                '/api/personal_api_keys/': async ({ request }) => {
+                    capturedCreatePayload = await request.json()
+                    return [
+                        200,
+                        {
+                            id: 'new-key-id',
+                            label: capturedCreatePayload?.label,
+                            scopes: capturedCreatePayload?.scopes,
+                            scoped_organizations: capturedCreatePayload?.scoped_organizations ?? [],
+                            scoped_teams: capturedCreatePayload?.scoped_teams ?? [],
+                            value: 'phx_test',
+                        },
+                    ]
+                },
+            },
+        })
+
+        initKeaTests()
+        featureFlagLogic.mount()
+        userLogic.mount()
+        userLogic.actions.loadUserSuccess(MOCK_DEFAULT_USER)
+        // createKeySuccess opens a LemonDialog with a CodeSnippet, which reads themeLogic.
+        themeLogic.mount()
+
+        logic = personalAPIKeysLogic()
+        logic.mount()
+    })
+
+    it('strips llm_gateway scopes from create payload when GATEWAY_PERSONAL_API_KEY flag is disabled', async () => {
+        featureFlagLogic.actions.setFeatureFlags([], {})
+
+        logic.actions.setEditingKeyId('new')
+        logic.actions.setEditingKeyValues({
+            label: 'Test key',
+            access_type: 'all',
+            scopes: ['feature_flag:read', 'llm_gateway:read', 'insight:write'],
+        })
+
+        await logic.asyncActions.submitEditingKey()
+        // The form submit's API call settles asynchronously under MSW v2 — drain it
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(capturedCreatePayload).not.toBeNull()
+        expect(capturedCreatePayload.scopes).toEqual(['feature_flag:read', 'insight:write'])
+        expect(capturedCreatePayload.scopes).not.toContain('llm_gateway:read')
+    })
+
+    it('shows a field error from the server under the field it names', async () => {
+        useMocks({
+            post: {
+                '/api/personal_api_keys/': () => [
+                    400,
+                    {
+                        type: 'validation_error',
+                        code: 'max_length',
+                        detail: 'Ensure this field has no more than 40 characters.',
+                        attr: 'label',
+                    },
+                ],
+            },
+        })
+
+        logic.actions.setEditingKeyId('new')
+        logic.actions.setEditingKeyValues({
+            label: 'A label that is a lot longer than the forty characters allowed',
+            access_type: 'all',
+            scopes: ['feature_flag:read'],
+        })
+
+        await logic.asyncActions.submitEditingKey()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.editingKeyManualErrors).toEqual({
+            label: 'Ensure this field has no more than 40 characters.',
+        })
+        expect(logic.values.isEditingKeySubmitting).toBe(false)
+        expect(logic.values.editingKeyId).toBe('new')
+
+        logic.actions.setEditingKeyValue('label', 'Short label')
+        expect(logic.values.editingKeyManualErrors).toEqual({})
+        expect(logic.values.editingKeyHasErrors).toBe(false)
+    })
+
+    it('shows a server error that names no field as a toast', async () => {
+        const toastError = jest.spyOn(lemonToast, 'error').mockImplementation(() => '')
+        useMocks({
+            post: {
+                '/api/personal_api_keys/': () => [
+                    400,
+                    {
+                        type: 'validation_error',
+                        code: 'invalid_input',
+                        detail: 'You can only have 10 personal API keys. Remove an existing key before creating a new one.',
+                        attr: null,
+                    },
+                ],
+            },
+        })
+
+        logic.actions.setEditingKeyId('new')
+        logic.actions.setEditingKeyValues({ label: 'Test key', access_type: 'all', scopes: ['feature_flag:read'] })
+
+        await logic.asyncActions.submitEditingKey()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(toastError).toHaveBeenCalledWith(
+            'You can only have 10 personal API keys. Remove an existing key before creating a new one.'
+        )
+        expect(logic.values.editingKeyManualErrors).toEqual({})
+        expect(logic.values.editingKeyId).toBe('new')
+    })
+
+    test.each([
+        { status: 404, expectedKeyIds: [] },
+        { status: 500, expectedKeyIds: ['stale-key'] },
+    ])('a delete that returns $status leaves keys $expectedKeyIds', async ({ status, expectedKeyIds }) => {
+        jest.spyOn(lemonToast, 'error').mockImplementation(() => '')
+        useMocks({
+            delete: {
+                '/api/personal_api_keys/:id/': () => [status, { detail: 'Not found.' }],
+            },
+        })
+        logic.actions.loadKeysSuccess([{ id: 'stale-key', label: 'Stale key' } as PersonalAPIKeyType])
+
+        logic.actions.deleteKey('stale-key')
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.keys.map((key) => key.id)).toEqual(expectedKeyIds)
+    })
+
+    it('preserves llm_gateway scopes from create payload when GATEWAY_PERSONAL_API_KEY flag is enabled', async () => {
+        featureFlagLogic.actions.setFeatureFlags([FEATURE_FLAGS.GATEWAY_PERSONAL_API_KEY], {
+            [FEATURE_FLAGS.GATEWAY_PERSONAL_API_KEY]: true,
+        })
+
+        logic.actions.setEditingKeyId('new')
+        logic.actions.setEditingKeyValues({
+            label: 'Test key',
+            access_type: 'all',
+            scopes: ['feature_flag:read', 'llm_gateway:read'],
+        })
+
+        await logic.asyncActions.submitEditingKey()
+        // The form submit's API call settles asynchronously under MSW v2 — drain it
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(capturedCreatePayload).not.toBeNull()
+        expect(capturedCreatePayload.scopes).toEqual(['feature_flag:read', 'llm_gateway:read'])
+    })
+
+    it('preserves the `*` (all access) scope regardless of flag state', async () => {
+        featureFlagLogic.actions.setFeatureFlags([], {})
+
+        logic.actions.setEditingKeyId('new')
+        logic.actions.setEditingKeyValues({
+            label: 'Test key',
+            access_type: 'all',
+            scopes: ['*'],
+        })
+
+        await logic.asyncActions.submitEditingKey()
+        // The form submit's API call settles asynchronously under MSW v2 — drain it
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(capturedCreatePayload).not.toBeNull()
+        expect(capturedCreatePayload.scopes).toEqual(['*'])
+    })
+
+    it('opens a new key with the preset scopes for a ?preset= link, all available to a project scoped key', () => {
+        router.actions.push(urls.settings('user-api-keys'), { preset: 'source_map_upload' })
+
+        expect(logic.values.editingKeyId).toBe('new')
+        expect(logic.values.editingKey).toMatchObject({
+            preset: 'source_map_upload',
+            scopes: ['error_tracking:write'],
+        })
+
+        logic.actions.setEditingKeyValues({ access_type: 'teams' })
+        expect(logic.values.scopeRows.filter((row) => row.value !== 'none' && row.muted).map((row) => row.key)).toEqual(
+            []
+        )
+    })
+
+    it.each(['survey', 'early_access_feature'])(
+        'auto-selects feature_flag:write when %s write is granted',
+        async (scope) => {
+            logic.actions.setEditingKeyId('new')
+            logic.actions.setScopeRadioValue(scope, 'write')
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.editingKey.scopes).toContain(`${scope}:write`)
+            expect(logic.values.editingKey.scopes).toContain('feature_flag:write')
+        }
+    )
+
+    it('clamps a group write to what each row can take', async () => {
+        logic.actions.setEditingKeyId('new')
+        logic.actions.setEditingKeyValues({ access_type: 'teams' })
+        // file_system is read-only, and organization is not available for a project scoped key.
+        logic.actions.setScopeGroupAccess(['survey', 'file_system', 'organization'], 'write')
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect([...logic.values.editingKey.scopes].sort()).toEqual([
+            'feature_flag:write',
+            'file_system:read',
+            'survey:write',
+        ])
+    })
+
+    it('keeps only the groups with a row that matches the search', () => {
+        logic.actions.setEditingKeyId('new')
+        logic.actions.setSearchTerm('survey')
+
+        expect(logic.values.filteredScopeGroups.flatMap(({ rows }) => rows.map(({ scope }) => scope.key))).toEqual([
+            'survey',
+        ])
+    })
+
+    it('leaves the auto-selected feature_flag:write removable', async () => {
+        logic.actions.setEditingKeyId('new')
+        logic.actions.setScopeRadioValue('survey', 'write')
+        await expectLogic(logic).toFinishAllListeners()
+
+        logic.actions.setScopeRadioValue('feature_flag', 'none')
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(logic.values.editingKey.scopes).toContain('survey:write')
+        expect(logic.values.editingKey.scopes).not.toContain('feature_flag:write')
+    })
+
+    it.each([
+        ['keep', undefined],
+        ['never', null],
+        ['1', dayjs('2026-01-02T10:00:00Z').toISOString()],
+        ['30', dayjs('2026-01-31T10:00:00Z').toISOString()],
+        ['365', dayjs('2027-01-01T10:00:00Z').toISOString()],
+    ] as const)('expiration %s sends expires_at %s', (expiration, expected) => {
+        expect(expiresAtForOption(expiration, dayjs('2026-01-01T10:00:00Z'))).toEqual(expected)
+    })
+})

@@ -1,0 +1,477 @@
+// DOM-based inspector for quill-charts. Reads what the chart rendered so tests
+// can assert on overlays (value labels, reference lines, axis ticks) and the
+// reported series count without poking at the canvas.
+//
+// The data-attr selectors below are part of the library's stable testing
+// contract — renaming them breaks consumers' tests. Keep in sync with the
+// overlay components that emit them.
+
+import { act, fireEvent, waitFor } from '@testing-library/react'
+
+import type { TooltipContext } from '../core/types'
+import { clickAtIndex, dragSelection, hoverAtIndex, hoverUntilTooltip } from './interactions'
+import {
+    type ChartTooltipAccessor,
+    createDefaultTooltipAccessor,
+    type DefaultTooltipAccessor,
+    waitForChartTooltip,
+} from './tooltip'
+
+/** A single entry of `TooltipContext.seriesData`. */
+type TooltipSeriesEntry<Meta = unknown> = TooltipContext<Meta>['seriesData'][number]
+
+/** Handle returned by `chart.waitForTooltip()` — every field of the structured `TooltipContext`,
+ *  plus the rendered portal `element`, an `isPinned` snapshot, and `series` (seriesData indexed
+ *  by series key, for order-independent lookups like `tooltip.series.a.value`). */
+export type TooltipSnapshot<Meta = unknown> = TooltipContext<Meta> &
+    ChartTooltipAccessor & {
+        series: Record<string, TooltipSeriesEntry<Meta>>
+    }
+
+interface ReferenceLineSummary {
+    label: string | null
+    /** Pixel position of the line — top px for horizontal, left px for vertical. */
+    position: number | null
+    /** Line color from inline style. */
+    color: string | null
+    /** "horizontal" for top-anchored lines, "vertical" for left-anchored. */
+    orientation: 'horizontal' | 'vertical' | null
+}
+
+export interface ValueBandSummary {
+    /** Pixel box of the band, from its inline style. */
+    top: number | null
+    left: number | null
+    width: number | null
+    height: number | null
+    /** Fill color from inline style. */
+    color: string
+}
+
+interface ValueLabelSummary {
+    text: string
+    /** Inline style backgroundColor (matches the series color). */
+    color: string
+}
+
+interface AnomalyPointSummary {
+    element: HTMLElement
+    /** Inline style backgroundColor (matches the marker's series color). */
+    color: string
+}
+
+interface SlopeValueLabelSummary {
+    text: string
+    /** Inline style color (matches the series color). */
+    color: string
+    /** Which end of the slope this label sits on. */
+    side: 'start' | 'end'
+}
+
+interface GaugeSummary {
+    value: string
+    label: string | null
+    min: string | null
+    max: string | null
+}
+
+interface PieSliceLabelSummary {
+    text: string
+    /** One entry per rendered line (label and/or value). */
+    lines: string[]
+}
+
+interface LegendItemSummary {
+    label: string
+    /** The row's secondary text (a slope chart's change, a proportion bar's `share · value`), or null
+     *  when absent. */
+    secondaryLabel: string | null
+}
+
+export interface ChartAccessor<Meta = unknown> {
+    /** The wrapper div of this chart. */
+    element: HTMLElement
+    /** The static (data) canvas, as opposed to the `aria-hidden` hover overlay. */
+    canvas: HTMLCanvasElement
+    /** Number of non-excluded data series rendered (read from the chart's aria-label). */
+    readonly seriesCount: number
+    /** Label index where another chart in a `ChartHoverSync` draws its crosshair here, or null. */
+    syncedIndex(): number | null
+    /** Visible y-axis tick labels (left axis). */
+    yTicks(): string[]
+    /** Visible right y-axis tick labels (multi-axis charts). */
+    yRightTicks(): string[]
+    /** Visible x-axis tick labels (post-collision-avoidance). */
+    xTicks(): string[]
+    xAxisLabel(): string | null
+    yAxisLabel(): string | null
+    xAxisLabelElement(): SVGTextElement | null
+    yAxisLabelElement(): SVGTextElement | null
+    /** Whether a right-y axis was rendered. */
+    hasRightAxis: boolean
+    /** All reference lines currently rendered for this chart (goal/alert/marker). */
+    referenceLines(): ReferenceLineSummary[]
+    /** All value bands currently rendered for this chart. */
+    valueBands(): ValueBandSummary[]
+    /** All value-label overlays currently rendered for this chart. */
+    valueLabels(): ValueLabelSummary[]
+    /** All anomaly point markers currently rendered (TimeSeriesLineChart only). */
+    anomalyPoints(): AnomalyPointSummary[]
+    slope: {
+        /** Value labels currently rendered (start + end columns). */
+        valueLabels(): SlopeValueLabelSummary[]
+        /** Series name labels currently rendered (post-collision-avoidance). */
+        seriesLabels(): string[]
+    }
+    sankey: {
+        /** Node labels in layout order. */
+        nodeLabels(): string[]
+        /** Column headers, left to right. */
+        columnLabels(): string[]
+    }
+    pie: {
+        /** On-slice labels, in slice order. */
+        sliceLabels(): PieSliceLabelSummary[]
+    }
+    gauge: {
+        /** The text a `Gauge` shows, or null for other charts. `label`, `min` and `max` are null when
+         *  hidden, for example when the min and max labels would overlap. */
+        text(): GaugeSummary | null
+        /** The CSS color of the value text, or null for other charts. */
+        valueColor(): string | null
+    }
+    flame: {
+        /** The zoom path as shown, from `All` down to the focused node. A deep path collapses its
+         *  middle crumbs into an ellipsis, which is not listed. */
+        breadcrumb(): string[]
+        /** The search summary (`3 matches · 12% of total`), or null without a search. */
+        searchSummary(): string | null
+        /** The scroll viewport, which takes keyboard focus and handles Escape. */
+        viewport(): HTMLElement
+        /** The "Reset zoom" button, or null when the whole graph is in view. */
+        resetButton(): HTMLElement | null
+    }
+    /** The legend container in this chart's render scope, or null when the legend is hidden. */
+    legend(): HTMLElement | null
+    /** Legend rows in this chart's render scope — label plus the row's secondary text (a slope
+     *  chart's change, a proportion bar's `share · value`), or null when none. Empty when the
+     *  legend is hidden. */
+    legendItems(): LegendItemSummary[]
+    /** Click the legend row with this label. `additive` holds ⌘/Ctrl, which toggles that one series
+     *  instead of isolating it. Throws when no legend row has the label. */
+    clickLegendItem(label: string, options?: { additive?: boolean }): void
+    /** Click the value-table header with this text, which sorts the legend by that column. Throws
+     *  when no header has the text. */
+    sortLegendBy(header: string): void
+    /** The value-table cells of each legend row as rendered, in row then column order. Empty for a
+     *  list legend. */
+    legendValues(): string[][]
+    /** Fire one `mouseMove` over the label at `index`, without waiting for a tooltip. */
+    hoverAtIndex(index: number): void
+    /** Hover the label at `index` until the tooltip shows its content, then read it as a `DefaultTooltip`.
+     *  For a custom tooltip, read `tooltip.element`. */
+    hoverTooltip(index: number, timeout?: number): Promise<DefaultTooltipAccessor>
+    /** Hover at the index, wait for the tooltip to settle, then click. Mirrors the
+     *  hover-then-click sequence the chart's onClick handler relies on. */
+    clickAtIndex(index: number, timeout?: number): Promise<void>
+    dragSelection(fromIndex: number, toIndex: number): void
+    /** Wait for the tooltip to mount, then return a snapshot — every `TooltipContext` field
+     *  plus the rendered portal element and an `isPinned` getter. Only available when the
+     *  chart was rendered via `renderChart`; throws otherwise. */
+    waitForTooltip(timeout?: number): Promise<TooltipSnapshot<Meta>>
+}
+
+export interface GetChartOptions<Meta = unknown> {
+    /** Returns the most recent `TooltipContext` the chart computed (set up by `renderChart`'s
+     *  capturing tooltip wrapper). When omitted, `chart.waitForTooltip()` throws. */
+    getLastTooltipContext?: () => TooltipContext<Meta> | null
+}
+
+export interface FindChartOptions {
+    scope?: HTMLElement
+    seriesCount?: number
+    timeout?: number
+}
+
+export async function findChart<Meta = unknown>({
+    scope = document.body,
+    seriesCount,
+    timeout = 3000,
+}: FindChartOptions = {}): Promise<ChartAccessor<Meta>> {
+    let chart!: ChartAccessor<Meta>
+    await waitFor(
+        () => {
+            chart = getChart<Meta>(scope)
+            if (seriesCount !== undefined && chart.seriesCount !== seriesCount) {
+                throw new Error(`Expected ${seriesCount} series, the chart has ${chart.seriesCount}`)
+            }
+        },
+        { timeout }
+    )
+    return chart
+}
+
+const SERIES_COUNT_RE = /Chart with (\d+) data series/i
+
+function findCanvas(scope: HTMLElement): HTMLCanvasElement | null {
+    return scope.querySelector('canvas[aria-label]')
+}
+
+function parsePixelStyle(style: CSSStyleDeclaration, prop: 'top' | 'left' | 'width' | 'height'): number | null {
+    const raw = style[prop]
+    if (!raw || !raw.endsWith('px')) {
+        return null
+    }
+    const n = Number(raw.slice(0, -2))
+    return Number.isFinite(n) ? n : null
+}
+
+/** Value bands rendered inside `scope`. Exported for overlay tests that render without a chart. */
+export function readValueBands(scope: ParentNode): ValueBandSummary[] {
+    return Array.from(scope.querySelectorAll<HTMLElement>('[data-attr="hog-chart-value-band"]')).map((el) => ({
+        top: parsePixelStyle(el.style, 'top'),
+        left: parsePixelStyle(el.style, 'left'),
+        width: parsePixelStyle(el.style, 'width'),
+        height: parsePixelStyle(el.style, 'height'),
+        color: el.style.backgroundColor,
+    }))
+}
+
+// The reference-line component renders a 1px line as a single coloured border
+// edge on an otherwise zero-size div: horizontal lines colour `border-top`,
+// vertical lines colour `border-left`. Whichever of the two is set tells us
+// both the orientation and the line colour in one shot.
+function readReferenceLine(el: HTMLElement): ReferenceLineSummary {
+    const horizontalColor = el.style.borderTopColor
+    const verticalColor = el.style.borderLeftColor
+    const orientation: 'horizontal' | 'vertical' | null = horizontalColor
+        ? 'horizontal'
+        : verticalColor
+          ? 'vertical'
+          : null
+    const color = horizontalColor || verticalColor || null
+    const position = parsePixelStyle(el.style, orientation === 'vertical' ? 'left' : 'top')
+
+    // The optional label is rendered as the immediately-following sibling div.
+    const labelEl = el.nextElementSibling
+    const isLabel = labelEl?.getAttribute('data-attr') === 'hog-chart-reference-line-label'
+    const label = isLabel ? (labelEl as HTMLElement).textContent : null
+
+    return { color, orientation, position, label }
+}
+
+export function getChart<Meta = unknown>(
+    scope: HTMLElement = document.body,
+    options: GetChartOptions<Meta> = {}
+): ChartAccessor<Meta> {
+    const canvas = findCanvas(scope)
+    if (!canvas) {
+        throw new Error('No quill-charts canvas found in scope')
+    }
+    // The chart wrapper is the canvas's parent — overlays render as siblings
+    // of the canvas inside that wrapper.
+    const wrapper = canvas.parentElement
+    if (!wrapper) {
+        throw new Error('quill-charts canvas has no parent wrapper')
+    }
+
+    const { getLastTooltipContext } = options
+
+    const labelCount = (): number => {
+        const count = Number(wrapper.dataset.hogChartsLabelCount)
+        if (!Number.isFinite(count)) {
+            throw new Error('This chart has no labels to hover by index')
+        }
+        return count
+    }
+    const gaugePart = (part: string): HTMLElement | null =>
+        wrapper.querySelector<HTMLElement>(`[data-attr="hog-chart-gauge-${part}"]`)
+    const flamePart = (part: string): HTMLElement | null =>
+        wrapper
+            .closest('[data-hog-charts-flame]')
+            ?.querySelector<HTMLElement>(`[data-attr="hog-chart-flame-${part}"]`) ?? null
+
+    return {
+        element: wrapper,
+        canvas,
+        syncedIndex: () => {
+            const raw = wrapper.dataset.hogChartsSyncedIndex
+            return raw == null ? null : Number(raw)
+        },
+        get seriesCount(): number {
+            const match = SERIES_COUNT_RE.exec(canvas.getAttribute('aria-label') ?? '')
+            return match ? Number(match[1]) : 0
+        },
+        get hasRightAxis(): boolean {
+            return wrapper.querySelectorAll('[data-attr="hog-chart-axis-tick-yr"]').length > 0
+        },
+        yTicks: () =>
+            Array.from(wrapper.querySelectorAll<HTMLElement>('[data-attr="hog-chart-axis-tick-y"]')).map(
+                (el) => el.textContent ?? ''
+            ),
+        yRightTicks: () =>
+            Array.from(wrapper.querySelectorAll<HTMLElement>('[data-attr="hog-chart-axis-tick-yr"]')).map(
+                (el) => el.textContent ?? ''
+            ),
+        xTicks: () =>
+            Array.from(wrapper.querySelectorAll<HTMLElement>('[data-attr="hog-chart-axis-tick-x"]')).map(
+                (el) => el.textContent ?? ''
+            ),
+        xAxisLabel: () =>
+            wrapper.querySelector<HTMLElement>('[data-attr="hog-chart-axis-title-x"]')?.textContent ?? null,
+        yAxisLabel: () =>
+            wrapper.querySelector<HTMLElement>('[data-attr="hog-chart-axis-title-y"]')?.textContent ?? null,
+        xAxisLabelElement: () => wrapper.querySelector<SVGTextElement>('[data-attr="hog-chart-axis-title-x"]'),
+        yAxisLabelElement: () => wrapper.querySelector<SVGTextElement>('[data-attr="hog-chart-axis-title-y"]'),
+        referenceLines: () =>
+            Array.from(wrapper.querySelectorAll<HTMLElement>('[data-attr="hog-chart-reference-line"]')).map(
+                readReferenceLine
+            ),
+        valueBands: () => readValueBands(wrapper),
+        valueLabels: () =>
+            Array.from(wrapper.querySelectorAll<HTMLElement>('[data-attr="hog-chart-value-label"]')).map((el) => ({
+                text: el.textContent ?? '',
+                color: el.style.backgroundColor,
+            })),
+        anomalyPoints: () =>
+            Array.from(wrapper.querySelectorAll<HTMLElement>('[data-attr="hog-chart-anomaly-point"]')).map((el) => ({
+                element: el,
+                color: el.style.backgroundColor,
+            })),
+        slope: {
+            valueLabels: () =>
+                Array.from(wrapper.querySelectorAll<HTMLElement>('[data-attr="hog-chart-slope-value-label"]')).map(
+                    (el) => ({
+                        text: el.textContent ?? '',
+                        color: el.style.color,
+                        side: el.dataset.slopeSide === 'end' ? 'end' : 'start',
+                    })
+                ),
+            seriesLabels: () => textsOf(wrapper, 'hog-chart-slope-series-label'),
+        },
+        sankey: {
+            nodeLabels: () => textsOf(wrapper, 'hog-chart-sankey-node-label'),
+            columnLabels: () => textsOf(wrapper, 'hog-chart-sankey-column-label'),
+        },
+        pie: {
+            sliceLabels: () =>
+                Array.from(wrapper.querySelectorAll<HTMLElement>('[data-attr="hog-chart-pie-slice-label"]')).map(
+                    (el) => ({
+                        text: el.textContent ?? '',
+                        lines: Array.from(el.querySelectorAll('div')).map((line) => line.textContent ?? ''),
+                    })
+                ),
+        },
+        gauge: {
+            text: () => {
+                const text = (part: string): string | null => gaugePart(part)?.textContent ?? null
+                const value = text('value')
+                return value === null ? null : { value, label: text('label'), min: text('min'), max: text('max') }
+            },
+            valueColor: () => gaugePart('value')?.style.color ?? null,
+        },
+        flame: {
+            breadcrumb: () => {
+                const root = wrapper.closest('[data-hog-charts-flame]')
+                return root ? textsOf(root, 'hog-chart-flame-breadcrumb') : []
+            },
+            searchSummary: () => flamePart('search-summary')?.textContent ?? null,
+            viewport: () => {
+                const viewport = flamePart('viewport')
+                if (!viewport) {
+                    throw new Error('This chart is not a flame graph')
+                }
+                return viewport
+            },
+            resetButton: () => flamePart('reset'),
+        },
+        legend: () => scope.querySelector<HTMLElement>('[data-hog-charts-legend]'),
+        legendItems: () => readLegendItems(scope),
+        clickLegendItem(label: string, { additive = false }: { additive?: boolean } = {}): void {
+            const labelEl = Array.from(
+                scope.querySelectorAll<HTMLElement>('[data-attr="hog-chart-legend-label"]')
+            ).find((el) => el.textContent === label)
+            const row = labelEl?.closest('button')
+            if (!row) {
+                throw new Error(`No clickable legend row labelled "${label}"`)
+            }
+            act(() => {
+                fireEvent.click(row, { metaKey: additive })
+            })
+        },
+        legendValues: () =>
+            Array.from(scope.querySelectorAll<HTMLElement>('[data-attr="hog-chart-legend-label"]'), (labelEl) =>
+                Array.from(
+                    labelEl
+                        .closest('button, div')
+                        ?.querySelectorAll<HTMLElement>('[data-attr="hog-chart-legend-value"]') ?? [],
+                    (cell) => cell.textContent ?? ''
+                )
+            ).filter((cells) => cells.length > 0),
+        sortLegendBy(header: string): void {
+            const button = Array.from(scope.querySelectorAll<HTMLElement>('[data-attr="hog-chart-legend-sort"]')).find(
+                (el) => el.textContent?.replace(/ [↑↓]$/, '') === header
+            )
+            if (!button) {
+                throw new Error(`No legend column headed "${header}"`)
+            }
+            act(() => {
+                fireEvent.click(button)
+            })
+        },
+        hoverAtIndex(index: number): void {
+            hoverAtIndex(wrapper, index, labelCount())
+        },
+        async hoverTooltip(index: number, timeout?: number): Promise<DefaultTooltipAccessor> {
+            const element = await hoverUntilTooltip(wrapper, index, labelCount(), timeout)
+            // The portal can mount a commit before its content does.
+            await waitFor(
+                () => {
+                    if (!element.textContent?.trim()) {
+                        throw new Error('tooltip has no content yet')
+                    }
+                },
+                { timeout }
+            )
+            return createDefaultTooltipAccessor(element)
+        },
+        async clickAtIndex(index: number, timeout?: number): Promise<void> {
+            await clickAtIndex(wrapper, index, labelCount(), timeout)
+        },
+        dragSelection(fromIndex: number, toIndex: number): void {
+            dragSelection(wrapper, fromIndex, toIndex, labelCount())
+        },
+        async waitForTooltip(timeout?: number): Promise<TooltipSnapshot<Meta>> {
+            const element = await waitForChartTooltip(timeout)
+            const ctx = getLastTooltipContext?.() ?? null
+            if (!ctx) {
+                throw new Error(
+                    'TooltipContext not captured. Render via renderChart to enable tooltip context capture.'
+                )
+            }
+            return {
+                ...ctx,
+                element,
+                isPinned: element.classList.contains('hog-charts-tooltip--pinned'),
+                series: Object.fromEntries(ctx.seriesData.map((s) => [s.series.key, s])),
+            }
+        },
+    }
+}
+
+function textsOf(root: ParentNode, dataAttr: string): string[] {
+    return Array.from(root.querySelectorAll<HTMLElement>(`[data-attr="${dataAttr}"]`)).map((el) => el.textContent ?? '')
+}
+
+// The legend renders as a sibling of the chart wrapper (inside ChartLegendLayout), so it lives in the
+// broader render scope rather than under the chart wrapper.
+function readLegendItems(scope: ParentNode): LegendItemSummary[] {
+    return Array.from(scope.querySelectorAll<HTMLElement>('[data-attr="hog-chart-legend-label"]')).map((labelEl) => {
+        const secondary = labelEl.nextElementSibling
+        const isSecondary = secondary?.getAttribute('data-attr') === 'hog-chart-legend-secondary'
+        return {
+            label: labelEl.textContent ?? '',
+            secondaryLabel: isSecondary ? (secondary as HTMLElement).textContent : null,
+        }
+    })
+}

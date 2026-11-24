@@ -1,0 +1,219 @@
+import { getCurrentTeamId } from 'lib/utils/getAppContext'
+
+import { apiMutator } from '../../../frontend/src/lib/api-orval-mutator'
+import {
+    businessKnowledgeDocumentsSearchList,
+    businessKnowledgeDocumentsWindowList,
+    businessKnowledgeLibrariesCreate,
+    businessKnowledgeLibrariesDestroy,
+    businessKnowledgeLibrariesList,
+    businessKnowledgeLibrariesPartialUpdate,
+    businessKnowledgeLibrariesRetrieve,
+    businessKnowledgePlaygroundChatsAskCreate,
+    businessKnowledgePlaygroundChatsCreate,
+    businessKnowledgePlaygroundChatsDestroy,
+    businessKnowledgePlaygroundChatsList,
+    businessKnowledgePlaygroundChatsRetrieve,
+    businessKnowledgeSourcesCreate,
+    businessKnowledgeSourcesDestroy,
+    businessKnowledgeSourcesDocumentsList,
+    businessKnowledgeSourcesList,
+    businessKnowledgeSourcesPartialUpdate,
+    businessKnowledgeSourcesRefreshCreate,
+    businessKnowledgeSourcesRetrieve,
+    businessKnowledgeSourcesTextRetrieve,
+} from './generated/api'
+import type {
+    BusinessKnowledgeDocumentsSearchListParams,
+    BusinessKnowledgeDocumentsWindowListParams,
+    BusinessKnowledgeSourcesListAddedBy,
+    BusinessKnowledgeSourcesListParams,
+    BusinessKnowledgeSourcesListSourceType,
+    CrawlModeEnumApi,
+    KnowledgeDocumentWindowApi,
+    KnowledgeLibraryApi,
+    KnowledgeSearchResultApi,
+    KnowledgeSourceApi,
+    PlaygroundChatApi,
+    PaginatedPlaygroundChatListListApi,
+    SandboxQuestionApi,
+    KnowledgeSourceDocumentApi,
+} from './generated/api.schemas'
+
+export type { KnowledgeSourceApi as KnowledgeSourceDTOApi }
+
+export const PLAYGROUND_CHAT_PAGE_SIZE = 100
+
+// TODO: replace with generated types once the backend exposes URL source serializers
+export type RefreshIntervalValue = 'manual' | '1h' | '6h' | '24h' | '7d'
+export type RefreshIntervalOption = { value: RefreshIntervalValue; label: string }
+
+export interface CreateUrlSourcePayload {
+    name: string
+    url: string
+    source_type: 'url'
+    crawl_mode: CrawlModeEnumApi
+    include_globs?: string[]
+    exclude_globs?: string[]
+    max_pages?: number
+    max_depth?: number
+    refresh_interval?: RefreshIntervalValue
+    always_include?: boolean
+}
+
+export interface UpdateSourcePayload {
+    name?: string
+    text?: string
+    url?: string
+    crawl_mode?: CrawlModeEnumApi
+    include_globs?: string[]
+    exclude_globs?: string[]
+    max_pages?: number
+    max_depth?: number
+    refresh_interval?: RefreshIntervalValue
+    always_include?: boolean
+    library_ids?: string[]
+}
+
+export async function listSources(params?: {
+    search?: string
+    sourceType?: string
+    addedBy?: string
+    libraryId?: string
+    unfiled?: boolean
+}): Promise<KnowledgeSourceApi[]> {
+    const search = params?.search?.trim()
+    const sourceType =
+        params?.sourceType && params.sourceType !== 'all'
+            ? (params.sourceType as BusinessKnowledgeSourcesListSourceType)
+            : undefined
+    const addedBy =
+        params?.addedBy && params.addedBy !== 'all'
+            ? (params.addedBy as BusinessKnowledgeSourcesListAddedBy)
+            : undefined
+    const query: BusinessKnowledgeSourcesListParams = {
+        limit: 1000,
+        ...(search ? { search } : {}),
+        ...(sourceType ? { source_type: sourceType } : {}),
+        ...(addedBy ? { added_by: addedBy } : {}),
+        ...(params?.libraryId ? { library_id: params.libraryId } : {}),
+        ...(params?.unfiled ? { unfiled: true } : {}),
+    }
+    const response = await businessKnowledgeSourcesList(String(getCurrentTeamId()), query)
+    return response.results
+}
+
+export async function getSource(id: string): Promise<KnowledgeSourceApi> {
+    return await businessKnowledgeSourcesRetrieve(String(getCurrentTeamId()), id)
+}
+
+export async function getSourceDocuments(id: string): Promise<KnowledgeSourceDocumentApi[]> {
+    // 5000 matches the crawl cap (MAX_URLS_PER_SOURCE), so one page is the full set.
+    const response = await businessKnowledgeSourcesDocumentsList(String(getCurrentTeamId()), id, { limit: 5000 })
+    return response.results
+}
+
+export async function getSourceText(id: string): Promise<{ id: string; text: string }> {
+    const response = await businessKnowledgeSourcesTextRetrieve(String(getCurrentTeamId()), id)
+    return { id, text: response.text ?? '' }
+}
+
+export async function createTextSource(
+    name: string,
+    text: string,
+    always_include: boolean = false
+): Promise<KnowledgeSourceApi> {
+    return await businessKnowledgeSourcesCreate(String(getCurrentTeamId()), { name, text, always_include })
+}
+
+export async function createUrlSource(payload: CreateUrlSourcePayload): Promise<KnowledgeSourceApi> {
+    return await businessKnowledgeSourcesCreate(
+        String(getCurrentTeamId()),
+        payload as unknown as Parameters<typeof businessKnowledgeSourcesCreate>[1]
+    )
+}
+
+export async function createFileSource(formData: FormData): Promise<KnowledgeSourceApi> {
+    return await apiMutator<KnowledgeSourceApi>(`/api/projects/${getCurrentTeamId()}/business_knowledge/sources/`, {
+        method: 'POST',
+        body: formData,
+    })
+}
+
+export async function updateSource(id: string, payload: UpdateSourcePayload): Promise<KnowledgeSourceApi> {
+    return await businessKnowledgeSourcesPartialUpdate(
+        String(getCurrentTeamId()),
+        id,
+        payload as Parameters<typeof businessKnowledgeSourcesPartialUpdate>[2]
+    )
+}
+
+export async function deleteSource(id: string): Promise<void> {
+    await businessKnowledgeSourcesDestroy(String(getCurrentTeamId()), id)
+}
+
+export async function listPlaygroundChats(offset: number = 0): Promise<PaginatedPlaygroundChatListListApi> {
+    return await businessKnowledgePlaygroundChatsList(String(getCurrentTeamId()), {
+        limit: PLAYGROUND_CHAT_PAGE_SIZE,
+        offset,
+    })
+}
+
+export async function createPlaygroundChat(): Promise<PlaygroundChatApi> {
+    return await businessKnowledgePlaygroundChatsCreate(String(getCurrentTeamId()))
+}
+
+export async function getPlaygroundChat(chatId: string): Promise<PlaygroundChatApi> {
+    return await businessKnowledgePlaygroundChatsRetrieve(String(getCurrentTeamId()), chatId)
+}
+
+export async function askPlaygroundChat(chatId: string, question: string): Promise<PlaygroundChatApi> {
+    const body: SandboxQuestionApi = { question }
+    return await businessKnowledgePlaygroundChatsAskCreate(String(getCurrentTeamId()), chatId, body)
+}
+
+export async function deletePlaygroundChat(chatId: string): Promise<void> {
+    await businessKnowledgePlaygroundChatsDestroy(String(getCurrentTeamId()), chatId)
+}
+
+export async function searchKnowledge(
+    params: BusinessKnowledgeDocumentsSearchListParams
+): Promise<KnowledgeSearchResultApi[]> {
+    return await businessKnowledgeDocumentsSearchList(String(getCurrentTeamId()), params)
+}
+
+export async function getDocumentWindow(
+    documentId: string,
+    params: BusinessKnowledgeDocumentsWindowListParams
+): Promise<KnowledgeDocumentWindowApi[]> {
+    return await businessKnowledgeDocumentsWindowList(String(getCurrentTeamId()), documentId, params)
+}
+
+export async function refreshSource(id: string): Promise<KnowledgeSourceApi> {
+    return await businessKnowledgeSourcesRefreshCreate(String(getCurrentTeamId()), id)
+}
+
+export type KnowledgeLibrary = KnowledgeLibraryApi
+
+export async function listLibraries(): Promise<KnowledgeLibrary[]> {
+    return await businessKnowledgeLibrariesList(String(getCurrentTeamId()))
+}
+
+export async function getLibrary(id: string): Promise<KnowledgeLibrary> {
+    return await businessKnowledgeLibrariesRetrieve(String(getCurrentTeamId()), id)
+}
+
+export async function createLibrary(name: string): Promise<KnowledgeLibrary> {
+    return await businessKnowledgeLibrariesCreate(String(getCurrentTeamId()), { name })
+}
+
+export async function updateLibrary(
+    id: string,
+    payload: { name?: string; source_ids?: string[]; repos?: string[] }
+): Promise<KnowledgeLibrary> {
+    return await businessKnowledgeLibrariesPartialUpdate(String(getCurrentTeamId()), id, payload)
+}
+
+export async function deleteLibrary(id: string): Promise<void> {
+    await businessKnowledgeLibrariesDestroy(String(getCurrentTeamId()), id)
+}

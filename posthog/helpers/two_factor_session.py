@@ -1,0 +1,651 @@
+import re
+import time
+import datetime
+import unicodedata
+from typing import Literal, cast
+
+from django.conf import settings
+from django.contrib.auth.models import AbstractBaseUser
+from django.contrib.auth.tokens import PasswordResetTokenGenerator
+from django.http import HttpRequest
+from django.utils.crypto import constant_time_compare, salted_hmac
+
+import structlog
+import posthoganalytics
+from loginas.utils import is_impersonated_session
+from posthoganalytics import capture_exception
+from prometheus_client import Counter
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.request import Request
+from two_factor.utils import default_device
+
+from posthog.cloud_utils import is_cloud, is_dev_mode
+from posthog.email import EmailRecipientUndeliverableError, is_email_available, is_http_email_service_available
+from posthog.models.organization import Organization
+from posthog.models.user import User
+from posthog.models.webauthn_credential import WebauthnCredential
+from posthog.redis import get_client
+from posthog.settings.web import AUTHENTICATION_BACKENDS
+
+from products.security.backend.facade.api import is_email_code_exempt
+
+
+def has_passkeys(user: User) -> bool:
+    """
+    Returns True if the user has any verified passkeys, False otherwise.
+
+    Unlike TOTP devices which have a single default device, users can have multiple passkeys
+    and they're all equivalent. This function simply checks if the user has any verified passkeys.
+
+    Args:
+        user: The user to check for passkeys
+
+    Returns:
+        bool: True if user has verified passkeys, False otherwise
+    """
+    return WebauthnCredential.objects.filter(user=user, verified=True).exists()
+
+
+mfa_logger = structlog.get_logger("posthog.auth.mfa")
+
+# One counter for the whole code-based login-verification flow, sliced by transition. Lets Grafana
+# derive send volume, delivery failures, completion rate (success / sent), invalid-code rate and
+# lockout rate, and alert on any of them.
+LOGIN_CODE_VERIFICATION_COUNTER = Counter(
+    "login_code_verification_total",
+    "Transitions in the code-based login-verification flow.",
+    labelnames=["result"],  # sent | resent | send_failed | undeliverable | success | invalid | locked_out
+)
+
+
+# Enforce Two-Factor Authentication only on sessions created after this date
+TWO_FACTOR_ENFORCEMENT_FROM_DATE = datetime.datetime(2025, 9, day=22, hour=13)
+
+TWO_FACTOR_VERIFIED_SESSION_KEY = "two_factor_verified"
+
+WHITELISTED_PATHS = [
+    "/api/users/@me/two_factor_start_setup/",
+    "/api/users/@me/two_factor_validate/",
+    "/api/users/@me/two_factor_status/",
+    "/api/users/@me/two_factor_backup_codes/",
+    "/api/users/@me/two_factor_disable/",
+    "/logout/",
+    "/api/logout/",
+    "/api/login/",
+    "/api/login/token/",
+    "/api/login/code-based-verification/",
+    "/api/users/@me/",
+    "/_health/",
+]
+
+WHITELISTED_PREFIXES = [
+    "/static/",
+    "/uploaded_media/",
+    "/api/instance_status",
+    "/api/signup",
+    "/api/social_signup",
+    "/login/google-oauth2",
+    "/login/github",
+    "/login/gitlab",
+    "/login/saml",
+    "/complete/google-oauth2",
+    "/complete/github",
+    "/complete/gitlab",
+    "/complete/saml",
+    "/api/saml/metadata",
+]
+
+
+def set_two_factor_verified_in_session(request: HttpRequest, verified: bool = True) -> None:
+    if verified:
+        request.session[TWO_FACTOR_VERIFIED_SESSION_KEY] = True
+    else:
+        clear_two_factor_session_flags(request)
+
+
+def is_two_factor_verified_in_session(request: HttpRequest) -> bool:
+    if not request.session.get(TWO_FACTOR_VERIFIED_SESSION_KEY):
+        return False
+
+    if is_two_factor_session_expired(request):
+        clear_two_factor_session_flags(request)
+        return False
+
+    return True
+
+
+def clear_two_factor_session_flags(request: HttpRequest) -> None:
+    request.session.pop(TWO_FACTOR_VERIFIED_SESSION_KEY, None)
+
+
+def is_two_factor_session_expired(request: HttpRequest) -> bool:
+    session_created_at = request.session.get(settings.SESSION_COOKIE_CREATED_AT_KEY)
+    if not session_created_at:
+        return True
+
+    return time.time() - session_created_at > settings.SESSION_COOKIE_AGE
+
+
+def enforce_two_factor(request, user, organization: Organization | None = None):
+    """
+    Enforce Two-Factor Authentication requirements for authenticated users in organizations that require it.
+    Excludes paths that are whitelisted and domains that have SSO enforcement enabled.
+    `organization` defaults to the user's current organization.
+    """
+    if is_path_whitelisted(request.path):
+        return
+
+    missing_step = missing_two_factor_step(request._request, user, organization)
+    if missing_step == "setup":
+        raise PermissionDenied(detail="2FA setup required", code="two_factor_setup_required")
+    if missing_step == "verification":
+        raise PermissionDenied(detail="2FA verification required", code="two_factor_verification_required")
+
+
+def enforce_credential_two_factor(
+    request: Request, scoped_organization_ids: list[str] | None, scoped_team_ids: list[int] | None
+) -> None:
+    """Refuse a credential that reaches an organization whose 2FA policy this session hasn't met.
+
+    Session auth checks the current organization only, and the credential never meets a 2FA check
+    later. A credential with no scope reaches every organization of the user. Each non-empty scope
+    list limits the reach on its own, as in `get_organization_ids_in_key_scope`.
+    """
+    user = cast(User, request.user)
+    organizations = user.organizations.filter(enforce_2fa=True)
+    if scoped_team_ids:
+        organizations = organizations.filter(team__id__in=scoped_team_ids)
+    if scoped_organization_ids:
+        organizations = organizations.filter(id__in=scoped_organization_ids)
+    # The policy is the same for every organization that enforces 2FA, so one is enough.
+    organization = organizations.first()
+    if organization is not None:
+        enforce_two_factor(request, user, organization)
+
+
+def missing_two_factor_step(
+    request: HttpRequest, user: User, organization: Organization | None = None
+) -> Literal["setup", "verification"] | None:
+    """`organization` defaults to the user's current organization. Pass another one to check its policy,
+    such as the organization of a project the user grants access to."""
+    # We currently don't enforce 2FA for any SSO-authenticated users, as we depend on the SSO provider to handle 2FA
+    # TODO: This will soon be made configurable
+    if is_sso_authentication_backend(request):
+        return None
+
+    organization = organization or getattr(user, "organization", None)
+    if not organization or not organization.enforce_2fa:
+        return None
+
+    # Same as above, we don't enforce 2FA on SSO-enforced domains, we depend on the SSO provider to handle 2FA
+    # TODO: This will soon be made configurable
+    if is_domain_sso_enforced(request):
+        return None
+
+    if not is_two_factor_enforcement_in_effect(request):
+        return None
+
+    if is_impersonated_session(request):
+        return None
+
+    device = default_device(user)
+    user_has_passkeys = has_passkeys(user)
+    passkeys_enabled_for_2fa = user_has_passkeys and user.passkeys_enabled_for_2fa
+    if not device and not passkeys_enabled_for_2fa:
+        return "setup"
+
+    if not is_two_factor_verified_in_session(request):
+        return "verification"
+
+    return None
+
+
+def is_path_whitelisted(path):
+    """
+    Check if the request path should bypass Two-Factor Authentication enforcement.
+    """
+    if path in WHITELISTED_PATHS:
+        return True
+
+    for prefix in WHITELISTED_PREFIXES:
+        if path.startswith(prefix):
+            return True
+
+    return False
+
+
+def is_two_factor_enforcement_in_effect(request: HttpRequest):
+    session_created_at = request.session.get(settings.SESSION_COOKIE_CREATED_AT_KEY)
+
+    if not session_created_at:
+        return False
+
+    return datetime.datetime.fromtimestamp(session_created_at) >= TWO_FACTOR_ENFORCEMENT_FROM_DATE
+
+
+def is_domain_sso_enforced(request: HttpRequest):
+    from posthog.models.organization_domain import OrganizationDomain
+
+    if not hasattr(request.user, "email"):
+        return False
+
+    return bool(OrganizationDomain.objects.get_sso_enforcement_for_email_address(request.user.email))
+
+
+def is_sso_authentication_backend(request: HttpRequest):
+    SSO_AUTHENTICATION_BACKENDS = []
+    NON_SSO_AUTHENTICATION_BACKENDS = [
+        "axes.backends.AxesBackend",
+        "django.contrib.auth.backends.ModelBackend",
+        "posthog.auth.WebauthnBackend",
+    ]
+
+    if not hasattr(request, "session"):
+        return False
+
+    # Check if we're in EE, if yes, use the EE settings, otherwise use the posthog settings
+    try:
+        from ee import settings
+
+        SSO_AUTHENTICATION_BACKENDS = settings.AUTHENTICATION_BACKENDS
+    except ImportError:
+        SSO_AUTHENTICATION_BACKENDS = AUTHENTICATION_BACKENDS
+
+    # Remove the non-SSO backends from the list
+    SSO_AUTHENTICATION_BACKENDS = list(set(SSO_AUTHENTICATION_BACKENDS) - set(NON_SSO_AUTHENTICATION_BACKENDS))
+
+    return request.session.get("_auth_user_backend") in SSO_AUTHENTICATION_BACKENDS
+
+
+CODE_LENGTH = 6
+CODE_TTL_SECONDS = 1800  # 30 minutes
+CODE_MAX_ATTEMPTS = 5
+
+# Characters an email client or manual entry can inject around/within the code without the
+# user seeing them: whitespace, the zero-width family, word joiner, BOM, soft hyphen, and the
+# hyphen someone types when grouping the code as "123-456".
+CODE_NOISE_RE = re.compile(r"[\s\u200b-\u200d\u2060\ufeff\u00ad-]")
+
+
+def normalize_verification_code(value: str) -> str:
+    """Fold compatibility forms (fullwidth digits become ASCII) then drop the noise an email client
+    or manual grouping injects. Callers still validate the result is exactly CODE_LENGTH digits."""
+    return CODE_NOISE_RE.sub("", unicodedata.normalize("NFKC", value or ""))
+
+
+# Authenticator apps show 6 digits, while StaticToken.random_token() backup codes are 8 base32
+# characters, so the shape of a 2FA login token is enough to tell which device it is for.
+TOTP_TOKEN_RE = re.compile(r"[0-9]{6}")
+
+
+def is_backup_code_attempt(token: object) -> bool:
+    """Whether a 2FA login token is checked against the backup codes rather than the authenticator.
+    Each device then keeps its own throttle, so a locked authenticator does not lock the backup codes."""
+    return isinstance(token, str) and bool(token) and not TOTP_TOKEN_RE.fullmatch(token)
+
+
+# Failed-attempt budget for a pending login is tracked in Redis so the cap is enforced atomically
+# (INCR) rather than via a raceable session read-modify-write, which parallel guesses could sidestep.
+CODE_ATTEMPTS_REDIS_KEY_PREFIX = "code_based_verification_attempts"
+
+# IdP approvals bind the code to the chosen mailbox in addition to the account.
+CODE_BASED_VERIFICATION_TARGET_SESSION_KEY = "code_based_verification_target"
+CODE_BASED_VERIFICATION_IDENTITY_SESSION_KEY = "code_based_verification_identity"
+
+# Set when a login through an identity provider stopped here. The verification endpoint reads it to
+# start the session on the provider's backend and to record the proof for that issuer.
+CODE_BASED_VERIFICATION_SSO_SESSION_KEY = "code_based_verification_sso"
+
+
+class CodeBasedVerificationTokenGenerator(PasswordResetTokenGenerator):
+    """Derive a short numeric login-verification code from the same secret-keyed,
+    per-user hash the framework uses for password-reset tokens. The code is pinned to
+    the login attempt's issuance time, valid for CODE_TTL_SECONDS, and rotates
+    automatically on login, password change, email change, or deactivation."""
+
+    def make_code(self, user: AbstractBaseUser, issued_at: int, target: str = "", identity: str = "") -> str:
+        """Deterministic CODE_LENGTH-digit code for this user and issuance time.
+
+        `target` binds the code to the address it authorizes. Without it, two sends for the same
+        user in the same second derive the same code. Identity binding also keeps subjects
+        asserting the same mailbox from sharing codes. Password login and signup use the defaults.
+        """
+        digest = salted_hmac(
+            self.key_salt,
+            self._make_hash_value(user, issued_at, target, identity),
+            secret=self.secret,
+            algorithm=self.algorithm,
+        ).hexdigest()
+        return f"{int(digest, 16) % (10**CODE_LENGTH):0{CODE_LENGTH}d}"
+
+    def check_code(
+        self, user: AbstractBaseUser, code: str, issued_at: int, target: str = "", identity: str = ""
+    ) -> bool:
+        """Constant-time compare against the expected code, rejecting expired codes.
+
+        Six digits need bounded attempts: password logins require a password first, while
+        IdP challenges have identity-scoped attempts and an account-wide issuance ceiling.
+        """
+        if not (user and code and issued_at):
+            return False
+        if int(time.time()) - issued_at > CODE_TTL_SECONDS:
+            return False
+        return constant_time_compare(self.make_code(user, issued_at, target, identity), code)
+
+    def _make_hash_value(self, user: AbstractBaseUser, timestamp: int, target: str = "", identity: str = "") -> str:
+        """Include last_login and is_active to invalidate tokens after use or deactivation.
+
+        `target` is the address an email change code authorizes, so a code cannot verify a
+        different address. Login and signup leave it empty.
+        """
+        from posthog.models.user import User
+
+        usable_user: User = User.objects.get(pk=user.pk)
+        login_timestamp = "" if user.last_login is None else user.last_login.replace(microsecond=0, tzinfo=None)
+        value = f"{usable_user.pk}{usable_user.email}{usable_user.password}{usable_user.is_active}{login_timestamp}{timestamp}{target}"
+        return f"{value}\x00{identity}" if identity else value
+
+
+code_based_verification_token_generator = CodeBasedVerificationTokenGenerator()
+
+
+NO_EMAIL_HTTP_SERVICE = "no_email_http_service"
+
+
+_RESERVE_CODE_ATTEMPT_LUA = """
+local count = redis.call('INCR', KEYS[1])
+if ARGV[2] == '1' or redis.call('TTL', KEYS[1]) == -1 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return count
+"""
+
+
+class CodeBasedVerifier:
+    def _recent_idp_code_key(self, user: User, target_email: str, identity: str, asserted_email: str) -> str:
+        context = code_based_verification_token_generator._make_hash_value(user, 0, target_email, identity)
+        context = f"{context}\x00{asserted_email}"
+        signature = salted_hmac(
+            "posthog.auth.recent_idp_code",
+            context,
+            secret=code_based_verification_token_generator.secret,
+            algorithm=code_based_verification_token_generator.algorithm,
+        ).hexdigest()
+        return f"idp_login_recent_code:{signature}"
+
+    def reuse_recent_idp_code(
+        self,
+        request: HttpRequest,
+        user: User,
+        target_email: str,
+        identity: str,
+        asserted_email: str,
+        *,
+        linked: bool = False,
+    ) -> bool:
+        """Fresh callbacks can lose the session while an emailed code is still valid for the same mailbox."""
+        try:
+            issued_at = get_client().get(self._recent_idp_code_key(user, target_email, identity, asserted_email))
+            if issued_at is None:
+                return False
+            issued_at = int(issued_at)
+            if not 0 <= time.time() - issued_at < CODE_TTL_SECONDS:
+                return False
+            if not self.reserve_idp_challenge(user, identity, linked=linked):
+                return False
+            self.clear_pending(request)
+            self._set_pending_code(request, user, issued_at, target_email, identity)
+            return True
+        except Exception:
+            mfa_logger.exception("idp_recent_code_unavailable", user_id=user.pk)
+            return False
+
+    def _remember_recent_idp_code(self, key: str, issued_at: int, user: User) -> None:
+        try:
+            get_client().set(key, issued_at, ex=CODE_TTL_SECONDS)
+        except Exception:
+            mfa_logger.exception("idp_recent_code_unavailable", user_id=user.pk)
+
+    def _set_pending_code(
+        self, request: HttpRequest, user: User, issued_at: int, target_email: str | None, identity: str | None
+    ) -> None:
+        request.session["code_based_verification_pending_user_id"] = user.pk
+        request.session["code_based_verification_issued_at"] = issued_at
+        request.session[CODE_BASED_VERIFICATION_TARGET_SESSION_KEY] = target_email
+        request.session[CODE_BASED_VERIFICATION_IDENTITY_SESSION_KEY] = identity
+
+    def reserve_idp_challenge(self, user: User, identity: str, *, linked: bool = False) -> bool:
+        """Reserve one account-wide slot for this identity for the code lifetime.
+
+        Replays and resends share the grant so one unproven subject cannot spend the
+        account's entire issuance quota or invalidate another subject's allocated budget.
+        """
+        from posthog.token_bucket import BucketDecision, Budget, consume
+
+        grant_key = f"idp_login_identity_grant:{user.pk}:{identity}"
+        try:
+            client = get_client()
+            attempts = client.get(self._attempts_redis_key(f"idp:{identity}"))
+            if attempts is not None and int(attempts) >= CODE_MAX_ATTEMPTS:
+                return False
+            grant = client.get(grant_key)
+            if grant is not None:
+                return grant in ("granted", b"granted")
+            if not client.set(grant_key, "pending", nx=True, ex=10):
+                return False
+            quota_key = f"idp_login_identity_quota:{user.pk}" + (f":linked:{identity}" if linked else "")
+            decision = consume(quota_key, Budget(burst=5, per_hour=6))
+            if not isinstance(decision, BucketDecision):
+                mfa_logger.warning("idp_identity_budget_unavailable", user_id=user.pk)
+                return False
+            granted = decision.allowed
+            client.set(grant_key, "granted" if granted else "denied", ex=CODE_TTL_SECONDS if granted else 60)
+            return granted
+        except Exception:
+            mfa_logger.exception("idp_identity_budget_unavailable", user_id=user.pk)
+            return False
+
+    def _capture_no_http_service_bypass_event(self, user: User) -> None:
+        try:
+            posthoganalytics.capture(
+                distinct_id=str(user.distinct_id),
+                event="code_based_verification_bypassed_due_to_suppression",
+                properties={
+                    "reason": NO_EMAIL_HTTP_SERVICE,
+                    "cached": False,
+                },
+            )
+        except Exception as e:
+            mfa_logger.warning(
+                "Failed to capture code-based verification suppression bypass event",
+                user_id=user.pk,
+                error=str(e),
+            )
+
+    def should_send_code_based_verification(self, user: User) -> bool:
+        if is_dev_mode() and not settings.TEST:
+            return False
+
+        if is_cloud() and not is_http_email_service_available():
+            # Cloud always has the Workflows key and an https host, so this means a deployment lost its email config
+            # and every password login is skipping the emailed code. Cloud has no SMTP, so check before email availability.
+            capture_exception(Exception("Login code skipped: HTTP email is unavailable on a cloud deployment"))
+
+        if not is_email_available(with_absolute_urls=True):
+            return False
+
+        if not is_http_email_service_available():
+            mfa_logger.info(
+                "Code-based verification bypassed - HTTP email service not configured",
+                user_id=user.pk,
+            )
+            self._capture_no_http_service_bypass_event(user)
+            return False
+
+        # An exempting rule drops only the emailed code. TOTP and passkey 2FA are gated earlier in the login flow.
+        if is_email_code_exempt(user.email):
+            mfa_logger.info("Code-based verification bypassed via access rule", user_id=user.pk)
+            return False
+
+        return True
+
+    def create_and_send_code_based_verification(
+        self,
+        request: HttpRequest,
+        user: User,
+        *,
+        is_resend: bool = False,
+        target_email: str | None = None,
+        identity: str | None = None,
+        asserted_email: str | None = None,
+    ) -> bool:
+        """Raises EmailRecipientUndeliverableError when the address cannot receive the code.
+
+        The account mailbox authorizes an IdP identity, so codes and budgets must not be
+        transferable to another identity asserting the same address.
+        """
+        from posthog.tasks import email
+
+        if not is_resend:
+            self.clear_pending(request)
+
+        if target_email is not None:
+            if not is_email_available(with_absolute_urls=True):
+                return False
+        elif not self.should_send_code_based_verification(user):
+            return False
+
+        try:
+            issued_at = int(time.time())
+            recent_key = (
+                self._recent_idp_code_key(user, target_email, identity, asserted_email)
+                if target_email is not None and identity is not None and asserted_email is not None
+                else None
+            )
+            code = code_based_verification_token_generator.make_code(
+                user, issued_at, target_email or "", identity or ""
+            )
+            email.send_code_based_verification(user.pk, code, to_email=target_email)
+            self._set_pending_code(request, user, issued_at, target_email, identity)
+            if recent_key is not None:
+                self._remember_recent_idp_code(recent_key, issued_at, user)
+            if is_resend and (sso := request.session.get(CODE_BASED_VERIFICATION_SSO_SESSION_KEY)):
+                sso["issued_at"] = issued_at
+                request.session[CODE_BASED_VERIFICATION_SSO_SESSION_KEY] = sso
+            # Neither a resend nor a new partial may replenish an unproven identity's guess budget.
+            if not is_resend and identity is None:
+                self._reset_attempts(user.pk)
+            LOGIN_CODE_VERIFICATION_COUNTER.labels(result="resent" if is_resend else "sent").inc()
+            mfa_logger.info(
+                "Code-based verification email sent",
+                user_id=user.pk,
+                user_last_login=str(user.last_login) if user.last_login else None,
+            )
+            return True
+        except EmailRecipientUndeliverableError:
+            LOGIN_CODE_VERIFICATION_COUNTER.labels(result="undeliverable").inc()
+            mfa_logger.info("Code-based verification email refused as undeliverable", user_id=user.pk)
+            raise
+        except Exception as e:
+            LOGIN_CODE_VERIFICATION_COUNTER.labels(result="send_failed").inc()
+            mfa_logger.exception(
+                "Code-based verification email failed",
+                user_id=user.pk,
+                error=str(e),
+            )
+            capture_exception(Exception(f"Code-based verification email failed: {e}"))
+            return False
+
+    def has_pending_code_based_verification(self, request: HttpRequest) -> bool:
+        return request.session.get("code_based_verification_pending_user_id") is not None
+
+    def get_pending_code_based_verification_user_id(self, request: HttpRequest) -> int | None:
+        user_id: int | None = request.session.get("code_based_verification_pending_user_id")
+        return user_id
+
+    def get_pending_code_based_verification_issued_at(self, request: HttpRequest) -> int | None:
+        return request.session.get("code_based_verification_issued_at")
+
+    def get_pending_code_based_verification_target(self, request: HttpRequest) -> str | None:
+        target: str | None = request.session.get(CODE_BASED_VERIFICATION_TARGET_SESSION_KEY)
+        return target
+
+    def get_pending_identity(self, request: HttpRequest) -> str | None:
+        return request.session.get(CODE_BASED_VERIFICATION_IDENTITY_SESSION_KEY)
+
+    def get_pending_budget_identity(self, request: HttpRequest) -> str | None:
+        user_id = self.get_pending_code_based_verification_user_id(request)
+        if user_id is None:
+            return None
+        identity = self.get_pending_identity(request)
+        return f"idp:{identity}" if identity else str(user_id)
+
+    def check_code(self, request: HttpRequest, user: User, code: str) -> bool:
+        issued_at = self.get_pending_code_based_verification_issued_at(request)
+        if not issued_at:
+            return False
+        target = self.get_pending_code_based_verification_target(request) or ""
+        return code_based_verification_token_generator.check_code(
+            user, code, issued_at, target, self.get_pending_identity(request) or ""
+        )
+
+    @staticmethod
+    def _attempts_redis_key(user_id: int | str) -> str:
+        return f"{CODE_ATTEMPTS_REDIS_KEY_PREFIX}:{user_id}"
+
+    def _reset_attempts(self, user_id: int) -> None:
+        try:
+            get_client().delete(self._attempts_redis_key(user_id))
+        except Exception:
+            mfa_logger.exception("Failed to reset code-based verification attempt counter", user_id=user_id)
+
+    def reserve_attempt(self, request: HttpRequest) -> int:
+        """Atomically count this verification attempt against the pending login's budget.
+
+        Unproven IdP subjects need separate, non-renewable budgets so they cannot lock out
+        another identity or a password login. They fail closed on Redis errors; password
+        logins retain their existing throttle backstop.
+        """
+        user_id = self.get_pending_code_based_verification_user_id(request)
+        if not user_id:
+            return 0
+        try:
+            client = get_client()
+            budget_identity = self.get_pending_budget_identity(request) or str(user_id)
+            key = self._attempts_redis_key(budget_identity)
+            return int(
+                client.eval(
+                    _RESERVE_CODE_ATTEMPT_LUA,
+                    1,
+                    key,
+                    CODE_TTL_SECONDS,
+                    int(self.get_pending_identity(request) is None),
+                )
+            )
+        except Exception:
+            mfa_logger.exception(
+                "Failed to reserve code-based verification attempt",
+                user_id=user_id,
+            )
+            return CODE_MAX_ATTEMPTS + 1 if self.get_pending_identity(request) else 0
+
+    def clear_pending(self, request: HttpRequest) -> None:
+        user_id = self.get_pending_code_based_verification_user_id(request)
+        if (
+            user_id
+            and self.get_pending_identity(request) is None
+            and CODE_BASED_VERIFICATION_SSO_SESSION_KEY not in request.session
+        ):
+            self._reset_attempts(user_id)
+        for key in (
+            "code_based_verification_pending_user_id",
+            "code_based_verification_issued_at",
+            "code_based_verification_attempts",
+            CODE_BASED_VERIFICATION_TARGET_SESSION_KEY,
+            CODE_BASED_VERIFICATION_IDENTITY_SESSION_KEY,
+            CODE_BASED_VERIFICATION_SSO_SESSION_KEY,
+        ):
+            request.session.pop(key, None)
+
+
+code_based_verifier = CodeBasedVerifier()

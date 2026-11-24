@@ -1,0 +1,314 @@
+import {
+  type CloudRegion,
+  getCloudUrlFromRegion,
+  REGION_LABELS,
+} from "@posthog/shared";
+import { useAuthStore } from "@posthog/ui/features/auth/store";
+import { getPostHogUrl } from "@posthog/ui/utils/urls";
+
+export interface LinkOverrides {
+  projectId?: number | null;
+  cloudRegion?: CloudRegion | null;
+}
+
+export interface ErrorTrackingIssueLinkOverrides extends LinkOverrides {
+  fingerprint?: string | null;
+}
+
+function resolveProjectId(override?: number | null): number | null {
+  if (override != null) return override;
+  return useAuthStore.getState().authState.currentProjectId ?? null;
+}
+
+function withProjectId(
+  path: (projectId: number) => string,
+  overrides?: LinkOverrides,
+): string | null {
+  const projectId = resolveProjectId(overrides?.projectId);
+  if (!projectId) return null;
+  return getPostHogUrl(path(projectId), overrides?.cloudRegion);
+}
+
+/** A page inside the current project, given its path after `/project/<id>/`. */
+export function projectPathUrl(
+  path: string,
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId((pid) => `/project/${pid}/${path}`, overrides);
+}
+
+export function flagUrl(
+  flagId: number,
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId(
+    (pid) => `/project/${pid}/feature_flags/${flagId}`,
+    overrides,
+  );
+}
+
+export function flagUrlByKey(
+  flagKey: string,
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId(
+    (pid) =>
+      `/project/${pid}/feature_flags?search=${encodeURIComponent(flagKey)}`,
+    overrides,
+  );
+}
+
+export function eventDefinitionUrl(
+  definitionId: string,
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId(
+    (pid) => `/project/${pid}/data-management/events/${definitionId}`,
+    overrides,
+  );
+}
+
+export function experimentUrl(
+  experimentId: number,
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId(
+    (pid) => `/project/${pid}/experiments/${experimentId}`,
+    overrides,
+  );
+}
+
+/** The project's date and time settings, where its timezone is set. */
+export function projectTimezoneSettingsUrl(
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId(
+    (pid) => `/project/${pid}/settings/environment-customization#date-and-time`,
+    overrides,
+  );
+}
+
+export function skillUrl(
+  skillName: string,
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId(
+    (pid) => `/project/${pid}/skills/${encodeURIComponent(skillName)}`,
+    overrides,
+  );
+}
+
+/** The browser-accessible URL for a Self-driving report. */
+export function inboxReportUrl(
+  reportId: string,
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId(
+    (pid) => `/project/${pid}/inbox/${encodeURIComponent(reportId)}`,
+    overrides,
+  );
+}
+
+/** The browser-accessible URL for a support ticket, by ticket number or by ticket uuid. */
+export function supportTicketUrl(
+  ticketRef: string | number,
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId(
+    (pid) =>
+      `/project/${pid}/support/tickets/${encodeURIComponent(String(ticketRef))}`,
+    overrides,
+  );
+}
+
+/** `/project/<id>` for a share link, so the web interstitial can open the item in its own project. */
+function projectPrefix(overrides?: LinkOverrides): string {
+  const projectId = resolveProjectId(overrides?.projectId);
+  return projectId ? `/project/${projectId}` : "";
+}
+
+/**
+ * The shareable https link for a canvas (a dashboard inside a channel):
+ * `<instance>/project/<id>/code/canvas/<channelId>/<dashboardId>`. Opening it in a
+ * browser hits a web interstitial that deep-links into the desktop app (or offers
+ * the download), so the link works for anyone — app installed or not. The ids are
+ * globally-unique desktop file-system row ids; the project prefix only tells the
+ * interstitial which project to open the web canvas in. The inbound desktop side
+ * lives in `CanvasLinkService` / `useCanvasDeepLink`.
+ */
+export function canvasShareUrl(
+  channelId: string,
+  dashboardId: string,
+  overrides?: LinkOverrides,
+): string | null {
+  return getPostHogUrl(
+    `${projectPrefix(overrides)}/code/canvas/${encodeURIComponent(channelId)}/${encodeURIComponent(dashboardId)}`,
+    overrides?.cloudRegion,
+  );
+}
+
+/**
+ * The shareable https link for a channel — or a thread (channel-filed task)
+ * inside it: `<instance>/project/<id>/code/channel/<channelId>[/tasks/<taskId>]`.
+ * Opening it in a browser hits a web interstitial that deep-links into the
+ * desktop app (or offers the download), so the link works for anyone — app
+ * installed or not. The ids are globally-unique row ids; the project prefix only
+ * tells the interstitial which project to open the web space in. The inbound
+ * desktop side lives in `ChannelLinkService` / `useChannelDeepLink`.
+ */
+export function channelShareUrl(
+  channelId: string,
+  taskId?: string,
+  overrides?: LinkOverrides,
+): string | null {
+  const base = `${projectPrefix(overrides)}/code/channel/${encodeURIComponent(channelId)}`;
+  const path = taskId ? `${base}/tasks/${encodeURIComponent(taskId)}` : base;
+  return getPostHogUrl(path, overrides?.cloudRegion);
+}
+
+/**
+ * Parse a URL, rejecting anything that isn't https. The gate every surface that
+ * renders a backend-supplied link goes through before fetching from it or
+ * handing it to the host's external-link opener.
+ */
+export function parseHttpsUrl(url: string): URL | null {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export type ShareLinkTarget =
+  | { kind: "canvas"; channelId: string; dashboardId: string }
+  | { kind: "channel"; channelId: string; taskId?: string };
+
+function posthogHosts(): Set<string> {
+  return new Set(
+    (Object.keys(REGION_LABELS) as CloudRegion[]).flatMap((region) => {
+      try {
+        return [new URL(getCloudUrlFromRegion(region)).host];
+      } catch {
+        return [];
+      }
+    }),
+  );
+}
+
+interface ShareLinkRoute {
+  pattern: string[];
+  build: (params: Record<string, string>) => ShareLinkTarget;
+}
+
+const SHARE_LINK_ROUTES: ShareLinkRoute[] = [
+  {
+    pattern: ["code", "canvas", ":channelId", ":dashboardId"],
+    build: ({ channelId, dashboardId }) => ({
+      kind: "canvas",
+      channelId,
+      dashboardId,
+    }),
+  },
+  {
+    pattern: ["code", "channel", ":channelId"],
+    build: ({ channelId }) => ({ kind: "channel", channelId }),
+  },
+  {
+    pattern: ["code", "channel", ":channelId", "tasks", ":taskId"],
+    build: ({ channelId, taskId }) => ({ kind: "channel", channelId, taskId }),
+  },
+];
+
+function decodePathSegments(pathname: string): string[] {
+  return pathname
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    });
+}
+
+/**
+ * A share link names its project with a `/project/<id>/` prefix, and links from
+ * before that have none. The route is the same either way, so drop the prefix.
+ */
+function withoutProjectPrefix(segments: string[]): string[] {
+  return segments[0] === "project" && /^\d+$/.test(segments[1] ?? "")
+    ? segments.slice(2)
+    : segments;
+}
+
+function matchRoute(
+  segments: string[],
+  route: ShareLinkRoute,
+): ShareLinkTarget | null {
+  if (segments.length !== route.pattern.length) return null;
+  const params: Record<string, string> = {};
+  for (const [index, token] of route.pattern.entries()) {
+    const segment = segments[index];
+    if (token.startsWith(":")) {
+      params[token.slice(1)] = segment;
+    } else if (token !== segment) {
+      return null;
+    }
+  }
+  return route.build(params);
+}
+
+export function parseShareLink(href: string): ShareLinkTarget | null {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  if (!posthogHosts().has(url.host)) return null;
+
+  const segments = withoutProjectPrefix(decodePathSegments(url.pathname));
+  for (const route of SHARE_LINK_ROUTES) {
+    const target = matchRoute(segments, route);
+    if (target) return target;
+  }
+  return null;
+}
+
+export function errorTrackingIssueUrl(
+  issueId: string,
+  overrides?: ErrorTrackingIssueLinkOverrides,
+): string | null {
+  return withProjectId((pid) => {
+    const path = `/project/${pid}/error_tracking/${encodeURIComponent(issueId)}`;
+    return overrides?.fingerprint
+      ? `${path}?fingerprint=${encodeURIComponent(overrides.fingerprint)}`
+      : path;
+  }, overrides);
+}
+
+export function colonOffsetToSeconds(offset: string): number | null {
+  const parts = offset.split(":");
+  if (parts.length < 2 || parts.length > 3) return null;
+  if (parts.some((p) => !/^\d+$/.test(p))) return null;
+  const nums = parts.map(Number);
+  const [h, m, s] = parts.length === 3 ? nums : [0, nums[0], nums[1]];
+  if (m >= 60 || s >= 60) return null;
+  const total = h * 3600 + m * 60 + s;
+  return Number.isSafeInteger(total) ? total : null;
+}
+
+export function sessionRecordingUrl(
+  sessionId: string,
+  options?: { secondsOffsetFromStart?: number | null },
+  overrides?: LinkOverrides,
+): string | null {
+  return withProjectId((pid) => {
+    const path = `/project/${pid}/replay/${encodeURIComponent(sessionId)}`;
+    return options?.secondsOffsetFromStart != null
+      ? `${path}?t=${options.secondsOffsetFromStart}`
+      : path;
+  }, overrides);
+}

@@ -1,0 +1,99 @@
+import '@testing-library/jest-dom'
+
+import { render, waitFor } from '@testing-library/react'
+import { Provider } from 'kea'
+
+import { useMocks } from '~/mocks/jest'
+import { initKeaTests } from '~/test/init'
+import { AnyPropertyFilter, PropertyFilterType, PropertyOperator } from '~/types'
+
+import { PropertyFilterButton } from './PropertyFilterButton'
+
+describe('PropertyFilterButton', () => {
+    beforeEach(() => {
+        initKeaTests()
+    })
+
+    // The content span carries a native `title` only when the rich group card
+    // tooltip is NOT used; a group-identity filter suppresses it and wraps the
+    // chip in the formatted-card Tooltip instead.
+    const contentTitle = (container: HTMLElement): string | null =>
+        container.querySelector('.PropertyFilterButton-content')?.getAttribute('title') ?? null
+
+    it.each([
+        {
+            description: 'a $group_key group filter (the group identity)',
+            item: {
+                key: '$group_key',
+                type: PropertyFilterType.Group,
+                group_type_index: 0,
+                value: ['01953d33-82a2-0000-f577-8dcc2987f5ce'],
+                operator: PropertyOperator.Exact,
+            },
+        },
+        {
+            description: 'an id group filter (a group property that often holds the key)',
+            item: {
+                key: 'id',
+                type: PropertyFilterType.Group,
+                group_type_index: 0,
+                value: ['01953d33-82a2-0000-f577-8dcc2987f5ce'],
+                operator: PropertyOperator.Exact,
+            },
+        },
+    ])('suppresses the native title (uses the group card tooltip) for $description', ({ item }) => {
+        const { container } = render(
+            <Provider>
+                <PropertyFilterButton item={item as AnyPropertyFilter} onClick={jest.fn()} />
+            </Provider>
+        )
+
+        expect(container.querySelector('.PropertyFilterButton-content')).toBeInTheDocument()
+        // Native title is suppressed; the formatted-card Tooltip is used instead.
+        // (The inverse — group *property* keys not triggering the card — is
+        // covered by the isGroupCardFilterKey() unit tests.)
+        expect(contentTitle(container)).toBeNull()
+    })
+    it('labels a commented HogQL filter with its comment and titles it with the whole expression', () => {
+        const key = "properties.$browser = 'Chrome' -- Chrome users"
+        const { container } = render(
+            <Provider>
+                <PropertyFilterButton item={{ type: PropertyFilterType.HogQL, key, value: null }} onClick={jest.fn()} />
+            </Provider>
+        )
+
+        expect(container.querySelector('.PropertyFilterButton-content')).toHaveTextContent('Chrome users')
+        expect(contentTitle(container)).toBe(key)
+    })
+    it('resolves relationship member names without opening the picker and keeps unknown IDs readable', async () => {
+        useMocks({
+            get: {
+                '/api/organizations/:organization_id/members/': {
+                    count: 1,
+                    next: null,
+                    results: [
+                        {
+                            user: { id: 9001, first_name: 'Robin', last_name: 'Finch', email: 'robin@example.com' },
+                        },
+                    ],
+                },
+            },
+        })
+        const { container } = render(
+            <Provider>
+                <PropertyFilterButton
+                    item={
+                        {
+                            type: PropertyFilterType.AccountRelationship,
+                            key: 'example-relationship',
+                            label: 'CSM',
+                            operator: PropertyOperator.IsNot,
+                            value: [9001, 9002],
+                        } as unknown as AnyPropertyFilter
+                    }
+                />
+            </Provider>
+        )
+        await waitFor(() => expect(contentTitle(container)).toContain('CSM ≠ Robin Finch, 9002'))
+    })
+})
