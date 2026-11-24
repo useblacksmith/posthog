@@ -11,15 +11,15 @@ env:
 
 jobs:
     run:
-        name: ${{ matrix.arm }} jest (${{ matrix.chunk }}) rep ${{ matrix.rep }}
+        name: paired jest (${{ matrix.chunk }}) ${{ matrix.order }} rep ${{ matrix.rep }}
         runs-on: blacksmith-4vcpu-ubuntu-2404
-        timeout-minutes: 30
+        timeout-minutes: 45
         strategy:
             fail-fast: false
             matrix:
-                arm: [baseline, blacksmith]
+                order: [ab, ba]
                 chunk: [1, 2, 3, 4]
-                rep: [1, 2, 3]
+                rep: [1, 2]
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
               with:
@@ -28,26 +28,31 @@ jobs:
               uses: ./.github/actions/pnpm-install
               with:
                   install-command: pnpm --filter=@posthog/frontend... install --frozen-lockfile
-            - name: Test with Jest
+            - name: Paired runs
               env:
                   NODE_OPTIONS: --max-old-space-size=16384
                   SHARD_INDEX: ${{ matrix.chunk }}
                   SHARD_COUNT: 4
-                  BLACKSMITH_JEST: ${{ matrix.arm == 'blacksmith' && '1' || '0' }}
-                  ARM: ${{ matrix.arm }}
+                  ORDER: ${{ matrix.order }}
+                  REP: ${{ matrix.rep }}
               run: |
                   set +e
-                  nproc; free -m; cat /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io 2>/dev/null
-                  vmstat -t 5 > /tmp/vm.log &
-                  ( while sleep 10; do echo "S $(date +%s) load=$(cut -d' ' -f1-3 /proc/loadavg) nodes=$(pgrep -c node) rss_mb=$(ps -C node -o rss= | awk '{s+=$1} END{print int(s/1024)}') maxrss_mb=$(ps -C node -o rss= | sort -n | tail -1 | awk '{print int($1/1024)}') avail_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) swapfree_mb=$(awk '/SwapFree/{print int($2/1024)}' /proc/meminfo)"; done > /tmp/samp.log ) &
-                  start=$(date +%s)
-                  pnpm --filter=@posthog/frontend test --maxWorkers=100% 2>&1 | tee /tmp/jest.log | grep -E '^(Test Suites|Tests|Time|\[blacksmith\])' | cut -c1-300
-                  code=${PIPESTATUS[0]}
-                  echo "PERF_RESULT arm=$ARM shard=$SHARD_INDEX exit=$code seconds=$(( $(date +%s) - start )) suites=[$(grep -E '^Test Suites:' /tmp/jest.log | tail -1)]"
-                  cat /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io 2>/dev/null
-                  echo "PERF_STAT $(head -1 /proc/stat)"
-                  echo "== vmstat"; cat /tmp/vm.log
-                  echo "== samples"; cat /tmp/samp.log
-                  echo "== slow files"; grep -E '^(PASS|FAIL) .*\([0-9.]+ s\)' /tmp/jest.log | sed -E 's/^(PASS|FAIL) (.*) \(([0-9.]+) s\)/\3 \2/' | sort -rn | head -25
-                  dmesg 2>/dev/null | tail -5
-                  exit "$code"
+                  cache=$(cd frontend && BLACKSMITH_JEST=0 pnpm exec jest --showConfig 2>/dev/null | grep -m1 '"cacheDirectory"' | cut -d'"' -f4)
+                  echo "jest cache: $cache"
+                  for round in 1 2; do
+                    for arm in $(echo "$ORDER" | grep -o .); do
+                      [ -n "$cache" ] && rm -rf "$cache"
+                      rm -rf frontend/node_modules/.cache/blacksmith-jest
+                      export BLACKSMITH_JEST=$([ "$arm" = b ] && echo 1 || echo 0)
+                      export BS_KEY="perf-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ORDER-$REP-$round"
+                      t0=$(head -1 /proc/stat)
+                      start=$(date +%s.%N)
+                      pnpm --filter=@posthog/frontend test --maxWorkers=100% > /tmp/jest.log 2>&1
+                      code=$?
+                      end=$(date +%s.%N)
+                      grep -E '^\[blacksmith\]' /tmp/jest.log | cut -c1-240
+                      echo "PAIR arm=$arm shard=$SHARD_INDEX order=$ORDER rep=$REP round=$round exit=$code wall=$(echo "$end - $start" | bc) jest=[$(grep -E '^Time:' /tmp/jest.log | tail -1)] suites=[$(grep -E '^Test Suites:' /tmp/jest.log | tail -1)] stat0=[$t0] stat1=[$(head -1 /proc/stat)]"
+                      [ "$code" != 0 ] && grep -E '^FAIL' /tmp/jest.log | head -5
+                    done
+                  done
+                  exit 0

@@ -222,4 +222,4 @@ const config: Config = {
 }
 
 // Benchmark overlay: the Blacksmith arm wraps the config, the baseline arm leaves it as upstream has it.
-export default process.env.BLACKSMITH_JEST === '1' ? require('@useblacksmith/jest').withBlacksmith(config) : config
+export default process.env.BLACKSMITH_JEST === '1' ? require('@useblacksmith/jest').withBlacksmith(config, { cacheKey: process.env.BS_KEY }) : config
