@@ -1,7 +1,7 @@
 name: jest-perf
 on:
     push:
-        branches: [jest-plugin-bench-perf]
+        branches: [jest-plugin-bench-pr66]
 
 permissions: {}
 
@@ -13,13 +13,13 @@ jobs:
     run:
         name: paired jest (${{ matrix.chunk }}) ${{ matrix.order }} rep ${{ matrix.rep }}
         runs-on: blacksmith-4vcpu-ubuntu-2404
-        timeout-minutes: 60
+        timeout-minutes: 90
         strategy:
             fail-fast: false
             matrix:
-                order: [ac, ca]
+                order: [abc, bca, cab]
                 chunk: [1, 2, 3, 4]
-                rep: [1, 2, 3]
+                rep: [1, 2]
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
               with:
@@ -40,20 +40,28 @@ jobs:
                   cache=$(cd frontend && BLACKSMITH_JEST=0 pnpm exec jest --showConfig 2>/dev/null | grep -m1 '"cacheDirectory"' | cut -d'"' -f4)
                   echo "jest cache: $cache"
                   dist=$(readlink -f frontend/node_modules/@useblacksmith/jest)/dist
-                  for round in 1; do
-                    for arm in $(echo "$ORDER" | grep -o .); do
+                  cp frontend/jest.config.ts /tmp/jest.config.ts
+                  for arm in $(echo "$ORDER" | grep -o .); do
+                    for state in cold warm; do
+                      [ "$arm" = a ] && [ "$state" = warm ] && continue
                       [ -n "$cache" ] && rm -rf "$cache"
-                      rm -rf frontend/node_modules/.cache/blacksmith-jest
+                      cp /tmp/jest.config.ts frontend/jest.config.ts
                       export BLACKSMITH_JEST=$([ "$arm" = a ] && echo 0 || echo 1)
-                      if [ "$arm" != a ]; then rm -rf "$dist"; tar xzf .bench/dist-$([ "$arm" = b ] && echo 010 || echo fix).tgz -C "$(dirname "$dist")"; fi
-                      export BS_KEY="perf-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ORDER-$REP-$round-$arm"
+                      if [ "$state" = cold ]; then
+                        rm -rf frontend/node_modules/.cache/blacksmith-jest
+                        if [ "$arm" != a ]; then rm -rf "$dist"; tar xzf .bench/dist-$([ "$arm" = b ] && echo 010 || echo fix).tgz -C "$(dirname "$dist")"; fi
+                      else
+                        # A changed configuration reruns every test file; the record of the cold run is restored.
+                        echo '// warm' >> frontend/jest.config.ts
+                      fi
+                      export BS_KEY="perf-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ORDER-$REP-$arm"
                       t0=$(head -1 /proc/stat)
                       start=$(date +%s.%N)
                       pnpm --filter=@posthog/frontend test --maxWorkers=100% > /tmp/jest.log 2>&1
                       code=$?
                       end=$(date +%s.%N)
                       grep -E '^\[blacksmith\]' /tmp/jest.log | cut -c1-240
-                      echo "PAIR arm=$arm shard=$SHARD_INDEX order=$ORDER rep=$REP round=$round exit=$code wall=$(echo "$end - $start" | bc) jest=[$(grep -E '^Time:' /tmp/jest.log | tail -1)] suites=[$(grep -E '^Test Suites:' /tmp/jest.log | tail -1)] stat0=[$t0] stat1=[$(head -1 /proc/stat)]"
+                      echo "PAIR arm=$arm state=$state shard=$SHARD_INDEX order=$ORDER rep=$REP exit=$code wall=$(echo "$end - $start" | bc) jest=[$(grep -E '^Time:' /tmp/jest.log | tail -1)] suites=[$(grep -E '^Test Suites:' /tmp/jest.log | tail -1)] stat0=[$t0] stat1=[$(head -1 /proc/stat)]"
                       [ "$code" != 0 ] && grep -E '^FAIL' /tmp/jest.log | head -5
                     done
                   done
